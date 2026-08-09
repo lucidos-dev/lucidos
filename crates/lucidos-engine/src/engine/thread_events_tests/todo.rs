@@ -16,6 +16,30 @@ fn todo_status_serializes_as_snake_case() {
         serde_json::to_value(TodoStatus::Completed).unwrap(),
         json!("completed")
     );
+    // The two engine-only statuses. `waiting` is the wire word the panel
+    // branches on for a thread parked on an *event wait*, so it is pinned here
+    // beside the rest rather than only being asserted through the settle path.
+    assert_eq!(
+        serde_json::to_value(TodoStatus::Waiting).unwrap(),
+        json!("waiting")
+    );
+    assert_eq!(
+        serde_json::to_value(TodoStatus::Abandoned).unwrap(),
+        json!("abandoned")
+    );
+}
+
+/// `Completed` and `Abandoned` are terminal; everything else a response
+/// terminator may still rewrite. `Waiting` being OPEN is what stops a parked
+/// list reading as parked forever once its wait resolves.
+#[test]
+fn only_completed_and_abandoned_are_terminal() {
+    use crate::engine::thread_events::TodoStatus;
+    assert!(TodoStatus::Pending.is_open());
+    assert!(TodoStatus::InProgress.is_open());
+    assert!(TodoStatus::Waiting.is_open());
+    assert!(!TodoStatus::Completed.is_open());
+    assert!(!TodoStatus::Abandoned.is_open());
 }
 
 #[test]
@@ -54,7 +78,7 @@ fn todo_list_written_round_trips_through_serde_with_empty_items() {
 }
 
 #[test]
-fn todo_list_written_round_trips_through_serde_with_all_three_statuses() {
+fn todo_list_written_round_trips_through_serde_with_every_status() {
     use crate::engine::thread_events::{TodoItem, TodoStatus};
     let event = ThreadEvent::TodoListWritten {
         items: vec![
@@ -72,6 +96,16 @@ fn todo_list_written_round_trips_through_serde_with_all_three_statuses() {
                 content: "c".into(),
                 active_form: "doing c".into(),
                 status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "d".into(),
+                active_form: "doing d".into(),
+                status: TodoStatus::Waiting,
+            },
+            TodoItem {
+                content: "e".into(),
+                active_form: "doing e".into(),
+                status: TodoStatus::Abandoned,
             },
         ],
     };

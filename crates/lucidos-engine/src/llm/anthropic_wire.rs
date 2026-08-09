@@ -1198,4 +1198,61 @@ mod tests {
 
         assert_eq!(meta.unknown_sse_dropped, 0);
     }
+
+    /// The transport half of the HTML-entity bug hunt
+    /// (`docs/plans/2026-08-09-tool-arg-html-entity-repair.md`): tool arguments
+    /// that reach us with `& < > " '` in them must come out of the SSE
+    /// accumulator byte-identical.
+    ///
+    /// This pins the bisection result rather than a fix. The escaping turned
+    /// out to be the model's own, and `engine::tool_arg_entity_repair` corrects
+    /// it downstream. If the transport ever DID start escaping, that repair
+    /// would quietly mask it on the allow-listed label arguments while
+    /// corrupting everything else, so the accumulator gets its own guard.
+    ///
+    /// The deltas deliberately split mid-value and mid-escape-sequence, which
+    /// is how a real stream arrives, so a per-chunk transform could not hide
+    /// behind chunk boundaries.
+    #[test]
+    fn tool_argument_special_characters_survive_the_sse_accumulator() {
+        let mut blocks = Vec::new();
+        let mut meta = TurnMeta::default();
+        process_sse_data(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"trigger_groups"}}"#,
+            &mut blocks,
+            &mut meta,
+            "Test",
+        )
+        .unwrap();
+        // `{"name": "Machine & Tooling <Health> \"q\" 'a'", "action": "create"}`
+        // arriving in five chunks, one of them splitting the `\"` escape.
+        for partial in [
+            r#"{\"name\": \"Machine & Too"#,
+            r#"ling <Health> \\"#,
+            r#"\"q\\\" 'a'\", "#,
+            r#"\"action\": "#,
+            r#"\"create\"}"#,
+        ] {
+            process_sse_data(
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{partial}"}}}}"#
+                ),
+                &mut blocks,
+                &mut meta,
+                "Test",
+            )
+            .unwrap();
+        }
+
+        let AccumulatedBlock::ToolUse { json_parts, .. } = &blocks[0] else {
+            panic!("expected a tool_use block");
+        };
+        let args: serde_json::Value = serde_json::from_str(json_parts).expect("valid tool JSON");
+        assert_eq!(
+            args["name"], "Machine & Tooling <Health> \"q\" 'a'",
+            "the accumulator must not entity-escape tool argument text"
+        );
+        assert_eq!(args["action"], "create");
+        assert_eq!(meta.unknown_sse_dropped, 0);
+    }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus } from '../../store/store';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
@@ -209,11 +209,17 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
  *  (a sibling of `.thread-content` in the position:relative `.thread-content-wrap`).
  *  Living outside the scroll container lets it linger and crossfade OUT as the
  *  exchanges render underneath, rather than hard-swapping. `show` is the
- *  delay-gated loading flag; the overlay then lingers SKELETON_FADE_OUT_MS while
- *  fading. Decorative + pointer-events:none so it never blocks the content. */
-const SKELETON_FADE_OUT_MS = 250;
+ *  delay-gated loading flag; the overlay then lingers for the length of its own
+ *  fade while fading. Decorative + pointer-events:none so it never blocks the
+ *  content.
+ *
+ *  The fade is `opacity var(--duration-normal)`, whose 1x value is the constant
+ *  below; the linger scales it by the Animation speed slider and adds fixed
+ *  slack, so the overlay cannot unmount mid-fade at a slow setting. */
+const SKELETON_FADE_OUT_MS = 200;
+const SKELETON_FADE_SLACK_MS = 50;
 function ThreadSkeletonOverlay({ show }: { show: boolean }) {
-    const mounted = useLingeringFlag(show, SKELETON_FADE_OUT_MS);
+    const mounted = useLingeringFlag(show, scaledDurationMs(SKELETON_FADE_OUT_MS) + SKELETON_FADE_SLACK_MS);
     if (!mounted) return null;
     return (
         <div class={`thread-skeleton-overlay${show ? '' : ' is-fading'}`} aria-hidden="true">

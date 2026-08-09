@@ -1,5 +1,5 @@
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { speedMultiplier } from '../store/store';
+import { durationScale } from '../store/store';
 import { prefersReducedMotion } from '../utils/platform';
 import { isMobile } from '../utils/viewport';
 
@@ -121,9 +121,11 @@ export function useFlipTransitions(
         hiddenEls.current = [];
         portalClones.current = [];
 
-        const speed = speedMultiplier.value;
         const mobile = isMobile();
-        const durationScale = (1 / speed) * (mobile ? MOBILE_DURATION_SCALE : 1);
+        // The shared slider scale (store/store.ts), the same one every CSS
+        // --duration-* token folds in, times this animation's own mobile
+        // shortening.
+        const scale = durationScale.value * (mobile ? MOBILE_DURATION_SCALE : 1);
         const easing = mobile ? EASING_MOBILE : EASING_DESKTOP;
 
         const rows = el.querySelectorAll<HTMLElement>('[data-flip-id]');
@@ -152,7 +154,7 @@ export function useFlipTransitions(
                     ];
                 const anim = row.animate(
                     newItemKeyframes,
-                    { duration: (isSection ? 350 : 450) * durationScale, easing, fill: 'none' },
+                    { duration: (isSection ? 350 : 450) * scale, easing, fill: 'none' },
                 );
                 newAnims.push(anim);
                 continue;
@@ -175,7 +177,7 @@ export function useFlipTransitions(
             const baseDuration = noMovement
                 ? MIN_MS  // Section-transitioned but same position: use min duration for scale-settle
                 : Math.max(MIN_MS, Math.min(MAX_MS, dist / PX_PER_SEC * 1000));
-            const duration = baseDuration * durationScale;
+            const duration = baseDuration * scale;
 
             if (isMoved) {
                 // ── Portal-based flight for moved threads ──

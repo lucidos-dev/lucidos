@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
+import type { JSX } from 'preact';
 import { isMobile } from '../../utils/viewport';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
@@ -68,6 +69,48 @@ export function isTypeaheadSeedKey(
     && !e.metaKey && !e.ctrlKey && !e.altKey;
 }
 
+/** Class list for the menu panel. The menu is portaled to `<body>` (see the
+ *  `<Overlay portal>` below), which severs every ancestor-scoped rule that used
+ *  to reach it through the DOM. Exactly one such context styled the rows: a
+ *  dropdown used as a **form field**, whose taller `.form-group` control wants
+ *  its options sized to match. That context travels with the panel as its own
+ *  class (`.dropdown-menu-field`) instead of being read off an ancestor that is
+ *  no longer there. Pure over anything `closest`-capable, so it is testable
+ *  without a DOM. */
+export function dropdownMenuClass(trigger: { closest(selector: string): unknown } | null): string {
+  return trigger?.closest('.form-group') ? 'dropdown-menu dropdown-menu-field' : 'dropdown-menu';
+}
+
+/** Inline style for the menu panel, given the trigger's width and the computed
+ *  position (`null` until `useAnchoredPosition` has measured the panel).
+ *
+ *  `minWidth` is present from the FIRST render, before `pos` exists, and that
+ *  is load-bearing rather than tidy: the hook measures THIS panel to compute
+ *  the position, and the panel is portaled to `<body>`, where the stylesheet's
+ *  `min-width: 100%` resolves against the initial containing block. Left to
+ *  the stylesheet, the measurement pass would report a viewport-wide menu, and
+ *  `computeAnchorPosition` would strand `left` at the viewport margin instead
+ *  of under the trigger, jumping into place a frame or two later once the
+ *  ResizeObserver re-measured the narrowed panel. (`.thread-overflow-menu`
+ *  hit the same trap from the other direction and fixed it with
+ *  `width: max-content`; a min-width would have beaten that, so this one is
+ *  answered where it is set.) `fixed` plus the zeroed offsets keep the hidden
+ *  measurement box inside the viewport rather than 100vh down the document,
+ *  so it measures at exactly the geometry it will be shown at. */
+export function dropdownPanelStyle(
+  anchorWidth: number | null,
+  pos: { top: number; left: number } | null,
+): JSX.CSSProperties {
+  if (anchorWidth === null) return { visibility: 'hidden' };
+  return {
+    position: 'fixed',
+    minWidth: `${anchorWidth}px`,
+    ...(pos
+      ? { top: `${pos.top}px`, left: `${pos.left}px` }
+      : { top: '0px', left: '0px', visibility: 'hidden' }),
+  };
+}
+
 /** Walk `options` from `start` in direction `step` (±1), skipping any
  *  `disabled` entries (section headers). Used by ArrowDown/Up + the initial
  *  focus seed so navigation never lands stuck on a header. Returns `start`
@@ -98,10 +141,10 @@ export function Dropdown({
 }: DropdownProps) {
   // Anchor element when open, null when closed. `useAnchoredPosition` reacts
   // to anchor changes via its effect deps — no separate `open` flag needed.
-  // The menu uses `position: fixed` so it escapes any `overflow: hidden`
-  // ancestor (notably `.mobile-swipe-pane` on mobile, where an
-  // `absolute`-positioned menu was clipped at the pane edge regardless of
-  // placement direction).
+  // The menu uses `position: fixed` (and is portaled to <body>, see the
+  // `<Overlay>` below) so it escapes any `overflow: hidden` ancestor (notably
+  // `.mobile-swipe-pane` on mobile, where an `absolute`-positioned menu was
+  // clipped at the pane edge regardless of placement direction).
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [filter, setFilter] = useState('');
   // Latches true on the first printable keystroke while open and resets on
@@ -346,16 +389,18 @@ export function Dropdown({
         onClose={closeDropdown}
         anchor={ref.current}
         backdrop={false}
-        panelClass="dropdown-menu"
+        // Portaled to <body>, and both halves of that matter. The menu carries
+        // VIEWPORT coordinates, so a `transform`ed ancestor would become its
+        // containing block and resolve them against the wrong origin; and the
+        // pane it opens from is a stacking context (`.mobile-swipe-pane` is
+        // `isolation: isolate` + `translateZ(0)`), which caps every z-index
+        // inside it below the floating header chrome however high the menu
+        // asks to be. Hoisting the panel out of `.app-shell` is what lets the
+        // z-index in `.dropdown-menu` actually out-rank that chrome.
+        portal
+        panelClass={dropdownMenuClass(anchor)}
         panelRef={menuRef}
-        panelStyle={anchor && pos
-          ? {
-              position: 'fixed',
-              top: `${pos.top}px`,
-              left: `${pos.left}px`,
-              minWidth: `${anchor.getBoundingClientRect().width}px`,
-            }
-          : { visibility: 'hidden' }}
+        panelStyle={dropdownPanelStyle(anchor ? anchor.getBoundingClientRect().width : null, pos)}
       >
           {!freeText && searching && (
             <input

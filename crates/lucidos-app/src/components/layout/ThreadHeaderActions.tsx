@@ -8,13 +8,15 @@ import { ComposeIcon, HelpIcon, SearchIcon } from '../shared/icons';
 import { CollapsingActions, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
-/** The thread row's three zones. The centre one is CENTRED on the region rather
- *  than being a flex zone, so the room these actions have is half of what the
- *  centred cluster leaves, not the row's leftover (see `centred`). Stable
- *  identity so the collapse effect's deps do not re-fire every render. */
+/** The thread row's zones. The centre one is CENTRED on the region rather than
+ *  being a flex zone, so the room these actions have is half of what the centred
+ *  cluster leaves, not the row's leftover (see `centred`). No `leading`: the
+ *  row's leading control is the drawer toggle, which is positioned against the
+ *  header rather than being a member of this region, and `centred` derives the
+ *  leading width arithmetically anyway. Stable identity so the collapse effect's
+ *  deps do not re-fire every render. */
 const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   container: '.pane-header-brand',
-  leading: '.thread-nav-group',
   centre: '.pane-header-brand-label',
   // Present only while sessions are resuming, and it never collapses, so the
   // measurement has to budget for it exactly as the content row budgets for the

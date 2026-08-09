@@ -44,7 +44,7 @@
 /* Strikethrough marks the ITEM, never the row. It lives on `.todo-panel-text`
    because a row-level `text-decoration` propagates into the row's flex items —
    and a child CANNOT cancel an inherited decoration, so `text-decoration: none`
-   on the ⊘/✓ marker or the ABANDONED tag would be inert and the line would
+   on the ⊘/✓ marker or the status tag would be inert and the line would
    draw straight through them. Scoping it to the text span is the only way to
    keep the row chrome unstruck. Solid = completed, dashed = abandoned. */
 .todo-panel-row[data-status="completed"] {
@@ -61,6 +61,19 @@
     font-weight: 500;
 }
 
+/* Parked, not dropped: the thread holds a live event wait and something will
+   wake it. So a waiting row keeps full-strength text and takes NO
+   strikethrough (the work is still going somewhere), and only its marker is
+   tinted. Deliberately the opposite treatment to abandoned, which is the whole
+   distinction the status exists to draw. */
+.todo-panel-row[data-status="waiting"] {
+    color: var(--text-primary);
+}
+
+.todo-panel-row[data-status="waiting"] .todo-panel-marker {
+    color: var(--accent-yellow);
+}
+
 .todo-panel-row[data-status="abandoned"] {
     color: var(--text-secondary);
     opacity: 0.7;
@@ -71,7 +84,7 @@
     text-decoration-style: dashed;
 }
 
-/* Indicator glanceable signal. All three states render the SAME TodoListIcon
+/* Indicator glanceable signal. All four states render the SAME TodoListIcon
    ticked checkbox, so the button keeps reading as "todo list" whatever the
    agent is doing; the state rides on color alone. Shape-switching is what the
    old two-glyph pair did, and its in-progress glyph (a filled dome inside a
@@ -80,10 +93,16 @@
 
    Color has to carry it because the tooltip is desktop-only per the project
    rule, so on mobile the glyph is the whole signal. Accent for in-progress
-   reads as "live, being worked"; desaturated + semi-transparent for abandoned
-   reads as "incomplete / walked away from" against the brighter two. */
+   reads as "live, being worked"; accent-yellow for waiting reads as "live, but
+   stopped on something", the same colour language as the *subscription
+   indicator* beside it; desaturated + semi-transparent for abandoned
+   reads as "incomplete / walked away from" against the brighter three. */
 .icon-btn[data-role="todo-indicator"][data-state="in-progress"] {
     color: var(--accent);
+}
+
+.icon-btn[data-role="todo-indicator"][data-state="waiting"] {
+    color: var(--accent-yellow);
 }
 
 .icon-btn[data-role="todo-indicator"][data-state="abandoned"] {
@@ -98,7 +117,10 @@
     font-size: var(--font-size-sm);
 }
 
-.todo-panel-abandoned-tag {
+/* One tag for both engine-written statuses (`waiting`, `abandoned`). The word
+   is the differentiator; the chrome is deliberately identical, so a row wears
+   the same shape whichever way its work ended up. */
+.todo-panel-status-tag {
     flex: 0 0 auto;
     font-size: var(--font-size-xs);
     font-weight: 500;

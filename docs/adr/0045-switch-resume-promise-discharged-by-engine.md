@@ -66,9 +66,19 @@ uses it to say exactly that.
   coding-agent resume has only emitted `ContinuationRequested` when the floor
   runs, and that type is deliberately absent from `THREAD_START_EVENTS_SQL`, so a
   query-only exclusion would re-abort a thread that is resuming perfectly well.
-- In the failure case the timeline shows two boundaries in a row, "You Restarted"
-  then "System Response interrupted". That is accepted: it only happens when the
-  promise was actually broken, and the second panel is the honest record of it.
+- In the failure case the timeline shows two boundaries in a row, "Paused by
+  restart" then "Response interrupted". That is accepted: it only happens when
+  the promise was actually broken, and the second panel is the honest record of
+  it. **Both name the device that clicked switch.** As first written the
+  withdrawal hardcoded `MessageOrigin::system()`, so the pair read "Paused by
+  restart" then "⚙ System / Response interrupted", telling the user a crash had
+  taken a turn they themselves had restarted. Corrected 2026-08-09 by inheriting
+  the actor off the switch abort being withdrawn, the boot-side spelling of the
+  *teardown actor* rule (`docs/glossary.md`); the two days between this ADR and
+  the 2026-08-07 teardown-actor sweep are why that sweep missed it. Only the
+  `cause` distinguishes the panels, which is correct: `RecoveryAfterRestart` is
+  what re-arms Continue and settles `failed`, and it says nothing about who
+  restarted.
 - The sweep must be idempotent across boots, since nothing supersedes the original
   switch abort in the start-event sense. It is, because its own withdrawal becomes
   the thread's newest `ResponseAborted` and the query requires the switch abort to

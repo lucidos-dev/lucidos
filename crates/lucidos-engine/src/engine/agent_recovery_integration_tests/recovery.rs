@@ -1014,17 +1014,48 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
          its only chance: excluding it here is a permanent dead end"
     );
 
-    // The withdrawal has to be VISIBLE, not just recorded. Its abort carries a
-    // system actor and `recovery_after_restart`, neither of which is the switch
-    // fingerprint, so the status follows the promise off `paused` and onto
-    // `failed`: the red dot, a slot in the needs-attention count, and the
-    // Continue button the withdrawal exists to hand back. Leaving these two on
-    // the reassuring pause glyph is exactly the state the user reported.
+    // The withdrawal has to be VISIBLE, not just recorded. `recovery_after_restart`
+    // is not the switch fingerprint (which needs `engine_shutdown` AND a device),
+    // so the status follows the promise off `paused` and onto `failed`: the red
+    // dot, a slot in the needs-attention count, and the Continue button the
+    // withdrawal exists to hand back. Leaving these two on the reassuring pause
+    // glyph is exactly the state the user reported.
     for thread_id in [declined, archived] {
         assert_eq!(
             status_of(thread_id).await,
             "failed",
             "a withdrawn resume promise must stop reading as paused"
+        );
+    }
+
+    // ...and the CAUSE is what does that, not the actor. The withdrawal names
+    // the device that clicked switch, inherited from the abort it withdraws,
+    // because the restart it is reporting was that person's. Hardcoding
+    // `system` here is what made a user's own *Switch to new version* come back
+    // as "⚙ System / Response interrupted" over a red thread, and it is the
+    // fourth site of that bug rather than the first: see
+    // `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`
+    // for the three teardown emits swept two days after this floor was written.
+    //
+    // Asserted as "no boundary on this thread says system", not merely "the
+    // withdrawal says device", because the recurrence is always a NEW emit site
+    // appearing beside the fixed ones.
+    for thread_id in [declined, archived] {
+        let actors: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT payload->'actor'->>'kind' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseAborted' \
+             ORDER BY sequence",
+        )
+        .bind(thread_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .expect("actor query");
+        assert_eq!(
+            actors,
+            vec![Some("device".to_string()), Some("device".to_string())],
+            "both boundaries about ONE user-initiated teardown must name the \
+             human who caused it: the switch abort and the withdrawal of its \
+             promise are two statements about the same restart"
         );
     }
     assert_eq!(
@@ -1277,6 +1308,219 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         "the reported end state: a transcript that opens 'Paused by restart' and \
          a thread that ends red, in the attention count, asking the user to \
          Continue work the engine had promised to resume itself"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A coding-agent thread does not get a fresh branch per turn: it applies a
+/// change and keeps working on the same one. So nothing the branch did on an
+/// EARLIER turn may reach the recovery gate, or the thread is retired from the
+/// first Apply onward and never auto-resumes again.
+///
+/// The reported shape (2026-08-09, thread "Persisting Thread Auto-Scroll to
+/// Bottom"): a change on the branch was applied at 16:55, the user sent a
+/// follow-up at 17:15, and at 17:21:54 they hit *Switch to new version* with
+/// the turn mid-flight. Boot classified the branch `running` and the switch
+/// fingerprint held, exactly as asserted below, and recovery skipped it anyway
+/// with "has no in-flight signal": `in_flight` also consulted
+/// `completed_change_branches`, `SELECT DISTINCT branch_name FROM changes WHERE
+/// status IN ('applied','discarded')`, which had held that branch since 16:55.
+/// No resume was actuated, `settle_unresumed_switch_threads` withdrew the
+/// promise, and "Paused by restart" became "⚙ System / Response interrupted"
+/// over a `failed` thread, reading to the user as a crash they had not caused.
+///
+/// So the assertions are deliberately spread across all three reads the resume
+/// decision is made from, not just the gate that carried the bug. The two DB
+/// reads were already correct in the report and are pinned here because the
+/// obvious wrong repair is to make one of them agree with the veto: adding
+/// `ChangeApplied` to `TURN_ENDED_EVENT_TYPES_SQL` would re-close the same hole
+/// from the other side, and it would look reasonable.
+#[tokio::test]
+async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume() {
+    use crate::engine::agent_recovery::{
+        branch_awaits_recovery, switch_was_user_initiated, BRANCH_CLASSIFICATION_SQL,
+    };
+    use crate::engine::thread_events::{AbortCause, MessageOrigin};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let branch = format!("claude-code/{thread_id}");
+    let change_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    let device = MessageOrigin::Device {
+        device_id: "d1".into(),
+        label: "My iPhone".into(),
+    };
+
+    // Turn 1: a session on the branch, a change, and the user applying it.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "sid-turn-1".into(),
+            branch: branch.clone(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            change_id: change_id.to_string(),
+            description: Some("turn 1".into()),
+            files: vec!["a.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: branch.clone(),
+            repo_root: "/tmp/repo".into(),
+            hardened: false,
+            incomplete: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeApplied {
+            change_id: change_id.to_string(),
+            requires_restart: false,
+            client_update: false,
+            commits: vec!["feat: turn 1".into()],
+            thread_title: None,
+            actor: Some(device.clone()),
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            path: String::new(),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Turn 2 on the SAME branch: the follow-up, a fresh session, and the user's
+    // switch landing mid-turn.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentUserMessageSent {
+            text: "follow-up".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            session_id: "sid-turn-2".into(),
+            branch: branch.clone(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::EngineShutdown,
+        },
+        meta: EventMeta {
+            actor: Some(device),
+            ..cc_meta.clone()
+        },
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Precondition: the branch really does carry a completed change, so this is
+    // the seed the veto used to fire on rather than a shape it never saw.
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM changes WHERE branch_name = $1 AND status = 'applied'",
+    )
+    .bind(&branch)
+    .fetch_one(&pool)
+    .await
+    .expect("changes row query");
+    assert_eq!(
+        completed, 1,
+        "precondition: turn 1's change is applied and the branch is in the \
+         completed set the retired veto read"
+    );
+
+    // Read 1: the branch classifier. `ChangeApplied` is not a lifecycle event,
+    // so turn 2's `SessionStarted` is still the newest one and the turn is open.
+    let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
+        .fetch_all(&pool)
+        .await
+        .expect("branch classification query");
+    let status = rows
+        .into_iter()
+        .find(|(b, _)| *b == branch)
+        .map(|(_, s)| s)
+        .expect("the seeded branch is classified");
+    assert_eq!(
+        status, "running",
+        "an applied change from turn 1 must not read as turn 2 having ended"
+    );
+
+    // Read 2: the switch fingerprint. The engine promised this turn a resume.
+    assert!(
+        switch_was_user_initiated(&pool, thread_id).await,
+        "the teardown abort carries a device actor and EngineShutdown, so this \
+         is a user switch and the boot owes it an auto-resume"
+    );
+
+    // Read 3: the gate that broke. `idle_branches` is what read 1 feeds it, and
+    // turn 1's change is resolved so nothing is pending.
+    let pending = bus
+        .changes_projection()
+        .get_pending_by_branch(&branch)
+        .await
+        .expect("pending lookup succeeds");
+    assert!(
+        pending.is_none(),
+        "precondition: the applied change leaves nothing pending, so the gate \
+         cannot be rescued by the pending-change arm"
+    );
+    assert!(
+        branch_awaits_recovery(&branch, &std::collections::HashSet::new(), false),
+        "the reported failure: recovery must not skip this branch, or no resume \
+         is actuated and the boot floor withdraws the promise the user was shown"
     );
 
     pool.close().await;

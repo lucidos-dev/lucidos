@@ -493,13 +493,6 @@ impl LucidosEngine {
             );
             Vec::new()
         });
-        let completed_change_branches_list = proj.list_completed_branches().await.unwrap_or_else(|e| {
-            log!(
-                "[Recovery] list_completed_branches: {} — recovery proceeds without completed branch context",
-                e
-            );
-            Vec::new()
-        });
         let change_branches_list: Vec<(String, Uuid)> = pending_changes_list
             .iter()
             .filter_map(|c| c.thread_id.map(|tid| (c.branch_name.clone(), tid)))
@@ -588,9 +581,6 @@ impl LucidosEngine {
             branch_to_thread.entry(br).or_insert(tid);
         }
 
-        let completed_change_branches: std::collections::HashSet<String> =
-            completed_change_branches_list.into_iter().collect();
-
         log!("[Recovery] Worktree scan: {}ms, DB classification: {}ms (worktrees={}, idle={}, running={})",
             t_worktree_scan.as_millis(),
             (t0.elapsed() - t_worktree_scan).as_millis(),
@@ -671,10 +661,21 @@ impl LucidosEngine {
             if discovered_branches.contains(branch) {
                 continue;
             }
-            if already_recovered.contains(branch)
-                || completed_change_branches.contains(branch)
-                || idle_branches.contains(branch)
-            {
+            // `idle_branches` can still hold this branch even though we are
+            // iterating the running set: the classifier emits one row per
+            // THREAD, so two threads sharing a branch name can disagree. A
+            // disagreement is not a mandate to recreate a worktree.
+            //
+            // `already_recovered` is deliberately NOT consulted here, where the
+            // main loop below narrows it instead of dropping it. Every branch in
+            // this loop is classified `running`, and "the branch's newest
+            // ContinuationStarted was followed by a completion" can only be true
+            // of a running branch when a LATER turn opened after that completion.
+            // So here the set has no configuration in which it is right, only the
+            // one in which it silently drops a live turn whose worktree is also
+            // gone: the exact half-fix that would leave a lost worktree behaving
+            // differently from a surviving one.
+            if idle_branches.contains(branch) {
                 continue;
             }
 
@@ -884,21 +885,24 @@ impl LucidosEngine {
                     continue;
                 }
             }
-            if already_recovered.contains(&branch_name) {
+            // A completed prior recovery only settles the turn it recovered. The
+            // set is keyed by branch and asks a question about the newest
+            // `ContinuationStarted`, so on a thread that was auto-resumed once
+            // and then kept working it stays true forever, which is the same
+            // shape [`branch_awaits_recovery`] documents. A live classification
+            // therefore outranks it: an in-flight turn at boot has no live
+            // subprocess whoever recovered the last one.
+            if !actively_running_branches.contains(&branch_name)
+                && already_recovered.contains(&branch_name)
+            {
                 log!(
                     "[Recovery] Skipping worktree {} — recovery thread already exists",
                     wt_path.display()
                 );
                 continue;
             }
-            // Skip non-in-flight branches so applied/idle threads don't
-            // surface a misleading "Continue?" affordance. Pending change
-            // counts as in-flight — CC was awaiting Apply when the engine
-            // died.
-            let in_flight = !idle_branches.contains(&branch_name)
-                && !completed_change_branches.contains(&branch_name);
             let has_pending_change = pending_by_branch.contains_key(&branch_name);
-            if !in_flight && !has_pending_change {
+            if !branch_awaits_recovery(&branch_name, &idle_branches, has_pending_change) {
                 log!(
                     "[Recovery] Skipping clean worktree {} — branch {} has no in-flight signal; cleanup worker will reclaim",
                     wt_path.display(),
@@ -1081,6 +1085,48 @@ impl LucidosEngine {
 
         recovering_threads.into_iter().collect()
     }
+}
+
+/// True when a discovered worktree's branch still owes the user a recovery: the
+/// turn on it was open when the engine died, or a change on it is still waiting
+/// to be applied. False means the branch is settled, so surfacing a "Continue?"
+/// affordance for it would be noise and the cleanup worker can have the disk.
+///
+/// **Every input must be a fact about the branch's CURRENT turn.** That is the
+/// whole content of this function, and it is why it exists as a named predicate
+/// rather than an inline `&&`. `idle_branches` comes from
+/// [`BRANCH_CLASSIFICATION_SQL`], which reads the newest lifecycle event, and a
+/// pending change is by definition unresolved. A *historical* fact about the
+/// branch is not admissible here however settled it sounds, because a
+/// coding-agent thread keeps working on ONE branch across many turns: anything
+/// true of an earlier turn stays true forever and silently retires the thread.
+///
+/// It carried exactly such an input until 2026-08-09: `completed_change_branches`
+/// (`SELECT DISTINCT branch_name FROM changes WHERE status IN
+/// ('applied','discarded')`). Added 2026-04-01 against ghost recovery threads
+/// from a reset DB, it only ever changed the answer for a branch the classifier
+/// had already called `running`, since an applied-then-idle one is in
+/// `idle_branches` anyway and a branch with no originating thread is dropped by
+/// [`orphan_recovery_target`] a few lines below (the modern form of the same
+/// commit's `known_branches`, which was the real fix for ghosts). So its only
+/// live effect was on a mid-turn branch, where it was wrong. The cost, on a
+/// thread whose change had been applied hours earlier and which was mid-turn
+/// when the user hit *Switch to new version*: recovery logged "no in-flight
+/// signal" and skipped it, no resume was actuated, and
+/// [`settle_unresumed_switch_threads`] withdrew the promise. The user watched
+/// "Paused by restart" turn into "⚙ System / Response interrupted" over a
+/// `failed` thread, attributing their own restart to a crash. Permanently, too:
+/// a branch never leaves that set, so every later restart cost the same thread
+/// its auto-resume.
+pub(crate) fn branch_awaits_recovery(
+    branch: &str,
+    idle_branches: &std::collections::HashSet<String>,
+    has_pending_change: bool,
+) -> bool {
+    // Pending change wins over an idle classification: the agent reached its
+    // idle and then waited for Apply, so the branch is settled only once the
+    // user resolves the change.
+    has_pending_change || !idle_branches.contains(branch)
 }
 
 /// True when the thread's most recent `UserQuestionAsked` has no later answer,
@@ -1576,13 +1622,34 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
 /// that is the compose lifecycle, and a composing or discarded row is not a
 /// dismissed thread but a draft or a tombstone.
 ///
-/// Selecting `payload->>'request_event_id'` too: the withdrawal reuses the switch
-/// abort's own originating id, so both boundaries land in the same exchange
-/// rather than the withdrawal opening a stray one.
+/// **The withdrawal inherits the switch abort's `request_event_id` AND its
+/// `actor`, which is why both are selected here.** Same reasoning for both: this
+/// boundary is a second statement about somebody else's teardown, so every field
+/// describing that teardown is read off the boundary being withdrawn rather than
+/// invented. The id keeps the two panels in one exchange instead of the
+/// withdrawal opening a stray one. The actor keeps them agreeing about who
+/// restarted the engine, which is the whole subject of both.
+///
+/// The actor half is not defensive: `SWITCH_TEARDOWN_ABORT_SQL` above selects
+/// **only** rows whose actor is a device, so every thread reaching the
+/// withdrawal was torn down by a human at a known device, and stamping
+/// `MessageOrigin::system()` on the result states the one thing the selection
+/// proves false. It did exactly that from 2026-08-05 to 2026-08-09, which is how
+/// the user's own *Switch to new version* came back as "⚙ System / Response
+/// interrupted": the fourth site of the hardcoded-`system()` bug that
+/// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`
+/// swept out of the three teardown emits two days after this one was written,
+/// and missed because this one lives on the boot path instead.
+///
+/// A boot cannot reach `LucidosEngine::teardown_actor` (that lives in the
+/// process that died), so the abort row is the only surviving record of who
+/// clicked, and inheriting it is the boot-side spelling of the same "one actor
+/// for the whole teardown" rule.
 fn unresumed_switch_threads_sql() -> String {
     format!(
         "SELECT e.aggregate_id::uuid AS thread_id, \
-                e.payload->>'request_event_id' AS request_event_id \
+                e.payload->>'request_event_id' AS request_event_id, \
+                e.payload->'actor' AS actor \
          FROM events e \
          JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
          WHERE e.aggregate = 'thread' \
@@ -1621,12 +1688,21 @@ fn unresumed_switch_threads_sql() -> String {
 /// Runs LAST in the boot sequence (`main.rs`, after both drains) for the obvious
 /// reason: it can only tell a broken promise from a kept one once every resume
 /// path has had its turn.
+///
+/// The boundary is crash-SHAPED, not crash-ATTRIBUTED. `RecoveryAfterRestart` is
+/// what re-arms Continue and keeps the thread `failed`
+/// (`AbortCause::status_sql`), and both are right: the turn is not coming back
+/// on its own. Who ended it is a separate axis, and on this path the answer is
+/// always a human at a device, carried over from the switch abort by
+/// [`unresumed_switch_threads_sql`]. See that function for what stamping
+/// `system` here cost.
 pub(crate) async fn settle_unresumed_switch_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
     resumed: &std::collections::HashSet<Uuid>,
 ) {
-    let rows: Vec<(Uuid, Option<String>)> = match sqlx::query_as(&unresumed_switch_threads_sql())
+    type UnresumedSwitchRow = (Uuid, Option<String>, Option<serde_json::Value>);
+    let rows: Vec<UnresumedSwitchRow> = match sqlx::query_as(&unresumed_switch_threads_sql())
         .fetch_all(pool)
         .await
     {
@@ -1641,7 +1717,7 @@ pub(crate) async fn settle_unresumed_switch_threads(
         }
     };
 
-    for (thread_id, request_event_id) in rows {
+    for (thread_id, request_event_id, switch_actor) in rows {
         if resumed.contains(&thread_id) {
             continue;
         }
@@ -1650,16 +1726,36 @@ pub(crate) async fn settle_unresumed_switch_threads(
              Withdrawing the resume promise so its Continue affordance returns",
             thread_id
         );
+        // Both fields describe the teardown this boundary is a second statement
+        // about, so both are inherited from the switch abort rather than
+        // invented. The id keeps the two panels in one exchange; the actor keeps
+        // them naming the same person.
+        //
+        // The actor fallback is genuinely unreachable, since the selection
+        // predicate matches only a device actor, so it can fire only if the row
+        // stopped round-tripping through `MessageOrigin`. Say so in the log
+        // rather than silently attributing the user's restart to the host: a
+        // `system` actor here is the shape of the bug this inheritance fixed.
+        let actor = switch_actor
+            .and_then(|v| match serde_json::from_value::<MessageOrigin>(v) {
+                Ok(origin) => Some(origin),
+                Err(e) => {
+                    log!(
+                        "[Recovery] Switch abort on thread {} has an unreadable actor: {}. \
+                         Withdrawal falls back to the system actor",
+                        thread_id,
+                        e
+                    );
+                    None
+                }
+            })
+            .unwrap_or_else(MessageOrigin::system);
         let meta = crate::engine::thread_events::EventMeta {
-            // Reuse the switch abort's originating id so the withdrawal lands in
-            // the same exchange as the interruption it is about. `.ok()` is safe
-            // here: an unparseable value means the withdrawal opens its own
-            // exchange instead of joining, which costs grouping and nothing else,
-            // and the field is one the engine wrote itself.
+            // `.ok()` is safe here: an unparseable value means the withdrawal
+            // opens its own exchange instead of joining, which costs grouping
+            // and nothing else, and the field is one the engine wrote itself.
             request_event_id: request_event_id.as_deref().and_then(|s| s.parse().ok()),
-            // The host system ended this turn and no resume followed. Not
-            // engine-deliberate work, so `system` rather than `Engine{reason}`.
-            actor: Some(MessageOrigin::system()),
+            actor: Some(actor),
             ..crate::engine::thread_events::EventMeta::NONE
         };
         crate::engine::thread_events::emit_response_aborted(

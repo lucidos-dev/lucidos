@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath } from '../../store/store';
+import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
 import { contentViewKey } from './contentViewKey';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -22,13 +22,16 @@ const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => 
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
 const NotificationDetailInline = lazyComponent(() => import('../notifications/NotificationDetailInline').then(m => m.NotificationDetailInline));
 
-/** How long the navigation cover stays mounted. Matches its CSS clear animation
- *  (`--duration-normal` = 200ms) plus a little slack, so the element survives
- *  its own fade and then leaves. It is also the fuse that unmounts the cover
- *  when no animation runs at all: under `prefers-reduced-motion: reduce` the CSS
- *  drops the animation, and an `animationend`-driven unmount would then never
- *  fire and leave the pane covered forever. */
-const NAV_COVER_MS = 250;
+/** The navigation cover's CSS clear animation at 1x (`--duration-normal`). The
+ *  fuse below is this scaled by the Animation speed slider plus a little slack,
+ *  so the element survives its own fade and then leaves however fast that fade
+ *  is running. It is also the fuse that unmounts the cover when no animation
+ *  runs at all: under `prefers-reduced-motion: reduce` the CSS drops the
+ *  animation, and an `animationend`-driven unmount would then never fire and
+ *  leave the pane covered forever (harmless to stretch, since that rule also
+ *  makes the cover transparent from its first frame). */
+const NAV_COVER_ANIM_MS = 200;
+const NAV_COVER_SLACK_MS = 50;
 
 /** The one view the iOS repaint below skips. The app-ui body is `overflow: hidden`
  *  with an iframe child, so it is not the scroll container that blanks, and the
@@ -105,7 +108,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
     // arriving view, so there is nothing to cover.
     if (viewKey === null) { setCoverKey(null); return; }
     setCoverKey(viewKey);
-    const fuse = setTimeout(() => setCoverKey(null), NAV_COVER_MS);
+    const fuse = setTimeout(() => setCoverKey(null), scaledDurationMs(NAV_COVER_ANIM_MS) + NAV_COVER_SLACK_MS);
     return () => clearTimeout(fuse);
   }, [viewKey]);
 

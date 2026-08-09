@@ -64,7 +64,8 @@ not a constraint.
   its minimum and the trailing one takes what is left. Not a corner case, since
   the three pane floors are derived from the root font size (see
   `store/paneMinimums.ts`) and stop summing under a 1280px screen somewhere past
-  150% ui-scale.
+  150% ui-scale. (ADR 0058 raised the drawer's floor on the web client, which
+  moved that crossing down to 150% exactly.)
 - **`computeSnapRatio`, `computeDrawerSnap`, `cancelPendingSnap`, the pending-snap
   timer and `SNAP_DELAY_MS` are deleted.** `beginPaneResize` / `endPaneResize`
   survive as the `data-pane-resizing` attribute pair, which still turns the header

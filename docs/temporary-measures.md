@@ -876,6 +876,42 @@ condition; fix the condition rather than acting on it.
 - **Status:** active
 - **Investigation:** `model-tool-call-as-text`
 
+### HTML entities in tool-argument text (`Machine &amp; Tooling Health`)
+
+- **Added:** 2026-08-09
+- **Lives in:** `crates/lucidos-engine/src/engine/tool_arg_entity_repair.rs`
+  (+ its tests in the sibling `tool_arg_entity_repair_tests.rs`) and its wiring
+  in `crates/lucidos-engine/src/engine/agentic_loop/run.rs`, the third
+  post-response repair block. The two guards that pin the bisection are
+  `tool_argument_special_characters_survive_the_sse_accumulator`
+  (`llm/anthropic_wire.rs`) and
+  `tool_called_args_persist_special_characters_verbatim`
+  (`engine/event_bus_tests/serialization_persistence.rs`).
+- **Impermanent because (tolerates):** The chat model sometimes HTML-entity-
+  escapes the text it puts in a tool argument, so a trigger group the user
+  asked to call `Machine & Tooling Health` was created, persisted and re-served
+  as `Machine &amp; Tooling Health`. Affects `& < > " '` alike, and the
+  corruption reaches the domain event, so it is permanent in the user's data.
+  Verified NOT an engine bug, from both ends: no site on the write path
+  escapes (the four entity-encoding sites in the tree all build standalone HTML
+  pages, and the frontend's are render-time), and the model's context for the
+  canonical turn held bare `&` with zero entities in both preceding tool
+  results. Two shapes rule out a transport escape outright: one
+  `run_coding_agent` call carries `"title": "Nightly: build &amp; test"` beside
+  a clean `"prompt": "Build & test the engine…"` in the SAME arguments object,
+  and human `MessageReceived` text is clean at scale (21 bare-`&` messages
+  against 1 entity, which was the user quoting the bug). See
+  `docs/plans/2026-08-09-tool-arg-html-entity-repair.md`.
+- **Removal / resolution condition:** When the routed models reliably stop
+  escaping tool-argument text. Sample with the repair disabled, and count the
+  right denominator: tool calls whose allow-listed plain-text arguments
+  actually CONTAIN one of `& < > " '`, not raw turn count. A population that
+  never passed one of those characters proves nothing. On removal, drop the
+  module, its tests and the `run.rs` block; keep the two transport/persistence
+  guards, which assert a property of our own code rather than the model's.
+- **Status:** active
+- **Investigation:** `model-escapes-tool-arg-text`
+
 ### code-review findings array leaking into chat (`[]` after "no findings")
 
 - **Added:** 2026-07-01
@@ -1275,3 +1311,35 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Status:** open
 - **Measures referencing this investigation:** Inline tool-call XML repair (§2),
   Inline `ask_user_question` XML repair (§2).
+
+### `model-escapes-tool-arg-text`: model HTML-entity-escapes tool-argument text
+
+- **Opened:** 2026-08-09
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** An investigation closes once its question is
+  answered. The chat model intermittently HTML-entity-escapes text it places in
+  a tool argument (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`), per-field and
+  per-turn rather than consistently: one turn created seven trigger groups with
+  `&amp;` in their names while a later turn renamed the same groups cleanly.
+  Confirmed model-side, not an engine escape (see the measure for the full
+  bisection). Sibling in spirit to `model-tool-call-as-text`, but a distinct
+  question: that one is the model choosing the wrong *channel* for a tool call,
+  this one is the model corrupting the *payload* of a correctly-structured one,
+  so closing either says nothing about the other.
+- **Open question this still owes an answer to:** whether the same escaping
+  reaches tools we do not own. The Claude Code path shows the identical shape in
+  `CodingAgentToolCalled` args going back to 2026-03-18, including mangled Rust
+  generics (`impl.*From&lt;&amp;str&gt;` as a Grep pattern). Those calls execute
+  inside CC's own process against CC's Grep/Edit, so Lucidos cannot intercept
+  them and must not rewrite the record (it would make our event disagree with
+  what CC actually ran). If the escaping is one model behavior, closing this
+  investigation should be able to cite clean CC tool calls too.
+- **Removal / resolution condition:** When a sampled batch of chat tool calls,
+  taken with the repair disabled and counted over calls whose plain-text
+  arguments actually contain one of `& < > " '`, shows no entity forms. On
+  close, flip every measure tagged
+  `Investigation: model-escapes-tool-arg-text` to `removed` per its own removal
+  steps.
+- **Status:** open
+- **Measures referencing this investigation:** HTML entities in tool-argument
+  text (§2).

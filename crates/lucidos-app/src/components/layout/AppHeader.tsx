@@ -37,8 +37,8 @@ function ThreadsHeader() {
   // suppresses the synthetic `click`, so firing focus on click means only a
   // real click (press + release, no drag) moves focus. Off Tauri this is just
   // "click to focus" and behaves the same as before. The other three regions
-  // (collapsed-thread-actions, pane-header-brand, content-header-elements)
-  // follow the same rule.
+  // (thread-toggle-slot, pane-header-brand, content-header-elements) follow the
+  // same rule.
   return (
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
          onClick={() => focusPane('drawer')}>
@@ -276,23 +276,27 @@ export function AppHeader() {
 
         {/* ─── Desktop: full header ─── */}
         <div class="desktop-header">
-          {/* Both nav-icon hosts stay mounted; CSS keyed on
-              data-thread-drawer-open fades between them so the drawer
-              toggle animates instead of popping (mount/unmount can't
-              transition). */}
           <div class="thread-header-elements">
             <ThreadsHeader />
-            {/* Focus on click, not pointerdown, so a window drag never shifts
+            {/* The drawer toggle, in ONE host for both drawer states. It used to
+                exist twice, once here and once inside the brand, with CSS keyed
+                on data-thread-drawer-open crossfading the pair. That read as the
+                user described it: an icon that had never been on screen sat
+                waiting at the header's leading edge and faded UP from nothing
+                while its twin slid toward it fading DOWN, so for most of the
+                slide the header carried two half-transparent icons that ended up
+                on nearly the same x. One element that TRAVELS between the two
+                positions (shell.css) is the same animation without either of
+                those: it is a part of the header the whole way, at full opacity.
+
+                Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
-            <div class="collapsed-thread-actions" onClick={onThreadHeaderClick}>
+            <div class="thread-toggle-slot" onClick={onThreadHeaderClick}>
               <ThreadToggleButton />
             </div>
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
             <span class="pane-header-brand" onClick={onThreadHeaderClick}>
-              <div class="thread-nav-group">
-                <ThreadToggleButton />
-              </div>
               {/* The Lucidos mark, absolutely centred on the pane: brand,
                   connection light and menu in one control, the same one both
                   mobile headers carry. It replaced a `[Lucidos * workspace]`
@@ -315,10 +319,11 @@ export function AppHeader() {
                 </span>
                 <ThreadForwardButton showTooltip />
               </span>
-              {/* Right-side actions, pinned to the region's trailing edge by the
-                  brand's space-between while the label floats over the pane's
-                  true middle. They fold into a ⋯ menu as the split narrows, see
-                  ThreadHeaderActions. */}
+              {/* Right-side actions, and the region's ONLY in-flow child now
+                  that the drawer toggle has its own host: the brand pins them to
+                  its trailing edge with justify-content, while the label floats
+                  over the pane's true middle. They fold into a ⋯ menu as the
+                  split narrows, see ThreadHeaderActions. */}
               <ThreadHeaderActions />
             </span>
           </div>

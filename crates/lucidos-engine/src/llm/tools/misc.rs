@@ -473,7 +473,7 @@ pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::TODO_WRITE.to_string(),
-            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. ABANDONMENT: any item still `pending` or `in_progress` when your response ends is flipped to `abandoned`, so the user sees you walked away from it.".to_string(),
+            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

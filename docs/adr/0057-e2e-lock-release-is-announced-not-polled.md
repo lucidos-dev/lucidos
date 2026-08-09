@@ -74,6 +74,22 @@ against.
   another workspace, and a release emitted while the engine is down. A waiter
   must therefore treat the timeout as a case it handles by reporting, not as an
   error.
+- **Both announcements of one hold are addressed as of the moment it was taken,
+  and that had to be made true** (`_e2e_capture_emit_env`, added 2026-08-09).
+  "The emitting subprocess's own `$LUCIDOS_WORKSPACE`" is not one workspace per
+  run: `acquire_e2e_lock` runs first, while the variable still names the
+  caller's, and then `reset_e2e_database` reaches `setup_postgres`, which
+  exports the e2e-test workspace into the entry script's **own** shell. The
+  release, emitted from the EXIT trap after that and after
+  `stop_e2e_workspace`, went to an engine teardown had just stopped, in a
+  workspace no waiter watches. It read as this decision's accepted gap and was
+  not: a waiter in the SAME workspace as the holder was never woken either, so
+  the case named above as "exactly the case that already works" did not. One
+  workspace's event store held 20 `E2ELockAcquired` against 3 `E2ELockReleased`
+  on the day this was found, the three being the only paths that end before
+  `setup_postgres`. The emit environment is now captured once at acquire and
+  applied through `env`. The cross-workspace gap is unchanged by that fix and
+  stays accepted.
 - The lock file gains a `STARTED_EPOCH` key so `held_secs` is portable
   arithmetic. Readers ignore unknown keys, so a lock file written before it
   existed still reclaims; its release just carries no `held_secs`.

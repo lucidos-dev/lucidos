@@ -475,6 +475,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   failing rather than as a reading of the SQL.
   (`engine/event_wait/mod.rs`, `engine/event_wait/register.rs`, ADR 0053.)
 
+- **`tool_arg_entity_repair` decoding the same key for one tool and not
+  another is the design, not an inconsistency.** A reviewer sees `name`
+  rewritten for `trigger_groups` and untouched for `proxy_request`, or
+  `summary` rewritten inside an `emit_event` payload while its sibling `name`
+  is not, and reads the asymmetry as an oversight. The allow-list is scoped per
+  TOOL precisely because the same word is prose in one schema and an identifier
+  in another: a trigger group's `name` is its label, `proxy_request`'s resolves
+  an entry in `data/config/apis.json`, and `env_vars`' is a variable name. A
+  tool with no row is declined whole, which is also how every third-party
+  `mcp__<server>__<tool>` is handled: by never having claimed to know its
+  schema, rather than by a special case. Entries are **full paths from the
+  argument root**, not leaf keys, so there is no exclusion list to check
+  against and no "but a nested X also matches" gap: `new_value.message`,
+  `env.name`, `on.condition.name` and `payload.details.summary` are simply not
+  the listed paths. An array index is not a path segment, so
+  `questions.options.label` covers every option. Re-flag only with a listed
+  (tool, path) pair whose value is demonstrably an identifier or opaque data
+  rather than prose the user reads.
+  (`engine/tool_arg_entity_repair.rs`, `docs/temporary-measures.md` §2.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -525,6 +545,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`lucidos-app/src/desktop.rs`, the macOS unread-indicator thread in `launch`.)
 
 ## Frontend
+
+- **The shared `Dropdown` portals its menu to `<body>` at a z-index BELOW
+  `--z-modal`, and no dropdown is nested in a modal, so the "hidden behind the
+  modal it belongs to" bug has no instance.** The shape invites the finding
+  (Codex raised it as P1 on 2026-08-09): a body-portaled panel at
+  `--z-control-panel + 1` would indeed render under a `.modal-overlay`, and its
+  clicks would read as "outside" to the enclosing overlay's dismiss handler.
+  What refutes it is that **no `<Dropdown>` renders inside a backdrop
+  `<Overlay>`**. `CredentialModal` and `TriggerDetails` are the two that look
+  like modals and are not: both are reached through `InlineForm`, which
+  `ContentPane` renders as an ordinary content-pane view inside
+  `.content-pane-body` (`overlay?.type === 'form'`), which is why neither file
+  contains an `<Overlay>` at all. The name is a leftover. Every other
+  Dropdown host is a settings page, the composer, or a content-pane view.
+  Re-flag only with an actual nesting: a `<Dropdown>` rendered inside a panel
+  that is itself a backdrop `<Overlay>`. The `.dropdown-menu` rule in
+  `styles/global/host-components.css` states the ordering constraint at the
+  site, including what to do if that day comes.
 
 - **`sendCompose`'s catch cannot be reached by a failed chat POST, so a reviewer
   reasoning about "the send failed after the draft was cleared" is describing an
@@ -1411,6 +1449,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`.claude/skills/project-stats/sloc.awk`, the `rust: block comments close at
   the first */, deliberately` fixture in `sloc_test.sh`.)
 
+- **The e2e lock's emit capture records an empty `$LUCIDOS_WORKSPACE` as
+  ABSENT, and that cannot address an event anywhere the live value would not**
+  (2026-08-09, `_e2e_capture_emit_env`). The tempting flag is precise about the
+  CLI and wrong about the consequence: `resolve_from_env` really does
+  `env::var(..).ok()`, so `Some("")` is distinct from `None`, and the capture
+  really does collapse the two. What the two forms then DO is the part to check.
+  `Some("")` joins `.lucidos/ports` onto an empty root, giving a path relative to
+  the process cwd, with no fallback if it is missing. `None` walks up for the
+  same file starting AT that same cwd (`walk_up_for_ports` tests `start_dir`
+  before its parents). So wherever the empty form resolves at all, the walk-up
+  resolves to the identical directory on its first iteration, and wherever the
+  empty form errors, it addressed nothing to diverge from. The capture pins the
+  cwd alongside the workspace precisely so this holds at both ends of a hold.
+  Re-flag only if the CLI stops starting its walk-up at the cwd, or if something
+  begins setting `LUCIDOS_WORKSPACE` to the empty string deliberately.
+  (`scripts/lib/e2e_lock.sh`, `crates/lucidos-cli/src/workspace.rs`.)
+
 ## CI workflows
 
 - **`front-door`'s payload gate on `push: rc/**` racing the RC publication is
@@ -1912,3 +1967,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   instruction, grep `system_prompt.rs`, `process_helpers.rs` and the
   `system-knowhow/*.md` body the schema now names. Re-flagging needs evidence
   that NO surface carries it, not that the schema no longer does.
+
+- **`scaledDurationMs` is called at render time in three components and inside
+  an effect in a fourth, and both are correct** (2026-08-09, animation-speed
+  scale). A reviewer will read the split as an oversight in whichever direction
+  they notice first: either "these three needlessly re-render when the slider
+  moves" or "ContentPane's fuse never picks up a slider change". Neither is a
+  bug, because the two shapes are asking for different things. A render-time
+  read (`ThreadDrawer`, `ThreadView`, `AppUiInline`) feeds a `useLingeringFlag`
+  whose linger is a *prop* held across renders, so it MUST subscribe or a
+  mid-animation slider change would leave the old linger in place; the resulting
+  re-render costs nothing at the rate a human drags a slider. An effect-body read
+  (`ContentPane`'s nav-cover fuse) is evaluated fresh on each navigation, which
+  is the only moment its value matters, so subscribing would buy a re-render for
+  a value that is already re-read at every use. Re-flag only with evidence that a
+  site's timer can now outlive a slider change without re-reading it.
+  (`store/store.ts`, `components/layout/ContentPane.tsx`.)

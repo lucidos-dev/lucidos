@@ -49,13 +49,26 @@ html {
        hardcodes 2500 there rather than referencing a token defined here. */
     --z-tooltip: 10000;
 
-    /* Transitions */
-    --duration-fast: 0.15s;
-    --duration-normal: 0.2s;
-    --duration-slow: 0.3s;
+    /* Transitions.
+     *
+     * Every duration below is its 1x literal MULTIPLIED by --duration-scale,
+     * the diagnostic Animation speed slider (Settings > System > Debugging),
+     * published onto :root by store/effects.ts as the reciprocal of the speed.
+     * That multiplication is the only thing that carries the slider into CSS:
+     * it used to reach the JS-driven animations alone (FLIP rows, toasts) while
+     * all 100-odd token-driven transitions ran at 1x whatever the slider said.
+     * A new duration token joins the same form, or it silently opts out.
+     *
+     * 1 here is both the untouched-slider value and the value that holds for
+     * the frame before the effect first runs, so nothing moves for a user who
+     * never opens the setting. Unitless, so the tokens can multiply it. */
+    --duration-scale: 1;
+    --duration-fast: calc(0.15s * var(--duration-scale));
+    --duration-normal: calc(0.2s * var(--duration-scale));
+    --duration-slow: calc(0.3s * var(--duration-scale));
     /* For deliberate state-change cues that must register with the user
      * (e.g. Send → Cancel morph). Reach for normal/slow first. */
-    --duration-emphasis: 0.5s;
+    --duration-emphasis: calc(0.5s * var(--duration-scale));
 
     /* Layout */
     --divider-width: 0.1875rem;

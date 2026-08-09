@@ -683,6 +683,30 @@ impl LucidosEngine {
                     synth_id,
                 );
             }
+            // Post-response repair (argument text): the model sometimes
+            // HTML-entity-escapes the text it puts in a tool argument, so a
+            // trigger group the user asked to call `Machine & Tooling Health`
+            // is created, persisted and re-served as
+            // `Machine &amp; Tooling Health`. Runs here, after both synthesis
+            // repairs and before anything reads the arguments, so the tool
+            // handler, the `ToolCalled` args, its derived description, the
+            // domain event the handler emits and the tool result that echoes
+            // back to the model all carry the literal text. Only plain-text
+            // label arguments are touched; markup arguments keep their
+            // escaping. See `tool_arg_entity_repair` for why this is the
+            // model's doing and not ours.
+            for tool_call in response.tool_calls.iter_mut() {
+                if crate::engine::tool_arg_entity_repair::repair_tool_arg_entities(
+                    &tool_call.name,
+                    &mut tool_call.arguments,
+                ) {
+                    crate::log!(
+                        "[ToolArgEntityRepair] thread={} decoded HTML entities in '{}' arguments",
+                        thread_id,
+                        tool_call.name,
+                    );
+                }
+            }
             // Final flush — send any remaining buffered text and persist
             // remainder. This includes the assistant's preamble on a tool-call
             // turn ("Let me organize the cards…" before write_file): the loop

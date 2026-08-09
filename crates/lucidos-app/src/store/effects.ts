@@ -1,5 +1,5 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
+import { pageTitle, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
@@ -47,6 +47,16 @@ effect(() => {
 // Persist animation speed
 effect(() => {
   localStorage.setItem('lucidos-animation-speed-slider', String(animationSpeed.value));
+});
+
+// Publish the animation-speed slider to CSS. Every --duration-* token in
+// styles/global/base.css is its 1x literal times this, so a plain CSS
+// transition scales with the slider the same way the JS-driven animations
+// (FLIP, toasts) already did. Unitless, because the tokens multiply it into a
+// time; base.css defaults it to 1 for the frame before this effect first runs
+// and for any document that never loads this bundle.
+effect(() => {
+  document.documentElement.style.setProperty('--duration-scale', String(durationScale.value));
 });
 
 // Persist steps expanded state

@@ -472,6 +472,40 @@ export const animationSpeed = signal(
 /** Slider position (-10..10) → speed multiplier (0.1x..10x) via 10^(v/10). */
 export const speedMultiplier = computed(() => Math.pow(10, animationSpeed.value / 10));
 
+/** What every animated duration is MULTIPLIED by: the reciprocal of the speed,
+ *  so 10x speed is a 0.1 scale. Same name root in all three layers it crosses,
+ *  which is the point of it existing next to the multiplier rather than each
+ *  caller writing `1 / speed`:
+ *
+ *    - CSS reads it as `var(--duration-scale)`, published onto :root by
+ *      store/effects.ts and folded into every `--duration-*` token in
+ *      styles/global/base.css. That is what makes the slider reach a plain CSS
+ *      transition at all; before it, the slider moved only the handful of
+ *      JS-driven animations below.
+ *    - TS reads it through `scaledDurationMs` for a timer that must outlive one
+ *      of those transitions, and directly for a Web Animations duration
+ *      (useFlipAnimation).
+ *
+ *  1 at the slider's centre, so a user who never touches it sees today's
+ *  timings exactly. */
+export const durationScale = computed(() => 1 / speedMultiplier.value);
+
+/** A base duration in ms, scaled to the current animation speed.
+ *
+ *  For a TS timer that MIRRORS a CSS duration (keeping an element mounted
+ *  through its own fade, holding an animation class on for the length of a
+ *  transition). Pass the 1x duration of the CSS it mirrors and add any safety
+ *  slack OUTSIDE the call: slack is a fixed margin, not animation, so
+ *  `scaledDurationMs(PANE_TRANSITION_MS) + 100` is the shape, never
+ *  `scaledDurationMs(PANE_TRANSITION_MS + 100)`.
+ *
+ *  Scaling the CSS without scaling these desyncs the pair: at 0.1x the drawer's
+ *  width transition runs 3s while an unscaled 350ms timer unmounts its list
+ *  a tenth of the way in, so the drawer blanks and then slides shut empty. */
+export function scaledDurationMs(baseMs: number): number {
+  return baseMs * durationScale.value;
+}
+
 // --- Threads ---
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
@@ -514,10 +548,10 @@ export function setDrawerView(view: DrawerView): void {
 export const DEFAULT_DRAWER_WIDTH = 300;
 export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';
 
-// Clamp at load: a width persisted under a smaller root font size (or on the
-// other desktop build) would otherwise render an overflowing header until the
-// next drag corrects it. The floor itself lives in store/paneMinimums.ts,
-// alongside the two split-pane floors it has to be weighed against.
+// Clamp at load: a width persisted under a smaller root font size would
+// otherwise render an overflowing header until the next drag corrects it. The
+// floor itself lives in store/paneMinimums.ts, alongside the two split-pane
+// floors it has to be weighed against.
 export const threadDrawerWidth = signal(
   Math.max(
     minDrawerWidth(),

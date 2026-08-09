@@ -65,3 +65,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0055: The frontend preview is a separate origin, never the workspace's serving path](0055-frontend-preview-is-a-separate-origin.md)
 - [0056: Pane dividers clamp at the pane minimums; the deferred snap is retired](0056-pane-dividers-clamp-instead-of-snapping.md)
 - [0057: A blocked e2e run subscribes to the lock's release event; the cross-workspace gap recovers on the timeout](0057-e2e-lock-release-is-announced-not-polled.md)
+- [0058: The thread drawer's width floor is one number for every desktop client](0058-drawer-floor-is-one-number-for-every-client.md)

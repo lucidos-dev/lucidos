@@ -3,7 +3,6 @@ import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsC
 import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
-import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { prefersReducedMotion } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
 
@@ -139,7 +138,6 @@ export function ThreadPane() {
 
   return (
     <div class={`thread-pane${isComposeEmpty ? ' compose-empty' : ''}`} data-drop-zone="attach">
-      <ThreadToggleButton class="thread-pane-toggle" />
       <div class="thread-pane-body">
         {tid && !isComposingDraft ? <div class="thread-view-clip"><ThreadView /></div> : <CreateThreadView />}
         <div class="prompt-area" ref={promptRef}>

@@ -434,15 +434,6 @@ impl ChangesProjection {
         .await
     }
 
-    /// Distinct branch names with at least one applied or discarded change.
-    pub async fn list_completed_branches(&self) -> sqlx::Result<Vec<String>> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT branch_name FROM changes WHERE status IN ('applied', 'discarded')",
-        )
-        .fetch_all(&self.pool)
-        .await
-    }
-
     /// Recently applied or reverted changes, newest `resolved_at` first.
     /// `before`: only items with `resolved_at < before`. `limit`: max count.
     pub async fn list_recently_applied(

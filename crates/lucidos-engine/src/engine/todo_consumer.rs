@@ -1,19 +1,23 @@
-//! EventBus consumer that garbage-collects abandoned Lucidos Agent todo lists.
+//! EventBus consumer that settles open Lucidos Agent todo lists.
 //!
 //! On every persisted chat-thread terminator (`ResponseGenerated` /
-//! `ResponseCanceled` / `ResponseAborted` / `ResponseFailed` — the full
+//! `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`, the full
 //! `TERMINATOR_EVENT_TYPES` set in `thread_events.rs`), calls
-//! [`crate::engine::tools::todo::mark_abandoned_todos`] to enforce the agent's
+//! [`crate::engine::tools::todo::settle_open_todos`] to enforce the agent's
 //! contract: either keep working the list until every item is `completed`, or
-//! call `todo_write` with `[]` to drop it. If the agent left non-completed
-//! items behind, the helper emits a fresh `TodoListWritten` with those flipped
-//! to `Abandoned` so the panel makes it obvious the work was dropped.
-//! All-completed lists are left alone — finished lists persist by design.
+//! call `todo_write` with `[]` to drop it. If the agent left open items behind,
+//! the helper emits a fresh `TodoListWritten` with those settled to `Waiting`
+//! (the thread is parked on a live *event wait*) or to `Abandoned` (it walked
+//! away), so the panel says which. All-completed lists are left alone, since
+//! finished lists persist by design.
 //!
-//! The helper takes the terminator's sequence number so the SELECT only
-//! considers TodoListWritten rows that were persisted at-or-before the
-//! terminator. Without that gate, a fresh todo_write from the next turn
-//! could be picked up by a delayed consumer and clobbered by the abandon-flip.
+//! The helper takes the terminator's sequence number so both of its questions
+//! are answered as of the terminator rather than as of whenever this async
+//! consumer got round to it: which `TodoListWritten` is the current list, and
+//! whether the thread was still subscribed. Without that gate a fresh
+//! todo_write from the next turn could be picked up by a delayed consumer and
+//! clobbered, and a wait delivered in the meantime would make a parked thread
+//! read as abandoned.
 //!
 //! Coding-agent threads never emit `TodoListWritten` (CC has its own
 //! `TodoWrite`), so the helper's `SELECT` short-circuits to `None` for them
@@ -26,11 +30,11 @@ use tokio_stream::StreamExt;
 
 use super::event_bus::{BusEvent, EmittedEvent, EventBus};
 use super::thread_events::ThreadEvent;
-use super::tools::todo::mark_abandoned_todos;
+use super::tools::todo::settle_open_todos;
 use super::LucidosEngine;
 
 /// Process a single broadcast event: if it's a response-termination for a
-/// thread, run the abandoned-todo cleanup. Exposed so tests can drive the
+/// thread, run the open-todo settle. Exposed so tests can drive the
 /// dispatch without spawning the background task.
 pub async fn handle_event(bus: &EventBus, pool: &sqlx::PgPool, emitted: &EmittedEvent) {
     // Only react to persisted thread events; in-memory broadcasts (seq == None)
@@ -47,7 +51,7 @@ pub async fn handle_event(bus: &EventBus, pool: &sqlx::PgPool, emitted: &Emitted
     // Match every chat terminator. Keep this list in sync with
     // `ThreadEvent::TERMINATOR_EVENT_TYPES` — `ResponseFailed` is in that set
     // (e.g. upstream LLM error, OOM-killed bash, empty assistant text on a
-    // non-cancel turn) and must also clean up abandoned todos.
+    // non-cancel turn) and must also settle open todos.
     if !matches!(
         event,
         ThreadEvent::ResponseGenerated { .. }
@@ -57,10 +61,10 @@ pub async fn handle_event(bus: &EventBus, pool: &sqlx::PgPool, emitted: &Emitted
     ) {
         return;
     }
-    mark_abandoned_todos(bus, pool, *thread_id, seq).await;
+    settle_open_todos(bus, pool, *thread_id, seq).await;
 }
 
-/// Spawn the todo garbage collector as a background task.
+/// Spawn the todo settle consumer as a background task.
 /// Returns a `JoinHandle` so the caller can observe panics if needed.
 pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     let rx = engine.event_bus.subscribe();
@@ -79,7 +83,7 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
                 Err(BroadcastStreamRecvError::Lagged(n)) => {
                     crate::log!(
                         @Todo,
-                        "Broadcast lagged by {} events — abandoned-todo cleanup may have been missed for those terminators; continuing",
+                        "Broadcast lagged by {} events: the open-todo settle may have been missed for those terminators; continuing",
                         n
                     );
                 }
@@ -328,6 +332,54 @@ mod tests {
             super::super::thread_events::TodoStatus::Abandoned,
             "in_progress flipped to abandoned, got {:?}",
             flipped[0].status,
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn handle_event_settles_to_waiting_when_the_thread_holds_a_live_event_wait() {
+        // The end-to-end shape of the reported bug, driven through the consumer
+        // rather than the helper: the agent registered a subscription, said so,
+        // and ended its turn. The terminator that means "walked away" for every
+        // other turn means "parked" for this one.
+        use crate::core::event_subscription::EventSubscription;
+        let (bus, mut rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, thread_id).await;
+        let wait_id = Uuid::new_v4();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::EventWaitStarted {
+                wait_id,
+                tool_use_id: format!("toolu_{wait_id}"),
+                on: vec![EventSubscription {
+                    event_type: "ChangeProposed".into(),
+                    condition: None,
+                }],
+                reason: "watching for the change to land".into(),
+                armed_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                watermark: 0,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit EventWaitStarted");
+        drain(&mut rx);
+
+        emit_response_generated(&bus, thread_id).await;
+        dispatch_next_terminator(&bus, &pool, &mut rx, thread_id).await;
+
+        let settled = next_todo_items(&mut rx, thread_id).await;
+        assert_eq!(settled.len(), 1, "list kept, got {:?}", settled);
+        assert_eq!(
+            settled[0].status,
+            super::super::thread_events::TodoStatus::Waiting,
+            "in_progress parked rather than abandoned, got {:?}",
+            settled[0].status,
         );
 
         pool.close().await;

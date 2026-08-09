@@ -622,11 +622,18 @@ export const THREAD_EVENT_TYPE_NAMES: ReadonlySet<ThreadEvent['type']> = new Set
   Object.keys(THREAD_EVENT_TYPE_FLAGS) as ThreadEvent['type'][],
 );
 
-/** See `system-knowhow/glossary.md` § Todo item. `abandoned` is engine-only:
- *  the engine flips any pending/in_progress item to `abandoned` at response
- *  termination so the user can see the agent walked away from it. The LLM
- *  cannot write that status via `todo_write`. */
-export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
+/** See `system-knowhow/glossary.md` § Todo item. `waiting` and `abandoned` are
+ *  both engine-only: at response termination the engine settles every still-open
+ *  item, to `waiting` when the thread holds a live *event wait* (it parked on
+ *  purpose, the same fact the thread's own `waiting` status dot shows) and to
+ *  `abandoned` otherwise (it walked away). The LLM cannot write either via
+ *  `todo_write`. */
+export type TodoStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'completed'
+  | 'waiting'
+  | 'abandoned';
 
 /** See `system-knowhow/glossary.md` § Todo item. `active_form` is shown only
  *  while `status === 'in_progress'`; otherwise the row renders `content`. */

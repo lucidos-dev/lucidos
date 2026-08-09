@@ -17,12 +17,12 @@
  * `360` they replace at a 16px root.
  *
  * The cost of deriving them is that the three no longer fit every window: they
- * sum to 828px at 100% ui-scale, 1035 at 125%, 1242 at 150% and 1449 at 175%,
- * so past roughly 150% on a 1280px screen `clampSplitRatio`'s empty-range branch
- * is what the user actually meets. That branch is load-bearing, not a corner.
- * Those are the web build's sums; the packaged macOS build adds twice the fixed
- * traffic-lights reserve on top (see `computeMinDrawerWidth`), so it meets the
- * same branch on a wider screen.
+ * sum to 972px at 100% ui-scale, 1175 at 125%, 1378 at 150% and 1581 at 175%,
+ * so from 150% on a 1280px screen `clampSplitRatio`'s empty-range branch is what
+ * the user actually meets (137.5%, the step below, still fits at 1277). That
+ * branch is load-bearing, not a corner. Those sums hold on every desktop client,
+ * because the drawer's floor no longer varies by build (see
+ * `computeMinDrawerWidth`).
  *
  * Deliberately holds no signal and imports nothing from `store.ts`: the store's
  * own module init reads `minDrawerWidth()` to clamp the persisted drawer width,
@@ -38,9 +38,9 @@ const DRAWER_ROW_SIDE_REM = 2.25 + 0.25;
 /** The title's own room, in rem: wide enough to stay a title rather than an
  *  ellipsis. */
 const DRAWER_ROW_TITLE_REM = 4.5;
-/** The row's own padding, in rem, at whichever end has no traffic lights to
- *  clear. Half of `.threads-header`'s `0 0.5rem`, so it is also the leading
- *  padding on a build with no lights at all. */
+/** The row's own padding, in rem, per end. Half of `.threads-header`'s
+ *  `0 0.5rem`. It is the floor UNDER the floor: whatever lead the row is sized
+ *  around, an end can never be narrower than the padding every build has. */
 const DRAWER_ROW_PAD_REM = 0.5;
 /** Fallback for the traffic-lights reserve if the property cannot be read (it
  *  is declared inside the desktop media query, so a sub-769px viewport reports
@@ -55,46 +55,48 @@ const MIN_THREAD_PANE_REM = 18.75;
  *  content need more room than a chat column. */
 const MIN_CONTENT_PANE_REM = 22.5;
 
-/** Floor for the thread drawer's width, from the root font size and the leading
- *  reserve. Pure, so the arithmetic is testable without a layout engine; the DOM
- *  read lives in `minDrawerWidth` below.
+/** Floor for the thread drawer's width, from the root font size and the lead its
+ *  header row is sized around. Pure, so the arithmetic is testable without a
+ *  layout engine; the DOM read lives in `minDrawerWidth` below.
  *
  *  The row is sized around a title centred on the PANE (`.threads-header-title`
  *  in styles/panels/shell.css), not on the gap between the two buttons flanking
  *  it, so the title clears the WIDER of the row's two ends on BOTH sides and the
- *  floor is symmetric: `2 * side + title`. That is why the reserve below is
- *  counted twice rather than once, and it is the whole difference between the
- *  two builds.
+ *  floor is symmetric: `2 * side + title`. That is why the lead is counted twice
+ *  rather than once.
  *
- *  Only the row's LEADING padding differs between them. The web build starts
- *  after its own 0.5rem, which makes both its ends the same width and leaves its
- *  floor byte-identical to the pre-centring one. The packaged macOS build starts
- *  after the fixed reserve that clears the traffic lights, since the row's
- *  controls reach up into the reclaimed title-bar band, so there the leading end
- *  is the wider one and sets both sides. The reserve is PX and stays outside the
- *  rem term on purpose: the lights are OS chrome and do not scale with our root
- *  font size. */
-export function computeMinDrawerWidth(remPx: number, lightsReservePx: number | null): number {
-  const leadingPx = lightsReservePx ?? DRAWER_ROW_PAD_REM * remPx;
-  const trailingPx = DRAWER_ROW_PAD_REM * remPx;
-  const sidePx = Math.max(leadingPx, trailingPx) + DRAWER_ROW_SIDE_REM * remPx;
+ *  ONE floor for every desktop client: its only caller passes the traffic-lights
+ *  reserve as the lead, on the web build that has no lights too (ADR 0058). That
+ *  is deliberate, not an oversight: a workspace opened in the browser and the
+ *  same workspace in the packaged app must stop the drawer at the same width,
+ *  and the packaged build's row is the wider of the two (its controls reach up
+ *  into the reclaimed title-bar band, so it starts after the fixed reserve that
+ *  clears the lights, where the web row starts after its own 0.5rem). Taking the
+ *  wider one is what makes the floor a floor on both. The web row still LAYS OUT
+ *  at 0.5rem, so what it gains is 144px of title room it is not obliged to use;
+ *  nothing there paints against a light that is not there.
+ *
+ *  The `max` against the row's own padding keeps the floor honest at the other
+ *  end of the scale: the reserve is PX (the lights are OS chrome and do not
+ *  scale with our root font size) while the padding is rem, so at a large enough
+ *  root the padding is the wider end and has to win. */
+export function computeMinDrawerWidth(remPx: number, leadPx: number): number {
+  const sidePx = Math.max(leadPx, DRAWER_ROW_PAD_REM * remPx) + DRAWER_ROW_SIDE_REM * remPx;
   return Math.ceil(2 * sidePx + DRAWER_ROW_TITLE_REM * remPx);
 }
 
-/** Floor for the thread drawer's width: exactly what its header row needs, at
- *  the CURRENT root font size and on the current desktop build. */
+/** Floor for the thread drawer's width, at the CURRENT root font size. Reads no
+ *  build attribute: `data-titlebar-overlay` decides how the row is LAID OUT, not
+ *  how narrow the drawer may get. */
 export function minDrawerWidth(): number {
-  const root = document.documentElement;
-  const rem = getRemPx();
-  if (!root.hasAttribute('data-titlebar-overlay')) return computeMinDrawerWidth(rem, null);
   // Read from CSS rather than restated, with the literal as the fallback: the
   // property is declared inside the desktop media query, so a viewport under
   // 769px (or a test harness with no layout engine) reports nothing.
   const reserve = parseFloat(
-    getComputedStyle(root).getPropertyValue('--titlebar-lights-reserve'),
+    getComputedStyle(document.documentElement).getPropertyValue('--titlebar-lights-reserve'),
   );
   return computeMinDrawerWidth(
-    rem,
+    getRemPx(),
     Number.isFinite(reserve) ? reserve : TITLEBAR_LIGHTS_RESERVE_PX,
   );
 }

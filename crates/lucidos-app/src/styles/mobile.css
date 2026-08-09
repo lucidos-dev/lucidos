@@ -114,8 +114,12 @@
     to { transform: translateX(0); }
 }
 
+/* Tokenized so the panel's exit scales with the animation-speed slider exactly
+   as its entrance above does. A literal here (0.2s, which is what
+   --duration-normal is) left the pair half-scaled the moment the slider moved:
+   the panel slid in over 1.5s at 0.1x and snapped shut in 0.2s. */
 .drawer.closing {
-    animation: drawer-slide-out 0.2s ease-in forwards;
+    animation: drawer-slide-out var(--duration-normal) ease-in forwards;
 }
 
 @keyframes drawer-slide-out {
@@ -161,8 +165,10 @@
     }
 }
 
+/* Same token as the panel it dims, for the same reason: the two leave together
+   or the dim outlives the panel by a whole slide at a slow setting. */
 .drawer-backdrop.closing {
-    animation: backdrop-fade-out 0.2s ease-in forwards;
+    animation: backdrop-fade-out var(--duration-normal) ease-in forwards;
 }
 
 @keyframes backdrop-fade-out {
@@ -434,11 +440,6 @@
        visualViewport.height is the only reliable signal. */
     .app-shell {
         height: var(--app-height, 100dvh);
-    }
-
-    /* Thread toggle in pane body: hidden on mobile — mobile header has it */
-    .thread-pane-toggle {
-        display: none !important;
     }
 
     /* ─── Mobile header: fixed, direction-aware hide on scroll ─── */

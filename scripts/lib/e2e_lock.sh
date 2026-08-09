@@ -27,8 +27,12 @@
 # raced for this lock and both losers hand-rolled a sleep loop, one of them a
 # 40 minute foreground tool call re-executing the entry script every 20 seconds.
 # The refusal below teaches the subscribe path, and .claude/skills/e2e-lock-wait/
-# carries the full rules. Two gaps are accepted rather than closed, and both
-# recover through the subscriber's own timeout:
+# carries the full rules. Both announcements of one hold are addressed as of the
+# moment it was TAKEN (`_e2e_capture_emit_env`), because the entry scripts
+# repoint $LUCIDOS_WORKSPACE at the e2e workspace in between; that is a fixed
+# bug rather than a gap, and the section header on announcing says what it cost.
+# Two gaps are accepted rather than closed, and both recover through the
+# subscriber's own timeout:
 #   - CROSS-WORKSPACE. The lock is shared by every workspace on the machine, but
 #     an emit lands in the emitting subprocess's own $LUCIDOS_WORKSPACE, so a
 #     holder in workspace A never wakes a waiter in workspace B. The refusal says
@@ -459,6 +463,59 @@ EOF
 # acquire's announcements are backgrounded at the call site. The child bounds
 # and kills itself exactly as it would in the foreground, so a shell that exits
 # first leaves nothing unbounded behind.
+#
+# ADDRESSED AS OF ACQUIRE TIME, both of them, and this is the second thing about
+# them that is load-bearing. `lucidos events emit` writes to the emitting
+# subprocess's own $LUCIDOS_WORKSPACE, and the entry scripts REPOINT that
+# variable between the two announcements: `acquire_e2e_lock` runs first in
+# `setup_e2e_session` / `scripts/e2e.sh` while it still names the caller's
+# workspace, then `reset_e2e_database` reaches `setup_postgres`, which does
+# `export LUCIDOS_WORKSPACE="$WORKSPACE"` for the e2e-test workspace, into the
+# entry script's OWN shell. So the release, emitted from the EXIT trap after
+# that (and after `stop_e2e_workspace` has taken that engine down), used to be
+# addressed to a dead engine in a workspace nobody watches and whose database
+# the next run drops.
+#
+# That is not ADR 0057's accepted cross-workspace gap, it is the mechanism
+# failing in the case that ADR calls the one which already works: a waiter in
+# the SAME workspace as the holder was never woken either, and its subscription
+# could only end at its own deadline. It showed up as 20 `E2ELockAcquired`
+# against 3 `E2ELockReleased` in one workspace on 2026-08-09, the three being
+# the only paths that end before `setup_postgres` (two runs that failed in
+# seconds, and one reclaim announced from inside `acquire_e2e_lock`).
+#
+# So the emit environment is captured ONCE, when the lock is taken, and every
+# announcement of that hold runs under it. Three states in two variables, and
+# each variable means one thing:
+#
+#   _E2E_LOCK_EMIT_CAPTURED empty  no capture (nobody called the function), so
+#                                  the live environment stands, as it always did
+#   captured, _E2E_LOCK_EMIT_WS    emit under LUCIDOS_WORKSPACE=<that>
+#   captured, WS empty             emit with LUCIDOS_WORKSPACE UNSET
+#
+# The third state is not the first: the CLI falls back to walking up from the
+# working directory when the variable is absent, so a run that had no workspace
+# at acquire must still be denied whatever the entry script exported afterwards.
+# $_E2E_LOCK_EMIT_CWD is captured for that fallback to resolve the same way at
+# both ends.
+_E2E_LOCK_EMIT_CAPTURED=""
+_E2E_LOCK_EMIT_WS=""
+_E2E_LOCK_EMIT_CWD=""
+
+# Capture the environment every announcement of this hold will be emitted under.
+# Called at the top of `acquire_e2e_lock`, before either success path announces
+# anything, so the reclaim path's release-on-behalf-of-a-dead-owner is covered
+# too.
+#
+# A LUCIDOS_WORKSPACE that is set but EMPTY is recorded as absent, deliberately:
+# the CLI reads `env::var(..).ok()`, so it would take `Some("")` for a workspace
+# root and resolve `.lucidos/ports` against nothing. There is no state in which
+# passing that on is better than falling back to the walk-up.
+_e2e_capture_emit_env() {
+    _E2E_LOCK_EMIT_WS="${LUCIDOS_WORKSPACE:-}"
+    _E2E_LOCK_EMIT_CWD="$PWD"
+    _E2E_LOCK_EMIT_CAPTURED=1
+}
 
 # Escape a string for embedding in a JSON string literal: backslash and double
 # quote, plus control characters dropped (a JSON string may not carry them raw).
@@ -518,6 +575,15 @@ _e2e_lock_held_secs() {
 # minute of teardown stall is not acceptable, and that default does not cover a
 # `lucidos` wedged before its HTTP client exists. macOS ships no `timeout`
 # binary, hence the tick loop.
+#
+# The call runs under the environment `_e2e_capture_emit_env` recorded when the
+# lock was taken, so this hold's release lands in the same event store as its
+# acquire. See that function and the section header for what repoints
+# $LUCIDOS_WORKSPACE in between. `exec` is the subshell's last act on purpose:
+# it replaces the subshell rather than forking under it, so `$!` still names the
+# CLI itself and the deadline below still bounds the thing that can hang. With
+# no capture (a caller that set E2E_LOCK_OWNED by hand, which only the suite
+# does) it emits under the live environment exactly as it always did.
 _e2e_emit_lock_event() {
     local event="$1" summary="$2" payload="$3"
     [ -z "${E2E_LOCK_DIR_OVERRIDE:-}" ] || return 0
@@ -526,8 +592,23 @@ _e2e_emit_lock_event() {
     local timeout_s="${E2E_LOCK_EMIT_TIMEOUT_S:-5}"
     case "$timeout_s" in ''|*[!0-9]*) timeout_s=5 ;; esac
 
-    lucidos events emit "$event" --summary "$summary" --payload "$payload" \
-        >/dev/null 2>&1 &
+    # Applied through `env` rather than by exporting into the subshell, so this
+    # function modifies no variable anybody else reads. The three states are the
+    # ones `_e2e_capture_emit_env` documents; `env` with no argument of its own
+    # is the no-capture case and changes nothing.
+    local -a emit_env=(env)
+    if [ -n "$_E2E_LOCK_EMIT_CAPTURED" ]; then
+        if [ -n "$_E2E_LOCK_EMIT_WS" ]; then
+            emit_env+=("LUCIDOS_WORKSPACE=$_E2E_LOCK_EMIT_WS")
+        else
+            emit_env+=(-u LUCIDOS_WORKSPACE)
+        fi
+    fi
+    (
+        [ -z "$_E2E_LOCK_EMIT_CWD" ] || cd "$_E2E_LOCK_EMIT_CWD" 2>/dev/null || :
+        exec "${emit_env[@]}" lucidos events emit \
+            "$event" --summary "$summary" --payload "$payload"
+    ) >/dev/null 2>&1 &
     local pid=$!
     # A WALL-CLOCK deadline, not a tick count. Counting `sleep 0.1` iterations
     # bounds the number of naps, not the elapsed time: each one costs a fork,
@@ -543,7 +624,7 @@ _e2e_emit_lock_event() {
         sleep 0.1
     done
     if kill -0 "$pid" 2>/dev/null; then
-        # Only ever the child backgrounded three lines up, so the
+        # Only ever the child backgrounded just above, so the
         # never-signal-an-ancestor rule (ADR 0025) cannot be reached from here.
         kill -KILL "$pid" 2>/dev/null || :
         echo "[e2e-lock] $event emit exceeded ${timeout_s}s and was abandoned" >&2
@@ -641,6 +722,12 @@ acquire_e2e_lock() {
     local script_name="${1:-e2e}"
     local lock_file
     lock_file="$(_e2e_lock_path)"
+
+    # Before anything can be announced, and before the caller's own setup gets a
+    # chance to repoint $LUCIDOS_WORKSPACE at the e2e workspace. Every
+    # announcement of the hold this call is about to take, including the release
+    # its EXIT trap emits an hour later, is addressed from here.
+    _e2e_capture_emit_env
 
     if _e2e_lock_write "$lock_file" "$script_name"; then
         E2E_LOCK_OWNED="$lock_file"

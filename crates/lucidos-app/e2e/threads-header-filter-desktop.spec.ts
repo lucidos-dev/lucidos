@@ -127,9 +127,10 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     const divider = page.locator('.drawer-divider');
     for (const overlay of [false, true]) {
       const build = overlay ? 'packaged macOS' : 'web';
-      // Stamp the build FIRST: the drawer's floor is derived per build (the
-      // packaged one reserves the traffic lights), so a drag clamped before the
-      // attribute would stop at the other build's floor.
+      // Stamp the build FIRST: the two rows lay out differently (the packaged
+      // one indents past the traffic lights), so a drag run before the attribute
+      // would measure the other build's row. The FLOOR is the same on both
+      // (ADR 0058), which is why one `toBeGreaterThan` covers the pair.
       await page.evaluate((on) => {
         const root = document.documentElement;
         if (on) {
@@ -151,14 +152,17 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       await page.mouse.down();
       await page.mouse.move(150, box!.y + 100, { steps: 12 });
       await page.mouse.up();
-      // 400ms snap delay + the 300ms geometry transition.
+      // The geometry transition, with room to spare. Nothing moves after
+      // release under the clamp (ADR 0056); the wait is for the drag itself.
       await page.waitForTimeout(1200);
 
       const g = await measure();
       expect(g, `${build}: visible threads-header`).not.toBeNull();
-      // The snap pulled it back up, which is the floor doing its job.
+      // The clamp refused to follow the pointer, which is the floor doing its
+      // job. 300 rather than the exact 312, so a UI-scale default or a row
+      // tweak does not re-tune this test: what it guards is the overlap below.
       expect(g!.drawerWidth, `${build}: the drawer stayed below its floor`)
-        .toBeGreaterThan(160);
+        .toBeGreaterThan(300);
       expect(g!.titleWidth, `${build}: the title has no room left at all`)
         .toBeGreaterThan(20);
       expect(g!.searchInside, `${build}: the Search button is outside the drawer`).toBe(true);
@@ -466,9 +470,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Hide the whole pane the panel is a view of. Its state is a signal and it
     // holds an Escape-registry entry, so leaving it "open" behind a hidden
     // drawer would eat the user's next Escape and reopen onto the filter.
-    // The toggle has a host per drawer state (.pane-header-brand while open,
-    // .collapsed-thread-actions while closed) and both stay mounted, so click
-    // whichever one is actually on screen.
+    // The desktop toggle is one element in both drawer states, but the mobile
+    // header's copy stays mounted under a desktop viewport, so click whichever
+    // one is actually on screen.
     const toggled = await clickVisibleElement(page, 'button[aria-label^="Show or hide thread drawer"]');
     expect(toggled, 'drawer toggle was visible').toBe(true);
     await expect(page.locator('.thread-filter-panel')).toHaveCount(0);

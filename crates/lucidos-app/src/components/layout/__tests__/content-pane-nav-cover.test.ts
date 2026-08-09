@@ -60,8 +60,23 @@ describe('content pane navigation cover', () => {
     // `prefers-reduced-motion: reduce` drops the animation, so an
     // `animationend`-driven unmount would never fire and the pane would stay
     // covered forever.
-    expect(src).toMatch(/setTimeout\(\(\) => setCoverKey\(null\), NAV_COVER_MS\)/);
+    expect(src).toMatch(
+      /setTimeout\(\(\) => setCoverKey\(null\), scaledDurationMs\(NAV_COVER_ANIM_MS\) \+ NAV_COVER_SLACK_MS\)/,
+    );
     expect(src).not.toMatch(/onAnimationEnd/);
+  });
+
+  it('scales the fuse with the animation-speed slider, and only the animation half', () => {
+    // The cover clears on `animation: … var(--duration-normal)`, and that token
+    // is scaled by the slider, so a fixed 250ms fuse would unmount the cover a
+    // tenth of the way into its own fade at 0.1x. The slack is a fixed safety
+    // margin rather than animation, so it stays outside the scaled term.
+    expect(src).toMatch(/const NAV_COVER_ANIM_MS = 200;/);
+    expect(src).toMatch(/const NAV_COVER_SLACK_MS = 50;/);
+    // The base must be the 1x value of the token the CSS actually uses.
+    expect(css).toMatch(
+      /\.content-nav-cover\s*\{[^}]*animation:\s*content-nav-cover-clear var\(--duration-normal\)/,
+    );
   });
 
   it('does not cover a pane that is navigating to nothing', () => {

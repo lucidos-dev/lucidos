@@ -160,7 +160,7 @@ export function EventWaitClockIcon({ className }: { className?: string }) {
 /** The todo indicator's ONE glyph, for every state it can be in.
  *
  *  A ticked checkbox: two strokes, echoing the ✓ the panel's completed rows
- *  use. Idle, in-progress and abandoned differ only in COLOR (see
+ *  use. Idle, in-progress, waiting and abandoned differ only in COLOR (see
  *  `styles/chat/todo-list.css`), never in shape, so the button keeps saying
  *  "todo list" at a glance.
  *

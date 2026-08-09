@@ -506,22 +506,61 @@ html[data-theme="dark"] .split-button.open::before {
 /* Default styling for `.dropdown-menu` is `position: absolute`, anchored
  * to its `.dropdown` wrapper. The shared `Dropdown` component overrides
  * to `position: fixed` inline (paired with viewport-coordinate `top`/`left`
- * from `useAnchoredPosition`) so the menu escapes any `overflow: hidden`
- * ancestor — notably `.mobile-swipe-pane` on mobile, where an
- * `absolute`-positioned menu was clipped at the pane edge regardless of
- * placement direction. Custom callers that use `.dropdown-menu` directly
- * (e.g. `ChangeSelector`) inherit the legacy absolute positioning. */
+ * from `useAnchoredPosition`) AND portals the panel to <body>, so the menu
+ * escapes any `overflow: hidden` ancestor, notably `.mobile-swipe-pane` on
+ * mobile, where an `absolute`-positioned menu was clipped at the pane edge
+ * regardless of placement direction. Custom callers that use `.dropdown-menu`
+ * directly (e.g. `ChangeSelector`) inherit the legacy absolute positioning.
+ *
+ * The z-index out-ranks the floating header chrome (--z-control-panel), which
+ * otherwise paints its icons over a menu that reaches up into the header band.
+ * That is an ordinary case for the composer's destination picker: it opens
+ * upward and clamps to the top margin once the option list outgrows the space
+ * above it. Being a <body> child is what makes the number reachable at all,
+ * since inside a pane it is capped by that pane's stacking context. It ties
+ * with `.collapsed-thread-actions` and wins on DOM order (the portal appends
+ * after `.app-shell`), the same footing as `.thread-overflow-menu` /
+ * `.thread-info-popover`.
+ *
+ * Deliberately below --z-modal, so a modal (and the UI-blocking overlay, which
+ * shares that level) still covers an open menu. The price is that a `Dropdown`
+ * nested INSIDE a backdrop `<Overlay>` would be portaled out to a layer that
+ * modal paints over, and its clicks would read as "outside" to that modal's
+ * dismiss handler. No dropdown is nested that way today (`CredentialModal` and
+ * `TriggerDetails` are content-pane views despite the names, see
+ * `docs/code-review-priors.md` § Frontend), so this is a constraint rather
+ * than a bug. Putting one in a modal means portaling the menu into that
+ * modal's panel, NOT raising this number past --z-modal, which would float
+ * every menu over the blocker.
+ *
+ * `max-width` caps a long option label so it clips (via the
+ * `.dropdown-option-label` ellipsis) instead of growing a viewport-positioned
+ * menu off a narrow screen. It bites only when the CONTENT wants more room
+ * than the trigger: `min-width` is the trigger's own width (set inline by
+ * `Dropdown`) and a min-width above the max-width wins, so a wide form field
+ * keeps its full-width menu. */
 .dropdown-menu {
     position: absolute;
     top: calc(100% + 0.25rem);
     left: 0;
     min-width: 100%;
+    max-width: min(24rem, calc(100vw - 1rem));
     max-height: 18.75rem;
     overflow-y: auto;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
-    z-index: var(--z-dropdown);
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+/* A dropdown used as a form field sizes its option rows to the taller control
+ * the trigger is (`.form-group .dropdown-trigger`), so the menu does not read
+ * as a different, smaller widget hanging off it. `Dropdown` puts this class on
+ * the panel itself (`dropdownMenuClass`) because the menu is portaled out of
+ * the `.form-group` that used to scope the rule through the DOM. */
+.dropdown-menu-field .dropdown-option {
+    padding: var(--space-sm) var(--space-md);
+    font-size: var(--font-size-md);
 }
 
 /* Overflow (⋯) menu — a sleek icon-list popover (the shared OverflowMenu shell
@@ -694,12 +733,11 @@ html[data-theme="dark"] .split-button.open::before {
    the popover off a narrow viewport. The chevrons live in the floating
    `.app-header` regions, whose `transform` traps a `position: fixed` child as
    its containing block — so NavChevron portals this panel to <body> (escaping
-   the transform). Being a <body> child, it must out-rank the header chrome
-   (--z-control-panel) to paint above it; matches `.collapsed-thread-actions`. */
+   the transform). Its own z-index is gone: `.dropdown-menu` above now carries
+   the one that clears the header chrome, for every menu on that surface. */
 .nav-history-menu {
     min-width: 11rem;
     max-width: min(20rem, 90vw);
-    z-index: calc(var(--z-control-panel) + 1);
 }
 
 /* History rows pair a leading type glyph (thread type for ThreadNav, content

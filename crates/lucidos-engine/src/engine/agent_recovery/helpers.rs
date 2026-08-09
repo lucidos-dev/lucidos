@@ -325,8 +325,8 @@ pub(crate) async fn last_turn_ended_cleanly(pool: &sqlx::PgPool, thread_id: Uuid
     .await
     .unwrap_or_else(|e| {
         // Mirrors the recovery sweep's other best-effort queries
-        // (`list_pending`, `list_completed_branches` in
-        // `recover_orphaned_worktrees`): log and fall through. Returning
+        // (`list_pending` in `recover_orphaned_worktrees`): log and fall
+        // through. Returning
         // None here biases the caller toward `incomplete: true`, which is
         // the safe direction — Apply will require explicit confirmation
         // rather than auto-applying possibly-mid-turn work.

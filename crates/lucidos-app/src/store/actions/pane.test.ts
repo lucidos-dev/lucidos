@@ -525,23 +525,33 @@ describe('resetPaneLayout', () => {
     resetState();
     (globalThis as any).innerWidth = 1024;
   });
-  afterEach(() => vi.restoreAllMocks());
+  // unstub as well as restore: three of these stub the root font size, and an
+  // inline unstub at the end of each is skipped by a failing assertion, which
+  // leaks the stubbed root into every later test in the file.
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   it('restores the default split ratio and drawer width, persisting the width', () => {
+    // The reset is `max(default, floor)`, and at a 16px root the floor (312)
+    // already leads the constant (300), so this is the floor. That is the
+    // ordinary case since the drawer's floor became one number for every
+    // desktop client; the constant only leads below 100% ui-scale, pinned below.
+    const width = Math.max(DEFAULT_DRAWER_WIDTH, minDrawerWidth());
     splitRatio.value = 0.8;
     threadDrawerWidth.value = 500;
     resetPaneLayout();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
-    expect(threadDrawerWidth.value).toBe(DEFAULT_DRAWER_WIDTH);
-    expect(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)).toBe(String(DEFAULT_DRAWER_WIDTH));
+    expect(threadDrawerWidth.value).toBe(width);
+    expect(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)).toBe(String(width));
   });
 
-  it('never resets BELOW the drawer floor, which the default can fall under', () => {
+  it('never resets BELOW the drawer floor, which the default falls under', () => {
     // The default is a constant while the floor is derived from the root font
-    // size and the desktop build, so the two cross: at a large UI scale, or on
-    // the packaged macOS build (which reserves the traffic lights), the header
-    // row needs more than 300px and a bare reset would put the drawer straight
-    // back under its own floor. Scale the root past that crossing point.
+    // size, so the two cross: from a 16px root up the header row needs more than
+    // 300px, and a bare reset would put the drawer straight back under its own
+    // floor. Scale the root well past that crossing point.
     vi.stubGlobal('getComputedStyle', () => ({ fontSize: '32px', getPropertyValue: () => '' }));
     const floor = minDrawerWidth();
     expect(floor, 'a 32px root must put the floor above the default').toBeGreaterThan(DEFAULT_DRAWER_WIDTH);
@@ -550,7 +560,19 @@ describe('resetPaneLayout', () => {
     resetPaneLayout();
     expect(threadDrawerWidth.value).toBe(floor);
     expect(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)).toBe(String(floor));
-    vi.unstubAllGlobals();
+  });
+
+  it('resets to the default where the floor is below it, under 100% ui-scale', () => {
+    // The other side of that crossing, and why the `max` is not a one-way trip
+    // to the floor: at UI_SCALE_MIN (75%, a 12px root) the row needs 274px and
+    // the constant is what a reset lands on.
+    vi.stubGlobal('getComputedStyle', () => ({ fontSize: '12px', getPropertyValue: () => '' }));
+    expect(minDrawerWidth(), 'a 12px root must put the floor below the default')
+      .toBeLessThan(DEFAULT_DRAWER_WIDTH);
+
+    threadDrawerWidth.value = 500;
+    resetPaneLayout();
+    expect(threadDrawerWidth.value).toBe(DEFAULT_DRAWER_WIDTH);
   });
 
   it('no-ops on mobile', () => {

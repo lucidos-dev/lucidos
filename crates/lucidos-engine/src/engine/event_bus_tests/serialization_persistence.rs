@@ -527,3 +527,63 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
         "CodingAgentIdled must be the final event — ChangeProposed must come before it"
     );
 }
+
+/// The persistence half of the HTML-entity bug hunt
+/// (`docs/plans/2026-08-09-tool-arg-html-entity-repair.md`): a tool argument
+/// holding `& < > " '` must reach the `events` row byte-identical, and come
+/// back out the same way.
+///
+/// The reported corruption was visible in persisted `ToolCalled` args, so
+/// Postgres and the jsonb round-trip were suspects alongside the provider
+/// stream. Neither escapes: this pins that, so a future regression in the
+/// write path cannot hide behind `engine::tool_arg_entity_repair` fixing the
+/// label arguments while silently mangling the rest.
+#[tokio::test]
+async fn tool_called_args_persist_special_characters_verbatim() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    // A plain-text label alongside markup the model wrote on purpose: after
+    // the repair the first is literal and the second keeps its escaping, and
+    // persistence must not touch either.
+    let name = "Machine & Tooling <Health> \"q\" 'a'";
+    let html = "<p>Tools &amp; Toys</p>";
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolCalled {
+            name: "trigger_groups".into(),
+            args: serde_json::json!({"name": name, "html_content": html}),
+            description: format!("Creating trigger group '{name}'..."),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ToolCalled'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload["args"]["name"], name,
+        "the persisted argument must hold the literal characters, not entities"
+    );
+    assert_eq!(
+        payload["args"]["html_content"], html,
+        "markup the model escaped on purpose must survive escaped"
+    );
+    assert_eq!(
+        payload["description"],
+        format!("Creating trigger group '{name}'..."),
+        "the derived description is persisted verbatim too"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

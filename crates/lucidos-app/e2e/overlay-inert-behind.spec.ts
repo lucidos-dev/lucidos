@@ -32,7 +32,9 @@ test.describe('Overlay makes the UI behind it inert', () => {
     // kind as the connection panel the user reported.
     const anchor = page.locator('.compose-destination-picker .dropdown-trigger:visible').first();
     await anchor.click();
-    const menu = page.locator('.compose-destination-picker .dropdown-menu:visible').first();
+    // The menu is portaled to <body> (so it clears the header's stacking
+    // context), hence located on its own class rather than under the picker.
+    const menu = page.locator('.dropdown-menu:visible').first();
     await expect(menu).toBeVisible();
 
     // While it's open: <html data-overlay-open>; the icons behind are inert; the
@@ -55,7 +57,7 @@ test.describe('Overlay makes the UI behind it inert', () => {
     // Dismiss via Escape; the behind UI is live again (poll — the markers are
     // removed in the effect cleanup, a tick after the menu unmounts).
     await page.keyboard.press('Escape');
-    await expect(page.locator('.compose-destination-picker .dropdown-menu')).toHaveCount(0);
+    await expect(page.locator('.dropdown-menu')).toHaveCount(0);
     await expect.poll(overlayOpen).toBe(false);
     await expect.poll(() => pe(behind)).not.toBe('none');
   });

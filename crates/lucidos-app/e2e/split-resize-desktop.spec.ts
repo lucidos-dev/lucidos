@@ -1,13 +1,12 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, DRAWER_TOGGLE_LABEL } from './helpers';
 
-/** Free divider drags with a deferred snap (SplitLayout / DrawerDivider +
- *  splitHelpers): a drag lands exactly where the pointer drops it; ~400ms
- *  after release a pane below its minimum width animates to the minimum, or
- *  collapses entirely below half of it. While the drag is live the header
- *  regions track the panes 1:1 (data-pane-resizing disables their geometry
- *  transitions) — the old always-on eases left the header visibly
- *  disconnected from the panels mid-drag.
+/** Clamped divider drags (SplitLayout / DrawerDivider + splitHelpers; ADR 0056):
+ *  a drag is clamped to the pane minimums as it moves, so it stops at the wall
+ *  while the pointer keeps going, and nothing corrects it on release. While the
+ *  drag is live the header regions track the panes 1:1 (data-pane-resizing
+ *  disables their geometry transitions), the old always-on eases having left the
+ *  header visibly disconnected from the panels mid-drag.
  *
  *  Desktop-only: the split layout and its header regions only exist on
  *  desktop (mobile swipes between full-screen panes). */
@@ -24,6 +23,12 @@ const MIN_CONTENT_PANE = 360;
 // Well below the drawer's floor: the clamp must refuse to follow the pointer
 // there rather than land and be corrected.
 const BELOW_FLOOR_X = 150;
+// Seeded before every drawer test so a narrowing drag has somewhere to travel
+// FROM. It has to clear the drawer's floor by a wide margin, and the floor is
+// 312 at these projects' 16px root now that it no longer varies by client
+// (ADR 0058): opening at the default would put the drawer on its wall already,
+// and a drag that cannot move proves nothing about a clamp.
+const OPEN_DRAWER_WIDTH = 420;
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -65,11 +70,11 @@ async function threadHeaderGapX(page: Page): Promise<number> {
   const gap = await page.evaluate(() => {
     const header = document.querySelector('.desktop-header');
     if (!header) return null;
-    // Whichever leading icon host is currently the visible one (the pair
-    // crossfades on data-thread-drawer-open, so the other has no box).
-    const leadingRight = ['.collapsed-thread-actions', '.thread-nav-group']
-      .map((sel) => header.querySelector(sel)?.getBoundingClientRect())
-      .reduce((max, r) => (r && r.width > 0 ? Math.max(max, r.right) : max), 0);
+    // The leading icon host. One element in both drawer states: it used to be a
+    // pair crossfading on data-thread-drawer-open, and is a single slot that
+    // travels between the two positions now.
+    const leading = header.querySelector('.thread-toggle-slot')?.getBoundingClientRect();
+    const leadingRight = leading && leading.width > 0 ? leading.right : 0;
     // The whole centred cluster, not the mark inside it: the chevrons take its
     // ends, so the mark's left edge is well inside the interactive run.
     const cluster = header.querySelector('.pane-header-brand-label')?.getBoundingClientRect();
@@ -86,26 +91,26 @@ async function threadHeaderGapX(page: Page): Promise<number> {
   return (gap!.from + gap!.to) / 2;
 }
 
-/** openThreadDrawer returns as soon as the drawer has ANY width, but the
- *  open animates over var(--duration-slow) — grabbing the divider mid-slide
- *  reads a stale bounding box and the drag silently misses it. Wait for the
- *  default width (300, no persisted width in these tests) to settle. */
+/** openThreadDrawer returns as soon as the drawer has ANY width, but the open
+ *  animates over var(--duration-slow): grabbing the divider mid-slide reads a
+ *  stale bounding box and the drag silently misses it. Wait for the seeded
+ *  OPEN_DRAWER_WIDTH to settle. */
 async function openDrawerAndSettle(page: Page): Promise<void> {
   await openThreadDrawer(page);
-  await page.waitForFunction(() => {
+  await page.waitForFunction((want) => {
     const drawer = document.querySelector('.thread-drawer');
-    return drawer && Math.abs(drawer.getBoundingClientRect().width - 300) < 1;
-  }, undefined, { timeout: 5_000 });
+    return !!drawer && Math.abs(drawer.getBoundingClientRect().width - want) < 1;
+  }, OPEN_DRAWER_WIDTH, { timeout: 5_000 });
 }
 
 test.describe('Split layout: dividers clamp at the pane minimums', () => {
   test.beforeEach(async ({ page, context }) => {
     await assertHealthy(page);
-    await context.addInitScript(() => {
+    await context.addInitScript((width) => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
-      localStorage.removeItem('lucidos-thread-drawer-width');
-    });
+      localStorage.setItem('lucidos-thread-drawer-width', String(width));
+    }, OPEN_DRAWER_WIDTH);
     await navigateToApp(page);
   });
 
@@ -216,8 +221,8 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     await page.waitForTimeout(SETTLE_MS);
     const settled = await drawerWidth(page);
     expect(settled, 'the drawer moved after release').toBe(during);
-    expect(settled, 'stopped at the default width, so this is not the floor')
-      .toBeLessThan(300);
+    expect(settled, 'the drag never moved the drawer, so this is not the floor')
+      .toBeLessThan(OPEN_DRAWER_WIDTH - 40);
     // The floor is what the drawer's own header row needs, so the row has to fit
     // in it: that is the property the number was standing in for.
     const fits = await page.evaluate(() => {

@@ -167,9 +167,11 @@
     --pane-header-gap: 0.25rem;
     /* Brand-blue bar (both themes) with a LIGHT foreground scale. Every glyph,
        label, and badge in the bar consumes these --header-* tokens so the
-       inversion lives in one place; popout panels anchored inside the header
-       subtree reset them back to the normal dark-on-light values (see the
-       "Brand-blue header" block at the end of this file). */
+       inversion lives in one place. A popout ANCHORED in the bar needs no
+       reset back to dark-on-light, because it is never IN this subtree: the
+       menus portal their panel to <body> and inherit the document's own
+       defaults. One that ever rendered inline would need the reset restored;
+       see the note where it used to live, at the end of this file. */
     --header-fg: #ffffff;
     --header-fg-muted: rgba(255, 255, 255, 0.72);
     --header-control-hover-bg: rgba(255, 255, 255, 0.12);
@@ -615,7 +617,7 @@
         background: var(--header-divider);
         opacity: 1;
         pointer-events: none;
-        transition: opacity 0.3s, left var(--duration-slow) ease;
+        transition: opacity var(--duration-slow), left var(--duration-slow) ease;
     }
 
     /* Divider between thread drawer and chat header — tracks drawer divider */
@@ -629,7 +631,7 @@
         background: var(--header-divider);
         opacity: 0;
         pointer-events: none;
-        transition: opacity 0.3s, left var(--duration-slow) ease;
+        transition: opacity var(--duration-slow), left var(--duration-slow) ease;
     }
 
     :root[data-thread-drawer-open] .app-header::before {
@@ -671,6 +673,41 @@
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
 
+    /* Packaged macOS: the row never starts left of the traffic lights, whatever
+       the divider is doing. It is the same sideways step the drawer toggle and
+       the drawer-open row make one region over, so the header's left-most slot
+       clears the lights in every state that can hold it, and it is needed here
+       for the same reason as there: this row's leading control is the
+       hamburger, and a --header-icon-box centred on the bar reaches up into the
+       reclaimed band, so wherever the row starts is where a control paints.
+
+       Maximizing the Canvas pane is what makes that reachable. Collapsing the
+       Conversation side takes --split-ratio to 0 and hides the drawer with it,
+       so --co, --ddo and --divider-x are all 0 and the base rule lands the
+       hamburger at the window's own left edge, directly on the lights.
+
+       A `max()` rather than a rule gated on [data-thread-collapsed], because
+       the collapse is not the only way under the reserve: --split-ratio is a
+       persisted RATIO and nothing re-clamps it when the window shrinks, so a
+       divider dropped at the Conversation pane's floor on a very wide display
+       (store/paneMinimums.ts clamps the drag in px, against the container it
+       was dragged in) reopens proportionally narrower in a small window. Rare,
+       but a floor written as a floor covers it for free, where an attribute
+       gate would have to enumerate it.
+
+       The inner term is a copy of the base rule's `left`, which CSS cannot hand
+       back as a resolved length; the drift check is in
+       styles/__tests__/header-band-centering.test.ts, same as the one that
+       holds --threads-title-lead to the threads row's own padding.
+
+       Horizontal only, like both of its counterparts: the row keeps the base
+       rule's bar centring (--header-band-lift), so the hamburger stays on the
+       line every other control in the bar sits on. `left` already transitions
+       there, so the step rides the collapse animation instead of jumping. */
+    :root[data-titlebar-overlay] .app-header .content-header-elements {
+        left: max(calc(var(--divider-x) + var(--divider-width)), var(--titlebar-lights-reserve));
+    }
+
     .app-header .content-header-elements > .hamburger-panel,
     .app-header .content-header-actions {
         flex-shrink: 0;
@@ -684,11 +721,31 @@
         flex: 0 0 auto;
     }
 
-    /* Thread toggle + nav — grouped at left edge when drawer is closed.
-       z-index must beat .pane-header-brand (--z-control-panel = 2200) which
+    /* The thread drawer toggle's ONE host, in both drawer states. It used to be
+       the drawer-closed half of a crossfading pair, the other half being a
+       second copy inside .pane-header-brand, and the swap between them was the
+       bug: the incoming copy faded UP from nothing at a position it had never
+       occupied while the outgoing one slid toward it fading DOWN, so most of the
+       slide showed two half-transparent icons that ended on nearly the same x.
+       One element that TRAVELS is the same animation with neither fault, and it
+       is why NOTHING here transitions opacity.
+
+       Both settled positions are exactly where the pair used to sit, so no
+       static layout moved: --thread-toggle-home while the drawer is shut, and
+       the Conversation pane header's leading edge while it is open (below). The
+       travel between them rides `left` on the same --duration-slow ease the
+       drawer body's width takes, which is what keeps the icon just outside the
+       shrinking drawer for the whole slide rather than crossing it: the row's
+       right edge interpolates --co to 0 while this interpolates --co + --ddo to
+       the home inset, and the second is greater than the first at both ends, so
+       it stays greater throughout.
+
+       z-index must beat .pane-header-brand (--z-control-panel = 2200), which
        starts at left:0 when the drawer is closed and would otherwise swallow
        pointer events. The centred brand-label keeps clear of it via
-       --brand-side-reserve (defined on :root above).
+       --brand-side-reserve (defined on :root above), which is sized to the
+       WIDER (trailing) end of that region, so a single leading icon is well
+       inside it in either drawer state.
 
        It takes --header-band-lift like the three header regions, so the drawer
        toggle sits at the same height as every other control in the bar. It once
@@ -698,42 +755,103 @@
        dissolves the collision without singling this control out vertically (see
        the [data-titlebar-overlay] rule below). Same for .view-selector-slot with
        the drawer open. */
-    .collapsed-thread-actions {
+    .thread-toggle-slot {
+        /* Where the toggle rests while the drawer is shut: the header's own
+           leading padding. Named rather than written inline so the overlay
+           build can move that resting place without restating the drawer-open
+           geometry, which is identical on both builds. */
+        --thread-toggle-home: 0.5rem;
         position: absolute;
-        left: 0.5rem;
+        left: var(--thread-toggle-home);
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
         display: flex;
         align-items: center;
         gap: 0.25rem;
+        /* The slot is exactly its one control wide, stated rather than left to
+           `auto` because the collapse below animates it to 0 and `auto` is not
+           interpolable. A second control added here has to widen this with it,
+           and unlike a magic travel distance a wrong value shows up immediately
+           as a clipped icon in the RESTING state rather than only in an
+           animation's tail. */
+        width: var(--header-icon-box);
         z-index: calc(var(--z-control-panel) + 1);
-        transition: opacity var(--duration-slow) ease, visibility var(--duration-slow);
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    visibility var(--duration-slow);
     }
 
-    /* Drawer closed, packaged macOS: the toggle starts after the traffic lights
-       instead of at the row's own padding. Horizontal only, deliberately: it
-       keeps the vertical centring of the base rule above, so it lines up with
-       "Threads", the search icon and every other control in the bar. Its box
-       still reaches up into the reclaimed band, which costs nothing (nothing
-       clips between .titlebar-strip and .app-header, and both paint the same
-       blue) and is exactly why the sideways step is still needed.
+    /* Packaged macOS: the toggle rests after the traffic lights instead of at
+       the row's own padding. Horizontal only, deliberately: it keeps the
+       vertical centring of the base rule above, so it lines up with "Threads",
+       the search icon and every other control in the bar. Its box still reaches
+       up into the reclaimed band, which costs nothing (nothing clips between
+       .titlebar-strip and .app-header, and both paint the same blue) and is
+       exactly why the sideways step is still needed.
+
+       It moves the RESTING PLACE rather than `left` itself, which is what keeps
+       this from having to restate (and so drift from) the drawer-open rule
+       below: with the drawer open the toggle is at the Conversation pane's
+       leading edge on both builds, well clear of the lights, because the
+       drawer's own floor is derived from a row that starts after this same
+       reserve (store/paneMinimums.ts, ADR 0058).
 
        It stays a child of .app-header rather than moving into the strip, which
        is what keeps the window drag correct for free: the strip's own drag
        handler never sees these pointer events (the header subtree paints, and
        hit-tests, above it), and the header's handler already exempts
        interactive targets via headerCanDragStart. */
-    :root[data-titlebar-overlay] .collapsed-thread-actions {
-        left: var(--titlebar-lights-reserve);
+    :root[data-titlebar-overlay] .thread-toggle-slot {
+        --thread-toggle-home: var(--titlebar-lights-reserve);
     }
 
-    /* Always mounted (AppHeader renders both nav-icon hosts); faded out while
-       the drawer header owns the icons, or while the whole thread side is
-       collapsed. Fading instead of unmounting is what lets the drawer toggle
-       animate the swap. */
-    :root[data-thread-drawer-open] .collapsed-thread-actions,
-    :root[data-thread-collapsed] .collapsed-thread-actions {
-        opacity: 0;
+    /* Drawer open: the Conversation pane header's leading edge, the same x the
+       retired second copy occupied as the first in-flow child of
+       .pane-header-brand. Absolute rather than in that region's flow so the two
+       states are two values of one property on one element. */
+    :root[data-thread-drawer-open] .thread-toggle-slot {
+        left: calc(var(--co) + var(--ddo));
+    }
+
+    /* The whole Conversation side is collapsing (maximize Canvas, ⌘⇧↵, a
+       divider double-click), so the toggle leaves WITH its pane: it travels out
+       past the header's leading edge instead of fading where it stands. Fading
+       in place was the same defect as the crossfade above, one animation over:
+       the Canvas pane's hamburger slides left into exactly this slot
+       (.content-header-elements, floored at the lights reserve), so a toggle
+       dimming at the home inset put a ghost under an arriving control.
+
+       It leaves by SHRINKING, with `left` staying on the --co + --ddo track it
+       rides in every other state. Sliding it out to a negative `left` was the
+       obvious answer and was wrong, because `left` interpolates between two
+       resolved lengths and the collapsed one has to serve the way BACK too: a
+       toggle parked at -1 icon box re-enters from a whole box LEFT of where the
+       drawer row's right edge starts, so a re-expand spends 92% of its
+       animation with the toggle inside the growing row, on top of that row's
+       Search button (caught in review; the arithmetic is in the plan). A box
+       that only ever shrinks cannot cross anything: its left edge IS the track,
+       which stays --ddo clear of the row at every point of every transition,
+       and its right edge only moves inward. Nothing static can serve both
+       directions, because the row's right edge and the hamburger's landing spot
+       both converge on 0, so a full-width box resting anywhere at or past 0
+       covers the hamburger.
+
+       `overflow: clip` rather than a clip-path, and ONLY here rather than on the
+       base rule, because clipping the slot clips the button's focus-ring
+       box-shadow with it. This is the one state where that costs nothing: the
+       toggle is `visibility: hidden` here, so it cannot hold focus and cannot be
+       wearing a ring. `overflow` does not transition, so the clip is off again
+       from the first frame of the way back and the icon returns at full size
+       riding the track outward, which is the right read for a control arriving
+       with its pane.
+
+       visibility transitions as a step at the END of its duration, so the button
+       stays paintable while it shrinks and leaves the tab order only once it is
+       gone. Never co-occurs with the drawer-open rule above: SplitLayout only
+       sets data-thread-drawer-open when the pane is NOT collapsed. */
+    :root[data-thread-collapsed] .thread-toggle-slot {
+        left: calc(var(--co) + var(--ddo));
+        width: 0;
+        overflow: clip;
         visibility: hidden;
         pointer-events: none;
     }
@@ -786,9 +904,11 @@
     }
 
     /* Drawer open, packaged macOS: the whole ROW starts after the traffic
-       lights, which is the same sideways step .collapsed-thread-actions makes in
-       the other drawer state, so the leading control is in one place whatever
-       the drawer is doing and the two fade into each other without travelling.
+       lights, which is the same sideways step --thread-toggle-home makes for the
+       drawer toggle in the other state, so the header's leading control lands on
+       one x whatever the drawer is doing: the Filter button here while the row
+       is up, the toggle once the row has clipped away and it has finished
+       travelling in.
 
        Moving the row rather than the Filter button is what keeps the two states
        on one height for free: the button is an ordinary flex child of an
@@ -902,12 +1022,13 @@
         flex-shrink: 0;
     }
 
-    /* Brand area spans from drawer edge to split divider. Children flow
-       left-to-right: thread-nav-group (back+compose) | brand-label (the Lucidos
-       mark + the workspace name, centered in available space) | search.
-       When the drawer is closed, the back+compose buttons live in
-       .collapsed-thread-actions outside the brand and overlap the brand's
-       left edge, so we reserve padding to keep them clear of brand-label. */
+    /* Brand area spans from drawer edge to split divider. It holds the Lucidos
+       mark + workspace name (brand-label, absolutely centred on the pane) and
+       the trailing actions cluster. The drawer toggle overlaps its LEADING edge
+       from outside, in both drawer states now that .thread-toggle-slot is one
+       travelling element positioned against the header rather than a member of
+       this region; --brand-side-reserve is what keeps the centred label clear of
+       it (and of the wider trailing cluster opposite). */
     .app-header .pane-header-brand {
         position: absolute;
         left: calc(var(--co) + var(--ddo));
@@ -917,9 +1038,13 @@
         z-index: var(--z-control-panel);
         overflow-x: clip;
         overflow-y: visible;
-        /* nav-group (left) and the actions cluster (right) sit at the box edges;
-           the brand-label is absolutely centered between them (below). */
-        justify-content: space-between;
+        /* The actions cluster is the region's ONLY in-flow child (the
+           brand-label is absolutely centred, below), so it is pinned to the
+           trailing edge directly. This was `space-between`, which needed a
+           second in-flow child at the leading edge to mean the same thing: with
+           the drawer toggle gone from the flow it would have put the actions at
+           the LEADING edge instead. */
+        justify-content: flex-end;
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
@@ -1145,6 +1270,13 @@
     :root[data-pane-resizing] .app-header .content-header-elements,
     :root[data-pane-resizing] .app-header .pane-header-brand,
     :root[data-pane-resizing] .threads-header,
+    /* The drawer toggle joined this list the moment it started TRAVELLING: its
+       `left` is --co + --ddo while the drawer is open, and a drawer-divider drag
+       rewrites --co on every pointermove. Left out, it is the one control in the
+       bar still easing while the drawer, the row beside it and the brand region
+       it leads all track the pointer 1:1. It could not lag before, having had a
+       constant `left` and no geometry transition at all. */
+    :root[data-pane-resizing] .thread-toggle-slot,
     :root[data-pane-resizing] .thread-drawer,
     :root[data-pane-resizing] .header-focus-wash,
     :root[data-pane-resizing] .toast-column,
@@ -1158,15 +1290,9 @@
     }
 }
 
-.thread-nav-group {
-    display: flex;
-    align-items: center;
-    flex-shrink: 0;
-}
-
 /* Right-side cluster of the brand: control panel + compose + search (+ recovery).
-   Pinned to the brand box's right edge by the brand's space-between; the centered
-   brand-label floats over the middle independently. */
+   Pinned to the brand box's right edge by the brand's justify-content; the
+   centered brand-label floats over the middle independently. */
 .pane-header-brand-actions {
     display: flex;
     align-items: center;
@@ -1174,30 +1300,14 @@
     flex-shrink: 0;
 }
 
-/* Drawer closed → the drawer toggle lives in .collapsed-thread-actions instead;
-   collapse this group with a max-width slide + fade (display:none would pop
-   it out of the brand while the brand box is still animating). max-width
-   slightly above the natural 2.25rem icon (the drawer toggle, which is all this
-   group holds since the thread chevrons moved to flank the mark). */
-.desktop-header .pane-header-brand .thread-nav-group {
-    max-width: 2.75rem;
-    overflow: clip;
-    transition: max-width var(--duration-slow) ease,
-                opacity var(--duration-slow) ease, visibility var(--duration-slow);
-}
-
-:root:not([data-thread-drawer-open]) .desktop-header .pane-header-brand .thread-nav-group {
-    max-width: 0;
-    opacity: 0;
-    visibility: hidden;
-    pointer-events: none;
-}
-
 @media (min-width: 769px) {
     /* Collapsing a pane fades its header regions out while their left/width
        transitions slide them to zero — display:none here popped them out at
-       the start of the pane animation. (.collapsed-thread-actions has its
-       matching rule next to its base styles above.) */
+       the start of the pane animation. The drawer toggle is deliberately NOT in
+       this list: it is a single control rather than a whole region, and it
+       leaves by travelling out past the header's leading edge instead (see
+       .thread-toggle-slot above), because the slot it would fade in is the one
+       the Canvas pane's hamburger slides into. */
     :root[data-thread-collapsed] .app-header .threads-header,
     :root[data-thread-collapsed] .app-header .pane-header-brand,
     :root[data-content-collapsed] .app-header .content-header-elements {
@@ -1400,17 +1510,8 @@
     color: var(--header-badge-fg);
 }
 
-/* Popout panels anchored in the header subtree are normal surfaces — restore
-   the default token values so the selectors above render dark-on-light there. */
-.app-header .dropdown-menu,
-.app-header .nav-history-menu {
-    --header-fg: var(--text-primary);
-    --header-fg-muted: var(--text-secondary);
-    --header-control-hover-bg: var(--bg-hover);
-    --header-control-active-bg: var(--bg-tertiary);
-    --header-badge-bg: var(--accent);
-    --header-badge-fg: #ffffff;
-    /* Undo the bar's base light color so inherited text in the popout reads
-       dark-on-light again. */
-    color: var(--text-primary);
-}
+/* A popout anchored in the header needs no token restore, because it is never
+   IN the header subtree: `.dropdown-menu` and `.nav-history-menu` both portal
+   their panel to <body>, so they inherit the document's own dark-on-light
+   defaults rather than the bar's light-on-blue ones. Reintroduce the restore
+   only alongside a header popout that renders inline. */

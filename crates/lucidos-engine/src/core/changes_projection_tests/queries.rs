@@ -127,34 +127,6 @@ async fn other_pending_for_branch_returns_false_when_only_one_pending() {
 }
 
 #[tokio::test]
-async fn list_completed_branches_returns_distinct_branches() {
-    let (pool, db) = setup_test_db().await;
-    let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let thread = Uuid::new_v4();
-    let id_a = Uuid::new_v4();
-    let id_b = Uuid::new_v4();
-    let id_c = Uuid::new_v4();
-    start_cc_thread(&bus, thread).await;
-
-    emit(&bus, thread, aggregate_proposed(id_a, "branch-a", "/r")).await;
-    emit(&bus, thread, applied_event(id_a, &["feat: a"], false)).await;
-    emit(&bus, thread, aggregate_proposed(id_b, "branch-b", "/r")).await;
-    emit(&bus, thread, discarded_event(id_b)).await;
-    // Pending only — must NOT appear in completed
-    emit(&bus, thread, aggregate_proposed(id_c, "branch-c", "/r")).await;
-
-    let proj = ChangesProjection::new(pool);
-    let mut completed = proj.list_completed_branches().await.unwrap();
-    completed.sort();
-    assert_eq!(
-        completed,
-        vec!["branch-a".to_string(), "branch-b".to_string()]
-    );
-
-    teardown_test_db(&db).await;
-}
-
-#[tokio::test]
 async fn list_recently_applied_orders_newest_first_with_limit_and_cursor() {
     let (pool, db) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());

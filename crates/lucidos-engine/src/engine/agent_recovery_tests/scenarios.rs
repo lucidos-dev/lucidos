@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::engine::agent_recovery::branch_awaits_recovery;
 use crate::engine::agent_session::resume::deterministic_worktree_path;
 use crate::engine::git_ops::{is_external_repo_path, worktrees_dir};
 
@@ -60,15 +61,21 @@ pub(crate) struct RecoveryFilter {
     pub pending: HashSet<String>,
     pub already_recovered: HashSet<String>,
     pub idle: HashSet<String>,
-    pub merged: HashSet<String>,
     pub actively_running: HashSet<String>,
-    pub completed_change: HashSet<String>,
     pub known: HashSet<String>,
     pub discovered: HashSet<String>,
 }
 
 /// Simulates the recovery filtering logic from `recover_orphaned_worktrees`.
 /// Returns the branches that would be recovered (not skipped).
+///
+/// The in-flight decision itself is NOT simulated: it calls the production
+/// [`branch_awaits_recovery`]. A hand-copied `&&` chain is what let the
+/// completed-change veto sit here as an asserted invariant for four months
+/// while it was quietly retiring live turns (see that function's doc). Only the
+/// surrounding sequencing, which is interleaved with side effects in the real
+/// loop and cannot be lifted out, is mirrored. `known` mirrors
+/// `orphan_recovery_target`, which the real loop applies a few lines later.
 pub(crate) fn filter_recovery_candidates(
     candidates: &[(PathBuf, String)],
     f: &RecoveryFilter,
@@ -77,10 +84,8 @@ pub(crate) fn filter_recovery_candidates(
         .iter()
         .filter(|(_, branch)| {
             (!f.pending.contains(branch) || f.actively_running.contains(branch))
-                && !f.already_recovered.contains(branch)
-                && !f.idle.contains(branch)
-                && !f.completed_change.contains(branch)
-                && (!f.merged.contains(branch) || f.actively_running.contains(branch))
+                && (f.actively_running.contains(branch) || !f.already_recovered.contains(branch))
+                && branch_awaits_recovery(branch, &f.idle, f.pending.contains(branch))
                 && (f.known.contains(branch) || f.actively_running.contains(branch))
         })
         .map(|(_, branch)| branch.clone())
@@ -93,12 +98,7 @@ pub(crate) fn filter_recovery_candidates(
 pub(crate) fn find_worktreeless_active_branches(f: &RecoveryFilter) -> Vec<String> {
     f.actively_running
         .iter()
-        .filter(|branch| {
-            !f.discovered.contains(*branch)
-                && !f.already_recovered.contains(*branch)
-                && !f.completed_change.contains(*branch)
-                && !f.idle.contains(*branch)
-        })
+        .filter(|branch| !f.discovered.contains(*branch) && !f.idle.contains(*branch))
         .cloned()
         .collect()
 }
@@ -137,28 +137,23 @@ fn lost_worktree_already_discovered_not_duplicated() {
 }
 
 #[test]
-fn lost_worktree_already_recovered_skipped() {
+fn lost_worktree_running_branch_rediscovered_despite_an_earlier_recovery() {
+    // Inverted on 2026-08-09, together with the `already_recovered` narrowing in
+    // the main loop. A branch reaches this loop only when the classifier calls
+    // it `running`, and a completed prior recovery can coexist with that only
+    // when a LATER turn opened after the completion. Skipping was therefore
+    // never right here, and it made a lost worktree behave differently from a
+    // surviving one on the very same thread.
     let result = find_worktreeless_active_branches(&RecoveryFilter {
         actively_running: HashSet::from(["claude-code/recovered-before".to_string()]),
         already_recovered: HashSet::from(["claude-code/recovered-before".to_string()]),
         ..Default::default()
     });
-    assert!(
-        result.is_empty(),
-        "Branch already recovered must not be re-discovered"
-    );
-}
-
-#[test]
-fn lost_worktree_completed_change_skipped() {
-    let result = find_worktreeless_active_branches(&RecoveryFilter {
-        actively_running: HashSet::from(["claude-code/done".to_string()]),
-        completed_change: HashSet::from(["claude-code/done".to_string()]),
-        ..Default::default()
-    });
-    assert!(
-        result.is_empty(),
-        "Branch with completed change must not be re-discovered"
+    assert_eq!(
+        result,
+        vec!["claude-code/recovered-before".to_string()],
+        "a later turn in flight needs a worktree, whatever an earlier turn's \
+         recovery did"
     );
 }
 
@@ -172,7 +167,7 @@ fn lost_worktree_mixed_scenario() {
             "claude-code/needs-recovery".to_string(),
             "claude-code/already-done".to_string(),
         ]),
-        completed_change: HashSet::from(["claude-code/already-done".to_string()]),
+        idle: HashSet::from(["claude-code/already-done".to_string()]),
         ..Default::default()
     });
     assert_eq!(
@@ -225,7 +220,7 @@ fn all_skip_conditions_work_together() {
         (PathBuf::from("/tmp/wt-b"), "claude-code/b".to_string()), // already recovered
         (PathBuf::from("/tmp/wt-c"), "claude-code/c".to_string()), // was idle
         (PathBuf::from("/tmp/wt-d"), "claude-code/d".to_string()), // needs recovery
-        (PathBuf::from("/tmp/wt-e"), "claude-code/e".to_string()), // already merged
+        (PathBuf::from("/tmp/wt-e"), "claude-code/e".to_string()), // no originating thread
     ];
 
     let result = filter_recovery_candidates(
@@ -234,13 +229,11 @@ fn all_skip_conditions_work_together() {
             pending: HashSet::from(["claude-code/a".to_string()]),
             already_recovered: HashSet::from(["claude-code/b".to_string()]),
             idle: HashSet::from(["claude-code/c".to_string()]),
-            merged: HashSet::from(["claude-code/e".to_string()]),
             known: HashSet::from([
                 "claude-code/a".to_string(),
                 "claude-code/b".to_string(),
                 "claude-code/c".to_string(),
                 "claude-code/d".to_string(),
-                "claude-code/e".to_string(),
             ]),
             ..Default::default()
         },
@@ -271,78 +264,77 @@ fn all_idle_means_no_recovery() {
     assert!(result.is_empty());
 }
 
+/// A branch settles when the classifier says its turn ended, or when a pending
+/// change is waiting on it. Nothing else, and in particular nothing about what
+/// the branch did on an EARLIER turn.
+///
+/// The three inputs the gate used to carry that are gone, in the order they
+/// stopped being true of production:
+///
+/// * **already merged to main.** Recovery no longer runs a git-level "no diff
+///   vs main" skip at all: `recover_orphaned_worktrees` keeps such a branch on
+///   purpose ("Orphaned empty branches are cheap"), because a transient git
+///   failure reads identically to an empty diff and the skip cost real commits.
+/// * **a change on the branch was applied or discarded.** Removed 2026-08-09;
+///   see [`branch_awaits_recovery`] for the report it produced.
+/// * A branch with **no originating thread** is still skipped, but by
+///   `orphan_recovery_target` rather than here, so `known` stays in the mirror.
 #[test]
-fn merged_branch_skipped_during_recovery() {
-    // A session whose branch was already merged to main (e.g., changes applied,
-    // then an Apply-time hardening session emitted SessionStarted after
-    // CodingAgentIdled, then engine restarted). The SQL idle_branches check
-    // misses this because SessionStarted after CodingAgentIdled makes it
-    // look non-idle. But git shows no diff vs main.
+fn only_current_turn_facts_settle_a_branch() {
+    let idle = HashSet::from(["claude-code/turn-ended".to_string()]);
+
+    // The reported failure: a thread applied a change on its branch hours
+    // earlier, kept working on that same branch, and was mid-turn when the user
+    // hit *Switch to new version*. Nothing about the applied change reaches this
+    // predicate, so the live classification decides and the turn is recovered.
+    assert!(
+        branch_awaits_recovery("claude-code/applied-then-resumed", &idle, false),
+        "an applied change on an earlier turn must not retire a live branch"
+    );
+
+    // The classifier's own verdict still settles it.
+    assert!(!branch_awaits_recovery(
+        "claude-code/turn-ended",
+        &idle,
+        false
+    ));
+
+    // A pending change outranks that verdict: the agent idled and then waited
+    // for Apply, so the branch is settled only once the user resolves it.
+    assert!(branch_awaits_recovery(
+        "claude-code/turn-ended",
+        &idle,
+        true
+    ));
+
+    // End to end through the candidate filter, with `known` carrying every
+    // branch so `orphan_recovery_target`'s half is out of the way.
     let candidates = vec![
         (
             PathBuf::from("/tmp/wt-1"),
-            "claude-code/already-merged".to_string(),
+            "claude-code/applied-then-resumed".to_string(),
         ),
         (
             PathBuf::from("/tmp/wt-2"),
-            "claude-code/has-changes".to_string(),
+            "claude-code/turn-ended".to_string(),
         ),
     ];
-
-    let merged = HashSet::from(["claude-code/already-merged".to_string()]);
-    let known = HashSet::from([
-        "claude-code/already-merged".to_string(),
-        "claude-code/has-changes".to_string(),
-    ]);
-
     let result = filter_recovery_candidates(
         &candidates,
         &RecoveryFilter {
-            merged,
-            known,
+            idle,
+            known: HashSet::from([
+                "claude-code/applied-then-resumed".to_string(),
+                "claude-code/turn-ended".to_string(),
+            ]),
             ..Default::default()
         },
     );
-    assert_eq!(result, vec!["claude-code/has-changes".to_string()]);
-}
-
-#[test]
-fn completed_change_branches_skipped_during_recovery() {
-    // Branches with applied or discarded changes should not be re-recovered.
-    // The original session completed and proposed changes that were resolved.
-    let candidates = vec![
-        (
-            PathBuf::from("/tmp/wt-1"),
-            "claude-code/applied".to_string(),
-        ),
-        (
-            PathBuf::from("/tmp/wt-2"),
-            "claude-code/discarded".to_string(),
-        ),
-        (
-            PathBuf::from("/tmp/wt-3"),
-            "claude-code/needs-recovery".to_string(),
-        ),
-    ];
-    let completed = HashSet::from([
-        "claude-code/applied".to_string(),
-        "claude-code/discarded".to_string(),
-    ]);
-    let known = HashSet::from([
-        "claude-code/applied".to_string(),
-        "claude-code/discarded".to_string(),
-        "claude-code/needs-recovery".to_string(),
-    ]);
-
-    let result = filter_recovery_candidates(
-        &candidates,
-        &RecoveryFilter {
-            completed_change: completed,
-            known,
-            ..Default::default()
-        },
+    assert_eq!(
+        result,
+        vec!["claude-code/applied-then-resumed".to_string()],
+        "only the branch whose turn was still open is recovered"
     );
-    assert_eq!(result, vec!["claude-code/needs-recovery".to_string()]);
 }
 
 #[test]
@@ -714,13 +706,14 @@ fn completed_session_with_response_generated_skips_recovery() {
 
 #[test]
 fn running_session_with_no_git_changes_still_recovered() {
-    // Bug: A Claude Code session killed mid-work before producing any git changes
-    // was incorrectly skipped by the git-level "already merged" check.
-    // The session had SessionStarted as its last lifecycle event (not idle),
-    // and the idle_branches SQL correctly identified it as non-idle,
-    // but the git check saw no commits and no uncommitted changes and
-    // skipped it. These sessions MUST be resumed — they just hadn't
-    // produced any output yet before the engine restarted.
+    // Bug: A Claude Code session killed mid-work before producing any git
+    // changes was incorrectly skipped by a git-level "already merged" check
+    // (since removed). The session had SessionStarted as its last lifecycle
+    // event, so the classifier correctly called it non-idle, but the git check
+    // saw no commits and no uncommitted changes and skipped it. These sessions
+    // MUST be resumed: they just hadn't produced any output yet before the
+    // engine restarted, and having produced nothing is not evidence of being
+    // done.
     let candidates = vec![
         (
             PathBuf::from("/tmp/wt-1"),
@@ -728,32 +721,28 @@ fn running_session_with_no_git_changes_still_recovered() {
         ),
         (
             PathBuf::from("/tmp/wt-2"),
-            "claude-code/truly-merged".to_string(),
+            "claude-code/no-changes-and-idle".to_string(),
         ),
     ];
 
     let result = filter_recovery_candidates(
         &candidates,
         &RecoveryFilter {
-            merged: HashSet::from([
-                "claude-code/no-changes-but-running".to_string(),
-                "claude-code/truly-merged".to_string(),
-            ]),
             actively_running: HashSet::from(["claude-code/no-changes-but-running".to_string()]),
+            idle: HashSet::from(["claude-code/no-changes-and-idle".to_string()]),
             known: HashSet::from([
                 "claude-code/no-changes-but-running".to_string(),
-                "claude-code/truly-merged".to_string(),
+                "claude-code/no-changes-and-idle".to_string(),
             ]),
             ..Default::default()
         },
     );
 
-    // The actively running session must be recovered despite no git changes.
-    // The truly merged session (not actively running) is correctly skipped.
+    // Both branches are diff-less; only the classifier's verdict separates them.
     assert_eq!(
         result,
         vec!["claude-code/no-changes-but-running".to_string()],
-        "Running session with no git changes must be recovered, truly merged must be skipped"
+        "Running session with no git changes must be recovered; the idle one must not"
     );
 }
 
@@ -822,6 +811,45 @@ fn double_restart_completed_recovery_stays_in_already_recovered() {
     assert!(
         result.is_empty(),
         "Completed recovery (followed by CodingAgentIdled) must NOT be re-recovered"
+    );
+}
+
+#[test]
+fn a_completed_recovery_does_not_settle_a_later_turn_on_the_same_branch() {
+    // The sibling of the completed-change veto (`branch_awaits_recovery`), found
+    // by looking for the same shape elsewhere in the gate chain: a
+    // branch-keyed fact that stays true forever on a thread that keeps working.
+    //
+    // `already_recovered` asks whether the branch's NEWEST `ContinuationStarted`
+    // was followed by a completion. Once a thread has been auto-resumed and that
+    // resume finished, the answer is yes for the rest of the thread's life, so
+    // every LATER turn interrupted mid-flight was skipped with "recovery thread
+    // already exists" and lost its resume, the same end state the user reported.
+    //
+    // Event sequence:
+    //   ... → ContinuationStarted → SessionStarted → CodingAgentIdled   (turn 3,
+    //   resumed and finished, so the branch is in already_recovered)
+    //   → CodingAgentUserMessageSent → SessionStarted → [restart]       (turn 4,
+    //   in flight, so the classifier says running)
+    let candidates = vec![(
+        PathBuf::from("/tmp/wt-1"),
+        "claude-code/resumed-then-worked-again".to_string(),
+    )];
+
+    let result = filter_recovery_candidates(
+        &candidates,
+        &RecoveryFilter {
+            already_recovered: HashSet::from(["claude-code/resumed-then-worked-again".to_string()]),
+            actively_running: HashSet::from(["claude-code/resumed-then-worked-again".to_string()]),
+            known: HashSet::from(["claude-code/resumed-then-worked-again".to_string()]),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        result,
+        vec!["claude-code/resumed-then-worked-again".to_string()],
+        "a turn in flight NOW has no live subprocess whoever recovered the last \
+         one, so the completed prior recovery must not skip it"
     );
 }
 

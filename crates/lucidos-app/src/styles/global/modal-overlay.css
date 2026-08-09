@@ -16,7 +16,7 @@
    non-event, so the tab stays interactive and shows only a light dismissible
    "Restarting engine…" toast.
    z-index above --z-control-panel so the header (.pane-header-brand,
-   .collapsed-thread-actions, .message-route-panel all sit at 2200) is
+   .thread-toggle-slot, .message-route-panel all sit at 2200) is
    covered by the dim overlay and its buttons aren't clickable through.
    .toast-container sits a step higher so the "Refreshing…" toast stays visible. */
 .ui-blocking-overlay {

@@ -25,11 +25,20 @@
     --transition: 0.15s ease;
 
     /* Transition durations — mirror base.css so the shared component classes
-       below animate identically to the host. Keep in sync with base.css. */
-    --duration-fast: 0.15s;
-    --duration-normal: 0.2s;
-    --duration-slow: 0.3s;
-    --duration-emphasis: 0.5s;
+       below animate identically to the host. Keep in sync with base.css.
+
+       Same calc() form as the host so the two files stay literally in sync, but
+       --duration-scale is pinned to 1 here and stays there: it carries the
+       host's diagnostic Animation speed slider, which an iframe cannot see. The
+       host publishes it as an inline style on ITS OWN :root, and a custom
+       property does not cross a document boundary, so an app always animates at
+       1x. That is deliberate: the slider is a host debugging aid for inspecting
+       host transitions, not a preference apps are expected to honour. */
+    --duration-scale: 1;
+    --duration-fast: calc(0.15s * var(--duration-scale));
+    --duration-normal: calc(0.2s * var(--duration-scale));
+    --duration-slow: calc(0.3s * var(--duration-scale));
+    --duration-emphasis: calc(0.5s * var(--duration-scale));
 
     /* Icon sizes (used by .icon-btn variants). Keep in sync with base.css. */
     --icon-size-sm: 0.875rem;

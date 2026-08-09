@@ -31,10 +31,33 @@ which is the same failure `.claude/rules/system-knowhow.md` gates elsewhere.
 | Color | `--bg-{primary,secondary,tertiary}`, `--border-color`, `--text-{primary,secondary,muted,on-accent}`, `--accent`, `--accent-{green,yellow,red}` | Never hardcode a color. The one exception is `#fff` / `rgba(255,255,255,*)` on a translucent overlay over image content. |
 | Type scale | `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` | `font-size` takes a token, never a raw `rem`. `em`, percentages, `inherit` and `var(--user-ui-scale)` stay literal on purpose, as does a value deliberately pinned to a computed-px threshold, which must carry a comment saying why. |
 | Z-index | `--z-{float,dropdown,sticky,drawer,control-panel,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. `--z-float` (20) is the lowest step, for a popover anchored inside its own pane. |
-| Duration | `--duration-{fast,normal,slow,emphasis}` | `emphasis` is for a deliberate state-change cue the user must register; reach for `normal` or `slow` first. |
+| Duration | `--duration-{fast,normal,slow,emphasis}` | `emphasis` is for a deliberate state-change cue the user must register; reach for `normal` or `slow` first. A new one is declared as `calc(<literal> * var(--duration-scale))`, see below. |
 | Icon size | `--icon-size-{sm,md,lg}` | Do not set inline `width`/`height` on an SVG inside `.icon-btn`; the class sizes it. |
 | Shadow | `--shadow-{sm,md,lg}` | Never hardcode a `box-shadow`. |
 | Syntax | `--syntax-{key,string,number,keyword,comment,control}` | Highlighting only. |
+
+### Every duration is scaled by the animation-speed slider
+
+The `--duration-*` tokens are each their 1x literal times `var(--duration-scale)`,
+the *animation speed scale* (`docs/glossary.md`) that `store/effects.ts` publishes
+onto `:root` from the diagnostic slider. That multiplication is the only thing
+carrying the slider into CSS, so **a new duration token declared as a bare
+literal is the one animation in the app that ignores the setting.** Pinned by
+`styles/__tests__/duration-scale-guard.test.ts`.
+
+Two consequences beyond the token block:
+
+- **A TS timer that outlives a CSS transition** (holding an animation class on,
+  keeping content mounted through its own fade) passes its 1x base through
+  `scaledDurationMs` and adds its slack OUTSIDE the call:
+  `scaledDurationMs(PANE_TRANSITION_MS) + 100`. Slack is a fixed safety margin,
+  not animation. An unscaled timer fires partway into the transition it exists to
+  outlive: at 0.1x the drawer body blanks mid-slide and a maximizing pane snaps
+  the rest of the way. The five sites are listed in
+  `store/__tests__/duration-scale.test.ts`, which fails if one stops scaling.
+- **An indefinite animation does NOT scale**: a spinner, a shimmer, anything
+  `infinite`. It is an activity indicator rather than a transition, so it keeps a
+  literal duration and no token.
 
 - **Every icon-only button needs an `aria-label`.** If a button has no visible text, it has no accessible name.
 - **Tab title**: `(count) Lucidos` (count first for narrow tabs)

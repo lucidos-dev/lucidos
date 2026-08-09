@@ -439,10 +439,12 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     });
   });
   if (!isOpen) {
-    // Several ThreadToggleButton instances exist (thread-header brand,
-    // collapsed-thread-actions, thread pane), and the brand copy stays mounted
-    // (faded) while the drawer is closed — target the collapsed-thread-actions
-    // one explicitly: it is the interactable opener whenever the drawer is closed.
+    // The desktop header's own slot. There used to be a second, faded copy
+    // inside .pane-header-brand for the other drawer state, so this had to name
+    // the interactable one; the toggle is a single element that travels between
+    // the two positions now (.thread-toggle-slot), and the mobile header's copy
+    // is the only other one in the app. Still scoped rather than bare, because
+    // that mobile copy stays mounted under a desktop viewport.
     //
     // Match the label as a PREFIX, never exact: ThreadToggleButton appends the
     // needs-attention count to its own aria-label ("... (1 needing attention)")
@@ -450,7 +452,7 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     // while the thread list is hidden, which is every case this branch runs in.
     // An `=` match therefore found nothing the moment any thread awaited the
     // user, the seeded state of most of coding-agent-question.spec.ts.
-    await page.locator(`.collapsed-thread-actions button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();
+    await page.locator(`.thread-toggle-slot button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();
   }
   // Wait for the drawer's open width-transition (`width var(--duration-slow)`)
   // to SETTLE — not merely to be non-zero. Returning at width > 0 catches the
@@ -528,33 +530,42 @@ export async function assertHealthy(page: Page): Promise<void> {
   expect(body.status).toBe('ok');
 }
 
+/** Every open menu's option rows. The shared `Dropdown` portals its panel to
+ *  <body> (clearing the header's stacking context), so an option is NOT under
+ *  the trigger's wrapper. Addressing them globally is safe because the overlay
+ *  dismiss contract allows only one open menu at a time. */
+const MENU_OPTION = '.dropdown-menu .dropdown-option';
+
 /** Drive a shared `Dropdown` (components/shared/Dropdown.tsx): open the
  *  trigger inside `rootSelector`, click the option containing `optionLabel`,
  *  and wait for the menu to close. Failures throw at the pick — silently
  *  proceeding with the previous value sends the test down a minutes-long
  *  wrong-path timeout instead. Waiting on menu CLOSE (not on the trigger
  *  label) is deliberate: the trigger's hidden .dropdown-sizer spans contain
- *  EVERY option label, so a label assertion would always pass. */
+ *  EVERY option label, so a label assertion would always pass.
+ *
+ *  Only the TRIGGER lives under `rootSelector`; the options come from
+ *  `MENU_OPTION` above. */
 export async function pickDropdownOption(page: Page, rootSelector: string, optionLabel: string): Promise<void> {
   const opened = await clickVisibleElement(page, `${rootSelector} .dropdown-trigger`);
   if (!opened) throw new Error(`pickDropdownOption: no visible ${rootSelector} .dropdown-trigger`);
   // The menu renders on the next Preact commit — wait for the option to land.
   await page.waitForFunction(({ sel, label }) => {
-    const opts = document.querySelectorAll(`${sel} .dropdown-option`);
+    const opts = document.querySelectorAll(sel);
     return Array.from(opts).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(label);
     });
-  }, { sel: rootSelector, label: optionLabel }, { timeout: 5_000 });
-  const picked = await clickVisibleElement(page, `${rootSelector} .dropdown-option`, optionLabel);
-  if (!picked) throw new Error(`pickDropdownOption: option "${optionLabel}" not clickable in ${rootSelector}`);
+  }, { sel: MENU_OPTION, label: optionLabel }, { timeout: 5_000 });
+  const picked = await clickVisibleElement(page, MENU_OPTION, optionLabel);
+  if (!picked) throw new Error(`pickDropdownOption: option "${optionLabel}" not clickable for ${rootSelector}`);
   await page.waitForFunction((sel) => {
-    const opts = document.querySelectorAll(`${sel} .dropdown-option`);
+    const opts = document.querySelectorAll(sel);
     return !Array.from(opts).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     });
-  }, rootSelector, { timeout: 3_000 });
+  }, MENU_OPTION, { timeout: 3_000 });
 }
 
 /** Pick an option in the compose destination picker — dual-layout safe.

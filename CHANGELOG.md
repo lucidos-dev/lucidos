@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.25.1 — 2026-08-09
+
+### Changed
+
+- **The thread drawer stops at the same minimum width in every client.** The browser and the packaged macOS app share one floor, so a drag in one cannot reach a width the other refuses.
+- **A todo list left open while the thread is subscribed reads as waiting, not abandoned.** It settles to abandoned once the subscription resolves.
+
+### Fixed
+
+- **Text passed as a tool argument keeps its plain characters.** A trigger group named "Machine & Tooling Health" is created and re-served under that name instead of "Machine &amp; Tooling Health".
+- **A coding-agent thread shows what it is waiting for.** The subscription indicator and its Stop waiting button now render on those threads, not only on Lucidos Agent ones.
+- **The animation speed setting reaches every transition**, including the drawer collapse and the pane maximize, which were pure CSS and ignored it. The mobile panel drawer's exit is scaled to match its entrance.
+- **The composer's destination picker paints over the header** instead of under it, and opens at its trigger's width rather than snapping into place a frame later.
+- **The desktop drawer toggle travels between its two positions** instead of crossfading two half-transparent copies across the same spot.
+- **The maximized Canvas pane's hamburger clears the traffic lights** on the packaged macOS app.
+- **A thread whose change was applied keeps its auto-resume across a restart**, and a thread auto-resumed once is still resumed on later turns.
+- **A restart you triggered yourself is reported as yours.** The withdrawal of a resume promise names the device that restarted instead of showing a system-attributed "Response interrupted" over a red thread.
 ## v0.25.0 — 2026-08-09
 
 ### Added

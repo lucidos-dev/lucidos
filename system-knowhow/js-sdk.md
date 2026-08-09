@@ -117,6 +117,14 @@ always defined, so a fallback is dead noise at best:
 | `--space-xl` | `1.5rem` (24px) | | `--icon-size-md` | `1rem` (16px) |
 | `--duration-fast` | `0.15s` | | `--icon-size-lg` | `1.25rem` (20px) |
 | `--duration-normal` | `0.2s` | | `--duration-slow` | `0.3s` |
+| `--duration-emphasis` | `0.5s` | | `--duration-scale` | `1` |
+
+Each `--duration-*` above is its listed value times `--duration-scale`, which is
+always `1` inside an app. The host multiplies its own copy by a debugging slider
+that slows every transition down for inspection, and a custom property does not
+cross into an iframe, so your chrome always animates at the listed durations.
+Set `--duration-scale` on your own `:root` if you want the same knob for your
+app's transitions.
 
 **Type scale — `--font-size-*`.** The sanctioned font sizes; the host shell and
 this SDK stylesheet both size text from these, so use the token instead of a raw

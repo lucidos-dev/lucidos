@@ -39,6 +39,7 @@ pub mod thread_lifecycle;
 pub mod thread_queue;
 pub mod thread_state;
 pub mod todo_consumer;
+pub(crate) mod tool_arg_entity_repair;
 pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;

@@ -107,8 +107,12 @@ export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollaps
 export interface HeaderCollapseTargets {
   /** The 3-zone row the cluster lives in. */
   container: string;
-  /** The leading zone, flex-shrink:0. */
-  leading: string;
+  /** The leading zone, flex-shrink:0. Required UNLESS `centred`, which derives
+   *  the leading width from the container and the centre zone instead of
+   *  measuring anything (see below) and so never reads this. The thread pane's
+   *  row omits it: its leading control, the drawer toggle, is positioned
+   *  against the header rather than being a member of the row at all. */
+  leading?: string;
   /** The centre zone (see above). */
   centre: string;
   /** A trailing member of the cluster that never collapses: the content pane's
@@ -196,7 +200,7 @@ export function useHeaderActionCollapse(
     // drag. A missing bell degrades to iconWidth 0 → "everything fits" → no
     // collapse; the flex layout still guarantees non-overlap (the title just
     // ellipsizes earlier instead of icons folding into ⋯).
-    const nav = container.querySelector<HTMLElement>(targets.leading);
+    const nav = targets.leading ? container.querySelector<HTMLElement>(targets.leading) : null;
     const titleZone = container.querySelector<HTMLElement>(targets.centre);
     const measure = () => {
       // The stick is whichever control the host currently renders: every action

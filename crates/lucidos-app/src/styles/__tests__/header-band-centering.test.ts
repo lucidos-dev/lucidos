@@ -18,14 +18,15 @@
  *    the header and pinned to the window's top edge beside the traffic lights,
  *    and on the packaged build that read as one icon sitting higher than its
  *    neighbours. The user rejected it.
- * 2. That slot is still where the lights float, so on the overlay build the two
- *    controls step SIDEWAYS to clear them, and that step is now the only thing
- *    the build does to either. It has to be, rather than a vertical dodge: a
- *    2.25rem box centred on the bar reaches up into the band whatever else is
- *    true, so a leading control at the row's own padding would paint over a
- *    light. Both rules stay gated on `[data-titlebar-overlay]`, never on
- *    `--titlebar-inset` being `0px` -- the reserve is a flat 80px that would
- *    indent a web header by the width of lights it does not have.
+ * 2. That slot is still where the lights float, so on the overlay build each of
+ *    the three controls that can hold it steps SIDEWAYS to clear them, and that
+ *    step is now the only thing the build does to any of them. It has to be,
+ *    rather than a vertical dodge: a 2.25rem box centred on the bar reaches up
+ *    into the band whatever else is true, so a leading control at the row's own
+ *    padding would paint over a light. Every rule stays gated on
+ *    `[data-titlebar-overlay]`, never on `--titlebar-inset` being `0px` -- the
+ *    reserve is a flat 80px that would indent a web header by the width of
+ *    lights it does not have.
  * 3. `.threads-header` clips SIDEWAYS ONLY, and with the leading control back on
  *    the row every edge is flush, so the clip is `inset(0)` on both builds. It
  *    must stay a `clip-path` anyway: `overflow-x: clip` is not available,
@@ -84,8 +85,12 @@ describe('the desktop header centers on the whole bar, not on the header alone',
     ['.app-header .content-header-elements'],
     // The drawer toggle, in the header's LEFT-MOST slot. It sat the lift out
     // while it was raised into the band instead; taking it is what puts it back
-    // on the same line as the rest of the bar's controls.
-    ['.collapsed-thread-actions'],
+    // on the same line as the rest of the bar's controls. It TRAVELS
+    // horizontally between the two drawer states
+    // (header-drawer-toggle-travel.test.ts), so the lift is also the only
+    // vertical term it may ever carry: a second one would make the icon rise or
+    // dip as it slid.
+    ['.thread-toggle-slot'],
   ])('%s takes the lift', selector => {
     expect(desktopRule(selector).props.get('transform')).toBe(CENTER_ON_BAND);
   });
@@ -140,9 +145,42 @@ describe('on the overlay build the leading control only steps sideways', () => {
   });
 
   it('the drawer toggle clears the lights, and moves in no other direction', () => {
-    const rule = desktopRule(':root[data-titlebar-overlay] .collapsed-thread-actions');
-    expect(rule.props.get('left')).toBe('var(--titlebar-lights-reserve)');
-    expect([...rule.props.keys()], 'the overlay build is horizontal-only now').toEqual(['left']);
+    // It moves the RESTING PLACE, not `left`: the toggle travels between two
+    // positions now, and only the drawer-shut one differs between the builds.
+    // Overriding `left` here would restate (and be free to drift from) the
+    // drawer-open rule, which is identical on both builds.
+    const rule = desktopRule(':root[data-titlebar-overlay] .thread-toggle-slot');
+    expect(rule.props.get('--thread-toggle-home')).toBe('var(--titlebar-lights-reserve)');
+    expect([...rule.props.keys()], 'the overlay build is horizontal-only now')
+      .toEqual(['--thread-toggle-home']);
+    // And the base rule is what consumes it, so the override cannot be inert.
+    expect(desktopRule('.thread-toggle-slot').props.get('left'))
+      .toBe('var(--thread-toggle-home)');
+  });
+
+  it('the content row keeps the reserve as a FLOOR under the divider', () => {
+    // The third control that can hold the header's left-most slot: the
+    // hamburger leading the Canvas pane's row. Maximizing that pane takes
+    // --split-ratio to 0 and hides the drawer with it, so --divider-x is 0 and
+    // the base rule lands the hamburger at the window's own left edge, on the
+    // lights.
+    //
+    // A floor rather than a rule gated on [data-thread-collapsed], because the
+    // collapse is not the only way under the reserve: --split-ratio is a
+    // persisted RATIO and nothing re-clamps it when the window shrinks, so a
+    // divider dropped at the Conversation pane's px floor on a very wide
+    // display reopens proportionally narrower in a small one.
+    const base = desktopRule('.app-header .content-header-elements').props.get('left');
+    expect(base).toBe('calc(var(--divider-x) + var(--divider-width))');
+
+    const rule = desktopRule(':root[data-titlebar-overlay] .app-header .content-header-elements');
+    // Two copies of the divider term, which CSS cannot hand back as a resolved
+    // length, so this is the drift check that makes the copy safe -- the same
+    // shape as --threads-title-lead against the threads row's own padding
+    // below. Horizontal only, like the drawer toggle above: the row keeps the
+    // base rule's bar centring, so the hamburger stays on the bar's one line.
+    expect(rule.props.get('left')).toBe(`max(${base}, var(--titlebar-lights-reserve))`);
+    expect([...rule.props.keys()], 'horizontal-only here too').toEqual(['left']);
   });
 
   it('the drawer-open row starts after the lights, carrying the button with it', () => {
@@ -184,8 +222,8 @@ describe('on the overlay build the leading control only steps sideways', () => {
     );
     expect(
       movers.length,
-      'expected the two leading-control rules, plus the centred title\'s clamp',
-    ).toBe(3);
+      'expected the three leading-control rules, plus the centred title\'s clamp',
+    ).toBe(4);
     for (const rule of movers) {
       expect(rule.selector, rule.selector).toContain('[data-titlebar-overlay]');
     }

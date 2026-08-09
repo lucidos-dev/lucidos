@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { signal, useSignalEffect } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane, scaledDurationMs } from '../../store/store';
 import { appliedThreadFilter } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
@@ -413,8 +413,11 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     const visible = forceVisible || (threadDrawerOpen.value && splitRatio.value > 0);
     // Keep the list mounted through the width-collapse transition —
     // unmounting at close start blanks the drawer body while it's still
-    // sliding shut.
-    const renderContent = useLingeringFlag(visible, PANE_TRANSITION_MS + 50);
+    // sliding shut. Scaled by the Animation speed slider, exactly as the
+    // transition it outlives is (the 50ms is slack, so it stays outside the
+    // scaled term); reading the scale here subscribes this component to the
+    // slider, which is what makes a mid-session change take effect.
+    const renderContent = useLingeringFlag(visible, scaledDurationMs(PANE_TRANSITION_MS) + 50);
     const isSearching = threadSearchQuery.value.trim().length > 0;
     const view = drawerView.value;
     // Search overrides the selected view; otherwise the selector decides.

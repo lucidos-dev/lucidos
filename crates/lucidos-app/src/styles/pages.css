@@ -869,11 +869,6 @@
     color: var(--text-primary);
 }
 
-.form-group .dropdown-option {
-    padding: 0.5rem 0.75rem;
-    font-size: var(--font-size-md);
-}
-
 .form-group input::placeholder {
     color: var(--text-muted);
 }

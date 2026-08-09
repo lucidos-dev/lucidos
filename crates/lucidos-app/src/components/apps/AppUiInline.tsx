@@ -1,5 +1,5 @@
 import { useRef, useLayoutEffect, useState, useEffect } from 'preact/hooks';
-import { currentApp, appPseudoFullscreen, appRefreshKey, showToast } from '../../store/store';
+import { currentApp, appPseudoFullscreen, appRefreshKey, showToast, scaledDurationMs } from '../../store/store';
 import { appFullscreenHost, syncAppFullscreenHost } from '../../store/appFullscreenHost';
 import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
 import { ExitFullscreenIcon } from '../shared/icons';
@@ -8,11 +8,12 @@ import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { navigateAppIframe } from './iframeNav';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 
-/** How long the load cover lingers, fading out, after the frame's `load`. A
- *  little longer than its CSS opacity transition (var(--duration-normal) =
- *  200ms) so it stays mounted until the fade finishes, the same way the
- *  LoadingFade component holds a clearing skeleton. */
-const COVER_FADE_MS = 250;
+/** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
+ *  cover lingers for this, scaled by the Animation speed slider, plus fixed
+ *  slack, so it stays mounted until the fade finishes at any setting, the same
+ *  way the LoadingFade component holds a clearing skeleton. */
+const COVER_FADE_MS = 200;
+const COVER_FADE_SLACK_MS = 50;
 
 /** Reveal fuse for a frame whose `load` never arrives (a hung request). A pane
  *  covered forever is worse than whatever the frame managed to paint. */
@@ -46,7 +47,7 @@ function AppFrame({ src }: { src: string }) {
   // something to show. See AppUiInline.test.ts for why the cover is a sibling
   // element rather than an opacity on the iframe itself.
   const [loaded, setLoaded] = useState(false);
-  const coverMounted = useLingeringFlag(!loaded, COVER_FADE_MS);
+  const coverMounted = useLingeringFlag(!loaded, scaledDurationMs(COVER_FADE_MS) + COVER_FADE_SLACK_MS);
 
   useEffect(() => {
     if (loaded) return;

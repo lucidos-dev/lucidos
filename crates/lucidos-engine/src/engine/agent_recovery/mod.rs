@@ -41,6 +41,11 @@ pub(crate) use recovery::switch_was_user_initiated;
 // production SQL rather than a hand-copied paraphrase of it.
 #[cfg(test)]
 pub(crate) use recovery::BRANCH_CLASSIFICATION_SQL;
+// "Does this branch still owe the user a recovery?", for the same reason: the
+// scenario mirror calls it instead of re-spelling its `&&`, which is how a
+// retired input sat in the mirror being asserted as correct.
+#[cfg(test)]
+pub(crate) use recovery::branch_awaits_recovery;
 pub(crate) use recovery::{switch_abort_unsuperseded_sql, SWITCH_TEARDOWN_ABORT_SQL};
 // The boot floor that withdraws a resume promise this boot could not keep, so a
 // switch-interrupted thread never sits paused with no Continue button. `main.rs`

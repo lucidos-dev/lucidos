@@ -24,10 +24,8 @@ import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
-import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
-import { LucidosControlMenu } from './LucidosControlMenu';
-import { EventWaitIndicator } from './EventWaitPanel';
-import { TodoListIndicator } from './TodoListPanel';
+import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
+import { PromptRowControls } from './PromptRowControls';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
 import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
@@ -609,7 +607,6 @@ export function PromptInput() {
     focusedThread,
     resolveCodingAgent(focusedThreadId.value),
   );
-  const showCodingAgentControls = promptCodingAgent !== null;
   // A focused composing draft has no backend session yet. Load controls as a
   // compose-view menu so Codex/Claude and repo scope come from the picker,
   // not from the server's legacy thread default. `codingAgentControlThreadId` is
@@ -1054,9 +1051,13 @@ export function PromptInput() {
           onChange={handleFileSelect}
         />
         <div class={rowClass} ref={promptActionsAreaRef}>
-          {showCodingAgentControls
-            ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} composeThreadId={composeControlThreadId} codingAgent={promptCodingAgent} />
-            : <><LucidosControlMenu threadId={focusedThreadId.value ?? undefined} composeContext={inComposeContext} /><TodoListIndicator /><EventWaitIndicator /></>}
+          <PromptRowControls
+            codingAgent={promptCodingAgent}
+            codingAgentThreadId={codingAgentControlThreadId}
+            composeThreadId={composeControlThreadId}
+            lucidosThreadId={focusedThreadId.value ?? undefined}
+            composeContext={inComposeContext}
+          />
           {(() => {
             // WIP app preview toggle: visible whenever the focused thread is an
             // app coding-agent thread that has an in-flight diff

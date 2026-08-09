@@ -317,11 +317,11 @@ export function stepThreadDrawerWidth(direction: 1 | -1): void {
  *  drawer at its default width. The drawer's open/closed state is the user's
  *  choice and stays untouched.
  *
- *  The default is a constant while the drawer's floor is derived, and the two
- *  cross: at a large UI scale (or on the packaged macOS build, which reserves
- *  the traffic lights) the row needs more than 300px, so a bare reset would put
- *  the drawer straight back under its own floor and overflow the header until
- *  something else clamped it. */
+ *  The default is a constant while the drawer's floor is derived, and the floor
+ *  wins from a 16px root up (312px against the default's 300), so a bare reset
+ *  would put the drawer straight back under its own floor and overflow the
+ *  header until something else clamped it. The constant still leads below 100%
+ *  ui-scale, which is the only range where a reset lands on it. */
 export function resetPaneLayout(): void {
   if (isMobile()) return;
   setSplitRatio(DEFAULT_SPLIT_RATIO);

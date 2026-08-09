@@ -1,8 +1,3 @@
-/* Thread toggle inside chat pane — mobile only */
-.thread-pane-toggle {
-    display: none;
-}
-
 /* ThreadDrawer inside ThreadPane — mobile only, hidden on desktop */
 .thread-pane > .thread-drawer {
     display: none;
@@ -52,13 +47,6 @@
 .compose-destination-row .compose-destination-picker .dropdown-sizer > * {
     overflow: hidden;
     text-overflow: ellipsis;
-}
-
-/* Cap the menu so a long app/repo name clips (via the global
- * .dropdown-option-label ellipsis) instead of growing the fixed-position
- * menu past a mobile viewport. */
-.compose-destination-row .compose-destination-picker .dropdown-menu {
-    max-width: min(24rem, calc(100vw - 1rem));
 }
 
 .compose-coding-agent-chip {

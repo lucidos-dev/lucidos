@@ -50,9 +50,16 @@ describe('app frame load cover', () => {
     expect(src).toMatch(/onLoad=\{\(\) => setLoaded\(true\)\}/);
   });
 
-  it('keeps the cover mounted through its fade-out', () => {
-    // Unmounting on `load` would hard-cut the app in instead of fading it.
-    expect(src).toMatch(/useLingeringFlag\(!loaded, COVER_FADE_MS\)/);
+  it('keeps the cover mounted through its fade-out, at any animation speed', () => {
+    // Unmounting on `load` would hard-cut the app in instead of fading it. The
+    // fade is a --duration-normal transition, and that token is scaled by the
+    // Animation speed slider, so an unscaled linger would unmount the cover
+    // partway through its own fade at a slow setting. The slack is a fixed
+    // margin, not animation, so it stays outside the scaled term.
+    expect(src).toMatch(
+      /useLingeringFlag\(!loaded, scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS\)/,
+    );
+    expect(src).toMatch(/const COVER_FADE_MS = 200;/);
   });
 
   it('re-covers the frame on an app switch', () => {

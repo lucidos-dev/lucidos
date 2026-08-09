@@ -120,6 +120,36 @@ describe('todoListIndicatorBody', () => {
     expect(text).toContain('1 of 3 done, 2 abandoned');
   });
 
+  it('renders the waiting state when items are parked on a live event wait', () => {
+    // The reported bug, seen from the indicator: a thread asleep on an event
+    // wait is not one that walked away, so the button must not dim to the
+    // abandoned colour.
+    const items: TodoItem[] = [
+      { content: 'a', active_form: 'doing a', status: 'completed' },
+      { content: 'b', active_form: 'doing b', status: 'waiting' },
+      { content: 'c', active_form: 'doing c', status: 'waiting' },
+    ];
+    const text = vnodeToText(todoListIndicatorBody({ items, onClick: NOOP }));
+    expect(text).toContain('data-state="waiting"');
+    expect(text).not.toContain('data-state="idle"');
+    expect(text).not.toContain('data-state="abandoned"');
+    expect(text).toContain('1 of 3 done, 2 waiting');
+    expect(text).toContain(
+      'aria-label="Todo list: 1 of 3 done, 2 waiting. Click to expand."',
+    );
+  });
+
+  it('prefers waiting over abandoned, because waiting is the live fact', () => {
+    // A list carrying both has parked items that are still going somewhere,
+    // which is what the user needs to see at a glance.
+    const items: TodoItem[] = [
+      { content: 'a', active_form: 'doing a', status: 'abandoned' },
+      { content: 'b', active_form: 'doing b', status: 'waiting' },
+    ];
+    const text = vnodeToText(todoListIndicatorBody({ items, onClick: NOOP }));
+    expect(text).toContain('data-state="waiting"');
+  });
+
   it('renders the SAME ticked-checkbox glyph in every state, so only the color differs', () => {
     // The state must never switch the shape. The pair this test was written
     // against drew this same checkbox for idle and a filled dome inside a
@@ -129,6 +159,7 @@ describe('todoListIndicatorBody', () => {
     const byState: Record<string, TodoItem[]> = {
       idle: [{ content: 'a', active_form: 'doing a', status: 'pending' }],
       'in-progress': [{ content: 'a', active_form: 'doing a', status: 'in_progress' }],
+      waiting: [{ content: 'a', active_form: 'doing a', status: 'waiting' }],
       abandoned: [{ content: 'a', active_form: 'doing a', status: 'abandoned' }],
     };
     for (const [state, items] of Object.entries(byState)) {
@@ -212,7 +243,34 @@ describe('todoListPanelBody', () => {
     // "Running tests" would imply the agent is still working it.
     expect(text).toContain('>Run tests<');
     expect(text).not.toContain('>Running tests<');
-    expect(text).toContain('todo-panel-abandoned-tag');
+    expect(text).toContain('todo-panel-status-tag');
     expect(text).toContain('>abandoned<');
+  });
+
+  it('renders waiting rows with the content and a waiting tag, so a parked item is not read as dropped', () => {
+    const items: TodoItem[] = [
+      { content: 'Run tests', active_form: 'Running tests', status: 'waiting' },
+    ];
+    const text = vnodeToText(todoListPanelBody({ items, onClose: NOOP }));
+    expect(text).toContain('data-status="waiting"');
+    // Same reason as abandoned: nothing is running, so the present-continuous
+    // form would claim activity that stopped.
+    expect(text).toContain('>Run tests<');
+    expect(text).not.toContain('>Running tests<');
+    expect(text).toContain('todo-panel-status-tag');
+    expect(text).toContain('>waiting<');
+    expect(text).not.toContain('>abandoned<');
+  });
+
+  it('tags ONLY the two engine-written statuses', () => {
+    // The three the agent writes are self-evident from the row's own styling;
+    // a tag on each would be noise on every row of every list.
+    const items: TodoItem[] = [
+      { content: 'a', active_form: 'doing a', status: 'pending' },
+      { content: 'b', active_form: 'doing b', status: 'in_progress' },
+      { content: 'c', active_form: 'doing c', status: 'completed' },
+    ];
+    const text = vnodeToText(todoListPanelBody({ items, onClose: NOOP }));
+    expect(text).not.toContain('todo-panel-status-tag');
   });
 });

@@ -1,4 +1,4 @@
-import { splitRatio, SPLIT_RATIO_KEY } from '../../store/store';
+import { splitRatio, scaledDurationMs, SPLIT_RATIO_KEY } from '../../store/store';
 import type { SplitBounds } from '../../store/paneMinimums';
 
 export const DEFAULT_SPLIT_RATIO = 0.4;
@@ -8,8 +8,13 @@ export const DEFAULT_SPLIT_RATIO = 0.4;
    helper in this module is pure by contract. Callers measure, these compute. */
 
 /** Mirror of var(--duration-slow) in styles/global/base.css — the duration
- *  every pane/header geometry transition runs at. TS timers that must
- *  outlive those transitions derive from this; update the two together. */
+ *  every pane/header geometry transition runs at, AT 1x. TS timers that must
+ *  outlive those transitions derive from this; update the two together.
+ *
+ *  1x, because the token is that literal times var(--duration-scale) (the
+ *  Animation speed slider). A timer mirroring it therefore passes this through
+ *  `scaledDurationMs` rather than using it raw, or the two come apart the
+ *  moment the slider leaves centre. */
 export const PANE_TRANSITION_MS = 300;
 
 /** While a divider drag is live. CSS keys off this to disable the header /
@@ -134,7 +139,12 @@ let paneAnimateTimer: ReturnType<typeof setTimeout> | null = null;
  *  no caller left. The timeout outlives the PANE_TRANSITION_MS transition so the
  *  class never drops mid-flight, and rapid repeated calls (a held keyboard-resize
  *  chord) reset the timer instead of stacking removals, since an earlier call's
- *  removal must not fire mid-way through the latest call's transition. */
+ *  removal must not fire mid-way through the latest call's transition.
+ *
+ *  The transition scales with the Animation speed slider, so the timer does too.
+ *  The 100ms is slack, not animation, and stays OUTSIDE the scaled term: at 0.1x
+ *  an unscaled timer would strip `pane-animate` a tenth of the way in and snap a
+ *  maximizing pane the rest of the way to full width. */
 function triggerPaneAnimate() {
   const container = document.querySelector('.split-layout') as HTMLElement | null;
   if (!container) return;
@@ -143,7 +153,7 @@ function triggerPaneAnimate() {
   paneAnimateTimer = setTimeout(() => {
     paneAnimateTimer = null;
     container.classList.remove('pane-animate');
-  }, PANE_TRANSITION_MS + 100);
+  }, scaledDurationMs(PANE_TRANSITION_MS) + 100);
 }
 
 /** Update splitRatio with animations and persist to localStorage */

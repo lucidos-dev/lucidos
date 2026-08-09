@@ -3,7 +3,7 @@ import { useRef, useState } from 'preact/hooks';
 import type { Ref } from 'preact';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusedThreadId, threadMap } from '../../store/store';
-import type { TodoItem } from '../../store/thread-events';
+import type { TodoItem, TodoStatus } from '../../store/thread-events';
 import { CloseIcon, TodoListIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 
@@ -19,34 +19,46 @@ export function todoListIndicatorBody({
   if (items === null || items.length === 0) return null;
   const total = items.length;
   const completed = items.filter((i) => i.status === 'completed').length;
+  const waiting = items.filter((i) => i.status === 'waiting').length;
   const abandoned = items.filter((i) => i.status === 'abandoned').length;
   const inProgress = items.find((i) => i.status === 'in_progress');
-  // Three honest indicator states, stamped as `data-state` and distinguished
+  // Four honest indicator states, stamped as `data-state` and distinguished
   // by COLOR alone (todo-list.css) over one shared ticked-checkbox glyph:
   //   - in-progress: the agent is actively working an item (accent)
+  //   - waiting: no in-progress item AND at least one item is parked on a live
+  //     event wait, i.e. the agent stopped on purpose and something will wake
+  //     it (accent-yellow, live but not working)
   //   - abandoned: no in-progress item AND at least one item was abandoned (dimmed)
   //   - idle: every non-completed item is gone (all done, or nothing pending)
+  // Waiting outranks abandoned because it is the live fact: a list carrying
+  // both has parked items that are still going somewhere.
   const state = inProgress
     ? 'in-progress'
-    : abandoned > 0
-      ? 'abandoned'
-      : 'idle';
+    : waiting > 0
+      ? 'waiting'
+      : abandoned > 0
+        ? 'abandoned'
+        : 'idle';
   const tooltip = inProgress
     ? inProgress.active_form
-    : abandoned > 0
-      ? `${completed} of ${total} done, ${abandoned} abandoned`
-      : `${completed} of ${total} done`;
+    : waiting > 0
+      ? `${completed} of ${total} done, ${waiting} waiting`
+      : abandoned > 0
+        ? `${completed} of ${total} done, ${abandoned} abandoned`
+        : `${completed} of ${total} done`;
   // The aria-label names the state, it does not just count. Color is the ONLY
-  // visual channel carrying it now that all three states share one glyph, and
+  // visual channel carrying it now that all four states share one glyph, and
   // color is exactly the channel a screen reader cannot read and forced-colors
-  // mode overwrites (there both --accent and --text-secondary collapse to the
-  // system foreground, so in-progress and idle would otherwise be identical).
+  // mode overwrites (there --accent, --accent-yellow and --text-secondary all
+  // collapse to the system foreground, so the states would be identical).
   // The tooltip can't stand in for it: it is desktop-hover only.
   const ariaLabel = inProgress
     ? `Todo list: ${inProgress.active_form}. ${completed} of ${total} done. Click to expand.`
-    : abandoned > 0
-      ? `Todo list: ${completed} of ${total} done, ${abandoned} abandoned. Click to expand.`
-      : `Todo list: ${completed} of ${total} done. Click to expand.`;
+    : waiting > 0
+      ? `Todo list: ${completed} of ${total} done, ${waiting} waiting. Click to expand.`
+      : abandoned > 0
+        ? `Todo list: ${completed} of ${total} done, ${abandoned} abandoned. Click to expand.`
+        : `Todo list: ${completed} of ${total} done. Click to expand.`;
   return (
     <button
       type="button"
@@ -63,6 +75,26 @@ export function todoListIndicatorBody({
     </button>
   );
 }
+
+/** One marker glyph per status, all from the same geometric-circle family so
+ *  the 1rem marker column reads as one column. `waiting`'s clock face echoes
+ *  the *subscription indicator*'s own clock icon beside it in the prompt bar:
+ *  both say the same thing, that something else will wake this. */
+const TODO_MARKER: Record<TodoStatus, string> = {
+  pending: '○',
+  in_progress: '◐',
+  completed: '✓',
+  waiting: '◷',
+  abandoned: '⊘',
+};
+
+/** The two engine-written statuses wear a word, because they are the two the
+ *  user did not watch happen and the glyph alone would not explain. The three
+ *  the agent writes are self-evident from the row's own styling. */
+const TODO_STATUS_TAG: Partial<Record<TodoStatus, string>> = {
+  waiting: 'waiting',
+  abandoned: 'abandoned',
+};
 
 /** `data-status` is stamped on each row so CSS can branch on it.
  *
@@ -90,31 +122,38 @@ export function todoListPanelBody({
       </div>
       <div class="prompt-bar-popover-body">
         <ul class="todo-panel-list">
-          {items.map((item, idx) => (
-            <li
-              key={idx}
-              class="todo-panel-row"
-              data-status={item.status}
-            >
-              <span class="todo-panel-marker" aria-hidden="true">
-                {item.status === 'completed'
-                  ? '✓'
-                  : item.status === 'in_progress'
-                    ? '◐'
-                    : item.status === 'abandoned'
-                      ? '⊘'
-                      : '○'}
-              </span>
-              <span class="todo-panel-text">
-                {item.status === 'in_progress' ? item.active_form : item.content}
-              </span>
-              {item.status === 'abandoned' ? (
-                <span class="todo-panel-abandoned-tag" aria-label="abandoned">
-                  abandoned
+          {items.map((item, idx) => {
+            const tag = TODO_STATUS_TAG[item.status];
+            return (
+              <li
+                key={idx}
+                class="todo-panel-row"
+                data-status={item.status}
+              >
+                {/* The fallback is NOT dead code the types make unreachable:
+                    `TodoStatus` is a compile-time claim, and the events arriving
+                    over SSE come from whatever engine is running now, which after
+                    an Apply and restart can be newer than this loaded client. An
+                    unrecognized status then renders as an ordinary open item
+                    rather than a blank marker column. */}
+                <span class="todo-panel-marker" aria-hidden="true">
+                  {TODO_MARKER[item.status] ?? TODO_MARKER.pending}
                 </span>
-              ) : null}
-            </li>
-          ))}
+                {/* Only an in-progress item is being worked, so only it renders
+                    the present-continuous form. A parked one is not: "Running
+                    tests" on a thread asleep on an event wait would claim
+                    activity that stopped. */}
+                <span class="todo-panel-text">
+                  {item.status === 'in_progress' ? item.active_form : item.content}
+                </span>
+                {tag ? (
+                  <span class="todo-panel-status-tag" aria-label={tag}>
+                    {tag}
+                  </span>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       </div>
     </>

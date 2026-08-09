@@ -59,6 +59,27 @@ case, not a failure, and it is not a reason to fall back to polling.
 Nothing is watching after a wake. If you say you are still waiting, call
 `await_event` again in that same turn: narrating it does not do it.
 
+### A watch you no longer need is yours to end
+
+The one-shot rule cuts the other way too, and this is the half that gets
+forgotten. A subscription is spent by a MATCH, and by nothing else: not by the
+turn ending, not by the user sending you something else, and not by you going on
+to run the suite some other way. It outlives all three on purpose (ADR 0052).
+
+So the moment the answer arrives from anywhere other than the wake, stand it
+down:
+
+```bash
+lucidos event-waits list            # the ids, reasons and deadlines
+lucidos event-waits cancel <id>     # or --all
+```
+
+The case that actually happens: you subscribe, the user comes back and resumes
+you, you retry and win the lock, and the suite runs green. Nothing resolved the
+subscription, so the thread reads **Waiting** for the rest of your timeout after
+its work is finished and applied. Six hours, in the incident that produced this
+section. Cancel it in the turn you stop caring, and say you did.
+
 ### It watches forward only, and the command tells you what you missed
 
 Registration scans the **3 minutes before** the call and reports any match it

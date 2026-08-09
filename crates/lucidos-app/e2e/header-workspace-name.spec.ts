@@ -100,10 +100,11 @@ test.describe('Desktop chat header: the mark, and the name while it fits', () =>
       if (!header) return { error: 'no desktop header' };
 
       const brandLabel = header.querySelector('.pane-header-brand-label') as HTMLElement | null;
-      // Left action group: collapsed-thread-actions when drawer is closed,
-      // thread-nav-group inside brand when drawer is open.
-      const leftActions = (header.querySelector('.collapsed-thread-actions') ||
-                           header.querySelector('.pane-header-brand .thread-nav-group')) as HTMLElement | null;
+      // The drawer toggle's slot: one element in both drawer states, travelling
+      // between the header's leading padding and the Conversation pane header's
+      // leading edge. It overlaps the brand from OUTSIDE in either state, which
+      // is what the clearance below is checking.
+      const leftActions = header.querySelector('.thread-toggle-slot') as HTMLElement | null;
       // The whole trailing cluster, not one button in it: at this width the
       // actions have folded into the ⋯ menu (ThreadHeaderActions), so naming
       // Search alone would find nothing. What must not overlap is the cluster,

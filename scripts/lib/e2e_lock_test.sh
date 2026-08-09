@@ -52,10 +52,13 @@ trap cleanup EXIT
 #
 # One line per call, tab separated. No argument the lock library passes can
 # contain a tab or a newline: `_e2e_json_escape` strips control characters from
-# every interpolated value, and the summary is the library's own text. The
-# trailing field records whether the lock file existed AT CALL TIME, which is how
-# the ordering invariant (announce a release only once the file is gone) is
-# asserted rather than assumed.
+# every interpolated value, and the summary is the library's own text. Two
+# trailing fields record what the ARGUMENTS cannot say. The workspace the call
+# was addressed to (`WS=<path>`, or `WS_UNSET`), because that is not an argument
+# at all: `lucidos events emit` reads it from the environment, and the entry
+# scripts repoint it between a hold's acquire and its release. And whether the
+# lock file existed AT CALL TIME, which is how the ordering invariant (announce
+# a release only once the file is gone) is asserted rather than assumed.
 STUB_DIR="$TMPROOT/stub"
 mkdir -p "$STUB_DIR"
 CAPTURE="$TMPROOT/lucidos-calls.txt"
@@ -74,6 +77,11 @@ if [ "${3:-}" = "${STUB_PREDELAY_EVENT:-}" ] && [ -n "${STUB_PREDELAY_S:-}" ]; t
 fi
 {
     printf '%s\t' "$@"
+    if [ -n "${LUCIDOS_WORKSPACE+set}" ]; then
+        printf 'WS=%s\t' "$LUCIDOS_WORKSPACE"
+    else
+        printf 'WS_UNSET\t'
+    fi
     if [ -e "${STUB_WATCH_LOCK:-/nonexistent}" ]; then
         printf 'LOCKFILE_PRESENT'
     else
@@ -105,9 +113,12 @@ export STUB_PREDELAY_S=""
 
 TAB="$(printf '\t')"
 
-# The first recorded call for an event type, and its two interesting fields.
+# The first recorded call for an event type, and its three interesting fields.
+# Counted from the END because the stub appends its two observations after the
+# arguments, so a new argument in the middle cannot shift them.
 emit_call() { grep "^events${TAB}emit${TAB}$1${TAB}" "$CAPTURE" | head -1; }
-emit_payload() { emit_call "$1" | awk -F'\t' '{ print $(NF - 1) }'; }
+emit_payload() { emit_call "$1" | awk -F'\t' '{ print $(NF - 2) }'; }
+emit_workspace() { emit_call "$1" | awk -F'\t' '{ print $(NF - 1) }'; }
 emit_marker() { emit_call "$1" | awk -F'\t' '{ print $NF }'; }
 
 # Wait for an event to be recorded, bounded. Needed only by the cases that
@@ -963,6 +974,7 @@ STARTED=2020-01-01T00:00:00Z
 STARTED_EPOCH=1577836800
 SCRIPT=e2e-browser
 EOF
+# shellcheck disable=SC2030 # local to this case is the point: the library reads it in the same subshell, and the next case must not inherit it
 ( LUCIDOS_WORKSPACE="$TMPROOT/ws-a"; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18b.out 2>&1
 if grep -q "not reach this thread" "$OUT_DIR"/test-18b.out; then
     fail "a same-workspace holder was wrongly reported as unreachable"
@@ -1106,6 +1118,63 @@ acquire_e2e_lock e2e-browser >/dev/null 2>&1
 assert_eq "0" "$?" "release_e2e_lock returns to its caller when the read fails"
 assert_eq "reached" "$(cat "$OUT_DIR"/test-21.marker 2>/dev/null)" "the teardown step after release still ran"
 release_e2e_lock >/dev/null 2>&1
+
+echo ""
+echo "Test 22: a hold's release is addressed to the workspace that TOOK the lock"
+# `lucidos events emit` writes to the emitting subprocess's own
+# $LUCIDOS_WORKSPACE, and the entry scripts repoint that variable BETWEEN a
+# hold's two announcements: acquire runs first, then `reset_e2e_database` reaches
+# `setup_postgres`, which exports the e2e workspace into the entry script's own
+# shell, and only then does the EXIT trap release. So the release used to be
+# addressed to an engine that teardown had just stopped, in a workspace no waiter
+# watches. The evidence it left, and what it cost, are in ADR 0057 and in the
+# library's own announcing section; both are one place, so neither goes stale
+# here.
+#
+# The re-export below IS the `setup_postgres` line, reproduced: the whole point
+# is that it happens after the lock is taken and before it is given back.
+reset_emit_sandbox
+mkdir -p "$TMPROOT/ws-caller" "$TMPROOT/ws-e2e"
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    # shellcheck disable=SC2030,SC2031 # both modifications are meant to be local: the subshell IS the entry script being simulated
+    export LUCIDOS_WORKSPACE="$TMPROOT/ws-caller"
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait                                          # let the backgrounded acquire land
+    export LUCIDOS_WORKSPACE="$TMPROOT/ws-e2e"    # setup_postgres, mid-run
+    release_e2e_lock
+)
+assert_eq "WS=$TMPROOT/ws-caller" "$(emit_workspace E2ELockAcquired)" \
+    "the acquire is addressed to the caller's workspace"
+assert_eq "WS=$TMPROOT/ws-caller" "$(emit_workspace E2ELockReleased)" \
+    "the release is addressed there too, not to the e2e workspace"
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 23: with no workspace at acquire, the release emits with none either"
+# A terminal run has no $LUCIDOS_WORKSPACE, so the CLI resolves by walking up
+# from the working directory. Pinning the capture as an empty STRING would be
+# worse than not pinning at all: the CLI reads `env::var(..).ok()`, so `Some("")`
+# is a workspace root and `.lucidos/ports` resolves against nothing. Absent has
+# to stay absent, and the value the entry script exported later must not stand in
+# for it.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    unset LUCIDOS_WORKSPACE
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+    # shellcheck disable=SC2031 # same as the case above: the subshell is the simulated entry script, and nothing outside reads this
+    export LUCIDOS_WORKSPACE="$TMPROOT/ws-e2e"
+    release_e2e_lock
+)
+assert_eq "WS_UNSET" "$(emit_workspace E2ELockAcquired)" \
+    "the acquire carries no workspace, as the caller had none"
+assert_eq "WS_UNSET" "$(emit_workspace E2ELockReleased)" \
+    "and the release carries none either, rather than the e2e workspace"
+rm -f "$EMIT_LOCK"
 
 # ── Summary ──────────────────────────────────────────────────────────────
 echo ""
