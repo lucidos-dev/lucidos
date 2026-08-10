@@ -947,17 +947,51 @@ describe('sending a message lands on the turn\'s agent status line', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  it('writes NO scroll when the reader is already at the live edge', () => {
-    // They are already there. A write that lands them where they already were is
-    // still an unrequested movement, and on iOS it cancels a momentum scroll, so
-    // the assertion is on the write and not only on the resulting position.
+  it('lands the reader who sent FROM the live edge, once their turn renders', () => {
+    // The reported bug, and the ordinary case: sending from the bottom is what
+    // most sends are. Being at the live edge WHEN THE SUBMIT IS MADE says nothing
+    // about where the turn will sit, because the submit is what appends it. The
+    // reader was left on the top of their own message with the status line below
+    // the fold and nothing to take them there.
+    //
+    // The two halves of the fixture are the whole point, and the old fake had
+    // them the wrong way round: park at the live edge, submit, and only THEN
+    // grow the transcript with the turn.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
-    makeScrollObservers(el);
+    const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
     const parked = atBottom(el);
     el.writes = 0;
 
     followSentMessage();
+    expect(el.writes).toBe(0);      // nothing yet: the turn does not exist
+    expect(el.scrollTop).toBe(parked);
+
+    el.addUserMessage({ top: 2900, height: 120 }); // the row and its status line
+    el.scrollHeight = 3400;                        // render below the old fold
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2548); // 3048 (status line bottom) - 500
+    expect(el.scrollTop).toBeGreaterThan(parked);
+  });
+
+  it('still writes nothing when that turn lands fully in view', () => {
+    // The other half, and where the deleted at-the-live-edge branch was RIGHT:
+    // a reader whose new status line renders above the fold has nowhere to go.
+    // Reached by measuring the target rather than by predicting it, which is the
+    // difference that makes the case above work.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const parked = atBottom(el);
+    el.writes = 0;
+
+    followSentMessage();
+    el.addUserMessage({ top: 2510, height: 20 }); // a one-line message, in view
+    el.scrollHeight = 3000;
+    onResize();
+    vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(parked);
@@ -1032,10 +1066,17 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     expect(3048).toBeLessThanOrEqual(el.scrollTop + el.clientHeight); // and so is the status line
   });
 
-  it('extends the landing when the response panel mounts a frame later', () => {
-    // The optimistic row can arrive before the response panel under it. A target
-    // fixed at call time would stop on the message and leave the reader one row
-    // short of the status line, so the anchor is re-asked until it is there.
+  it('WAITS for the response panel rather than settling on the message', () => {
+    // The reported bug, 2026-08-10: "it scrolls to weird place or to end of
+    // message, but not to agent response header". The optimistic row can arrive
+    // a commit before the response panel under it, and the landing used to
+    // resolve on the row. `landOnOwnTurn` asks its do-not-scroll-backwards test
+    // once, at the moment it is called, so anchored on the message it either
+    // declined outright or aimed one row short and settled there when the header
+    // arrived after the tween had finished.
+    //
+    // So the landing does not start until the status line is in the DOM. The
+    // round that has the row but not the header must move NOBODY.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1045,17 +1086,24 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     const sent = el.addUserMessage({ top: 2900, height: 120, status: false });
     el.scrollHeight = 3400;
     onResize();
-    vi.advanceTimersByTime(60);
-    el.mountStatusLine(sent); // the response panel renders mid-glide
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(500);  // nothing to aim at yet, so nobody moves
+    expect(el.writes).toBe(0);
+
+    el.mountStatusLine(sent);        // the response panel renders, which grows
+    onResize();                      // the transcript, so a real RO round fires
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548);
+    expect(el.scrollTop).toBe(2548); // 3048 (status line bottom) - 500
   });
 
-  it('lands on the message alone for a turn that never gets a status line', () => {
+  it('moves NOBODY for a turn that never gets a status line', () => {
     // A queued follow-up shows its "Queued" tag in its own bubble and renders no
-    // response panel at all, so there is no status line to aim at and what the
-    // reader produced is the whole of the turn.
+    // response panel at all. There is no status line to aim at, and the reader's
+    // own message is not a substitute for one: what a submit asks is whether the
+    // agent took it, and a queued turn's honest answer is "not yet". The landing
+    // lapses on its deadline and writes nothing, which is what that deadline was
+    // documented to be for all along.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1066,8 +1114,46 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     el.scrollHeight = 3400;
     onResize();
     vi.advanceTimersByTime(1500);
+    el.scrollHeight = 4000; // the reply streams in under the queued row
+    onResize();
 
-    expect(el.scrollTop).toBe(2520); // 3020 (message bottom) - 500
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('a lapsed landing does not block the NEXT submit', () => {
+    // The deadline is wall-clock, and the growth branch is the only thing that
+    // was checking it, so a landing whose turn never renders a status line sat
+    // on `_pendingLanding` for as long as nothing grew. A queued follow-up is
+    // exactly that turn, and the reader's next submit then returned early
+    // without installing its own resolver: it never landed. Found by the Codex
+    // reviewer while hardening this change, and reachable BECAUSE the landing
+    // now waits for a status line.
+    // The second submit is a CARD, which resolves at submit time and glides
+    // immediately: it never reaches the growth branch, so a stale pending
+    // landing is the only thing that can stop it. That is what makes this the
+    // shape that reproduces. A second SEND would be rescued by luck, because the
+    // stale resolver is `awaitsNewTurn(lastUserMessage)` and the newer row
+    // happens to satisfy it.
+    const nowSpy = vi.spyOn(performance, 'now');
+    let clock = 1_000_000;
+    nowSpy.mockImplementation(() => clock);
+    try {
+      const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+      makeScrollObservers(el);
+      setActiveScrollElement(el);
+      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+      followSentMessage(); // goes pending: its own turn has not rendered
+      clock += 5000;       // the deadline passes with nothing growing
+
+      followAnsweredQuestion('q1');
+      vi.advanceTimersByTime(1500);
+
+      expect(el.scrollTop).toBe(2228); // 2728 (the card's status line) - 500
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('stops short of the prompt dissolve, by the clearance the row asks for', () => {
@@ -1322,21 +1408,26 @@ describe('sending a message lands on the turn\'s agent status line', () => {
   });
 });
 
-describe('a send with nowhere to take anybody moves nobody', () => {
+describe('a send moves nobody only when the status line is already in view', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** The block above is the send earning its keep: the just-sent message and the
-   *  status line under it are below the fold, and the send is the reader asking
-   *  to be shown the agent taking it. This block is the case where the ask is
-   *  already satisfied the instant it is made, because the whole thread is on
-   *  screen. Moving then is not "show me the agent picking this up", it is "drag
-   *  me down through an answer I have not read", and it is what a BRAND-NEW
-   *  thread did: the first reply streamed in and carried the reader to its last
-   *  line.
+  /** The block above is the send earning its keep. This block is the case where
+   *  the ask is already satisfied, and the point of keeping it is WHERE that is
+   *  now decided.
    *
-   *  Two transcripts have nowhere to take anyone, and `hasSomewhereToLand` needs
-   *  both tests because neither implies the other. */
+   *  It used to be two pre-emptive tests in `followSubmit`: "is the reader at the
+   *  live edge" and "does this transcript hold a turn and scroll room"
+   *  (`hasSomewhereToLand`). Both asked about the transcript AS IT STANDS in
+   *  order to predict where a turn that had not rendered would sit, and both got
+   *  the ordinary case wrong: a reader who sends from the bottom is at the live
+   *  edge when asked and one commit later has the new status line below the fold.
+   *  Reported twice on 2026-08-10.
+   *
+   *  Now there is ONE test and it is a measurement: `landOnOwnTurn` writes
+   *  nothing when its target is at or behind the current position, asked per
+   *  frame against the status line itself. Every case below reaches "moves
+   *  nobody" through it rather than by being recognised in advance. */
 
   it('leaves the reader alone for the whole first reply in a brand-new thread', () => {
     // The reported bug, in the order the two call sites actually fire for one
@@ -1366,26 +1457,32 @@ describe('a send with nowhere to take anybody moves nobody', () => {
     expect(awayFromBottom.value).toBe(true); // and the chevron is their way down
   });
 
-  it('is not fooled by a compose view tall enough to scroll', () => {
-    // Why scroll room alone cannot answer this. The compose view renders the
-    // welcome message inside the same `.thread-content`, and on a short viewport
-    // it has real scroll room, so the geometry reads as "there is a live edge to
-    // ride" for a thread with no conversation in it at all.
+  it('lands the FIRST turn of a brand-new thread when its status line is below the fold', () => {
+    // The compose view renders the welcome message inside the same
+    // `.thread-content`, and on a short viewport it has real scroll room. That
+    // used to be answered with a pre-emptive "this transcript holds no turn, so
+    // there is nowhere to take anybody", which is the same mistake as the
+    // at-the-live-edge branch: it predicts where a turn that has not rendered
+    // will sit. The first turn of a brand-new thread lands below the fold here
+    // exactly like any other, and the reader is owed the same sight of the agent
+    // taking it.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000, turns: 0 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
 
     followSentMessage();
-    el.writes = 0;
-    el.addUserMessage({ top: 3100, height: 120 }); // the optimistic row renders
-    el.scrollHeight = 3400;
+    el.addUserMessage({ top: 3100, height: 120 }); // the optimistic row and its
+    el.scrollHeight = 3400;                        // Requesting row render
     onResize();
     vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2748); // 3248 (status line bottom) - 500
+
+    // And it arms nothing on the way, so the reply that follows moves nobody.
+    el.writes = 0;
     el.scrollHeight = 6000;
     onResize();
-
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(0);
   });
 
   it('leaves the reader alone in an existing thread that fits on screen', () => {
@@ -1974,38 +2071,38 @@ describe('Continue after an abort is a submit too', () => {
  *  be doing something the others are not. */
 const SUBMIT_SURFACES: Array<{
   name: string;
-  /** Render what must be on screen BEFORE the submit. The two deferred submits
-   *  render nothing: their turn does not exist yet. */
-  arrange: (el: any) => void;
+  /** Render what must be on screen BEFORE the submit, at `top`. The two deferred
+   *  submits render nothing: their turn does not exist yet. */
+  arrange: (el: any, top?: number) => void;
   /** Make the submit, then, for a deferred surface, render the turn it waits for
-   *  and give the growth branch the round it lands on. */
-  submit: (el: any, onResize: () => void) => void;
+   *  at `top` and give the growth branch the round it lands on. */
+  submit: (el: any, onResize: () => void, top?: number) => void;
 }> = [
   {
     name: 'a sent message',
     arrange: () => {},
-    submit: (el, onResize) => {
+    submit: (el, onResize, top = 2400) => {
       followSentMessage();
-      el.addUserMessage({ top: 2400, height: 300 });
+      el.addUserMessage({ top, height: 300 });
       onResize();
     },
   },
   {
     name: 'an answered question card',
-    arrange: (el) => el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 }),
+    arrange: (el, top = 2400) => el.addQuestionCard({ toolUseId: 'q1', top, height: 300 }),
     submit: () => followAnsweredQuestion('q1'),
   },
   {
     name: 'a decided permission card',
-    arrange: (el) => el.addPermissionCard({ requestId: 'p1', top: 2400, height: 300 }),
+    arrange: (el, top = 2400) => el.addPermissionCard({ requestId: 'p1', top, height: 300 }),
     submit: () => followResolvedPermission('p1'),
   },
   {
     name: 'Continue after an abort',
     arrange: () => {},
-    submit: (el, onResize) => {
+    submit: (el, onResize, top = 2400) => {
       followContinuedThread();
-      el.addContinuationTurn({ top: 2400, height: 300 });
+      el.addContinuationTurn({ top, height: 300 });
       onResize();
     },
   },
@@ -2025,14 +2122,20 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
     return { el, ...observers };
   }
 
-  it('branch 1, nowhere to take anybody: writes nothing', () => {
+  it('branch 1, the status line is already in view: writes nothing', () => {
+    // A thread that fits on screen, with the turn INSIDE it, which is the only
+    // way a short transcript can actually be laid out. The landing measures its
+    // target, finds it behind the reader, and writes nothing. There is no
+    // pre-emptive "this thread is too short" test any more, and there must not
+    // be: the same test asked one commit earlier is what left a reader who sent
+    // from the bottom of a long thread staring at their own message.
     const el = makeEl({ scrollTop: 0, scrollHeight: 400 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    arrange(el);
+    arrange(el, 40);
     el.writes = 0;
 
-    submit(el, onResize);
+    submit(el, onResize, 40);
     vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);

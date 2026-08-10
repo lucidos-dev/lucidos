@@ -280,7 +280,9 @@ describe('EventWaitRow', () => {
       matched_event_id: 'evt-1',
     }));
     expect(findByRole(woke, 'event-wait-jump')).toBeNull();
-    expect(findByClass(woke, 'event-row-link')).toBeNull();
+    // The chip carries the jump on the two rows that HAVE one, so its link
+    // variant is what would show up here if one grew back.
+    expect(findByClass(woke, 'event-name-link')).toBeNull();
     expect(vnodeText(woke)).not.toContain('Go to event');
     // The matched type is still named.
     expect(vnodeText(findByClass(woke, 'event-name'))).toBe('ChangeProposed');
@@ -340,8 +342,12 @@ describe('EventWaitRow', () => {
  *  the same delivery addressed to the user, and since 2026-08-10 it is the same
  *  event row the wait above it uses. */
 describe('eventDeliveryBody', () => {
+  /** No handler by default: a wake whose event has nowhere to open is the
+   *  ordinary case, not the exception. `linked` opts into the jump. */
   const wake = (over: Partial<Parameters<typeof eventDeliveryBody>[0]> = {}) =>
-    eventDeliveryBody({ eventType: 'CodingAgentIdled', opening: false, onOpenMatched: () => {}, ...over });
+    eventDeliveryBody({ eventType: 'CodingAgentIdled', opening: false, ...over });
+  const linked = (over: Partial<Parameters<typeof eventDeliveryBody>[0]> = {}) =>
+    wake({ onOpenMatched: () => {}, ...over });
 
   it('leads with the event name and keeps the payload folded', () => {
     const tree = wake({ payloadJson: '{\n  "has_changes": true\n}' });
@@ -387,26 +393,69 @@ describe('eventDeliveryBody', () => {
    *  that arrived, where a link out of "Set up an event wait" pointed at
    *  something that happened hours after the moment that card records.
    *
-   *  Only when the engine recorded which event matched. A delivery without an
-   *  `event_id` still names the type; a jump that resolves nothing is worse
-   *  than no jump. */
-  it('offers a jump to the matched event only when one was recorded', () => {
-    expect(findByRole(wake({ eventId: 'evt-1' }), 'event-delivery-jump')).not.toBeNull();
-    expect(findByRole(wake(), 'event-delivery-jump')).toBeNull();
+   *  **And the event's NAME is that jump.** It was a separate "Go to event"
+   *  link on the facts line, which asked the card to be read twice for one
+   *  destination while the chip right above it already named that destination.
+   *  The name is the only text the link could have had, so it is the link. */
+  it('makes the event name itself the jump', () => {
+    const tree = linked({ eventType: 'ChangeProposed' });
+    const jump = findByRole(tree, 'event-delivery-jump');
+
+    expect(jump?.type).toBe('button');
+    expect(vnodeText(jump)).toBe('ChangeProposed');
+    expect(String(jump?.props.class)).toContain('event-name');
+    // Nothing else on the card claims to be the way there.
+    expect(vnodeText(tree)).not.toContain('Go to event');
+  });
+
+  /** **The bug, as the card renders it** (reported 2026-08-10). A wake on a
+   *  `BackgroundBashCompleted` had nowhere to go, and the link went anyway: it
+   *  pulsed the unrelated question card that happened to start the turn the
+   *  completion landed in. No target now means no affordance, so the dead tap
+   *  is unreachable rather than merely unlikely.
+   *
+   *  It is also what a delivery with no recorded `event_id` renders, and what
+   *  the card shows while the answer is still being resolved. */
+  it('leaves the event name inert when there is nowhere to go', () => {
+    const tree = wake({ eventType: 'BackgroundBashCompleted' });
+
+    // Still named: the NAME is the answer to "why did this thread start
+    // talking again", whether or not it can be opened.
+    expect(vnodeText(findByClass(tree, 'event-name'))).toBe('BackgroundBashCompleted');
+    expect(findByRole(tree, 'event-delivery-jump')).toBeNull();
+    expect(findByClass(tree, 'event-name-link')).toBeNull();
+    expect(vnodeText(tree)).not.toContain('Go to event');
+  });
+
+  /** A real `<button>`, not a `<code>` carrying an onClick, so it is reachable
+   *  by keyboard and announces itself. Its accessible name says where it goes:
+   *  the visible text is a bare event type, which says only what the event is. */
+  it('is a keyboard-reachable control that says where it goes', () => {
+    const jump = findByRole(linked({ eventType: 'ChangeProposed' }), 'event-delivery-jump');
+
+    expect(jump?.type).toBe('button');
+    expect(jump?.props.type).toBe('button');
+    expect(jump?.props['aria-label']).toBe('Go to the ChangeProposed event');
   });
 
   /** Resolving the matched event's owning thread is a network round-trip in
    *  every case but a same-thread match, which on an iOS PWA over Tailscale is
-   *  long enough for the tap to read as dead. The jump says it is working and
-   *  goes inert so an impatient second tap cannot start a second navigation. */
+   *  long enough for the tap to read as dead. The chip goes inert so an
+   *  impatient second tap cannot start a second navigation.
+   *
+   *  It keeps its NAME while it works, rather than swapping in an "Opening…"
+   *  caption the way the old link did: the name is a fact the row states, not a
+   *  button label, and replacing it would delete the answer to "why did this
+   *  thread wake" for as long as the navigation takes. */
   it('reports the jump as pending and refuses a second tap', () => {
-    const idle = findByRole(wake({ eventId: 'evt-1' }), 'event-delivery-jump');
+    const idle = findByRole(linked(), 'event-delivery-jump');
     expect(idle?.props.disabled).toBe(false);
-    expect(vnodeText(idle)).toBe('Go to event');
+    expect(idle?.props['aria-busy']).toBeUndefined();
 
-    const pending = findByRole(wake({ eventId: 'evt-1', opening: true }), 'event-delivery-jump');
+    const pending = findByRole(linked({ opening: true }), 'event-delivery-jump');
     expect(pending?.props.disabled).toBe(true);
-    expect(vnodeText(pending)).toBe('Opening…');
+    expect(pending?.props['aria-busy']).toBe('true');
+    expect(vnodeText(pending)).toBe('CodingAgentIdled');
   });
 
   /** A marker event carries `{}`, and a disclosure that opens onto an empty
@@ -435,7 +484,15 @@ describe('eventDeliveryBody', () => {
  *  three report (something outside the thread happened), and it used to render
  *  its whole prompt as markdown above every response it produced. */
 describe('triggerFiredBody', () => {
+  /** No handler by default. On THIS row that is the everyday case rather than
+   *  the exception: a trigger fires on a workspace domain event, which belongs
+   *  to no conversation and has no transcript to open. */
   const fired = (over: Record<string, unknown> = {}, opening = false) =>
+    triggerFiredBody({
+      event: { type: 'TriggerStarted', trigger_id: 't1', ...over } as TriggerStarted,
+      opening,
+    });
+  const firedLinked = (over: Record<string, unknown> = {}, opening = false) =>
     triggerFiredBody({
       event: { type: 'TriggerStarted', trigger_id: 't1', ...over } as TriggerStarted,
       opening,
@@ -465,16 +522,43 @@ describe('triggerFiredBody', () => {
   });
 
   /** An event-driven run DOES carry its type, so it gets the same chip a wait's
-   *  subscription and a wake's delivery get. The jump appears only when the
-   *  engine also recorded which event matched. */
-  it('chips the matched event type, and jumps only with a recorded event', () => {
-    const withId = fired({ invocation: { kind: 'Event', event_type: 'ChangeApplied', event_id: 'e1' } });
-    expect(vnodeText(findByClass(withId, 'event-name'))).toBe('ChangeApplied');
-    expect(findByRole(withId, 'trigger-event-jump')).not.toBeNull();
+   *  subscription and a wake's delivery get.
+   *
+   *  **Whether that chip is also the jump is decided upstream**, by whether the
+   *  matched event turns out to live in a conversation at all (`eventHasTarget`).
+   *  On this row it usually does not: a trigger fires on a workspace domain
+   *  event, so the old separate "Go to event" link here was very often a
+   *  guaranteed toast. The chip is named either way; only its clickability
+   *  moves. */
+  const eventFire = { kind: 'Event', event_type: 'ChangeApplied', event_id: 'e1' };
 
-    const withoutId = fired({ invocation: { kind: 'Event', event_type: 'ChangeApplied' } });
-    expect(vnodeText(findByClass(withoutId, 'event-name'))).toBe('ChangeApplied');
-    expect(findByRole(withoutId, 'trigger-event-jump')).toBeNull();
+  it('chips the matched event type whether or not it can be opened', () => {
+    const plain = fired({ invocation: eventFire });
+    expect(vnodeText(findByClass(plain, 'event-name'))).toBe('ChangeApplied');
+    expect(findByRole(plain, 'trigger-event-jump')).toBeNull();
+    expect(findByClass(plain, 'event-name-link')).toBeNull();
+
+    const linkable = firedLinked({ invocation: eventFire });
+    expect(vnodeText(findByClass(linkable, 'event-name'))).toBe('ChangeApplied');
+    expect(findByRole(linkable, 'trigger-event-jump')).not.toBeNull();
+  });
+
+  /** The same chip atom the wake card uses, so one event type is spelled one
+   *  way wherever it appears, and the jump behaves identically on both rows. */
+  it('makes the chip the jump, with no separate link beside it', () => {
+    const tree = firedLinked({ invocation: eventFire });
+    const jump = findByRole(tree, 'trigger-event-jump');
+
+    expect(jump?.type).toBe('button');
+    expect(vnodeText(jump)).toBe('ChangeApplied');
+    expect(jump?.props['aria-label']).toBe('Go to the ChangeApplied event');
+    expect(vnodeText(tree)).not.toContain('Go to event');
+  });
+
+  it('reports the jump as pending and refuses a second tap', () => {
+    const pending = findByRole(firedLinked({ invocation: eventFire }, true), 'trigger-event-jump');
+    expect(pending?.props.disabled).toBe(true);
+    expect(vnodeText(pending)).toBe('ChangeApplied');
   });
 
   /** A legacy row carries neither a name nor a prompt. It still renders, saying

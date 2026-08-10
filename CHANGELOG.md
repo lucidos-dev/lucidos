@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.26.1 — 2026-08-10
+
+### Fixed
+
+- **A window restored off-screen or at an unusable size is put back where you can reach it.** The macOS app declares a minimum window size, falls back to the default size when a saved one is smaller, and re-centres a window whose saved position lands outside every attached display. A fullscreen window is left alone.
+- **A wake's jump lands on the event that matched**, and the event's name in the wake card is the link. A card with nowhere to go is plain text.
+- **Sending a message always lands on the turn's agent status line**, including when a previous landing lapsed.
 ## v0.26.0 — 2026-08-10
 
 ### Added

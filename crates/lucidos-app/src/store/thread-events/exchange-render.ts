@@ -1076,18 +1076,49 @@ export function stampedEventIds(exchange: Exchange): string[] {
   return ids;
 }
 
+/** Events that merely LANDED in a turn rather than being produced by it, and
+ *  that render nothing of their own. They have no anchor at all.
+ *
+ *  The containing-turn fallback below is an inference: "this step has no element
+ *  of its own, so show the turn that produced it". That inference is sound for a
+ *  step the turn caused and false for an event that arrived asynchronously and
+ *  was grouped into whichever exchange happened to be open at that instant. The
+ *  reported case (2026-08-10): a background bash task finished while the turn
+ *  started by a `UserQuestionAsked` was open, so the wake card's jump pulsed
+ *  that question. Causally unrelated, and the pulse asserts otherwise.
+ *
+ *  Deliberately an explicit list rather than a clever predicate. Membership is a
+ *  claim about CAUSATION, which nothing in the event's own shape reveals, so it
+ *  is stated per type with the reasoning attached and grows on evidence.
+ *
+ *  `BackgroundBashStarted` is deliberately NOT here: it is emitted by the turn's
+ *  own `run_bash_background` tool call, so the turn genuinely caused it and
+ *  landing there is the honest answer. Only the COMPLETION floats free, firing
+ *  whenever the process happens to exit. */
+const UNANCHORABLE_ASYNC_EVENTS: ReadonlySet<string> = new Set([
+  'BackgroundBashCompleted',
+]);
+
 /** The `data-event-id` a deep-link to `eventId` should actually target within
- *  `exchanges`, or `null` when no exchange holds that event.
+ *  `exchanges`, or `null` when there is nowhere honest to land.
  *
- *  An event that stamps its own element (see `stampedEventIds`) is its own
- *  target, so the pulse stays on the thing the user was sent to see. Anything
- *  else is a step that renders no addressable element of its own, so the target
- *  becomes the turn that CONTAINS it: landing on the turn is the honest answer,
- *  and it is the difference between a link that works and one that spends the
- *  4s resolve deadline and recovers to the bottom of the thread.
+ *  Three answers, in order:
  *
- *  This is what the *event wait* step's "show it" needs. A wait can match ANY
- *  event type, and the common match by far is a `CodingAgentIdled` from another
+ *   - An event that stamps its own element (see `stampedEventIds`) is its own
+ *     target, so the pulse stays on the thing the user was sent to see.
+ *   - An event the turn PRODUCED but that renders no addressable element of its
+ *     own targets the turn that contains it. Landing on the turn is the honest
+ *     answer, and it is the difference between a link that works and one that
+ *     spends the 4s resolve deadline and recovers to the bottom of the thread.
+ *   - An event that merely arrived inside an open turn
+ *     (`UNANCHORABLE_ASYNC_EVENTS`) has no anchor, and says so.
+ *
+ *  `null` is a real answer, not a failure: callers use it to decide there is
+ *  nowhere to go, and the wake / trigger rows render no jump affordance at all
+ *  rather than offering a tap that pulses something unrelated.
+ *
+ *  This is what the *event wait*'s "show it" needs. A wait can match ANY event
+ *  type, and the common match by far is a `CodingAgentIdled` from another
  *  thread, which stamps nothing anywhere. Notification deep-links do not need it
  *  (they point at events that are addressable by construction) and deliberately
  *  do not use it. */
@@ -1100,7 +1131,9 @@ export function deepLinkAnchorForEvent(
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const exchange = exchanges[i];
     if (stampedEventIds(exchange).includes(eventId)) return eventId;
-    if (exchange.steps.some(({ event }) => event._eventId === eventId)) {
+    const step = exchange.steps.find(({ event }) => event._eventId === eventId);
+    if (step) {
+      if (UNANCHORABLE_ASYNC_EVENTS.has(step.event.type)) return null;
       // A turn whose own starter is unstamped (a legacy row with no event id)
       // gives the deep-link nothing to aim at, and saying so beats returning an
       // `undefined` that would read as "not in this thread" further down.

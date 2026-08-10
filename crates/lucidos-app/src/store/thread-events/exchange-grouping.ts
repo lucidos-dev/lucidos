@@ -217,10 +217,26 @@ function dividerStillAwaitsUser(exchange: Exchange): boolean {
  *  EVENT_CLASSIFICATION so a new one added in Rust is picked up without an edit
  *  (ThreadArchived is excluded automatically: the contract classifies it
  *  terminal, not metadata) — plus the non-`Thread`-prefixed pure-bookkeeping
- *  events that also render nothing and must never count as a step. Only add an
- *  event to the explicit list if it has NO render case in exchange-render.ts;
- *  metadata events that DO render a panel (CodingAgentSettingsChanged,
- *  BackgroundBash*) must stay OUT of this set. */
+ *  events that also render nothing and must never count as a step.
+ *
+ *  **The bar for the explicit list is that NOTHING which reads an exchange's
+ *  steps may depend on the event.** Not rendering is necessary but not
+ *  sufficient: membership drops the event out of `steps` entirely, so any
+ *  consumer walking them loses it. `CodingAgentSettingsChanged` is the standing
+ *  example of a metadata event that must stay OUT for the second reason rather
+ *  than the first: it draws nothing itself, but `ccFieldFromExchange`
+ *  (exchange.ts) reads it out of the steps for the model and reasoning effort
+ *  the response header reports.
+ *
+ *  `BackgroundBashStarted` / `BackgroundBashCompleted` were named here as
+ *  examples of metadata events that "DO render a panel". They do not: neither
+ *  has a render case anywhere in the frontend (they appear only in the
+ *  `ThreadEvent` union, the generated classification table, an artifact-refresh
+ *  branch in actions/thread-sync.ts, and tests). Whether they belong in this set
+ *  is therefore an open question with grouping consequences, not a settled no.
+ *  `thread-flows-event-wait.test.ts` currently pins `BackgroundBashStarted` as a
+ *  step of the turn that spawned it, so answering it means deciding that case
+ *  too; the comment was corrected on 2026-08-10 without touching membership. */
 const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   ...Object.entries(EVENT_CLASSIFICATION)
     .filter(([evt, cls]) => cls === 'metadata' && evt.startsWith('Thread'))

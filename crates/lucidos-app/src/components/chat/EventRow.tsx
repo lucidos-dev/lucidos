@@ -59,21 +59,31 @@ export type EventRowTone = 'live' | 'arrived' | 'good' | 'bad' | 'lapsed' | 'hal
 /** One item on the facts line. `chip` is the shared event-type atom, and it is
  *  the ONLY way an event type is spelled anywhere in the transcript. `glue` is a
  *  connecting word between two chips ("or"), and is the one item the separator
- *  skips on both sides. */
+ *  skips on both sides.
+ *
+ *  There is no `link` kind. There was one, and both its users were a "Go to
+ *  event" sitting next to the chip naming the very event it went to: two things
+ *  to read for one destination, and one of them repeating nothing. The chip
+ *  carries the jump itself now (see `EventRowChip.onClick`). */
 export type EventRowFact =
-  | { kind: 'chip'; name: string }
+  | EventRowChip
   | { kind: 'text'; text: string }
-  | { kind: 'glue'; text: string }
-  | {
-      kind: 'link';
-      label: string;
-      /** Shown instead of `label` while the click is in flight, with the button
-       *  inert so an impatient second tap cannot start a second navigation. */
-      pendingLabel?: string;
-      pending?: boolean;
-      onClick: () => void;
-      role?: string;
-    };
+  | { kind: 'glue'; text: string };
+
+/** The event-type chip, optionally the row's jump. */
+export interface EventRowChip {
+  kind: 'chip';
+  name: string;
+  /** Makes the chip ITSELF the link to the event it names. Absent whenever the
+   *  event has nowhere to open, which is what keeps a dead tap unreachable
+   *  rather than merely unlikely (see `eventHasTarget`). */
+  onClick?: () => void;
+  /** The jump is in flight. The chip keeps its name (it is a fact about the
+   *  row, not a button label) and goes inert, so an impatient second tap cannot
+   *  start a second navigation. */
+  pending?: boolean;
+  role?: string;
+}
 
 export interface EventRowFold {
   /** Named for its content: `Payload`, `Summary`, `Prompt`. */
@@ -170,23 +180,44 @@ function renderFacts(facts: EventRowFact[]): ComponentChildren[] {
 function renderFact(fact: EventRowFact, i: number): ComponentChildren {
   switch (fact.kind) {
     case 'chip':
-      return <code key={`c${i}`} class="event-name">{fact.name}</code>;
+      return eventNameChip(fact, `c${i}`);
     case 'glue':
       return <span key={`g${i}`} class="event-row-glue">{fact.text}</span>;
     case 'text':
       return <span key={`t${i}`}>{fact.text}</span>;
-    case 'link':
-      return (
-        <button
-          key={`l${i}`}
-          type="button"
-          class="accent-link event-row-link"
-          data-role={fact.role}
-          disabled={!!fact.pending}
-          onClick={fact.onClick}
-        >
-          {fact.pending ? (fact.pendingLabel ?? fact.label) : fact.label}
-        </button>
-      );
   }
+}
+
+/** The event-type atom, in both of its forms.
+ *
+ *  Exported because a chip is not always a FACT: the wake card puts one in its
+ *  subject ("Woke on `CodingAgentIdled`"), and one event type must not be
+ *  spelled two ways depending on which line of the card it landed on.
+ *
+ *  A plain function rather than a component, matching `eventRowBody` and for the
+ *  same reason: there is no jsdom in the test infra, so the tests walk the vnode
+ *  tree these return, and a component vnode is opaque to that walk.
+ *
+ *  With `onClick` it is a real `<button>`, not a `<code>` carrying a handler, so
+ *  it is reachable by keyboard and announces itself. Its accessible name says
+ *  where it goes: the visible text is a bare event type, which says only what
+ *  the event IS. */
+export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildren {
+  if (!chip.onClick) return <code key={key} class="event-name">{chip.name}</code>;
+  const label = `Go to the ${chip.name} event`;
+  return (
+    <button
+      key={key}
+      type="button"
+      class="event-name event-name-link"
+      data-role={chip.role}
+      aria-label={label}
+      data-tooltip={label}
+      aria-busy={chip.pending ? 'true' : undefined}
+      disabled={!!chip.pending}
+      onClick={chip.onClick}
+    >
+      {chip.name}
+    </button>
+  );
 }

@@ -192,10 +192,43 @@
     font-size: var(--font-size-sm);
 }
 
-/* Sized down from `.accent-link`, which the button already carries, so a jump
-   sits on the facts line rather than towering over it. */
-.event-row-link {
-    font-size: var(--font-size-sm);
+/* The chip AS the jump. There is no separate "Go to event" link any more: it sat
+   beside a chip that already named the destination, so the card asked to be read
+   twice for one place to go.
+
+   It is a `<button>`, so it has to shed the UA button box and take the chip's
+   own back. Everything visual comes from `.event-name` above; this adds only
+   what makes it read as something you can press. The underline is the affordance
+   (a tinted background alone is what the inert chip already has, so colour
+   cannot carry it), and it is drawn in the accent at the same 40% strength
+   `.accent-link` uses, so a jump reads the same wherever it appears. */
+.event-name-link {
+    border: none;
+    margin: 0;
+    font-weight: inherit;
+    line-height: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+}
+
+@media (hover: hover) {
+    .event-name-link:hover {
+        background: color-mix(in srgb, var(--accent) 20%, transparent);
+        text-decoration-color: var(--accent);
+    }
+}
+
+/* In flight. The chip keeps its NAME rather than swapping in a "Opening…"
+   label, because the name is a fact the row states and not a button caption:
+   replacing it would delete the answer to "what woke this thread" for as long
+   as the navigation takes. Dimmed and inert instead, which says "working" while
+   leaving the fact on screen. */
+.event-name-link:disabled {
+    cursor: default;
+    opacity: 0.55;
+    text-decoration-color: transparent;
 }
 
 /* One disclosure, labelled by what it holds (Payload / Summary / Prompt), and

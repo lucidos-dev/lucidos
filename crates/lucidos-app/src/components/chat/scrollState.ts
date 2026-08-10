@@ -50,13 +50,12 @@ import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMa
  *  from the earlier rule, where a send and an answer armed the follow: riding is
  *  the chevron's alone now.
  *
- *  A SUBMIT ASKS FOR NOTHING WHEN THE THREAD IS ALREADY IN FRONT OF THE READER,
- *  so it writes nothing either (`hasSomewhereToLand`). A BRAND-NEW thread has
- *  nowhere to take anybody: its entire content is the message they just wrote,
- *  they can see all of it, and the send is honoured in full by moving nobody. So
- *  is a thread that fits on screen. Moving such a reader is not "show me the
- *  agent picking this up", it is "drag me down through an answer I have not read
- *  yet", which is the unrequested movement this whole rule exists to forbid.
+ *  A SUBMIT WRITES NOTHING ONLY WHEN THERE IS NOWHERE TO GO, and that is decided
+ *  by measuring the landing rather than by predicting it: if the status line is
+ *  already resting at or above the bottom edge, the target is behind the reader
+ *  and nothing is written. A thread that fits on screen answers that way by
+ *  construction. Two earlier branches tried to reach the same conclusion BEFORE
+ *  the turn rendered, and both got the ordinary case wrong; see `followSubmit`.
  *
  *  Three things retire a standing follow: the reader's own scroll, opening
  *  another thread, and a DEEP-LINK LANDING. A link is the reader asking to be at
@@ -623,36 +622,6 @@ function isScrollable(el: HTMLElement): boolean {
   return el.scrollHeight > el.clientHeight + 10;
 }
 
-/** Is there anywhere to take the reader, or is the whole thread already in front
- *  of them? Two conditions, and each answers a case the other cannot.
- *
- *  SCROLL ROOM. A transcript that fits on screen has one position: the reader is
- *  at its bottom because there is nowhere else to be, not because they chose to
- *  be, and what they just submitted is fully visible without moving anything,
- *  agent status line and all. There is nothing to land, so the submit is
- *  honoured in full by moving nobody, and the reply then grows past the fold
- *  below them like any other content they have not asked to follow.
- *
- *  A TURN. That is the brand-new thread, and scroll room alone gets it wrong:
- *  the compose view renders the welcome message inside the same
- *  `.thread-content`, which on a short viewport has real scroll room, so the
- *  geometry says "there is somewhere to go" for a thread with no conversation in
- *  it at all. A transcript holding no turn cannot be one the reader was reading.
- *
- *  Every submit asks this, which is what makes "same reaction everywhere" true
- *  of the brand-new thread too. The down chevron and `resumeFollowingBottom` do
- *  not: the chevron is the reader naming the live edge itself rather than
- *  producing content near it, and the resume is replaying a request they already
- *  made in this thread.
- *
- *  It was called `hasLiveEdgeToRide` while a send armed the follow. Nothing
- *  rides now, so the name would describe a thing this no longer decides. */
-function hasSomewhereToLand(el: HTMLElement): boolean {
-  if (!isScrollable(el)) return false;
-  if (typeof el.querySelectorAll !== 'function') return false;
-  return el.querySelectorAll(TURN_SELECTOR).length > 0;
-}
-
 /* ── Held scrolls, and how the reader's gesture is told from ours ────────────
  *  `_heldEl` / `_heldTop` record WHERE our own last deliberate write left the
  *  container. Two things hold a reader deliberately and both need it: the
@@ -806,6 +775,16 @@ export function stopFollowingBottom() {
 function cancelLanding() {
   if (_heldAnim && _heldAnimTarget === 'own-turn') cancelScrollAnim();
   _pendingLanding = null;
+}
+
+/** Retire a pending landing that has outlived `LANDING_DEADLINE_MS`. Called from
+ *  the two places a lapse can be noticed: the growth branch, and the next submit.
+ *  Neither alone is enough, because the deadline is wall-clock and the growth
+ *  branch only runs when something grows. */
+function dropLapsedLanding(): void {
+  if (_pendingLanding && nowMs() - _pendingLanding.at >= LANDING_DEADLINE_MS) {
+    _pendingLanding = null;
+  }
 }
 
 /** Is a submit's landing in flight, in either of its two phases: waiting for its
@@ -1027,35 +1006,47 @@ function glideToLiveEdge(el: HTMLElement): void {
  *  arm, and the reader was then dragged through the whole reply by a request
  *  they never made.
  *
- *  It is NOT a blind jump to the bottom, and splits four ways:
+ *  It is NOT a blind jump to the bottom, and splits TWO ways:
  *
- *   - **Nowhere to take anybody**: write nothing. The whole thread is on screen
- *     (a brand-new one, or one that fits), so the reader can already see both
- *     what they submitted and the agent taking it. See `hasSomewhereToLand`. It
- *     declines to MOVE rather than retiring anything, so a follow the reader
- *     armed themselves stands: this submit is not them taking it back.
- *   - **At the live edge**: write no scroll at all. They are already looking at
- *     the newest content, and a redundant write on a reader who never moved is
- *     exactly the unrequested movement this module exists to remove (on iOS it
- *     would also cancel an in-flight momentum scroll).
- *   - **Already riding the live edge, but off it**: glide to the live edge.
- *     Riding it is a STANDING request to be kept at the bottom, so a submit made
- *     while it is armed asks for the bottom and not for a look at the turn they
- *     acted on. Armed but off the edge is an ordinary state rather than a
- *     corner: the growth branch stands down while a tween owns the scroll, so a
- *     reply that streams entirely during a glide parks the reader above the
- *     bottom with the follow still armed and nothing left to grow them out of
- *     it.
- *   - **Scrolled up, following nothing**: glide to the turn's AGENT STATUS LINE,
- *     landing that row on the bottom of the viewport, so they see the agent take
- *     what they submitted with the thing they submitted sitting just above it
- *     and the answer growing in underneath. The status line and not the turn's
- *     own bottom edge, because "did it go through" is the question a submit asks
- *     and the Requesting / Working row is where it is answered. Anchored on an
- *     ELEMENT either way, never computed from `scrollHeight`: the transcript
- *     grows between the submit and the landing and a `scrollHeight` target then
- *     lands PAST the turn and hides the very thing they acted on. See
- *     `landOnOwnTurn` and `turnStatusLine`.
+ *   - **Already riding the live edge**: glide to the live edge. Riding it is a
+ *     STANDING request to be kept at the bottom, so a submit made while it is
+ *     armed asks for the bottom and not for a look at the turn they acted on.
+ *   - **Everyone else**: glide to the turn's AGENT STATUS LINE, landing that row
+ *     on the bottom of the viewport, so they see the agent take what they
+ *     submitted with the thing they submitted sitting just above it and the
+ *     answer growing in underneath. The status line and not the turn's own bottom
+ *     edge, because "did it go through" is the question a submit asks and the
+ *     Requesting / Working row is where it is answered. Anchored on an ELEMENT
+ *     either way, never computed from `scrollHeight`: the transcript grows
+ *     between the submit and the landing and a `scrollHeight` target then lands
+ *     PAST the turn and hides the very thing they acted on. See `landOnOwnTurn`
+ *     and `turnStatusLine`.
+ *
+ *  TWO, not four. It shipped with two more branches that declined to move
+ *  anybody, and both were the same mistake: they asked a question about the
+ *  transcript AS IT STANDS in order to predict where a turn that has not
+ *  rendered yet will sit.
+ *
+ *   - **At the live edge wrote nothing**, on the reasoning that the reader is
+ *     already looking at the newest content. They are, and a beat later the
+ *     submit APPENDS a turn whose status line is below the fold, so the reader
+ *     who sent from the bottom (the ordinary case) was left on the top of their
+ *     own message with nothing to take them down. Reported twice on 2026-08-10,
+ *     as "does not land on the first response line" and "answering with custom
+ *     text does not scroll at all".
+ *   - **Nowhere to take anybody** (`hasSomewhereToLand`: scrollable, and holding
+ *     at least one turn) wrote nothing for the same shape of reason, and got the
+ *     brand-new thread wrong in the same way: it holds no `.chat-exchange` at
+ *     submit time, and its first turn's status line can still land below the fold
+ *     on a short viewport.
+ *
+ *  What both were reaching for survives as ONE test, in the right place and
+ *  against the right thing: `landOnOwnTurn` writes nothing when its target is at
+ *  or behind the current position. That is physics rather than policy, since the
+ *  status line is already in view and there is nowhere to go, and it subsumes
+ *  both: a thread too short to scroll cannot produce a target ahead of the
+ *  reader, and neither can one whose status line is already resting above the
+ *  bottom edge. Asked per frame, against the real anchor, after the turn exists.
  *
  *  The landing takes a POSITION STAMP before it does anything, because the two
  *  deferred submits move nobody for a frame or more and the reader's flick in
@@ -1082,13 +1073,40 @@ function followSubmit(resolveTurn: TurnResolver): void {
   // the instant the real status is known.
   _submitLiveUntil = nowMs() + SUBMIT_LIVE_CLAIM_MS;
   const el = resolveTarget();
-  if (!el || !hasSomewhereToLand(el)) return;
-  if (isAtLiveEdge(el)) return;
-  if (_followingBottom.value) { glideToLiveEdge(el); return; }
+  if (!el) return;
+  if (_followingBottom.value) {
+    // The one place an at-the-live-edge test is still legitimate, and the
+    // difference from the branch below is the whole reason: this branch's target
+    // is the live edge itself, which is exactly where the growth is about to
+    // take them anyway, so a rider already on it needs no write and gets no
+    // redundant tween (on iOS that would cancel a momentum scroll). The LANDING
+    // cannot ask the same question, because its target is a status line that does
+    // not exist yet and will render BELOW where the reader is standing.
+    if (!isAtLiveEdge(el)) glideToLiveEdge(el);
+    return;
+  }
+  // A landing already PENDING keeps the floor, unless it has LAPSED. The two
+  // checks are the same rule from opposite sides: the growth branch expires it
+  // when a round happens to run, and this expires it when one never does. A
+  // queued follow-up is exactly that case, and it is the common one now that the
+  // landing waits for a status line the queued turn will never render: the turn
+  // resolves, nothing else grows the transcript, and the stale pending landing
+  // sat on `_pendingLanding` forever. The reader's NEXT submit then returned on
+  // the line below without installing its own resolver, so it never landed.
+  // Found by the Codex reviewer, 2026-08-10.
+  dropLapsedLanding();
   if (_pendingLanding) return;
   holdPosition(el);
+  // The turn AND its status line, or the landing waits. Resolving on the panel
+  // alone is what put the reader on the end of their own message: the response
+  // panel can mount a commit or two after the row, and `landOnOwnTurn` asks its
+  // do-not-scroll-backwards test once, at the moment it is called. Asked against
+  // the panel it either declines (nothing happens) or aims one row short and
+  // settles there if the header arrives after the tween has finished. Waiting
+  // costs nothing the deferral did not already cost, and hands the deadline the
+  // case it was written for: a turn that never gets a response panel at all.
   const panel = resolveTurn(el);
-  if (panel) { landOnOwnTurn(el, panel); return; }
+  if (panel && turnStatusLine(panel)) { landOnOwnTurn(el, panel); return; }
   _pendingLanding = { resolveTurn, at: nowMs() };
 }
 
@@ -1269,8 +1287,11 @@ function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
 function honourGrowth(el: HTMLElement): void {
   if (_scrollAnimRaf !== null) return;
   if (_pendingLanding) {
+    // Both, for the reason `followSubmit` gives: the status line is the anchor,
+    // so a landing started before it exists asks its own guard the wrong
+    // question.
     const panel = _pendingLanding.resolveTurn(el);
-    if (panel) {
+    if (panel && turnStatusLine(panel)) {
       _pendingLanding = null;
       landOnOwnTurn(el, panel);
       return;
@@ -1279,7 +1300,7 @@ function honourGrowth(el: HTMLElement): void {
     // land on, and nowhere to jump meanwhile. Past the deadline it is not late,
     // it is unaddressable, so the landing LAPSES and moves nobody (see
     // `LANDING_DEADLINE_MS`).
-    if (nowMs() - _pendingLanding.at >= LANDING_DEADLINE_MS) _pendingLanding = null;
+    dropLapsedLanding();
     return;
   }
   if (_followingBottom.value) markHeldScroll(el, liveEdgeTop(el));

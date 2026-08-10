@@ -16,6 +16,8 @@
         "title": "Lucidos",
         "width": 1024,
         "height": 768,
+        "minWidth": 480,
+        "minHeight": 400,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "visible": false,

@@ -2,7 +2,7 @@ import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../..
 import type { Change } from '../../api/client';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
-import { showEventWhereItLives } from '../../store/actions/event-navigation';
+import { ensureEventTargetResolved, eventHasTarget, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
 import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
@@ -15,7 +15,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { eventRowBody } from './EventRow';
+import { eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowFact, EventRowMark, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
@@ -205,6 +205,11 @@ export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
  *  UP and had no business linking to something that happened hours later). This
  *  card IS the arrival, so a link out of it goes to the thing that arrived.
  *
+ *  **The event's NAME is that jump**, as of 2026-08-10. It used to be a separate
+ *  "Go to event" link on the facts line, which put two things to read on the
+ *  card for one destination while the chip right above it already named the
+ *  destination.
+ *
  *  The thin hook-holding wrapper; the markup is `eventDeliveryBody`. */
 export function EventDeliveryBody({
   eventType,
@@ -216,67 +221,87 @@ export function EventDeliveryBody({
   payloadJson?: string;
 }) {
   // Resolving the matched event's thread is a round-trip in every case except a
-  // match in this same thread, so the jump says it is working and refuses to
-  // fire twice. See `showEventWhereItLives`.
+  // match in this same thread, so the chip dims and goes inert while the jump
+  // is in flight rather than accepting a second tap. See `showEventWhereItLives`.
   const opening = useSignal(false);
+  const linkable = useEventTarget(eventId);
   return eventDeliveryBody({
     eventType,
-    eventId,
     payloadJson,
     opening: opening.value,
-    onOpenMatched: async () => {
-      if (!eventId || opening.value) return;
-      opening.value = true;
-      try {
-        await showEventWhereItLives(eventId);
-      } finally {
-        opening.value = false;
-      }
-    },
+    onOpenMatched: linkable && eventId
+      ? async () => {
+          if (opening.value) return;
+          opening.value = true;
+          try {
+            await showEventWhereItLives(eventId);
+          } finally {
+            opening.value = false;
+          }
+        }
+      : undefined,
   });
+}
+
+/** Settle whether a jump to `eventId` has anywhere to go, and report it.
+ *
+ *  False until the answer is known, so a row starts plain and GAINS its link.
+ *  The other direction, a link that appears and then disappears, reads as a bug
+ *  and can be tapped in the window before it goes.
+ *
+ *  Shared by the two rows that offer a jump. Resolution happens in the effect
+ *  rather than the render body precisely so the row subscribes to the one small
+ *  verdict signal and not to `threadMap`. */
+function useEventTarget(eventId: string | undefined): boolean {
+  useEffect(() => { ensureEventTargetResolved(eventId); }, [eventId]);
+  return eventHasTarget(eventId);
 }
 
 /** The row's markup, hookless for the same reason `eventWaitRowBody` is: there
  *  is no jsdom in the test infra, so a component carrying a hook cannot be
- *  invoked as a plain function and the tests drive this instead. */
+ *  invoked as a plain function and the tests drive this instead.
+ *
+ *  `onOpenMatched` absent means there is nowhere to go, and then the event name
+ *  is inert text: no link, no affordance, no dead tap. Both of the ways that
+ *  happens are ordinary rather than exceptional, which is why the plain form is
+ *  the default and not a fallback. The engine may have recorded no `event_id`
+ *  for the delivery at all, and a recorded one may point at an event that no
+ *  transcript draws (a workspace domain event belongs to no conversation; a
+ *  `BackgroundBashCompleted` merely landed inside whichever turn was open). */
 export function eventDeliveryBody({
   eventType,
-  eventId,
   payloadJson,
   opening,
   onOpenMatched,
 }: {
   eventType: string;
-  eventId?: string;
   payloadJson?: string;
   opening: boolean;
-  onOpenMatched: () => void;
+  onOpenMatched?: () => void;
 }) {
   return eventRowBody({
     kind: 'wake',
     mark: 'arrived',
     role: 'event-delivery',
-    subject: <>{'Woke on '}<code class="event-name">{eventType}</code></>,
+    // The matched event usually lives somewhere ELSE: the headline cases are a
+    // `CodingAgentIdled` or a `ChangeProposed` from the coding-agent thread this
+    // one was watching. So the jump resolves the owning thread first and
+    // navigates there, rather than searching the open thread's DOM for an event
+    // that is by construction not in it.
+    subject: (
+      <>
+        {'Woke on '}
+        {eventNameChip({
+          kind: 'chip',
+          name: eventType,
+          onClick: onOpenMatched,
+          pending: opening,
+          role: 'event-delivery-jump',
+        })}
+      </>
+    ),
     stateLabel: 'delivered',
     tone: 'arrived',
-    facts: [
-      // The matched event usually lives somewhere ELSE: the headline cases are a
-      // `CodingAgentIdled` or a `ChangeProposed` from the coding-agent thread
-      // this one was watching. So the jump resolves the owning thread first and
-      // navigates there, rather than searching the open thread's DOM for an
-      // event that is by construction not in it. Absent on a delivery whose
-      // `event_id` the engine did not record.
-      eventId
-        ? {
-            kind: 'link' as const,
-            label: 'Go to event',
-            pendingLabel: 'Opening…',
-            pending: opening,
-            onClick: onOpenMatched,
-            role: 'event-delivery-jump',
-          }
-        : null,
-    ],
     fold: payloadJson ? { label: 'Payload', pre: true, body: payloadJson } : undefined,
   });
 }
@@ -294,31 +319,46 @@ type TriggerStartedEvent = Extract<Exchange['userEvent'], { type: 'TriggerStarte
  *  **It names no schedule.** `TriggerStarted` carries `invocation: { kind:
  *  'Schedule' }` and no cron expression, so a scheduled run says `scheduled` and
  *  stops rather than inventing one. An event-driven run does carry its
- *  `event_type`, and gets the chip; it gets the jump only when the engine also
- *  recorded which event matched.
+ *  `event_type`, and gets the chip.
+ *
+ *  **That chip is the jump, when there is one.** It was a separate "Go to event"
+ *  link beside the chip, and on this row it was usually a guaranteed toast: a
+ *  trigger fires on a workspace domain event, which belongs to no conversation
+ *  and therefore has no transcript to open. The engine does also fire triggers
+ *  on thread-scoped events (`TriggerInvocation::Event` carries an
+ *  `origin_thread_id`), and those genuinely do open, so the rule is the same one
+ *  the wake card uses rather than a blanket "never link here": the chip links
+ *  only when the event turns out to live somewhere.
  *
  *  The thin hook-holding wrapper; the markup is `triggerFiredBody`. */
 export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
   const matched = event.invocation?.kind === 'Event' ? event.invocation.event_id : undefined;
   const opening = useSignal(false);
+  const linkable = useEventTarget(matched);
   return triggerFiredBody({
     event,
     opening: opening.value,
-    onOpenMatched: async () => {
-      if (!matched || opening.value) return;
-      opening.value = true;
-      try {
-        await showEventWhereItLives(matched);
-      } finally {
-        opening.value = false;
-      }
-    },
+    onOpenMatched: linkable && matched
+      ? async () => {
+          if (opening.value) return;
+          opening.value = true;
+          try {
+            await showEventWhereItLives(matched);
+          } finally {
+            opening.value = false;
+          }
+        }
+      : undefined,
   });
 }
 
 /** The row's markup, hookless for the same reason `eventWaitRowBody` is: there
  *  is no jsdom in the test infra, so a component carrying a hook cannot be
- *  invoked as a plain function and the tests drive this instead. */
+ *  invoked as a plain function and the tests drive this instead.
+ *
+ *  `onOpenMatched` absent means the matched event has nowhere to open, and the
+ *  chip is then inert text. See the wrapper above for why that is the common
+ *  case on this row rather than the exceptional one. */
 export function triggerFiredBody({
   event,
   opening,
@@ -326,7 +366,7 @@ export function triggerFiredBody({
 }: {
   event: TriggerStartedEvent;
   opening: boolean;
-  onOpenMatched: () => void;
+  onOpenMatched?: () => void;
 }) {
   const invocation = event.invocation;
   const name = event.trigger_name?.trim();
@@ -342,15 +382,13 @@ export function triggerFiredBody({
     tone: 'arrived',
     facts: [
       invocation?.kind === 'Schedule' ? { kind: 'text' as const, text: 'scheduled' } : null,
-      invocation?.kind === 'Event' ? { kind: 'chip' as const, name: invocation.event_type } : null,
-      invocation?.kind === 'Event' && invocation.event_id
+      invocation?.kind === 'Event'
         ? {
-            kind: 'link' as const,
-            label: 'Go to event',
-            pendingLabel: 'Opening…',
+            kind: 'chip' as const,
+            name: invocation.event_type,
+            onClick: onOpenMatched,
             pending: opening,
             role: 'trigger-event-jump',
-            onClick: onOpenMatched,
           }
         : null,
     ],

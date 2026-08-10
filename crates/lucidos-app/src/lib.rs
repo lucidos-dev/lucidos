@@ -20,6 +20,7 @@ mod notifications;
 mod shell_env;
 mod traffic_lights;
 mod updater;
+mod window_restore;
 
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
 /// Boots the bundled Postgres + engine and supervises them with no window. The
@@ -1974,6 +1975,15 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // The window-state plugin has already written the saved rect onto
+            // `main` (its `on_window_ready` runs when the config window is
+            // built, which is before this callback), and nothing has shown the
+            // window yet: it is declared `visible: false` and waits for
+            // `show_startup_window`. This is therefore the one moment a
+            // corrupt or now-impossible rect can be corrected off screen. A
+            // healthy rect makes it a no-op. See `window_restore`.
+            window_restore::clamp_restored_geometry(app.handle(), MAIN_WINDOW_LABEL);
+
             // Install the app menu. The standard edit/window items keep the
             // usual shortcuts; Cmd+Q maps to "Close to Menu Bar" (closes all client
             // windows to the menu-bar tray) and the explicit "Quit and Stop

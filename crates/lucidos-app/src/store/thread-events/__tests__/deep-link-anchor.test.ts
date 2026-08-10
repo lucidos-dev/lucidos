@@ -64,6 +64,37 @@ describe('deepLinkAnchorForEvent', () => {
     expect(deepLinkAnchorForEvent([exchange('start-1')], 'elsewhere')).toBeNull();
   });
 
+  /** **The bug this predicate exists for** (reported 2026-08-10). A background
+   *  bash task completed while the turn started by a `UserQuestionAsked` was
+   *  open, so grouping filed the completion under that question and the wake
+   *  card's jump pulsed it. The turn did not cause the event, so the
+   *  containing-turn inference is false and there is no anchor at all. */
+  it('returns null for an event that merely landed in the open turn', () => {
+    const exchanges = [
+      exchange('question-1', [['BackgroundBashCompleted', 'bash-done-1']]),
+    ];
+    expect(deepLinkAnchorForEvent(exchanges, 'bash-done-1')).toBeNull();
+  });
+
+  /** Its own START is a different matter: the turn's `run_bash_background` call
+   *  emitted it, so landing on that turn is honest. The pair is deliberately
+   *  split rather than excluded together. */
+  it('keeps the containing turn for the bash START, which the turn caused', () => {
+    const exchanges = [
+      exchange('start-1', [['BackgroundBashStarted', 'bash-start-1']]),
+    ];
+    expect(deepLinkAnchorForEvent(exchanges, 'bash-start-1')).toBe('start-1');
+  });
+
+  /** The unanchorable rule is about the containing-turn INFERENCE, so it never
+   *  overrides an event that addresses itself. (No such event is in the set
+   *  today; the ordering is pinned so adding one cannot silently break the
+   *  stronger answer.) */
+  it('still prefers a self-stamped element over the unanchorable rule', () => {
+    const exchanges = [exchange('start-1', [['ResponseFailed', 'fail-1']])];
+    expect(deepLinkAnchorForEvent(exchanges, 'fail-1')).toBe('fail-1');
+  });
+
   /** A legacy row whose starter has no event id gives the link nothing to aim
    *  at. Saying null beats handing back an `undefined` that reads as a hit. */
   it('returns null when the containing turn has no stamped starter', () => {
