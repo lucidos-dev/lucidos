@@ -435,6 +435,15 @@ html[data-theme="dark"] .split-button.open::before {
     flex-shrink: 0;
 }
 
+/* A dropdown wrapped in a <LoadingFade> so it can show a skeleton while its value loads.
+   The fade wrapper becomes the flex item in the parent row, so it has to carry
+   the trigger's own refusal to shrink: without it the row compresses the
+   wrapper (and `.loading-fade > * { min-width: 0 }` lets the compression reach
+   the control) instead of wrapping, and the label inside clips. */
+.dropdown-slot {
+    flex-shrink: 0;
+}
+
 /* The selected value reads as the legible anchor of the control in both themes:
    the old dim (secondary) + grey glow made it look disabled/fuzzy on light, and
    washed-out grey on dark. Primary text, no glow — crisp everywhere. Hover keeps
@@ -472,6 +481,15 @@ html[data-theme="dark"] .split-button.open::before {
 .dropdown-trigger:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+/* The loading skeleton (`<DropdownSkeleton>`) borrows the trigger's box so the real
+   control lands in exactly its place. It is a span rather than a button, so all
+   that is left to undo is the pointer affordance: a shimmer that highlights
+   under the cursor reads as something you can press. */
+.dropdown-trigger.dropdown-skeleton {
+    pointer-events: none;
+    cursor: default;
 }
 
 .dropdown-placeholder {
@@ -1001,14 +1019,31 @@ html[data-theme="dark"] .split-button.open::before {
 .explainer-btn {
     /* Rides .icon-btn for colour, hover, focus ring and svg sizing. Overrides
        are only about sitting INSIDE a line of label text: no padding to push
-       the label away, and a small gap before it. `vertical-align: middle`
-       centres the glyph against the cap height of the label it follows.
-       `position: relative` is the anchor for the hit expander below. */
+       the label away, and a small gap before it. `position: relative` is the
+       anchor for the hit expander below, and for the optical nudge. */
     display: inline-flex;
     position: relative;
     padding: 0;
     margin-left: 0.375rem;
     vertical-align: middle;
+    /* `vertical-align: middle` is defined against the X-HEIGHT: it puts the
+       glyph's centre at the baseline plus half an x, which sits visibly below
+       the middle of a label that starts with a capital. The gap shows because
+       the glyph is TALLER than the text it sits in (--icon-size-sm 0.875rem
+       against --font-size-md 0.8125rem), so the circle hangs into the descender
+       space while its top only just reaches the cap. Raise it by
+       (cap height - x height) / 2 to centre it on the cap instead: for the
+       monospace UI faces that is about (0.70em - 0.53em) / 2.
+
+       In `em`, not `rem`, because the correction is proportional to the text it
+       aligns to and the explainer rides labels at several sizes (a settings
+       row, an uppercase section title, a drawer filter row). Applied
+       unconditionally rather than scoped to the inline case: the flex rows that
+       hold an explainer (.form-label-row, .form-checkbox-row,
+       .thread-filter-option) already centre it on the label's line box, which
+       is a fraction of a pixel below the cap centre, so the same nudge lands
+       them within a pixel too. */
+    top: -0.085em;
     color: var(--text-muted);
 }
 

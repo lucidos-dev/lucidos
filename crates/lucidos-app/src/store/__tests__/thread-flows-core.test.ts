@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeError, exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, exchangeUserSource, groupIntoExchanges, handleEvent, type ThreadEvent } from '../thread-events';
-import { getCollapsedVisibleEvents, getEventToggleState } from '../event-rendering';
+import { getCollapsedVisibleEvents, hidesEarlierProse } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
 
@@ -667,10 +667,10 @@ describe('Flow: Event ordering', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Flow 10: More/Less and Steps toggles
+// Flow 10: what the default view hides
 // ---------------------------------------------------------------------------
-describe('Flow: Toggle visibility', () => {
-  it('no steps → no toggles', () => {
+describe('Flow: what the default view hides', () => {
+  it('no steps → nothing hidden, however much prose', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -680,28 +680,10 @@ describe('Flow: Toggle visibility', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    const { showMoreToggle, showStepsToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(false);
-    expect(showMoreToggle).toBe(false);
+    expect(hidesEarlierProse(exchangeResponseEvents(exchanges[0]))).toBe(false);
   });
 
-  it('steps present → showStepsToggle true', () => {
-    const { map, id } = makeThread();
-
-    insertEvents(map, id, [
-      { type: 'MessageReceived', text: 'Search for cats' },
-      { type: 'ToolCalled', name: 'web_search', args: {} },
-      { type: 'ToolResult', name: 'web_search', result: 'found cats' },
-      { type: 'TextStreamed', text: 'Here are cats.' },
-      { type: 'ResponseGenerated' },
-    ]);
-
-    const exchanges = getExchanges(map, id);
-    const { showStepsToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(true);
-  });
-
-  it('steps + 2 text blocks → showMoreToggle true', () => {
+  it('steps + 2 text blocks → the earlier chunk is hidden by default', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -714,12 +696,10 @@ describe('Flow: Toggle visibility', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    const { showMoreToggle, showStepsToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(true);
-    expect(showMoreToggle).toBe(true);
+    expect(hidesEarlierProse(exchangeResponseEvents(exchanges[0]))).toBe(true);
   });
 
-  it('steps + only 1 text block → showMoreToggle false', () => {
+  it('steps + only 1 text block → nothing hidden', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -731,9 +711,7 @@ describe('Flow: Toggle visibility', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    const { showMoreToggle, showStepsToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(true);
-    expect(showMoreToggle).toBe(false);
+    expect(hidesEarlierProse(exchangeResponseEvents(exchanges[0]))).toBe(false);
   });
 
   it('collapsed view shows last text block', () => {
@@ -775,8 +753,6 @@ describe('Flow: Toggle visibility', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    const { showStepsToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(true);
 
     // Should have CC step events
     const events = exchangeResponseEvents(exchanges[0]);

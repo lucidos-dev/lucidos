@@ -5,6 +5,12 @@ declare global {
     __TAURI_INTERNALS__?: {
       invoke: <T>(cmd: string, args?: Record<string, unknown>, options?: unknown) => Promise<T>;
       transformCallback: (callback: (response: unknown) => void, once?: boolean) => number;
+      /** Injected per main frame by the Tauri runtime: which window / webview
+       *  this page is. `listen` needs the window label to scope itself. */
+      metadata?: {
+        currentWindow?: { label?: string };
+        currentWebview?: { label?: string };
+      };
     };
     /** Injected by the Tauri app on page load — CalVer version at build time. */
     __LUCIDOS_APP_VERSION__?: string;
@@ -84,6 +90,41 @@ export function setTitlebarColor(color: string): Promise<void> {
 }
 
 /**
+ * Centre the macOS traffic lights on a header bar `barHeightPx` tall (lib.rs
+ * `set_traffic_light_offset`). The bar height can only come from here: it is
+ * `--titlebar-inset` plus `--app-header-height`, and the second is rem-authored,
+ * so it is the user's UI scale that decides it. The shell remembers the last
+ * value for the next cold launch. Only call when isTauri() is true, and only on
+ * a build that stamps `data-titlebar-overlay` (see store/actions/trafficLights).
+ */
+export function setTrafficLightOffset(barHeightPx: number): Promise<void> {
+  return invoke('set_traffic_light_offset', { barHeightPx });
+}
+
+/** Tell the shell this document is about to paint, so it can show the window it
+ *  deliberately kept hidden at launch (lib.rs `window_ready_to_show`). Shown in
+ *  `setup()` as it used to be, the window is on screen for as long as the webview
+ *  takes to load, which the user sees as a frame of bare window tint before the
+ *  app appears.
+ *
+ *  ONE-SHOT per document, which is the load-bearing part. Both callers repeat:
+ *  `applyTheme` runs again on every theme toggle and system-appearance change,
+ *  and re-showing a window the user has since dismissed to the menu bar would be
+ *  a bug. The flag lives here rather than at either call site because the two
+ *  cover different boot paths and must share one shot (see the callers).
+ *
+ *  Best-effort telemetry carve-out (.claude/rules/frontend.md): a toast would be
+ *  wrong because nothing here is user-initiated, and the failure self-heals
+ *  without the user doing anything, since `setup()`'s fallback timer shows the
+ *  window a few seconds in regardless. Only call when isTauri() is true. */
+let readyToShowSignalled = false;
+export function windowReadyToShow(): void {
+  if (readyToShowSignalled) return;
+  readyToShowSignalled = true;
+  invoke('window_ready_to_show').catch((e) => console.warn('[window] ready-to-show failed', e));
+}
+
+/**
  * Start a native drag of the calling window. Used by `useWindowDragRegion` once
  * the pointer crosses the drag threshold over a non-interactive area of the
  * title-bar band. App command (always allowed) — replaces the ACL-blocked
@@ -117,7 +158,9 @@ export async function showNativeNotification(opts: {
   body: string;
   deepLink: Record<string, unknown>;
 }): Promise<void> {
-  // `link` (single word) matches the Rust command param name verbatim.
+  // `link` (single word) matches the Rust command param name verbatim. The
+  // caller stamps `workspace` into `deepLink`, which is what composes the UN
+  // request identifier and lets the tap route back to the right workspace.
   await invoke('show_native_notification', {
     title: opts.title,
     body: opts.body,
@@ -128,19 +171,29 @@ export async function showNativeNotification(opts: {
 /**
  * Remove an already-delivered native macOS banner via the app's
  * `dismiss_native_notification` command (notifications.rs →
- * `UNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers:)` /
- * `removeAllDeliveredNotifications`). The cross-device dismiss counterpart of
+ * `UNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers:)`,
+ * for one identifier or for the set this workspace owns, which
+ * `getDeliveredNotifications` enumerates). The cross-device dismiss counterpart of
  * `showNativeNotification`: when a notification is read elsewhere, the engine
  * broadcasts `NativePushDismissRequested` and the connected desktop app removes
- * its banner. `notificationId === null` removes ALL delivered banners (the
- * mark-all-read path). No-op in dev / off macOS (Rust side). Only call when
- * isTauri() is true.
+ * its banner. `notificationId === null` removes every delivered banner THIS
+ * workspace raised (the mark-all-read path), leaving other workspaces' banners
+ * on screen. `workspace` is the caller's gateway slug, the same one
+ * `showNativeNotification` stamped into the link: both arms of the Rust side
+ * rebuild the composite request identifier from it, so a bare id would match
+ * nothing. No-op in dev / off macOS (Rust side). Only call when isTauri() is
+ * true.
  */
 export async function dismissNativeNotification(opts: {
+  workspace: string | null;
   notificationId: string | null;
 }): Promise<void> {
-  // `id` matches the Rust command param name (`Option<String>`); null → dismiss all.
-  await invoke('dismiss_native_notification', { id: opts.notificationId });
+  // `workspace` / `id` match the Rust command params (`Option<String>`); a null
+  // id → dismiss all of this workspace's.
+  await invoke('dismiss_native_notification', {
+    workspace: opts.workspace,
+    id: opts.notificationId,
+  });
 }
 
 /**
@@ -197,10 +250,17 @@ export function getNativeWindowActive(): Promise<boolean> {
  * trayed / client relaunched). Returned in SW-message shape so each routes
  * through the same dispatchDeepLink as a live tap / web-push tap. The drain is
  * atomic in Rust, so calling it from both the startup cold path and the
- * `native-notification-tapped` warm signal routes each tap exactly once. Only
- * call when isTauri() is true. */
-export function takePendingNativeTaps(): Promise<Record<string, unknown>[]> {
-  return invoke<Record<string, unknown>[]>('take_pending_native_taps');
+ * `native-notification-tapped` warm signal routes each tap exactly once.
+ *
+ * `workspace` is this page's gateway slug (null on a legacy engine with no
+ * gateway). The stash is process-global while every window can sit on its own
+ * workspace, so the Rust side hands back only the taps THIS workspace raised
+ * (plus unattributable ones) and leaves the rest for the window their own
+ * router is bringing up. Only call when isTauri() is true. */
+export function takePendingNativeTaps(
+  workspace: string | null,
+): Promise<Record<string, unknown>[]> {
+  return invoke<Record<string, unknown>[]>('take_pending_native_taps', { workspace });
 }
 
 /**
@@ -401,15 +461,44 @@ export type TailscaleServeProgress =
   | { phase: 'failed'; message: string }
   | { phase: 'cancelled' };
 
-/** Listen for a Tauri event. Returns an unlisten function. Only call when isTauri() is true. */
+/** This window's Tauri label (`main`, `window-<n>`), read from the metadata the
+ *  runtime injects into every main frame. `null` off Tauri, and defensively when
+ *  the shape is missing. Exported for {@link listen}'s target and for tests. */
+export function currentWindowLabel(): string | null {
+  const label = window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label;
+  return typeof label === 'string' && label.length > 0 ? label : null;
+}
+
+/**
+ * Listen for a Tauri event **addressed to this window**. Returns an unlisten
+ * function. Only call when isTauri() is true.
+ *
+ * **The registered target is load-bearing, and `Any` is a trap.** Tauri's
+ * dispatch does `*listener_target == EventTarget::Any || filter(target)`
+ * (`match_any_or_filter` in tauri's `event/listener.rs`), so a listener
+ * registered as `Any` matches **unconditionally** and receives every
+ * `emit_to(other_label, ...)` in the process. Every listener here used to
+ * register that way, which silently defeated all three of the app's targeted
+ * emits: `native-window-active` (each window's focus state overwrote every other
+ * window's cache, so a backgrounded window reported itself ACTIVE and the engine
+ * suppressed its workspace's push into an invisible in-app toast),
+ * `native-notification-tapped`, and the `panel-*` panel-preview events.
+ *
+ * Registering as `AnyLabel` instead costs nothing on the broadcast path: a
+ * plain `app.emit(...)` dispatches with no filter, which that same expression
+ * passes, so the app-update and tailscale-serve progress streams still arrive.
+ * Falls back to `Any` when the label can't be read, i.e. the previous behaviour
+ * rather than a listener that hears nothing.
+ */
 export function listen<T>(event: string, handler: (e: { payload: T }) => void): Promise<() => void> {
   const internals = window.__TAURI_INTERNALS__!;
+  const label = currentWindowLabel();
   const callbackId = internals.transformCallback((raw: unknown) => {
     handler(raw as { payload: T });
   });
   return internals.invoke<number>('plugin:event|listen', {
     event,
-    target: { kind: 'Any' },
+    target: label === null ? { kind: 'Any' } : { kind: 'AnyLabel', label },
     handler: callbackId,
   }).then((id) => {
     return () => {

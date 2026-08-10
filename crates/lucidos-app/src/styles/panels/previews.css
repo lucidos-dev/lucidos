@@ -697,28 +697,47 @@
     font-weight: 600;
 }
 
-.message-route-panel .route-row {
-    display: flex;
+/* All of a section's rows share ONE two-column grid, so every value starts at
+   the same x whatever its label's width. Each row used to be its own flex box,
+   which let "Model", "Effort" and "Repository" each set a different value
+   offset and left the value column visibly ragged.
+
+   `display: contents` on a row lets its label + value join the section's grid
+   (same idiom as `.thread-info-rows` in host-components.css). A row therefore
+   contributes EXACTLY two grid items: a third would push every row below it one
+   cell along, so a multi-part value brings its own `.route-value-group` box
+   rather than adding a sibling. Pinned by MessageRoutePanel.test.ts. Anything
+   that is NOT a row (the heading, an audit line, an explainer) spans both
+   columns. */
+.message-route-panel .route-section {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
     align-items: baseline;
-    gap: 0.5rem;
-    margin: 0.125rem 0;
+    column-gap: 0.5rem;
+    row-gap: 0.125rem;
 }
 
-.message-route-panel .route-row strong {
-    flex: 0 0 auto;
+.message-route-panel .route-section > *:not(.route-row) {
+    grid-column: 1 / -1;
+}
+
+.message-route-panel .route-row {
+    display: contents;
+}
+
+.message-route-panel .route-row > strong {
     font-weight: 600;
 }
 
-/* Direct-child value elements only — a descendant `span` selector would leak
-   flex:1 1 auto onto nested spans (e.g. .route-app-icon / .route-app-name),
-   overriding their `flex: 0 0 auto` and spreading the app icon and name apart. */
 .message-route-panel .route-row > span,
 .message-route-panel .route-row > .accent-link {
-    flex: 1 1 auto;
     min-width: 0;
     word-break: break-word;
 }
 
+/* Direct children only: relaxed to a descendant selector this scores (0,2,1)
+   against `.route-app-name`'s (0,2,0) and wins, so the app name in a
+   `.route-value-group` would silently lose its `--text-primary`. */
 .message-route-panel .route-row > span {
     color: var(--text-secondary);
 }
@@ -728,11 +747,18 @@
     font-size: var(--font-size-xs);
 }
 
-.message-route-panel .route-app {
-    display: inline-flex;
+/* A value made of more than one element (app icon + name, user-agent + thread
+   link) keeps them on one baseline inside the row's single value cell. */
+.message-route-panel .route-value-group {
+    display: flex;
     align-items: baseline;
     gap: 0.5rem;
     flex-wrap: wrap;
+}
+
+.message-route-panel .route-value-group > * {
+    min-width: 0;
+    word-break: break-word;
 }
 
 .message-route-panel .route-app-icon {
@@ -740,7 +766,6 @@
 }
 
 .message-route-panel .route-app-name {
-    flex: 0 0 auto;
     color: var(--text-primary);
     font-weight: 500;
 }

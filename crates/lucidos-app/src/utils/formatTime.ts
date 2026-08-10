@@ -85,18 +85,28 @@ export function formatShortDateWithYear(date: Date): string {
   });
 }
 
+/** Do two instants fall on the same calendar day in the user's configured
+ *  timezone?
+ *
+ *  In THAT timezone, never the browser's: the two differ for a travelling user
+ *  or anyone who set the preference, and a `toDateString()` comparison then
+ *  makes "Today" flicker across the boundary. Every caller below needs the same
+ *  answer, and so does the deadline on an *event row*, so the comparison lives
+ *  here once instead of being inlined at each site. */
+export function isSameDayInUserTz(a: Date, b: Date): boolean {
+  const tz = getUserTimezone();
+  const opts = tz ? { timeZone: tz } : {};
+  return a.toLocaleDateString([], opts) === b.toLocaleDateString([], opts);
+}
+
 /** "Today 14:30", "Yesterday 14:30", or "Feb 28 14:30" */
 export function formatNotificationDate(date: Date): string {
   const now = new Date();
-  const tz = getUserTimezone();
   const time = formatShortTime(date);
-  // Compare dates in the user's configured timezone, not the browser's local tz.
-  const dateOpts = tz ? { timeZone: tz } : {};
-  const dateStr = date.toLocaleDateString([], dateOpts);
-  const isToday = dateStr === now.toLocaleDateString([], dateOpts);
+  const isToday = isSameDayInUserTz(date, now);
   const yesterday = new Date(now);
   yesterday.setDate(yesterday.getDate() - 1);
-  const isYesterday = dateStr === yesterday.toLocaleDateString([], dateOpts);
+  const isYesterday = isSameDayInUserTz(date, yesterday);
 
   if (isToday) {
     return `Today ${time}`;
@@ -110,17 +120,13 @@ export function formatNotificationDate(date: Date): string {
 /** "Today 14:30:05" or "Feb 28 14:30:05" — includes seconds */
 export function formatMessageTimestamp(isoTimestamp: string): string {
   const date = new Date(isoTimestamp);
-  const now = new Date();
   const tz = getUserTimezone();
   const time = date.toLocaleTimeString([], {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false,
     ...(tz ? { timeZone: tz } : {}),
   });
-  // Compare dates in the user's configured timezone, not the browser's local tz.
-  // toDateString() uses browser tz which causes "Today" to flicker when they differ.
-  const dateOpts = tz ? { timeZone: tz } : {};
-  const isToday = date.toLocaleDateString([], dateOpts) === now.toLocaleDateString([], dateOpts);
+  const isToday = isSameDayInUserTz(date, new Date());
 
   if (isToday) {
     return `Today ${time}`;

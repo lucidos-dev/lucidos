@@ -27,7 +27,15 @@
 # raced for this lock and both losers hand-rolled a sleep loop, one of them a
 # 40 minute foreground tool call re-executing the entry script every 20 seconds.
 # The refusal below teaches the subscribe path, and .claude/skills/e2e-lock-wait/
-# carries the full rules. Both announcements of one hold are addressed as of the
+# carries the full rules.
+#
+# AND IT CLOSES THAT LOOP AT THE OTHER END. Taking the lock stands the acquiring
+# thread's own watch for E2ELockReleased down (`_e2e_stand_down_lock_waits`),
+# because you cannot hold the lock and still need to be told it is free. Without
+# that, a thread that lost the race, subscribed, and later won the lock anyway
+# left a watch armed on work it had already finished; one woke two hours after
+# its change was applied. Only that watch is ended, never `--all`. Both
+# announcements of one hold are addressed as of the
 # moment it was TAKEN (`_e2e_capture_emit_env`), because the entry scripts
 # repoint $LUCIDOS_WORKSPACE at the e2e workspace in between; that is a fixed
 # bug rather than a gap, and the section header on announcing says what it cost.
@@ -561,31 +569,39 @@ _e2e_lock_held_secs() {
     printf '%s' "$(( now - started ))"
 }
 
-# Emit one lock event, bounded and best effort. Always returns 0.
+# Run one `lucidos` subcommand, bounded and best effort. Always returns 0, and
+# never lets the caller see the CLI's own exit status: every call site here is
+# an aside to an e2e run, and none of them is a reason for one to go red.
+#
+# `$1` names the call for the abandoned-after-timeout line; the rest is the
+# CLI's argv.
 #
 # The guard is $E2E_LOCK_DIR_OVERRIDE. This library's own suite exports it for
 # the whole file to sandbox the lock path (scripts/lib/e2e_lock_test.sh), and
 # nothing else sets it, so keying on it is what stops a unit-test run from
-# writing E2ELock* events into the developer's live workspace. The suite's emit
-# cases drop it inside a subshell and stay sandboxed through $E2E_WORKSPACE,
-# which it pins for the same reason.
+# reaching the developer's live workspace, whether by writing an E2ELock* event
+# or by standing a real subscription down. The suite's emit cases drop it inside
+# a subshell and stay sandboxed through $E2E_WORKSPACE, which it pins for the
+# same reason.
 #
 # Bounded in the shell rather than left to the CLI's own 30s reqwest default
-# (crates/lucidos-cli/src/http.rs): this runs inside an EXIT trap, where half a
-# minute of teardown stall is not acceptable, and that default does not cover a
-# `lucidos` wedged before its HTTP client exists. macOS ships no `timeout`
-# binary, hence the tick loop.
+# (crates/lucidos-cli/src/http.rs): one caller runs inside an EXIT trap, where
+# half a minute of teardown stall is not acceptable, and that default does not
+# cover a `lucidos` wedged before its HTTP client exists. macOS ships no
+# `timeout` binary, hence the tick loop.
 #
 # The call runs under the environment `_e2e_capture_emit_env` recorded when the
-# lock was taken, so this hold's release lands in the same event store as its
-# acquire. See that function and the section header for what repoints
+# lock was taken, so a hold's release lands in the same event store as its
+# acquire, and a stand-down reaches the thread's own workspace rather than the
+# e2e one. See that function and the section header for what repoints
 # $LUCIDOS_WORKSPACE in between. `exec` is the subshell's last act on purpose:
 # it replaces the subshell rather than forking under it, so `$!` still names the
 # CLI itself and the deadline below still bounds the thing that can hang. With
 # no capture (a caller that set E2E_LOCK_OWNED by hand, which only the suite
-# does) it emits under the live environment exactly as it always did.
-_e2e_emit_lock_event() {
-    local event="$1" summary="$2" payload="$3"
+# does) it runs under the live environment exactly as it always did.
+_e2e_run_lucidos_bounded() {
+    local label="$1"
+    shift
     [ -z "${E2E_LOCK_DIR_OVERRIDE:-}" ] || return 0
     command -v lucidos >/dev/null 2>&1 || return 0
 
@@ -596,18 +612,17 @@ _e2e_emit_lock_event() {
     # function modifies no variable anybody else reads. The three states are the
     # ones `_e2e_capture_emit_env` documents; `env` with no argument of its own
     # is the no-capture case and changes nothing.
-    local -a emit_env=(env)
+    local -a call_env=(env)
     if [ -n "$_E2E_LOCK_EMIT_CAPTURED" ]; then
         if [ -n "$_E2E_LOCK_EMIT_WS" ]; then
-            emit_env+=("LUCIDOS_WORKSPACE=$_E2E_LOCK_EMIT_WS")
+            call_env+=("LUCIDOS_WORKSPACE=$_E2E_LOCK_EMIT_WS")
         else
-            emit_env+=(-u LUCIDOS_WORKSPACE)
+            call_env+=(-u LUCIDOS_WORKSPACE)
         fi
     fi
     (
         [ -z "$_E2E_LOCK_EMIT_CWD" ] || cd "$_E2E_LOCK_EMIT_CWD" 2>/dev/null || :
-        exec "${emit_env[@]}" lucidos events emit \
-            "$event" --summary "$summary" --payload "$payload"
+        exec "${call_env[@]}" lucidos "$@"
     ) >/dev/null 2>&1 &
     local pid=$!
     # A WALL-CLOCK deadline, not a tick count. Counting `sleep 0.1` iterations
@@ -617,7 +632,7 @@ _e2e_emit_lock_event() {
     # happens. `SECONDS` is a bash builtin, so reading it costs no fork of its
     # own (unlike the `date` in the orphan reap loop above). Its 1s granularity
     # makes the true ceiling `timeout_s` plus one poll, and the floor
-    # `timeout_s - 1`, which at the 5s default is nowhere near a healthy emit
+    # `timeout_s - 1`, which at the 5s default is nowhere near a healthy call
     # against a local engine (~0.2s).
     local deadline=$(( SECONDS + timeout_s ))
     while [ "$SECONDS" -lt "$deadline" ] && kill -0 "$pid" 2>/dev/null; do
@@ -627,10 +642,54 @@ _e2e_emit_lock_event() {
         # Only ever the child backgrounded just above, so the
         # never-signal-an-ancestor rule (ADR 0025) cannot be reached from here.
         kill -KILL "$pid" 2>/dev/null || :
-        echo "[e2e-lock] $event emit exceeded ${timeout_s}s and was abandoned" >&2
+        echo "[e2e-lock] $label exceeded ${timeout_s}s and was abandoned" >&2
     fi
     wait "$pid" 2>/dev/null || :
     return 0
+}
+
+# Emit one lock event, bounded and best effort. Always returns 0.
+_e2e_emit_lock_event() {
+    local event="$1" summary="$2" payload="$3"
+    _e2e_run_lucidos_bounded "$event emit" \
+        events emit "$event" --summary "$summary" --payload "$payload"
+}
+
+# ── standing down the watch this hold just answered ─────────────────────
+# The other half of the loop the announcements open, and the half that was
+# missing until 2026-08-10.
+#
+# A run that LOST the lock subscribes to E2ELockReleased and ends its turn. When
+# that same thread later WINS the lock, its watch has been answered: you cannot
+# hold the lock and still need to be told it is free. Nothing said so, so the
+# subscription stayed armed and eventually fired on an unrelated release.
+#
+# That is not hypothetical and it is what this exists for. On 2026-08-09 a
+# thread subscribed at 18:31, took the lock itself seven minutes later and took
+# it eight more times over the next half hour, had its change applied at 19:14,
+# and was woken at 21:21 by the stale subscription: a seven-minute turn that
+# re-ran a spec and re-hardened a branch whose diff with main was empty. In
+# between, the thread read "Waiting" in the UI for two hours after its work was
+# done. `.claude/skills/e2e-lock-wait/` already told the model to stand a spent
+# watch down by hand; this is the same instruction as a mechanism, at the one
+# moment the answer is a fact rather than a judgment.
+#
+# ONLY E2ELockReleased, which is why `--on` exists rather than `--all`. A thread
+# may legitimately be waiting on something else while it runs e2e (a release
+# build, a sibling thread), and ending a watch nobody asked about is precisely
+# the harm ADR 0052 names. Every other way the answer can arrive is still the
+# model's to notice.
+#
+# Refused when nothing was subscribed, which is the ordinary case: most runs
+# never lost the lock. The output and the status are both discarded, so that
+# refusal costs nothing and says nothing.
+_e2e_stand_down_lock_waits() {
+    # No thread, no subscription. A human running e2e from a terminal has no
+    # $LUCIDOS_THREAD_ID, and the CLI would refuse for exactly that reason; not
+    # spawning the process at all is the same answer without the fork.
+    [ -n "${LUCIDOS_THREAD_ID:-}" ] || return 0
+    _e2e_run_lucidos_bounded "E2ELockReleased stand-down" \
+        event-waits cancel --on E2ELockReleased
 }
 
 # A hold has started. `$2` is true when this run took the lock over from a dead
@@ -679,7 +738,9 @@ _e2e_announce_lock_released() {
 #
 # Blocking HERE is fine and blocking in acquire was not: this runs inside the
 # caller's EXIT trap with the lock already gone. Bounded by that child's own
-# emit timeout, and `wait` names one pid rather than taking every background job
+# per-call deadlines (it runs two or three of them, each capped by
+# $E2E_LOCK_EMIT_TIMEOUT_S, and only a wedged engine gets anywhere near that),
+# and `wait` names one pid rather than taking every background job
 # of the entry script, which would otherwise sit on the webkit reaper and the
 # host-load sampler until the run ended.
 _e2e_await_acquire_announcement() {
@@ -734,7 +795,17 @@ acquire_e2e_lock() {
         # Backgrounded: the lock is now HELD and the caller has not armed its
         # teardown yet. See the section header above. The pid is kept so the
         # release can order itself after this, rather than racing it.
-        _e2e_announce_lock_acquired "$script_name" false &
+        #
+        # One child running both in sequence, so the stand-down cannot outlive
+        # the acquire it belongs to and the release still has one pid to wait
+        # on. The stand-down goes FIRST, on both acquire paths, because the
+        # watch is answered the instant the lock file is written rather than
+        # when anything is announced. It is only on the reclaim path below that
+        # the order can change an outcome, and there it is load-bearing.
+        {
+            _e2e_stand_down_lock_waits
+            _e2e_announce_lock_acquired "$script_name" false
+        } &
         E2E_LOCK_ANNOUNCE_PID=$!
         return 0
     fi
@@ -814,6 +885,14 @@ EOF
             # run's acquire, or the timeline shows the lock taken and then
             # released by someone else.
             {
+                # BEFORE the release, and that ordering is the point on this
+                # path. We hold the lock, so a watch of ours for its release is
+                # already answered; the release this child is about to announce
+                # on the dead owner's behalf is an E2ELockReleased, and a watch
+                # still live when it lands matches it and wakes us onto a lock
+                # we are holding. Standing down first is what makes the reclaim
+                # unable to wake its own reclaimer.
+                _e2e_stand_down_lock_waits
                 _e2e_announce_lock_released "${existing_script:-unknown}" \
                     "${existing_thread:-unknown}" "${existing_wt:-unknown}" \
                     "$existing_started_epoch" reclaimed

@@ -111,6 +111,14 @@ export E2E_LOCK_EMIT_TIMEOUT_S=""
 export STUB_PREDELAY_EVENT=""
 export STUB_PREDELAY_S=""
 
+# PINNED, because the suite is normally run from inside a coding-agent session
+# where the engine has already set this, and `_e2e_stand_down_lock_waits` keys
+# on it: without a pin, the stand-down cases would pass for whoever ran them in
+# a session and silently no-op for anyone running the file by hand. The value
+# reaches the CLI stub only, never an engine, since $E2E_LOCK_DIR_OVERRIDE and
+# the stub each block that independently.
+export LUCIDOS_THREAD_ID="11111111-2222-3333-4444-555555555555"
+
 TAB="$(printf '\t')"
 
 # The first recorded call for an event type, and its three interesting fields.
@@ -121,6 +129,12 @@ emit_payload() { emit_call "$1" | awk -F'\t' '{ print $(NF - 2) }'; }
 emit_workspace() { emit_call "$1" | awk -F'\t' '{ print $(NF - 1) }'; }
 emit_marker() { emit_call "$1" | awk -F'\t' '{ print $NF }'; }
 
+# The stand-down `acquire_e2e_lock` makes once it holds the lock, and the
+# workspace it was addressed to. A different subcommand from the emits, so the
+# two never match each other's greps.
+standdown_call() { grep "^event-waits${TAB}cancel${TAB}" "$CAPTURE" | head -1; }
+standdown_workspace() { standdown_call | awk -F'\t' '{ print $(NF - 1) }'; }
+
 # Wait for an event to be recorded, bounded. Needed only by the cases that
 # deliberately do NOT wait for the announcement acquire_e2e_lock backgrounds:
 # once their subshell exits, that child is re-parented and the test shell can no
@@ -129,6 +143,16 @@ emit_marker() { emit_call "$1" | awk -F'\t' '{ print $NF }'; }
 drain_emit() {
     local event="$1" waited=0
     while [ -z "$(emit_call "$event")" ] && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
+# The same, for the stand-down, which shares that child and is therefore
+# re-parented the same way.
+drain_standdown() {
+    local waited=0
+    while [ -z "$(standdown_call)" ] && [ "$waited" -lt 50 ]; do
         sleep 0.1
         waited=$((waited + 1))
     done
@@ -860,7 +884,10 @@ reset_emit_sandbox
     acquire_e2e_lock e2e-browser >/dev/null 2>&1
     release_e2e_lock          # no `wait`: release itself must do the ordering
 )
-order="$(awk -F'\t' '{ print $3 }' "$CAPTURE" | tr '\n' ' ')"
+# Emit calls only. This asserts the order two EVENTS were persisted in, and the
+# capture also holds the stand-down, whose own third field is a flag rather than
+# an event type.
+order="$(awk -F'\t' '$1 == "events" && $2 == "emit" { print $3 }' "$CAPTURE" | tr '\n' ' ')"
 case "$order" in
     "E2ELockAcquired E2ELockReleased "*)
         pass "acquired then released, in that order ($order)" ;;
@@ -1149,6 +1176,11 @@ assert_eq "WS=$TMPROOT/ws-caller" "$(emit_workspace E2ELockAcquired)" \
     "the acquire is addressed to the caller's workspace"
 assert_eq "WS=$TMPROOT/ws-caller" "$(emit_workspace E2ELockReleased)" \
     "the release is addressed there too, not to the e2e workspace"
+# The stand-down rides the same capture, and needs it for a second reason: the
+# subscription it ends belongs to a thread in the CALLER's workspace, so a call
+# addressed to the e2e one would reach an engine that has never heard of it.
+assert_eq "WS=$TMPROOT/ws-caller" "$(standdown_workspace)" \
+    "and so is the stand-down, which is where the subscription lives"
 rm -f "$EMIT_LOCK"
 
 echo ""
@@ -1174,6 +1206,96 @@ assert_eq "WS_UNSET" "$(emit_workspace E2ELockAcquired)" \
     "the acquire carries no workspace, as the caller had none"
 assert_eq "WS_UNSET" "$(emit_workspace E2ELockReleased)" \
     "and the release carries none either, rather than the e2e workspace"
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 24: taking the lock stands down this thread's watch for its release"
+# The other half of the announce loop. A thread that lost the race subscribed to
+# E2ELockReleased and ended its turn; when it later WINS the lock that watch is
+# answered, because you cannot hold the lock and still need to be told it is
+# free. On 2026-08-09 nothing said so: a thread subscribed at 18:31, took the
+# lock itself at 18:38 and eight more times after that, had its change applied
+# at 19:14, and was woken at 21:21 by the subscription it never stood down.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+)
+call="$(standdown_call)"
+case "$call" in
+    *"--on${TAB}E2ELockReleased"*)
+        pass "the acquire stands down the watch for E2ELockReleased" ;;
+    *)
+        fail "the acquire did not stand its watch down: ${call:-<no call>}" ;;
+esac
+# NEVER `--all`. A thread may legitimately be waiting on something unrelated
+# while it runs e2e (a release build, a sibling thread), and ending a watch
+# nobody asked about is the harm ADR 0052 exists to prevent. The lock may only
+# end the watch it just answered.
+case "$call" in
+    *"--all"*) fail "the stand-down reached for --all: $call" ;;
+    *)         pass "and touches nothing else this thread is waiting on" ;;
+esac
+# Which workspace it is addressed to is Test 22's, where the mid-run repoint
+# that makes the question interesting is already simulated.
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 25: a reclaim stands down BEFORE it announces the dead owner's release"
+# Load-bearing ordering, and the one place it changes an outcome. The reclaim
+# path emits an E2ELockReleased on the dead owner's behalf, which is exactly the
+# event our own watch matches: still live when it lands, it wakes us onto a lock
+# we are holding. Standing down first is what makes a reclaim unable to wake its
+# own reclaimer.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    cat > "$EMIT_LOCK" <<EOF
+PID=999999
+THREAD_ID=ghost
+WORKTREE=$TMPROOT/ws-dead
+STARTED=2020-01-01T00:00:00Z
+STARTED_EPOCH=1577836800
+SCRIPT=e2e-api
+EOF
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+)
+sequence="$(awk -F'\t' '{ print $1 "-" $2 }' "$CAPTURE" | tr '\n' ' ')"
+case "$sequence" in
+    "event-waits-cancel events-emit events-emit "*)
+        pass "stood down first, then announced both ends of the handover ($sequence)" ;;
+    *)
+        fail "a reclaim announced a release before standing its own watch down: $sequence" ;;
+esac
+assert_eq "reclaimed" "$(emit_payload E2ELockReleased | sed -n 's/.*"outcome":"\([^"]*\)".*/\1/p')" \
+    "and the release it announced is still the dead owner's"
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 26: no thread means no stand-down call at all"
+# A human running e2e from a terminal has no $LUCIDOS_THREAD_ID and therefore no
+# subscription. The CLI would refuse for that reason; not spawning the process
+# is the same answer without the fork, and it keeps a manual run silent.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    unset LUCIDOS_THREAD_ID
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+)
+drain_emit E2ELockAcquired
+if [ -n "$(standdown_call)" ]; then
+    fail "a thread-less run still called the stand-down: $(standdown_call)"
+else
+    pass "no thread, no stand-down"
+fi
+assert_eq "1" "$([ -n "$(emit_call E2ELockAcquired)" ] && echo 1 || echo 0)" \
+    "and the acquire is still announced, which needs no thread"
 rm -f "$EMIT_LOCK"
 
 # ── Summary ──────────────────────────────────────────────────────────────

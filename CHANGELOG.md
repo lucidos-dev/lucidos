@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.26.0 — 2026-08-10
+
+### Added
+
+- **An in-app workspace switcher.** The Workspaces row in the Lucidos menu unfolds the list in place: a state dot, the name, the unread count, and one tap to switch. Create, rename and the rest stay on the picker, linked from the list's last row.
+- **The agent can search what has already happened here.** `memory` gains search and source, `threads` gains search over past conversations, and an `events` query can be narrowed to one thread.
+- **Stand down an event subscription by event type.** `cancel_event_wait` takes an `on` argument, so one answered watch can be dropped while unrelated ones stay live.
+- **A follow toggle in the prompt area.** Arm it and the transcript rides the live edge through a reply, press it again to stop. It sits beside the composer on every thread, a brand-new one included, and your last press decides what the next thread starts as.
+
+### Changed
+
+- **The transcript renders a wait, a wake, a child callback and a trigger as one event row**, with the deadline naming the day when it is not today.
+- **The welcome message offers one action**, a blue button that starts the setup interview.
+- **The agent control in the prompt bar wears the row's gray icon treatment**, and the connect pulse sits on the mark rather than the whole button.
+- **The todo indicator pulses gray while a turn is waiting.**
+- **The turn's controls are three icons in the response header**, on every turn: unfold/fold chevrons for the full response, a log glyph for the steps, and a third that folds the turn itself. The header row is inert, the controls sit beside the executor label, and an active one brightens rather than turning accent.
+- **Lucidos places the macOS traffic lights**, centred on the header bar it measured, and re-centres them when UI scale changes.
+- **The Lucidos menu is wide enough to spell the workspace name whole.**
+- **The thread drawer's filter panel stays open across a reload**, like the drawer's other states.
+- **The Backup settings page ghosts its controls while it loads**, and offers backup setup only once it knows one is needed.
+- **Sending a message, answering a question or permission card, and Continue after an abort all land the same way**: the turn's agent status line rests on the bottom of the viewport, so you watch the agent take what you submitted with the reply growing in underneath. A reader already riding the live edge is carried there instead, and a thread that fits on screen moves nobody.
+- **The transcript chevrons are navigation only.** Riding the live edge belongs to the follow toggle, and only your own scroll ends the ride, while a reply is actually in flight.
+- **The welcome message has room above and below it** before the composer docks underneath.
+- **The System settings page sizes its Path and API values at one shared step**, so a wrapping value stays readable.
+- **The search tab indicator is a plain rounded line**, and stays visible on the active tab.
+- **The macOS app shows its window once the frontend is about to paint**, so a cold launch no longer opens on a frame of bare window tint.
+- **A popover open in the workspace picker stays out of the window drag region**, and the picker row drags the window.
+
+### Fixed
+
+- **Add cards and settings navigation rows are keyboard-reachable buttons**, focusable by Tab and activated by Enter or Space.
+- **Returning to a thread lands you where you left it**, and a deep link's own position survives the arrival instead of being pulled to the bottom.
+- **Sending a message with nowhere to scroll leaves the reader where they are.**
+- **A wake's jump goes to the matched event**, not to the card that armed the wait.
+- **A native notification tap opens the workspace that raised it**, and the banner names that workspace.
+- **A page served on an engine's own port shows the renamed workspace**, not the engine's directory name, and an installed PWA re-resolves the name on resume instead of waiting for a reload it never does.
+- **Claude Code's API error banner renders in the failure card** rather than as a paragraph inside the response.
+- **A coding-agent session answered after it went idle resumes with the answer**, including on the stale-resume retry.
+- **A chat turn no longer ends with background work unwatched.**
+- **An event wait reads the watermark before it decides what to watch for**, so a task that completes while the wait is arming is still delivered.
+- **The turn header's status and date stack in place** instead of dropping a row at narrow widths, and the executor name stays level with the status beside it.
+- **The transcript scrolls while the mobile keyboard is up**, and a question card's options stay tappable with the composer focused.
+- **A user profile written by an app, a trigger script or the CLI shows up in the next chat turn**, without a restart.
+- **The route panel's value column lines up across every row.**
+- **The collapse control is disabled when there is nothing to fold**, and the full-response control keeps its shape when clicked.
+- **Folding or unfolding a turn keeps the ride**, and an armed reader glides back to the live edge rather than being teleported by the growth.
+- **A thread whose change has been applied no longer claims the agent is live**, so one scroll cannot silently end a standing follow on an idle thread.
+- **Answering a card and then scrolling away ends the ride**, instead of hauling the reader back when the reply resumes.
+- **The By thread types checkmark no longer nudges its heading.**
 ## v0.25.1 — 2026-08-09
 
 ### Changed

@@ -103,6 +103,17 @@
     align-items: center;
     gap: 0.5rem;
     font-size: var(--font-size-md);
+    /* The row reserves a GLYPH's height whether or not the glyph is there, so
+       ticking a thread type cannot move the heading it appears on. Under a
+       `normal` line height the row was as tall as its own text, and this text is
+       --font-size-md against a --icon-size-md mark, so the check landed 1px
+       taller than the line it joined: the words dropped half a pixel and every
+       thread type below dropped a whole one, on a toggle the user is watching.
+       A LENGTH equal to the mark, not a ratio: the two tokens are what have to
+       agree, and a ratio between them silently stops covering the mark the day
+       either one moves. It sizes the text-only "Status" heading identically, so
+       the panel's two headings also stand the same height as each other. */
+    line-height: var(--icon-size-md);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.05em;

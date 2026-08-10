@@ -116,6 +116,8 @@ pub const FOLLOW_UP_CHILD_THREAD: &str = "follow_up_child_thread";
 pub const MEMORY: &str = "memory";
 pub const CORRECT_MEMORY: &str = "correct_memory";
 pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
+pub const SEARCH_MEMORY: &str = "search_memory";
+pub const MEMORY_SOURCE: &str = "memory_source";
 
 // Events — grouped `events` tool (emit/query/count) from the capability parity
 // manifest; the flat per-verb names below stay as back-compat aliases.
@@ -130,6 +132,7 @@ pub const COUNT_EVENTS: &str = "count_events";
 pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
+pub const SEARCH_THREADS: &str = "search_threads";
 
 // Changes (pending coding-agent-proposed changes) — grouped `changes` tool
 // (list/apply) from the capability parity manifest; flat names below are aliases.

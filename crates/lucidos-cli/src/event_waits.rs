@@ -38,17 +38,26 @@ pub(crate) fn cmd_event_waits_list(ws: &Workspace) -> Result<(), BoxError> {
 pub(crate) fn cmd_event_waits_cancel(
     ws: &Workspace,
     wait_id: Option<&str>,
+    on: Option<&str>,
     all: bool,
 ) -> Result<(), BoxError> {
     let thread_id = calling_thread()?;
-    // Both / neither is decided by the engine, so the two agents read the same
-    // refusal. Only the shape of the body is built here.
-    let body = match (wait_id, all) {
-        (Some(id), false) => json!({ "wait_id": id }),
-        (None, true) => json!({ "all": true }),
-        (Some(id), true) => json!({ "wait_id": id, "all": true }),
-        (None, false) => json!({}),
-    };
+    // Which combinations are legal is decided by the engine, so the two agents
+    // read the same refusal. This forwards what was passed and nothing else: a
+    // flag the caller omitted is absent from the body rather than sent as a
+    // null, so an over-specified call reaches the engine over-specified and is
+    // refused there instead of being silently narrowed here.
+    let mut body = json!({});
+    let fields = body.as_object_mut().expect("a fresh object");
+    if let Some(id) = wait_id {
+        fields.insert("wait_id".into(), json!(id));
+    }
+    if let Some(event_type) = on {
+        fields.insert("on".into(), json!(event_type));
+    }
+    if all {
+        fields.insert("all".into(), json!(true));
+    }
     let url = format!(
         "{}/api/v1/threads/{}/event-waits/cancel",
         ws.base_url(),

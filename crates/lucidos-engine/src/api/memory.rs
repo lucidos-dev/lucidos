@@ -13,6 +13,12 @@ pub(super) struct MemoryEntriesQuery {
 }
 
 #[derive(Deserialize)]
+pub(super) struct MemorySearchQuery {
+    q: String,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
 pub(super) struct MemorySourceQuery {
     source_id: Option<String>,
     source_type: Option<String>,
@@ -95,6 +101,22 @@ pub(super) async fn get_memory_entries(
     })))
 }
 
+/// `GET /api/v1/memory/search?q=<query>&limit=<n>`: the HTTP face of the
+/// agent's memory search. The ranking lives on the engine
+/// (`engine::memory::read`), shared with the `memory` tool's `search` action so
+/// the two can never disagree about an order.
+pub(super) async fn search_memory(
+    State(state): State<AppState>,
+    Query(query): Query<MemorySearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .engine
+        .search_memory_ranked(&query.q, query.limit)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
 pub(super) async fn get_memory_source(
     State(state): State<AppState>,
     Query(query): Query<MemorySourceQuery>,
@@ -108,48 +130,19 @@ pub(super) async fn get_memory_source(
 
     match source_type {
         "event" => {
-            let id_str = query.source_id.as_deref().ok_or((
+            let id = Uuid::from_str(query.source_id.as_deref().ok_or((
                 StatusCode::BAD_REQUEST,
                 "source_id required for event source".to_string(),
-            ))?;
-            let event_id = Uuid::from_str(id_str)
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid UUID".to_string()))?;
-
-            // Get the original event (may not exist for live-indexed text with synthetic IDs)
-            let event = state
-                .event_store
-                .get_event_by_id(event_id)
+            ))?)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid UUID".to_string()))?;
+            // Shared with the `memory` tool's `source` action: one place decides
+            // that either id resolves and that the event carries its thread_id.
+            state
+                .engine
+                .memory_source(id)
                 .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to get event: {}", e),
-                    )
-                })?;
-
-            // Get all memory entries from this source
-            let source_json = serde_json::json!({"type": "event", "id": id_str});
-            let entries = index.entries_for_source(&source_json).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to get entries: {}", e),
-                )
-            })?;
-
-            let event_json = event.map(|e| {
-                serde_json::json!({
-                    "id": e.id,
-                    "event_type": e.event_type,
-                    "payload": e.payload,
-                    "created": e.created,
-                })
-            });
-
-            Ok(Json(serde_json::json!({
-                "source_type": "event",
-                "event": event_json,
-                "entries": entries,
-            })))
+                .map(Json)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
         }
         "artifact" => {
             let path = query.path.as_deref().ok_or((
@@ -290,6 +283,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/memory/stats", get(get_memory_stats))
         .route("/memory/entries", get(get_memory_entries))
+        .route("/memory/search", get(search_memory))
         .route("/memory/source", get(get_memory_source))
         .route(
             "/memory/embedding-model-status",

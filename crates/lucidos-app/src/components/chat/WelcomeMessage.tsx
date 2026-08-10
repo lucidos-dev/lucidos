@@ -1,11 +1,9 @@
-import { useSignal } from '@preact/signals';
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openProviderSettings } from '../../store/actions/menu';
-import { applySuggestion, startSetupInterview } from '../../store/actions/compose';
+import { startSetupInterview } from '../../store/actions/compose';
 import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
-import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 
 /** The MIT-license disclaimer shown at the foot of every welcome variant. */
 function WelcomeDisclaimer() {
@@ -27,8 +25,8 @@ function WelcomeDisclaimer() {
 
 /** First-run state when the engine booted with no LLM provider configured
  *  (`llmConfigured === false`). The agent can't answer until a provider exists,
- *  so this replaces the starter suggestions with a single clear call to action
- *  that deep-links to Settings → Models → Providers. Shown regardless of the
+ *  so this replaces the setup-interview entry point with a single clear call to
+ *  action that deep-links to Settings → Models → Providers. Shown regardless of the
  *  "Don't show this again" dismissal — provider setup is a requirement, not a tip. */
 export function ProviderSetupWelcome() {
   return (
@@ -63,11 +61,15 @@ export function ProviderSetupWelcome() {
  *  triggers and knowhow that fit, in this session
  *  (`system-knowhow/setup-interview` drives it).
  *
- *  This is NOT a sixth starter suggestion, and it deliberately looks like a
- *  sibling of `ProviderSetupWelcome`'s CTA instead: same prominent
- *  `action-btn action-btn-confirm` plus a hint line. A suggestion hands the
- *  newcomer a sentence and leaves them holding the hard part, which is working
- *  out what Lucidos should do for THEM; this hands that part to the agent.
+ *  It is the ONLY action on the configured-workspace welcome, and it has the
+ *  same shape as `ProviderSetupWelcome`'s CTA: a prominent `action-btn` plus a
+ *  hint line. It stays on the BLUE default rather than taking the green
+ *  `action-btn-confirm` variant the provider CTA wears, because green reads as
+ *  "accept what is already on screen" and this one starts something. The surface
+ *  used to offer starter suggestions beside it, which handed the newcomer a
+ *  sentence and left them holding the hard part, which is working out what
+ *  Lucidos should do for THEM; this hands that part to the agent, so the
+ *  suggestions were dropped rather than kept as an "or".
  *
  *  Clicking SENDS (see `startSetupInterview`) rather than prefilling, so the
  *  interview starts on one gesture. Only rendered on the provider-configured
@@ -87,7 +89,7 @@ export function SetupInterviewWelcome() {
     <div class="welcome-setup-interview">
       <button
         type="button"
-        class="action-btn action-btn-confirm welcome-setup-interview-btn"
+        class="action-btn welcome-setup-interview-btn"
         {...composeHandlers(() => { void startSetupInterview(); })}
       >
         Help me get the most out of Lucidos
@@ -104,97 +106,9 @@ export function SetupInterviewWelcome() {
   );
 }
 
-/** Conversational starter ideas — example things to ask the Lucidos Agent.
- *  Clicking a suggestion drops it into the prompt (via `applySuggestion`, which
- *  targets the Lucidos Agent and confirms before overriding an in-progress draft)
- *  so the user can edit and send, rather than retyping it. Shown one at a time in
- *  a chevron carousel (SuggestionCarousel). */
-const IDEAS: string[] = [
-  'Build me an app that tracks my reading list.',
-  'Send a summary of my emails for review every weekday at 8am.',
-  'Research e-bike options under €3000 and write up what you find — then set up a daily web scraper for relevant bargains and notify me when a good one comes up.',
-  'Tell me how to set up Lucidos for mobile access.',
-  'Where can I download apps?',
-];
-
-/** Pure view-model for {@link SuggestionCarousel}: clamps `index` into range and
- *  reports the current suggestion plus whether the prev/next chevrons apply. */
-export function suggestionView(ideas: string[], index: number) {
-  const last = ideas.length - 1;
-  const clamped = Math.max(0, Math.min(index, last));
-  return {
-    current: ideas[clamped],
-    index: clamped,
-    hasPrev: clamped > 0,
-    hasNext: clamped < last,
-  };
-}
-
-/** One suggestion at a time, flanked by ‹ › chevrons. Both chevrons stay mounted
- *  on every step — the inapplicable one (at the first / last suggestion) is
- *  `disabled` (greyed, non-interactive) rather than hidden, so the carousel
- *  controls never disappear. Same circular nav treatment as the notification
- *  detail chevrons. The suggestion itself is a button: clicking it drops it into
- *  the prompt (focus-first via `composeHandlers` so the iOS keyboard opens within
- *  the tap gesture). Kept in its own component so WelcomeMessage stays hook-free
- *  (the welcome tests invoke it as a plain function).
- *
- *  All suggestions are rendered stacked in a single CSS grid cell
- *  (`.welcome-carousel-viewport`) so the viewport's height is driven by the
- *  TALLEST suggestion, not the currently-visible one. Suggestions vary in length,
- *  so a viewport sized to the visible card would change height per slide and the
- *  vertically-centered chevrons would bounce with it. Only the current suggestion
- *  is visible and interactive; the rest stay laid out (so they still size the
- *  track) but are hidden from sight, hit-testing, the tab order, and the a11y
- *  tree (CSS owns the visibility — see response.css). */
-export function SuggestionCarousel() {
-  const index = useSignal(0);
-  const view = suggestionView(IDEAS, index.value);
-  return (
-    <div class="welcome-carousel">
-      <button
-        type="button"
-        class="welcome-carousel-nav"
-        aria-label="Previous suggestion"
-        disabled={!view.hasPrev}
-        onClick={() => { index.value = view.index - 1; }}
-      >
-        <ChevronLeftIcon />
-      </button>
-      <div class="welcome-carousel-viewport">
-        {IDEAS.map((idea, i) => {
-          const active = i === view.index;
-          return (
-            <button
-              key={idea}
-              type="button"
-              class="welcome-carousel-item"
-              aria-hidden={active ? undefined : 'true'}
-              tabIndex={active ? undefined : -1}
-              aria-label={`Use this suggestion: ${idea}`}
-              {...composeHandlers(() => { void applySuggestion(idea); })}
-            >
-              {idea}
-            </button>
-          );
-        })}
-      </div>
-      <button
-        type="button"
-        class="welcome-carousel-nav"
-        aria-label="Next suggestion"
-        disabled={!view.hasNext}
-        onClick={() => { index.value = view.index + 1; }}
-      >
-        <ChevronRightIcon />
-      </button>
-    </div>
-  );
-}
-
 export function WelcomeMessage() {
-  // No provider configured → guide the user to set one up instead of offering
-  // starter prompts that would chat into a guaranteed "no provider" error.
+  // No provider configured → guide the user to set one up instead of offering an
+  // interview that would chat into a guaranteed "no provider" error.
   if (!llmConfigured.value) {
     return <ProviderSetupWelcome />;
   }
@@ -209,8 +123,6 @@ export function WelcomeMessage() {
       </button>
       <h2>Hi, there!</h2>
       <SetupInterviewWelcome />
-      <p class="welcome-suggestions-label">Or ask me anything, for example:</p>
-      <SuggestionCarousel />
       <WelcomeDisclaimer />
     </div>
   );

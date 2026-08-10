@@ -258,6 +258,14 @@ impl LucidosEngine {
         &self.pool
     }
 
+    /// The engine's hot copy of `artifacts/user_profile.md`. Exposed so the
+    /// data API's write and delete routes can keep it coherent: they write the
+    /// file through their own `ArtifactManager`, which has no way back to the
+    /// engine that serves the profile to every chat turn.
+    pub(crate) fn user_profile_cache(&self) -> &crate::engine::user_profile::UserProfileCache {
+        &self.user_profile
+    }
+
     /// The user's IANA timezone (e.g. "Europe/Oslo"), loaded at construction
     /// from the `timezone` preference and refreshed by the `Timezone` preference
     /// side-effect. Empty when unset. Read by the scheduler to register the

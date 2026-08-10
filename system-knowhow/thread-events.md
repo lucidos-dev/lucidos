@@ -289,7 +289,7 @@ never told about the event that just woke it.
 Read that promise narrowly: it covers a delivery, not every wake. A
 *child-completion* wake is the other way an event re-opens a thread, and the
 fan-in writes no `EventWaitDelivered`, so if you re-arm on
-`ChildThreadCompleted` in a wake turn the report can name the very card that
+`ChildThreadCompleted` in a wake turn the report can name the very callback that
 woke you. Recognise it by its `child_thread_id` and its age and carry on. Better
 still, do not subscribe to your own child at all: see the `ChildThreadCompleted`
 section below for why that wait buys nothing.
@@ -765,9 +765,9 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 
 `status` is `success` / `failure` / `no_changes` / `canceled`. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
 
-**The parent is woken BY this card, so it never has to wait for one.** The fan-in persists the card on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers the card, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, a grandchild's for instance, named with a `child_thread_id` condition.
+**The parent is woken BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, a grandchild's for instance, named with a `child_thread_id` condition.
 
-**One card per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
+**One callback per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
 
 **A steer is not a completion.** A `ResponseCanceled` whose cause is `superseded_by_followup` is the mid-turn redirect the engine arms when a follow-up lands on a live Codex turn: the caller steered, they did not abandon, and the child runs the redirected turn immediately afterwards. It fires no `ChildThreadCompleted` and no parent wake. The redirected turn's own terminal is the report.
 

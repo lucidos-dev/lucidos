@@ -34,6 +34,29 @@ async fn insert_event_with_payload(
         .expect("insert event with payload");
 }
 
+/// Like [`insert_event`] but attributes the row to a thread, for the
+/// `thread_id` filter.
+async fn insert_thread_event(
+    pool: &PgPool,
+    id: Uuid,
+    event_type: &str,
+    created: DateTime<Utc>,
+    thread_id: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, thread_id) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(event_type)
+    .bind(json!({ "summary": "fixture" }))
+    .bind(created)
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("insert thread event");
+}
+
 /// `before_event_id` returns events strictly older than the cursor under
 /// `(created, id)` lexicographic ordering. When five events share one
 /// timestamp and the middle one is the cursor, only the two with smaller
@@ -53,7 +76,14 @@ async fn query_events_before_cursor_returns_strictly_older_events_at_same_timest
     }
 
     let result = store
-        .query_events_paged(Some("PageBoundaryTest"), None, None, Some(ids[2]), None, 10)
+        .query_events_paged(
+            EventQueryFilters {
+                event_type: Some("PageBoundaryTest"),
+                before_event_id: Some(ids[2]),
+                ..Default::default()
+            },
+            10,
+        )
         .await
         .expect("query_events_paged should succeed");
 
@@ -88,7 +118,14 @@ async fn query_events_after_cursor_returns_strictly_newer_events_at_same_timesta
     }
 
     let result = store
-        .query_events_paged(Some("AfterCursorTest"), None, None, None, Some(ids[2]), 10)
+        .query_events_paged(
+            EventQueryFilters {
+                event_type: Some("AfterCursorTest"),
+                after_event_id: Some(ids[2]),
+                ..Default::default()
+            },
+            10,
+        )
         .await
         .expect("query_events_paged should succeed");
 
@@ -131,7 +168,14 @@ async fn query_events_pages_with_before_cursor_no_overlap() {
 
     async fn page(store: &EventStore, before: Option<Uuid>, limit: i64) -> Vec<Uuid> {
         match store
-            .query_events_paged(Some("PagingTest"), None, None, before, None, limit)
+            .query_events_paged(
+                EventQueryFilters {
+                    event_type: Some("PagingTest"),
+                    before_event_id: before,
+                    ..Default::default()
+                },
+                limit,
+            )
             .await
             .expect("query_events")
         {
@@ -178,13 +222,25 @@ async fn query_events_returns_cursor_not_found_when_uuid_missing() {
     let bogus = Uuid::new_v4();
 
     let before_result = store
-        .query_events_paged(None, None, None, Some(bogus), None, 10)
+        .query_events_paged(
+            EventQueryFilters {
+                before_event_id: Some(bogus),
+                ..Default::default()
+            },
+            10,
+        )
         .await
         .expect("query_events_paged should succeed");
     assert!(matches!(before_result, QueryEventsResult::CursorNotFound));
 
     let after_result = store
-        .query_events_paged(None, None, None, None, Some(bogus), 10)
+        .query_events_paged(
+            EventQueryFilters {
+                after_event_id: Some(bogus),
+                ..Default::default()
+            },
+            10,
+        )
         .await
         .expect("query_events_paged should succeed");
     assert!(matches!(after_result, QueryEventsResult::CursorNotFound));
@@ -317,6 +373,92 @@ async fn count_events_respects_since_until_window() {
         .await
         .expect("count_events with since+until");
     assert_eq!(count, 1, "open interval excludes both endpoints");
+
+    teardown_test_db(&db).await;
+}
+
+/// The read path behind "we talked about this": once thread search has found
+/// the thread, its messages come back by filtering on it.
+#[tokio::test]
+async fn query_events_can_be_restricted_to_one_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_500, 0).unwrap();
+    let wanted = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+    insert_thread_event(&pool, mine, "ThreadFilterTest", ts, wanted).await;
+    insert_thread_event(&pool, theirs, "ThreadFilterTest", ts, other).await;
+
+    let got = match store
+        .query_events_paged(
+            EventQueryFilters {
+                event_type: Some("ThreadFilterTest"),
+                thread_id: Some(wanted),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .expect("query_events_paged should succeed")
+    {
+        QueryEventsResult::Events(e) => e,
+        QueryEventsResult::CursorNotFound => panic!("no cursor was passed"),
+    };
+
+    assert_eq!(got.len(), 1, "only the named thread's row");
+    assert_eq!(got[0].id, mine);
+
+    teardown_test_db(&db).await;
+}
+
+/// The filter may only ever NARROW. Every existing caller (the CLI, triggers,
+/// the SDK, the app UI bridge) sends no `thread_id`, so an omitted filter that
+/// changed the result set would silently change all of them.
+#[tokio::test]
+async fn omitting_the_thread_filter_returns_every_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_600, 0).unwrap();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        "ThreadFilterOmitted",
+        ts,
+        Uuid::new_v4(),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        "ThreadFilterOmitted",
+        ts,
+        Uuid::new_v4(),
+    )
+    .await;
+    // A row with NO thread at all (a domain event) must still come back: the
+    // filter is `IS NULL OR thread_id = $9`, not a join.
+    insert_event(&pool, Uuid::new_v4(), "ThreadFilterOmitted", ts).await;
+
+    let got = match store
+        .query_events_paged(
+            EventQueryFilters {
+                event_type: Some("ThreadFilterOmitted"),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .expect("query_events_paged should succeed")
+    {
+        QueryEventsResult::Events(e) => e,
+        QueryEventsResult::CursorNotFound => panic!("no cursor was passed"),
+    };
+
+    assert_eq!(got.len(), 3, "two threaded rows plus the unthreaded one");
 
     teardown_test_db(&db).await;
 }

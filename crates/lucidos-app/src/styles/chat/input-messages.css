@@ -269,6 +269,30 @@
     transform: translateY(0.375rem);
 }
 
+/* The prompt row's two TOGGLES in their on-state: the follow toggle (riding the
+ * live edge) and the WIP app preview. Both already carried `.active` and
+ * `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
+ * announced its state to a screen reader and to nobody else.
+ *
+ * Deliberately the same paint as `.icon-btn.filter-active` (host-components.css)
+ * rather than a blanket `.icon-btn.active`: a blanket rule would also frame
+ * `.pin-thread-btn.active`, whose own rule takes the accent and NO frame on
+ * purpose, its icon being a filled silhouette that carries the state by itself.
+ * Scoped to this row, the two toggles that mean it get it and nothing else
+ * does. */
+.prompt-actions-row .icon-btn.header-icon.active {
+    color: var(--accent);
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
+}
+
+@media (hover: hover) {
+    .prompt-actions-row .icon-btn.header-icon.active:hover {
+        background: var(--bg-quaternary);
+        color: var(--accent);
+    }
+}
+
 .prompt-actions-right {
     display: flex;
     align-items: center;
@@ -323,19 +347,104 @@
     align-items: center;
 }
 
+/* The composer's leading control button wears the destination's mark: the
+   Lucidos mark, the Claude mark, or the Codex mark. It is one of the prompt
+   bar's icons, not a brand badge, so it carries `.icon-btn.header-icon` like
+   the todo / subscription / attach buttons beside it and inherits their box
+   (2.25rem), their glyph size (--icon-size-lg), their baseline nudge and their
+   gray. Every glyph therefore paints in `currentColor` and nothing here sets a
+   colour: the row reads as one cluster instead of one badge and three icons.
+   The colored marks survive everywhere else they appear (thread rows,
+   transcript actor chips, nav history, the header mark).
+
+   It needs no box rules of its own for the same reason: `flex-shrink` and the
+   colour transition both come from `.icon-btn`, and the local
+   `transition: color` this used to carry silently dropped that rule's
+   background half, so the hover fill snapped in while every neighbour's faded.
+
+   OPTICAL SIZING, the second half of "reads like its neighbours": the same BOX
+   is not the same SIZE. The row's other glyphs are drawn to one grid and each
+   paints exactly 0.75 of its own viewBox (measured painted extent, stroke
+   included: todo, the subscription clock and attach are 0.750 to three
+   decimals). The three agent marks are foreign artwork and are not: Claude
+   fills 0.997 of its box, Codex 0.880, and the Lucidos mark only 0.525, because
+   `LucidosMarkIcon` draws inside a `translate(13 13) scale(0.74)` group. So
+   handing all six `--icon-size-lg` painted Claude a third larger than the
+   checkbox beside it and the mark a third smaller, which is exactly how it
+   looked and what it was reported as.
+
+   Each mark is therefore sized by its OWN fill fraction, to land the ink the
+   run lands, which is what the eye compares. `--mark-art-fill` defaults to the
+   run's own 0.75, so a glyph nobody has measured just gets the run's box back.
+
+   Scoped to this row on purpose. The same artwork keeps its own treatment
+   everywhere else it appears, and the header's copy of the mark already carries
+   its own compensation for this identical inset (`--header-mark-size`,
+   styles/header-mark.css). Its `--header-mark-art-scale: 0.74` is NOT this
+   0.525 and the two must not be folded into one: that number is the group's
+   transform, this one is the painted extent, and they differ because the shapes
+   do not fill their own 0..100 grid either. The taller run is y 12 to 83, so
+   the ink is 0.74 * 0.71.
+
+   The fractions are pinned beside the formula in
+   `__tests__/prompt-mark-optical-size.test.ts`, which also re-derives the
+   mark's from the geometry in `icons.tsx`, so redrawing it without re-measuring
+   fails there rather than shipping the wrong size a second time. */
 .commands-btn {
-    flex-shrink: 0;
-    transition: color 0.3s ease;
+    --run-ink: calc(var(--icon-size-lg) * 0.75);
+    --mark-art-fill: 0.75;
 }
 
-.commands-btn svg {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
+.commands-btn .claude-icon {
+    --mark-art-fill: 0.997;
 }
 
-.commands-btn-active {
-    color: var(--initiator-coding-agent);
-    animation: control-connect-pulse 0.6s ease-out;
+.commands-btn .codex-icon {
+    /* The Codex mark hardcodes `stroke="var(--accent-light)"` as a presentation
+       attribute, because it stays accent-blue in those other surfaces; a
+       presentation attribute loses to any author rule, so this repaints it here
+       alone. Its stroke WIDTH is left as the artwork drew it: the fraction below
+       puts the mark in a smaller box than its neighbours, which thins the
+       painted stroke to 1.76px against the checkbox's 1.67px on its own. */
+    stroke: currentColor;
+    --mark-art-fill: 0.88;
+}
+
+.commands-btn .lucidos-mark-icon {
+    --mark-art-fill: 0.525;
+}
+
+/* Three classes, so this beats `.icon-btn.header-icon svg` (two) outright
+   rather than on the order the two sheets happen to be imported in. */
+.icon-btn.header-icon.commands-btn svg {
+    width: calc(var(--run-ink) / var(--mark-art-fill));
+    height: calc(var(--run-ink) / var(--mark-art-fill));
+}
+
+/* Set once the backend answers with a command list, which is also when the
+   button starts opening something (openMenu bails until then). One pulse marks
+   the arrival. The state used to be carried by tinting the mark
+   --initiator-coding-agent and holding it there; the hold is what made this the
+   only colored glyph in the row, so the waiting state is a dim instead. Only
+   the coding-agent control has the state at all, hence the exclusion: the
+   Lucidos model picker never carries the class and is always ready. */
+.commands-btn:not(.lucidos-commands-btn):not(.commands-btn-active) {
+    opacity: 0.45;
+}
+
+/* The pulse rides the GLYPH, not the button. The button's own `transform` is
+   now spoken for by the row's `.icon-btn.header-icon` translateY, so a keyframe
+   on the button would drop that nudge for the 0.6s it runs and jump the button
+   up and back. Pulsing the mark is also the better read: the 2.25rem hit box
+   carries a hover fill, and swelling that reads as the button growing rather
+   than the mark announcing itself.
+
+   On --duration-emphasis rather than the 0.6s literal it carried: this is
+   exactly what that token is for, a one-off state-change cue the user is meant
+   to register, and a literal is the one animation in the app that ignores the
+   animation-speed slider (the scale rides the tokens). */
+.commands-btn-active svg {
+    animation: control-connect-pulse var(--duration-emphasis) ease-out;
 }
 
 @keyframes control-connect-pulse {
@@ -344,15 +453,18 @@
     100% { transform: scale(1); }
 }
 
-@media (hover: hover) {
-    .commands-btn:hover:not(:disabled) {
-        color: var(--accent);
-    }
-}
-
+/* Offset from `.control-menu`, whose height is the button's. The button wears
+   `.icon-btn.header-icon` now, so that box is 0.75rem taller than the glyph
+   inside it and the row's translateY drops the glyph a further 0.375rem: the
+   old `100% + 0.375rem` measured from the box, so the panel would sit a visible
+   0.625rem further from the mark than it used to. Flush with the box top hands
+   most of that back while leaving the button entirely uncovered. Do NOT reach
+   past it into the button's padding to close the rest: the panel is the higher
+   layer, so a strip of the anchor under it stops being the anchor, and a click
+   there would neither fire the button's own toggle nor count as outside. */
 .control-dropdown {
     position: absolute;
-    bottom: calc(100% + 0.375rem);
+    bottom: 100%;
     left: 0;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
@@ -371,14 +483,6 @@
 .control-dropdown-auto {
     height: auto;
     max-height: 20rem;
-}
-
-/* The Lucidos Agent control button renders the agent glyph as the Lucidos mark
-   (an inline SVG with its own brand gradient — no `color` tint applies). */
-.lucidos-agent-glyph {
-    display: inline-flex;
-    align-items: center;
-    line-height: 1;
 }
 
 .control-list {
@@ -1021,6 +1125,10 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     background: var(--accent-red);
 }
 
+/* The app's "waiting" motion. Shared by the two progress dots above and by the
+   todo indicator's waiting state (chat/todo-list.css), which is deliberately
+   the same gray pulse rather than a colour of its own: keyframes are global,
+   so it reuses these rather than declaring a twin. */
 @keyframes progress-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
@@ -1062,26 +1170,35 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
 }
 
+/* `flex-start` plus a row unit on every field, exactly as `.response-header`
+   (chat/response.css), which is where the reasoning lives: the fields are all
+   one --turn-header-line tall and centre their own content, so a one-row header
+   is unchanged and a wrapped one keeps the actor's name level with the status
+   beside it instead of dropping half a line to centre against the stacked
+   pair. */
 .initiator-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.5rem;
     padding-left: var(--turn-body-inset);
     margin-bottom: 0.7rem;
-    min-height: 1.2rem;
+    min-height: var(--turn-header-line);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-wrap: wrap;
 }
 
-/* Both the initiator and response headers collapse the turn's body when clicked
-   — cursor: pointer is the affordance. Neither lights up the whole row on hover:
-   the hover highlight lives on the chips INSIDE the header (the actor/executor
-   chip — button.initiator-actor / .response-executor — and the timestamp/summary
-   buttons), so only the "[icon] Claude Code" chip tints, never the edge-to-edge
-   row. A full-row tint read as a heavy affordance stacked on the chip's own. */
-.initiator-header-clickable,
-.response-header-clickable {
+/* The INITIATOR header collapses its body when clicked, and cursor: pointer is
+   the affordance. It does not light the whole row up on hover: the hover
+   highlight lives on the chips INSIDE the header (the actor chip
+   button.initiator-actor, and the timestamp/summary buttons), so only the
+   "[icon] You" chip tints, never the edge-to-edge row. A full-row tint read as
+   a heavy affordance stacked on the chip's own.
+
+   The RESPONSE header used to work the same way and no longer does: folding a
+   turn is the third turn control's job (`turnControls`), so that row is inert
+   and carries no clickable class. */
+.initiator-header-clickable {
     cursor: pointer;
     user-select: none;
 }
@@ -1110,14 +1227,40 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 }
 
 /* Right-aligned header cluster: optional status chip (question/permission
-   resolution) + the timestamp. */
+   resolution) + the timestamp.
+
+   Deliberately identical to `.response-meta` (chat/response.css), which is
+   where the reasoning for every declaration below lives: this is the row's
+   elastic field, it stacks its two fields against the right edge instead of
+   being bumped whole onto a row of its own, `white-space` is what puts the
+   break between them rather than inside the timestamp, and the gaps are
+   longhands because `row-gap: 0` is load-bearing. The two headers sit one
+   above the other in a turn, so they have to degrade the same way. Not one
+   shared selector, because each header's rules live with its own component;
+   `styles/__tests__/turn-meta-stacking.test.ts` is what holds the two copies
+   together. */
 .initiator-meta {
-    margin-left: auto;
-    display: inline-flex;
+    display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.5rem;
-    flex-shrink: 0;
+    justify-content: flex-end;
+    column-gap: 0.5rem;
+    row-gap: 0;
+    flex: 1 1 0;
+    white-space: nowrap;
 }
+
+/* The field that shares the actor's line carries the header's row unit, so the
+   two sit on one line once the cluster stacks. Copy of the `.response-meta`
+   rule (chat/response.css), which is where the reasoning lives, including why
+   it is the first field only. On a chromeless turn the timestamp IS the first
+   field, which is the case this has to cover as much as the status. */
+.initiator-meta > :first-child {
+    display: flex;
+    align-items: center;
+    min-height: var(--turn-header-line);
+}
+
 .initiator-timestamp {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
@@ -1164,8 +1307,16 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.125rem 0.375rem;
-    margin: -0.125rem -0.375rem;
+    /* The vertical padding is a local var because the min-height below has to
+       add it back: it is cancelled by the negative margin under it (the hover
+       chip reaches past the text without taking any layout space), and a flex
+       line measures MARGIN boxes. Sized off the bare row unit, the chip's
+       margin box would come out 2 padding steps SHORT of it and the name would
+       ride that far above the status. */
+    --actor-chip-pad-y: 0.125rem;
+    padding: var(--actor-chip-pad-y) 0.375rem;
+    margin: calc(-1 * var(--actor-chip-pad-y)) -0.375rem;
+    min-height: calc(var(--turn-header-line) + 2 * var(--actor-chip-pad-y));
     min-width: 0;
     background: transparent;
     border: none;

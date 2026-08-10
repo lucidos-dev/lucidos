@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeResponseEvents, exchangeResponseText, exchangeStatus, exchangeSteps, exchangeUserChannel, exchangeUserMessage, isEmptyContinuedExchange, resumeEngineNote, type ThreadEvent } from '../thread-events';
-import { getEventToggleState } from '../event-rendering';
+import { hidesEarlierProse } from '../event-rendering';
 
 beforeEach(resetSeqCounter);
 
@@ -624,9 +624,7 @@ describe('Flow: Edge cases', () => {
     expect(exchangeSteps(exchanges[0])).toHaveLength(0);
     expect(exchangeResponseText(exchanges[0])).toBe('Simple answer.');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
-    const { showStepsToggle, showMoreToggle } = getEventToggleState(exchangeResponseEvents(exchanges[0]));
-    expect(showStepsToggle).toBe(false);
-    expect(showMoreToggle).toBe(false);
+    expect(hidesEarlierProse(exchangeResponseEvents(exchanges[0]))).toBe(false);
   });
 
   it('canceled exchange shows Canceled label', () => {

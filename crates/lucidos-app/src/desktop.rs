@@ -587,6 +587,39 @@ pub fn gateway_url(port: u16) -> String {
     format!("http://localhost:{port}")
 }
 
+/// Where [`launch`] should point the main window instead of the gateway root,
+/// set at most once by a native notification tap that arrives while the client
+/// is still starting.
+///
+/// A tap has to land in the workspace that raised the banner
+/// (`crate::route_native_tap`), but during startup there is nothing to land in:
+/// the main window has not been navigated yet and [`launch`] owns its first
+/// navigation. Pointing it here ourselves would just be clobbered a moment
+/// later. So the tap leaves the destination here and [`launch`] uses it, which
+/// is what makes tapping a banner while the client is not running open the
+/// client ON that workspace rather than on the picker plus a second window.
+static LAUNCH_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Aim [`launch`]'s first navigation at `url`. Last writer wins: two taps before
+/// the gateway is up can only produce one landing, and the most recent is the
+/// one the user just asked for.
+///
+/// macOS-gated because its one caller is `crate::route_native_tap`, and native
+/// banners exist only there. Off macOS nothing sets it and
+/// [`take_launch_target`] just keeps answering `None`.
+#[cfg(target_os = "macos")]
+pub fn set_launch_target(url: String) {
+    *LAUNCH_TARGET.lock().unwrap() = Some(url);
+}
+
+/// Take the pending launch target, if any. Consuming (rather than peeking) is
+/// what keeps it to the FIRST navigation: a tap arriving after the window is
+/// live is routed by `crate::route_native_tap` against the real window list
+/// instead.
+fn take_launch_target() -> Option<String> {
+    LAUNCH_TARGET.lock().unwrap().take()
+}
+
 /// Permissions granted on the gateway origin. Deliberately identical to the set
 /// `capabilities/default.json` grants on the LOCAL app URL: it is the same
 /// frontend, just reached over http instead of off the bundled assets. Kept in
@@ -804,16 +837,36 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             );
         }
 
-        let url = gateway_url(port);
-        match (handle.get_webview_window("main"), url.parse::<tauri::Url>()) {
-            (Some(win), Ok(parsed)) => {
-                if let Err(e) = win.navigate(parsed) {
-                    eprintln!("[desktop] failed to navigate window to gateway: {e}");
-                }
-            }
-            _ => eprintln!("[desktop] no main window / bad gateway URL: {url}"),
+        // A notification tap that arrived while we were waiting names the
+        // workspace to land on; otherwise the gateway root (the picker).
+        navigate_main_window(
+            &handle,
+            take_launch_target().unwrap_or_else(|| gateway_url(port)),
+        );
+        // A tap that landed between the take above and the navigate would
+        // otherwise be stranded on a window already pointed elsewhere. Cheap to
+        // re-check, and it closes the only window in which the aim can be lost.
+        if let Some(url) = take_launch_target() {
+            navigate_main_window(&handle, url);
         }
     });
+}
+
+/// Point the declared main window at `url`. Best-effort: a missing window or an
+/// unparseable URL is logged, never fatal, since the alternative is stranding
+/// the user on the bundled "Starting Lucidos…" splash with no explanation.
+fn navigate_main_window(app: &AppHandle, url: String) {
+    match (
+        app.get_webview_window(crate::MAIN_WINDOW_LABEL),
+        url.parse::<tauri::Url>(),
+    ) {
+        (Some(win), Ok(parsed)) => {
+            if let Err(e) = win.navigate(parsed) {
+                eprintln!("[desktop] failed to navigate window to {url}: {e}");
+            }
+        }
+        _ => eprintln!("[desktop] no main window / bad URL: {url}"),
+    }
 }
 
 /// Block until the gateway health endpoint answers 200, or the deadline passes.

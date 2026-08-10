@@ -104,13 +104,47 @@
     margin-top: var(--space-lg);
 }
 
+/* A real <button> (see SettingsView), so the first block is the UA button
+   reset. `font-feature-settings` is re-inherited straight after `font:
+   inherit`, which resets it to initial and would hand ligatures back to a Fira
+   Code user. The font-size and weight this reset inherits are then overridden
+   by `.settings-section-title.settings-nav-row` above, which outranks it.
+
+   `width: 100%` is belt and braces, not the thing holding the layout up: the
+   `display: flex` below already makes the box block-level, so `width: auto`
+   fills the row and parks the chevron at the far edge on its own. It is stated
+   anyway because a UA button is `inline-block`, and that is what the row would
+   fall back to if the display ever changed.
+
+   No `color` here, unlike `.list-row-add-card`, which does reset it: the UA's
+   `buttontext` never reaches this row because
+   `.settings-section-title.settings-nav-row` above already colours it at higher
+   specificity. Adding one would put a fourth colour declaration back into a
+   cascade that 55a8143c4 deliberately collapsed, and it would win nothing. */
 .settings-nav-row {
+    background: none;
+    border: none;
+    width: 100%;
+    font: inherit;
+    font-feature-settings: inherit;
+    text-align: left;
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 0.625rem 0;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
+}
+
+.settings-nav-row:focus-visible {
+    /* Shared --focus-ring (see .icon-btn:focus-visible in
+       global/shared-components.css). Drawn OUTWARD, unlike .list-row-add-card:
+       the row has no horizontal padding to inset a band into, and it sits
+       inside .settings-panel's 1rem gutter, so there is room for one. The
+       transparent outline is the forced-colors fallback, where box-shadow is
+       stripped. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 /* Hover LIFTS the row, to the accent (the same direction .settings-option

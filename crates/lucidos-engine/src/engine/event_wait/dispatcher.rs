@@ -744,8 +744,53 @@ impl LucidosEngine {
         cause: EventWaitCancelCause,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> usize {
+        self.cancel_waits_on_thread_where(thread_id, cause, actor, "all", |_| true)
+            .await
+    }
+
+    /// Cancel every live wait on a thread that WATCHES `event_type`, leaving the
+    /// rest alone. Returns how many were canceled.
+    ///
+    /// The narrow sibling of the call above, and the one an agent reaches for
+    /// when it got its answer about one thing and is still waiting on another.
+    /// Its caller is `cancel_event_waits_for_agent`, over
+    /// `lucidos event-waits cancel --on` and the `cancel_event_wait` tool's
+    /// `on`, and through those the e2e lock's own stand-down: taking the lock
+    /// answers a watch for `E2ELockReleased` and nothing else, so it may end
+    /// that watch and nothing else.
+    pub async fn cancel_event_waits_watching(
+        &self,
+        thread_id: Uuid,
+        event_type: &str,
+        cause: EventWaitCancelCause,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> usize {
+        self.cancel_waits_on_thread_where(thread_id, cause, actor, event_type, |w| {
+            w.watches(event_type)
+        })
+        .await
+    }
+
+    /// The shared body of the two calls above: cancel the live waits on
+    /// `thread_id` that `keep` selects, one emit each.
+    ///
+    /// `scope` names what was addressed, for the log line only. The predicate
+    /// is applied to the snapshot rather than inside the cache's lock, and the
+    /// `take` below is what makes that safe: a wait that resolved in between is
+    /// simply not there any more, exactly as it is for an unfiltered cancel.
+    async fn cancel_waits_on_thread_where(
+        &self,
+        thread_id: Uuid,
+        cause: EventWaitCancelCause,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+        scope: &str,
+        keep: impl Fn(&crate::engine::event_wait::LiveWait) -> bool,
+    ) -> usize {
         let mut canceled = 0usize;
         for live in self.live_waits.for_thread(thread_id).await {
+            if !keep(&live) {
+                continue;
+            }
             let Some(wait) = self.live_waits.take(live.wait_id).await else {
                 continue;
             };
@@ -757,9 +802,10 @@ impl LucidosEngine {
         }
         if canceled > 0 {
             crate::log!(
-                "[EventWait] Canceled {} live wait(s) on thread {} ({:?})",
+                "[EventWait] Canceled {} live wait(s) on thread {} ({}, {:?})",
                 canceled,
                 thread_id,
+                scope,
                 cause
             );
         }

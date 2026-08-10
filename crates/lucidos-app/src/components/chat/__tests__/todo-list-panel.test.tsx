@@ -42,8 +42,9 @@ const NOOP = () => {};
 // count) whatever the state. The SVG is pixel-identical to the adjacent
 // ImageIcon because both inherit `.icon-btn.header-icon svg` sizing
 // (--icon-size-lg). State is carried by `data-state` and rendered as COLOR
-// in todo-list.css, never as a different glyph. Counts go into the tooltip
-// and aria-label instead of the glyph. Tap target opens the panel.
+// (plus, for waiting, a pulse) in todo-list.css, never as a different glyph.
+// Counts go into the tooltip and aria-label instead of the glyph. Tap target
+// opens the panel.
 // ──────────────────────────────────────────────────────────────────────────
 
 describe('todoListIndicatorBody', () => {
@@ -70,10 +71,10 @@ describe('todoListIndicatorBody', () => {
     expect(text).toContain('1 of 3 done');
     expect(text).toContain('data-tooltip="doing b"');
     // The aria-label NAMES the in-progress state, it does not just count.
-    // Every state renders the same glyph and differs only in color, which a
-    // screen reader can't read and forced-colors mode overwrites, and the
-    // tooltip is desktop-hover only. So this is the one non-visual channel
-    // that tells idle and in-progress apart.
+    // Every state renders the same glyph and differs only in color (or, for
+    // waiting, a pulse), which a screen reader can't read and forced-colors
+    // mode overwrites, and the tooltip is desktop-hover only. So this is the
+    // one non-visual channel that tells idle and in-progress apart.
     expect(text).toContain('aria-label="Todo list: doing b. 1 of 3 done. Click to expand."');
   });
 
@@ -150,7 +151,7 @@ describe('todoListIndicatorBody', () => {
     expect(text).toContain('data-state="waiting"');
   });
 
-  it('renders the SAME ticked-checkbox glyph in every state, so only the color differs', () => {
+  it('renders the SAME ticked-checkbox glyph in every state, so only its painting differs', () => {
     // The state must never switch the shape. The pair this test was written
     // against drew this same checkbox for idle and a filled dome inside a
     // checkbox for in-progress, and the second one read as nothing

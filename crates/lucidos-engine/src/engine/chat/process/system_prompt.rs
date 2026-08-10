@@ -12,7 +12,7 @@ use std::path::Path;
 
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
-    APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
+    APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE, LOOK_BEFORE_ASSESSING_RULE,
 };
 
 /// What this install lets a coding agent edit, when the engine WAS launched
@@ -581,6 +581,8 @@ __ENGINE_RESTART_RULE__
 
 __APPLY_VERIFY_RULE__
 
+__LOOK_BEFORE_ASSESSING_RULE__
+
 ENGINE INTERNALS YOU CANNOT OBSERVE:
 You cannot count your own tool calls or measure any internal engine budget. The only real per-turn cap is __MAX_TOOL_CALLS__ tool calls, and the "[ENGINE-LIMIT]" prefix on the engine's message is the only signal it fired (the user changes it in Settings, Models, Chat & triggers). Never claim you hit a "tool-call cap" or "per-turn limit", and never cite a number or a file name about the agent loop: they are invisible to you, and inventing them poisons long-term memory. If you stop mid-task, give the real reason.
 
@@ -592,6 +594,44 @@ CRITICAL RULES:
 5. Asked to create N files, call write_file N times IN THE SAME RESPONSE.
 
 __REPEATED_ACTION_RULE__"#;
+
+/// The per-turn ENGINE BUILD section: what the running engine is, and whether
+/// the user has switched onto a newer one.
+///
+/// Pure over [`VersionStatus`] so the wording can be tested without an engine,
+/// and so the three cases stay visibly distinct. They are not the same claim:
+///
+/// * **Current.** Running build equals the on-disk build and source is not
+///   ahead. Nothing is pending, so a `requires_restart` change applied earlier
+///   in this thread IS live. This is the case the agent got wrong.
+/// * **Built, not switched.** A newer binary is on disk. The user has not
+///   pressed *Switch to new version* yet, so the running engine predates it.
+/// * **Source ahead, not built.** A restart-requiring change is on main with no
+///   fresh binary behind it yet (the rebuild is running, or failed). Saying
+///   "the user has not switched" here would be misleading: there is nothing to
+///   switch onto.
+///
+/// Deliberately no build id in the text. The user cannot look one up on any
+/// screen, so it would only invite the agent to quote a hex string at them
+/// (`.claude/rules/glossary.md`, and the engine prompt's own NAMES NOT IDS
+/// rule); what the agent needs is the verdict, which the boolean already is.
+fn engine_build_section(status: &crate::engine::engine_version::VersionStatus) -> String {
+    let state = if status.update_available {
+        "A NEWER ENGINE IS BUILT AND THE USER HAS NOT SWITCHED ONTO IT YET, so an applied \
+         restart-requiring change is NOT live."
+    } else if status.source_behind_head {
+        "A RESTART-REQUIRING CHANGE IS ON MAIN WITH NO BUILD BEHIND IT YET (rebuilding, or \
+         it failed), so there is nothing to switch onto: do not tell them to."
+    } else {
+        "THE RUNNING ENGINE IS CURRENT, matching both the built binary and main. Any applied \
+         restart-requiring change IS live, and the user HAS restarted if one needed it."
+    };
+    format!(
+        "\n\nENGINE BUILD (rebuilt every turn, never stale):\n{state}\nThis is the answer to \
+         \"has the user restarted?\". Never ask, and never infer it from what you applied \
+         earlier: they restart when they like, including mid-turn."
+    )
+}
 
 /// Resolve every placeholder token in [`SYSTEM_PROMPT_BASE`] and append the
 /// coding-surface section, yielding the workspace-independent body of the chat
@@ -613,6 +653,7 @@ fn static_prompt_body(has_lucidos_source: bool, max_tool_calls: usize) -> String
     let body = SYSTEM_PROMPT_BASE
         .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
         .replace("__APPLY_VERIFY_RULE__", &apply_verify_rule)
+        .replace("__LOOK_BEFORE_ASSESSING_RULE__", LOOK_BEFORE_ASSESSING_RULE)
         .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
         .replace(
             "__WORKSPACE_ASSETS_KNOWHOW_RULE__",
@@ -776,6 +817,27 @@ TIMEZONE HANDLING:
             system_prompt,
             static_prompt_body(has_lucidos_source, max_tool_calls)
         );
+
+        // Whether the user has restarted onto the newest build is a FACT the
+        // engine holds, so it is stated here rather than left to be inferred
+        // from having applied a `requires_restart` change earlier in the
+        // thread. On 2026-08-09 that inference produced "the engine is still
+        // serving the pre-restart build" about an engine that had been
+        // restarted, and the agent had no way to check: the rule's own
+        // prescribed probe (fetch a served asset) says nothing about a change
+        // that altered no served asset, which a backend-only change never
+        // does. Dev-only, on the same gate as the apply-verify addendum that
+        // reads it: a packaged install has no source rebuild and routes to the
+        // release updater instead.
+        let system_prompt = if has_lucidos_source {
+            format!(
+                "{}{}",
+                system_prompt,
+                engine_build_section(&self.version_status().await)
+            )
+        } else {
+            system_prompt
+        };
 
         // Tell the LLM where Lucidos is running
         let api_port = std::env::var("LUCIDOS_API_PORT").unwrap_or_else(|_| "3000".to_string());
@@ -946,12 +1008,16 @@ Do NOT refuse to discuss the user's own personal information from their own file
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::process_helpers::{APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE};
-    use super::{
-        coding_surface_section, static_prompt_body, workspace_identity_section,
-        ASK_USER_QUESTION_RULE, NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
-        TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
+    use super::super::super::process_helpers::{
+        APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, LOOK_BEFORE_ASSESSING_RULE,
     };
+    use super::{
+        coding_surface_section, engine_build_section, static_prompt_body,
+        workspace_identity_section, ASK_USER_QUESTION_RULE, NAMES_NOT_IDS_RULE,
+        NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, TRIGGER_VS_EVENT_WAIT_RULE,
+        WORKSPACE_ASSETS_KNOWHOW_RULE,
+    };
+    use crate::engine::engine_version::VersionStatus;
     use std::path::{Path, PathBuf};
 
     /// Ceiling on the engine-authored text every chat turn pays for before the
@@ -1032,7 +1098,89 @@ mod tests {
     /// agent the parameter exists. Nothing was trimmed to pay for it because
     /// the base measured 103,195 against the 103,200 line, i.e. there was no
     /// slack left to reclaim. Measured total is 103,603, leaving 47 characters.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 103_650;
+    ///
+    /// Raised to 103,950 for two sentences a real thread paid for on
+    /// 2026-08-09. It spent five hours idle after ending a turn with "I have a
+    /// watch loop draining both legs": a background task outlives the turn, but
+    /// nothing re-opens the thread when it finishes, and only a user message
+    /// eventually did. It then completed the work and never called `todo_write`
+    /// again, so its finished plan still reads `abandoned`.
+    ///
+    /// Both are facts about the ENGINE, which the model cannot infer, and both
+    /// are decided at the END of a turn, which is exactly when nothing is being
+    /// looked up: `running-python` already carries the `await_event on
+    /// BackgroundBashCompleted` recipe in full and that thread never loaded it.
+    /// That is what makes these two resident and the recipe knowhow.
+    ///
+    /// Placement follows the same reasoning. `run_bash_background` (+227)
+    /// rather than `bash_output`, because the plan to follow a task is formed
+    /// when it is spawned, and because `bash_output` sits 14 chars under the
+    /// per-tool ceiling, which is that test correctly refusing prose the
+    /// knowhow already owns. `todo_write` (+82) rather than `await_event`,
+    /// which is the tool a thread in this state is precisely NOT reaching for.
+    /// Measured total is 103,901, leaving 49 characters.
+    ///
+    /// **That entry's wake claim is now out of date, and the sentence with it.**
+    /// It said a chat or trigger thread has no `agent_sessions` entry for
+    /// `spawn_bash_completion_watcher` to push a resume prompt into, so nothing
+    /// re-opens it. True when written; the chat turn tail now arms an *event
+    /// wait* over any unwatched background task (`engine::event_wait::background_task`),
+    /// so the engine does re-open the thread. The schema says that instead, in
+    /// 60 fewer characters, and instructing the model to arm the wait itself
+    /// would now be telling it to do what has already been done.
+    ///
+    /// **Raised to 105,900 in one step by the merge that brought all of the
+    /// above together**, and stated as one delta on purpose: this branch and
+    /// `main` each raised the line from the same 103,603 base, so their
+    /// individual arithmetic (103,950 there, 104,180 here) no longer composes,
+    /// and a ladder of deltas that does not add up to the measurement is worse
+    /// than no ladder. What the +1,949 over 103,950 buys, measured on the
+    /// merged tree:
+    ///
+    /// - The **ENGINE BUILD section**, 371, billed at its longest of three
+    ///   states even though a turn renders one. It is metered at all only
+    ///   because this work added it to `always_loaded_areas`: it is built per
+    ///   turn rather than spliced into `static_prompt_body`, so it would
+    ///   otherwise have been always-loaded text outside the only meter that
+    ///   watches always-loaded text. It buys the restart question, which the
+    ///   prompt was previously paying for in wrong answers: a thread asserted
+    ///   the user had not restarted when they had, and the prescribed probe
+    ///   cannot see a backend-only change, so there was no way to check.
+    /// - The **lookup surface**, 1,369 across three grouped schemas
+    ///   (`memory` gained `search` and `source`, `threads` gained `search`,
+    ///   `events` gained a `thread_id` filter) plus 590 for
+    ///   `LOOK_BEFORE_ASSESSING_RULE` in the static body. They close the gap
+    ///   that let a thread assert the user's launch had not happened while the
+    ///   facts sat in memory: retrieval ran once, before the turn, from queries
+    ///   a classifier guessed, and nothing could ask again. The root fix is
+    ///   free (a decomposition rule inside `QUERY_CLASSIFICATION_PROMPT`, which
+    ///   is not resident); this is the backstop, and a backstop nobody can
+    ///   reach is not one.
+    /// - Minus 60, because the `run_bash_background` sentence above was
+    ///   rewritten rather than added to: the engine now arms that wait itself.
+    ///
+    /// Paid down first by stripping the when-to-search policy out of all three
+    /// schemas, which the rule owns and which is the duplication the per-tool
+    /// ceiling exists to catch: the three landed 1,171 characters below their
+    /// first draft. All three still exceed the shared 1,500 per-tool line and
+    /// are enumerated in `PER_TOOL_CEILING_EXCEPTIONS` with the structure
+    /// behind each. Measured total is 105,845, leaving 55 characters.
+    ///
+    /// Raised to 106,150 for `cancel_event_wait`'s third target, `on`: stand
+    /// down the subscriptions watching one event type. 245 characters, and
+    /// what they buy is the SAFE verb for the request the agent actually gets.
+    /// "Stop watching for the release build" had only two forms, and both are
+    /// bad: read the list, find the id, then cancel it (three steps, and the
+    /// id is a uuid the model has to carry between calls), or reach for `all`,
+    /// which silently ends watches nobody mentioned. That is the harm ADR 0052
+    /// exists to prevent, reachable in one hasty tool call, and an agent that
+    /// skips the list to save a step lands on it. The argument is also on the
+    /// CLI, where the caller cannot read a list at all: `scripts/lib/e2e_lock.sh`
+    /// stands down the acquiring thread's watch for `E2ELockReleased` the moment
+    /// it takes the lock. Both surfaces share one engine function, so leaving
+    /// `on` off the schema would mean the refusals naming it were addressed to
+    /// an argument only one caller had. Measured total is 106,090, leaving 60.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 106_150;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1083,11 +1231,27 @@ mod tests {
         .chars()
         .count();
 
+        // Billed at its WORST case, like the body above. The section is built
+        // per turn rather than spliced into `static_prompt_body`, so it would
+        // otherwise be always-loaded text sitting outside the only meter that
+        // watches always-loaded text, which is exactly how an unbudgeted
+        // surface grows. Dev-only, and the dev variant is the one measured.
+        let engine_build = [(false, false), (true, false), (false, true)]
+            .into_iter()
+            .map(|(update_available, source_behind_head)| {
+                engine_build_section(&version_status(update_available, source_behind_head))
+                    .chars()
+                    .count()
+            })
+            .max()
+            .expect("three states");
+
         vec![
             ("static prompt body + rule consts", body),
             ("flat tool schemas, JSON wire form", flat),
             ("grouped manifest tool schemas, JSON wire form", grouped),
             ("System Knowhow routing list", knowhow),
+            ("ENGINE BUILD section (dev, per turn)", engine_build),
         ]
     }
 
@@ -1220,6 +1384,33 @@ mod tests {
             1_900,
             "five phrases pinned by three tests, every one a side effect that \
              is invisible from the verb",
+        ),
+        (
+            "memory",
+            1_780,
+            "four actions where there were two: `search` and `source` turned \
+             this from a correction-only tool into a read, each contributing \
+             its own summary line, its own `(requires: …)` clause and its own \
+             argument schema. The discipline on when to search is NOT here, \
+             deliberately: LOOK_BEFORE_ASSESSING_RULE owns it, so the schema \
+             says what the action does and nothing about policy",
+        ),
+        (
+            "threads",
+            1_860,
+            "a third action on a domain whose two existing schemas are almost \
+             entirely a spelled-out `status` enum pinned to `ThreadStatus::ALL` \
+             by a test, repeated across both because `llm_schema` is a const \
+             JSON literal and cannot compose. `search` adds its own summary, \
+             `(requires: q)` and two properties on top of that frozen shape",
+        ),
+        (
+            "events",
+            1_650,
+            "one property added to a domain already at 1,485: `thread_id` is \
+             the read half of finding a past conversation, and it has to say \
+             which `event_type` to pair it with or the filter returns the \
+             whole transcript including every streamed token",
         ),
     ];
 
@@ -1808,6 +1999,204 @@ mod tests {
             APPLY_VERIFY_DEV_ADDENDUM.contains("works on Lucidos constantly")
                 && APPLY_VERIFY_DEV_ADDENDUM.contains("did you restart?"),
             "the dev addendum must carry both dev-only halves"
+        );
+    }
+
+    /// The failure of 2026-08-09 in one assertion. The addendum used to close
+    /// with an example of what to say when the probe showed the old build, and
+    /// a thread wrote that sentence verbatim about an engine the user HAD
+    /// restarted, having run no probe at all. A prompt that pre-writes a
+    /// conclusion invites the model to reach for the words rather than the
+    /// check, so no wording for an unverified outcome may live here.
+    #[test]
+    fn the_addendum_supplies_no_sentence_for_an_unverified_outcome() {
+        assert!(
+            !APPLY_VERIFY_DEV_ADDENDUM.contains("still serving the pre-restart build"),
+            "a ready-made sentence asserting an unverified outcome is what got \
+             quoted as a finding:\n{APPLY_VERIFY_DEV_ADDENDUM}"
+        );
+        assert!(
+            APPLY_VERIFY_DEV_ADDENDUM.contains("ENGINE BUILD section"),
+            "it must point at where the answer actually is:\n{APPLY_VERIFY_DEV_ADDENDUM}"
+        );
+    }
+
+    /// The other half of that failure, and the reason pointing at the section
+    /// is not enough on its own: the prescribed probe cannot answer for a
+    /// backend-only change, because such a change alters no served asset. The
+    /// rule has to say so, or a diligent agent still has no method.
+    #[test]
+    fn the_addendum_scopes_the_probe_to_what_it_can_answer() {
+        assert!(
+            APPLY_VERIFY_DEV_ADDENDUM.contains("ALTERED a served asset"),
+            "the probe must be scoped to changes that alter a served asset:\n\
+             {APPLY_VERIFY_DEV_ADDENDUM}"
+        );
+        assert!(
+            APPLY_VERIFY_DEV_ADDENDUM.contains("backend-only change alters none"),
+            "it must name the case the probe cannot answer:\n{APPLY_VERIFY_DEV_ADDENDUM}"
+        );
+    }
+
+    /// The rule must state an ORDER. A rule phrased as a review step fires
+    /// once the model has decided what it thinks, which is precisely when it
+    /// will not go and check: on 2026-08-09 the agent asserted there had been
+    /// no traction, and only looked a turn later after the user objected, by
+    /// which point they had supplied the fact themselves.
+    #[test]
+    fn the_look_rule_states_an_order_not_a_review() {
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("BEFORE YOU FORM AN ASSESSMENT"),
+            "the rule must be about ordering:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("not a review at the end"),
+            "it must rule out the audit-afterwards reading:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+    }
+
+    /// The specific claim that went wrong, banned by name. Asserting absence
+    /// from an absence of evidence is the one failure this rule exists for.
+    #[test]
+    fn the_look_rule_bans_asserting_a_negative_unchecked() {
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("NEVER assert something has not happened"),
+            "it must ban the unchecked negative:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("Absence from your context is not absence"),
+            "it must say WHY, or it reads as a style note:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+    }
+
+    /// It has to name the two tools, or it is an instruction with no verb: the
+    /// agent is told to look and not told what to look with.
+    #[test]
+    fn the_look_rule_names_the_two_searches_and_bounds_them() {
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE
+                .contains("`memory` and `threads` tools both have a 'search'"),
+            "it must name what to look with:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("not browsing"),
+            "the user's constraint (only when necessary) must ride with the \
+             permission:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+    }
+
+    fn version_status(update_available: bool, source_behind_head: bool) -> VersionStatus {
+        VersionStatus {
+            build_id: "test".to_string(),
+            update_available,
+            disk_build_id: None,
+            packaged: false,
+            build_state: "idle",
+            source_behind_head,
+            shared_build_in_progress: false,
+            build_elapsed_ms: None,
+            pending_commits: None,
+        }
+    }
+
+    /// The case the agent got wrong: nothing pending, so an applied
+    /// restart-requiring change IS live and the user HAS restarted. Stated
+    /// affirmatively, because "no update available" is a double negative the
+    /// model has to reason through at exactly the moment it is guessing.
+    #[test]
+    fn a_current_engine_says_so_affirmatively() {
+        let section = engine_build_section(&version_status(false, false));
+
+        assert!(
+            section.contains("RUNNING ENGINE IS CURRENT"),
+            "must state the current case in the affirmative:\n{section}"
+        );
+        assert!(
+            section.contains("HAS \nrestarted") || section.contains("HAS restarted"),
+            "must answer the restart question outright:\n{section}"
+        );
+    }
+
+    /// A built-but-not-switched engine is the one case where "the user has not
+    /// restarted" is true, and it is the only case that may say so.
+    #[test]
+    fn a_built_but_unswitched_engine_says_the_change_is_not_live() {
+        let section = engine_build_section(&version_status(true, false));
+
+        assert!(
+            section.contains("HAS NOT SWITCHED ONTO IT YET"),
+            "must state that the user has not switched:\n{section}"
+        );
+        assert!(
+            section.contains("is NOT live"),
+            "must draw the consequence for an applied change:\n{section}"
+        );
+    }
+
+    /// Source ahead with no binary behind it is NOT "the user has not
+    /// switched": there is nothing to switch onto, so telling them to restart
+    /// sends them to a button that would do nothing.
+    #[test]
+    fn source_ahead_of_a_built_binary_does_not_tell_the_user_to_switch() {
+        let section = engine_build_section(&version_status(false, true));
+
+        assert!(
+            section.contains("NO BUILD BEHIND IT YET"),
+            "must distinguish source-ahead from binary-ready:\n{section}"
+        );
+        assert!(
+            section.contains("nothing to switch onto"),
+            "must not send the user to a switch that cannot work:\n{section}"
+        );
+    }
+
+    /// The three cases must be genuinely different text. Collapsing any two
+    /// would restore the guess this section exists to remove.
+    #[test]
+    fn the_three_build_states_are_distinct() {
+        let current = engine_build_section(&version_status(false, false));
+        let built = engine_build_section(&version_status(true, false));
+        let source_ahead = engine_build_section(&version_status(false, true));
+
+        assert_ne!(current, built);
+        assert_ne!(current, source_ahead);
+        assert_ne!(built, source_ahead);
+    }
+
+    /// It answers the question the addendum forwards to it, and says the
+    /// answer can change under the agent's feet: the user restarts on their own
+    /// schedule, including while a turn is running.
+    #[test]
+    fn the_section_answers_the_restart_question_and_dates_itself() {
+        let section = engine_build_section(&version_status(false, false));
+
+        assert!(
+            section.contains("has the user restarted?"),
+            "must name the question it settles:\n{section}"
+        );
+        assert!(
+            section.contains("rebuilt every turn"),
+            "must say it is fresh, or a long thread will treat it as stale:\n{section}"
+        );
+        assert!(
+            section.contains("mid-turn"),
+            "must warn that the answer can change during a turn:\n{section}"
+        );
+    }
+
+    /// No build id in the text. The user cannot look one up on any screen, so
+    /// putting it here only invites the agent to quote a hex string at them.
+    #[test]
+    fn the_section_carries_no_build_id() {
+        let mut status = version_status(true, false);
+        status.build_id = "deadbeef1".to_string();
+        status.disk_build_id = Some("cafebabe2".to_string());
+
+        let section = engine_build_section(&status);
+
+        assert!(
+            !section.contains("deadbeef1") && !section.contains("cafebabe2"),
+            "a build id is meaningless to the user and must not be quotable:\n{section}"
         );
     }
 

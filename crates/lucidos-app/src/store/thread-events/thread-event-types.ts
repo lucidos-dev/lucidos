@@ -288,7 +288,7 @@ export function continuationStartedSummary(
 // Persisted thread events — stored in DB, appear in snapshots.
 // Optional fields (`?`) allow older DB rows (before the field was added) to deserialize safely.
 /** Mirrors the Rust `ChildCompletionStatus` (serde rename_all = "snake_case").
- *  Drives the status badge on the child-completion card. */
+ *  Drives the status badge on the child-completion row. */
 export type ChildCompletionStatus = 'success' | 'failure' | 'no_changes' | 'canceled';
 
 /** Mirrors the Rust `AllowScope` (serde rename_all = "snake_case"). Carried on
@@ -503,8 +503,9 @@ export type ThreadEvent =
   // ── Event-wait lifecycle ──────────────────────────────────────────────
   // The thread subscribed to an event and parked; the engine wakes it on a
   // match, the deadline, or a user cancel. These DO render. `EventWaitStarted`
-  // becomes a step-level row in the transcript, never an exchange divider,
-  // because the wake resumes the SAME exchange. A delivery and an expiry
+  // becomes an *event row* in the transcript (the marker it shares with a wake,
+  // a child callback and a trigger fire), never an exchange divider, because
+  // the wake resumes the SAME exchange. A delivery and an expiry
   // resolve that row in place by `wait_id`, adding the outcome to the same
   // subject line. A cancel never touches it: see the `EventWaitCanceled` note
   // below. They also feed `meta.liveEventWaits`, which backs the always-visible

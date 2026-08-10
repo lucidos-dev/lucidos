@@ -17,6 +17,14 @@
  * error as its own text chunk, and `mergeAdjacentTextEvents` would otherwise
  * glue it onto whatever real prose preceded it, leaving nothing that compares
  * equal and putting the duplicate back.
+ *
+ * Claude Code's copy no longer arrives: since 2026-08-10 the engine recognizes
+ * an *agent error banner* by CC's own `is_api_error_message` flag and never
+ * records it as text (`claude_code_parse.rs`). These cases are therefore the
+ * BACKSTOP, and they are still live: events persisted by older engines, the chat
+ * channel, Codex, and a CC that stops flagging its banner all still reach the
+ * rule. Do not delete them because the engine gate exists, and do not widen the
+ * match because the engine gate is what keeps the shapes it must handle narrow.
  */
 import { describe, it, expect } from 'vitest';
 import { exchangeResponseEvents, groupIntoExchanges, type ThreadEvent } from '../thread-events';

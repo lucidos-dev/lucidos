@@ -345,6 +345,13 @@ impl LucidosEngine {
                         },
                     )
                     .await?;
+                // Re-read rather than publish `body_text`: this tool is the one
+                // artifact writer that does NOT take `lock_workspace_repo`, so
+                // a concurrent writer may already have landed newer bytes, and
+                // the cache must never hold content the file does not.
+                self.user_profile
+                    .artifact_written_on_disk(self.workspace_path(), artifact_path)
+                    .await;
             }
         }
 

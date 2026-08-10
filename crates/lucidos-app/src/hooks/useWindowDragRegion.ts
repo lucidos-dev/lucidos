@@ -26,6 +26,14 @@ interface WindowDragOptions {
  * never cross the threshold, so they still reach the page's own handlers.
  *
  * No-op off Tauri (web / PWA / mobile): the listeners are never attached.
+ *
+ * The element must be mounted by the render that calls this, because the effect
+ * reads `ref.current` once and its deps never change afterwards. A CONDITIONALLY
+ * rendered region therefore cannot pass a `useRef`, which would still hold null
+ * from the render that rendered nothing: pass a state-backed element instead
+ * (`useState` + a callback `ref`, wrapped so the object identity changes with
+ * it), so the effect re-runs when the element appears. `WorkspacePicker` is the
+ * worked example.
  */
 export function useWindowDragRegion(
   ref: { current: HTMLElement | null },

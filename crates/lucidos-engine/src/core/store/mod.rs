@@ -77,6 +77,30 @@ pub(super) fn describe_tool_event(event: &EventRow) -> (String, String) {
     (tool_name, description)
 }
 
+/// Filters for the paged event-query path, the events-side sibling of
+/// [`ThreadSummaryFilters`].
+///
+/// A struct rather than seven positional parameters because they are all
+/// optional and several share a type: `Option<Uuid>` appears three times
+/// (`before_event_id`, `after_event_id`, `thread_id`), and at the call site
+/// nothing but argument order would have distinguished them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EventQueryFilters<'a> {
+    /// Exact `event_type` match. `None` queries every type, which is worth
+    /// avoiding on a busy workspace.
+    pub event_type: Option<&'a str>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    /// Walk backward from this event, exclusive, under `(created, id)`
+    /// lexicographic order.
+    pub before_event_id: Option<Uuid>,
+    /// Tail-follow forward from this event, exclusive.
+    pub after_event_id: Option<Uuid>,
+    /// Restrict to one thread. `None` is every thread, which is what every
+    /// caller predating this field passes, so the filter can only narrow.
+    pub thread_id: Option<Uuid>,
+}
+
 /// Outcome of [`EventStore::query_events_paged`]. Kept separate from
 /// `sqlx::Error` so the HTTP layer can map a missing cursor to a 404 without
 /// string-matching error messages.
@@ -188,19 +212,22 @@ impl EventStore {
         Ok(())
     }
 
-    /// Query events by type with optional time filter and limit.
+    /// Query events with optional filters and a limit, no cursor paging.
     /// Used by App UIs and the LLM `query_events` tool to fetch domain events
     /// (e.g. GoogleDocEdited). Newest-first; rows sharing one timestamp tie-
     /// break on `id DESC` so the order is deterministic across calls.
+    ///
+    /// Takes the whole [`EventQueryFilters`] rather than the three it used to
+    /// spell out. A filter this signature does not name is a filter its caller
+    /// silently drops, and that is not hypothetical: the LLM tool gained a
+    /// `thread_id` and kept calling the three-argument form, so the model could
+    /// ask for one thread's messages and be handed every thread's.
     pub async fn query_events(
         &self,
-        event_type: Option<&str>,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        filters: EventQueryFilters<'_>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        self.fetch_events(event_type, since, until, None, None, limit)
-            .await
+        self.fetch_events(filters, None, None, limit).await
     }
 
     /// Cursor-paged variant of [`Self::query_events`]. Pass `before_event_id`
@@ -212,25 +239,21 @@ impl EventStore {
     /// of silently returning the unfiltered history.
     pub async fn query_events_paged(
         &self,
-        event_type: Option<&str>,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
-        before_event_id: Option<Uuid>,
-        after_event_id: Option<Uuid>,
+        filters: EventQueryFilters<'_>,
         limit: i64,
     ) -> Result<QueryEventsResult, sqlx::Error> {
-        let before_cursor = match self.resolve_cursor(before_event_id).await? {
+        let before_cursor = match self.resolve_cursor(filters.before_event_id).await? {
             CursorResolution::None => None,
             CursorResolution::Found(c) => Some(c),
             CursorResolution::Missing => return Ok(QueryEventsResult::CursorNotFound),
         };
-        let after_cursor = match self.resolve_cursor(after_event_id).await? {
+        let after_cursor = match self.resolve_cursor(filters.after_event_id).await? {
             CursorResolution::None => None,
             CursorResolution::Found(c) => Some(c),
             CursorResolution::Missing => return Ok(QueryEventsResult::CursorNotFound),
         };
         let events = self
-            .fetch_events(event_type, since, until, before_cursor, after_cursor, limit)
+            .fetch_events(filters, before_cursor, after_cursor, limit)
             .await?;
         Ok(QueryEventsResult::Events(events))
     }
@@ -250,13 +273,16 @@ impl EventStore {
 
     async fn fetch_events(
         &self,
-        event_type: Option<&str>,
-        since: Option<DateTime<Utc>>,
-        until: Option<DateTime<Utc>>,
+        filters: EventQueryFilters<'_>,
         before_cursor: Option<(DateTime<Utc>, Uuid)>,
         after_cursor: Option<(DateTime<Utc>, Uuid)>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
+        // `thread_id` is one more `IS NULL OR` in the same shape as every other
+        // filter, so omitting it returns exactly what it always returned. That
+        // matters: every existing caller (the CLI, triggers, the SDK) passes
+        // `None`, and a filter that narrowed by default would silently change
+        // all of them. It rides the `idx_events_thread_id_created_seq` index.
         sqlx::query_as::<_, EventRow>(
             "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
@@ -264,16 +290,18 @@ impl EventStore {
              AND ($3::timestamptz IS NULL OR created < $3) \
              AND ($5::timestamptz IS NULL OR created < $5 OR (created = $5 AND id < $6)) \
              AND ($7::timestamptz IS NULL OR created > $7 OR (created = $7 AND id > $8)) \
+             AND ($9::uuid IS NULL OR thread_id = $9) \
              ORDER BY created DESC, id DESC LIMIT $4",
         )
-        .bind(event_type)
-        .bind(since)
-        .bind(until)
+        .bind(filters.event_type)
+        .bind(filters.since)
+        .bind(filters.until)
         .bind(limit)
         .bind(before_cursor.map(|(c, _)| c))
         .bind(before_cursor.map(|(_, i)| i))
         .bind(after_cursor.map(|(c, _)| c))
         .bind(after_cursor.map(|(_, i)| i))
+        .bind(filters.thread_id)
         .fetch_all(&self.pool)
         .await
     }

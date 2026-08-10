@@ -55,6 +55,24 @@ export async function checkHealth(): Promise<Loadable<HealthInfo>> {
   }
 }
 
+/** The name the USER gave this workspace, asked of our OWN engine.
+ *
+ *  Lives beside `checkHealth` because the two are the halves of one question:
+ *  health's `workspace` is the engine's directory name (identity, frozen), this
+ *  is the gateway registry's display name (renameable). The engine resolves it
+ *  by asking the co-located gateway over loopback, which is the only route open
+ *  to a page served on the engine's own port: the control listing is on the
+ *  gateway ORIGIN, and its CSRF gate refuses a cross-origin browser fetch. See
+ *  `api/workspace_label.rs` and `store/actions/workspace-label.ts`.
+ *
+ *  `null` whenever there is no gateway to ask or it could not be reached, and
+ *  on an older engine that has no such route (the 404 throws). The caller falls
+ *  back to the engine name, so this never fails loudly. */
+export async function getWorkspaceLabel(): Promise<string | null> {
+  const body = await json<{ label: string | null }>(`${API}/workspace-label`);
+  return body.label ?? null;
+}
+
 // --- Chat ---
 export async function submitChat(body: ChatRequestBody): Promise<{ event_id: string }> {
   const res = await mutatingFetch(`${API}/chat/stream`, {

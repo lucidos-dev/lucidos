@@ -1,9 +1,67 @@
 # Investigation: `API Error: Stream idle timeout - no chunks received`
 
-Coding-agent sessions in this workspace die with this error, losing all uncommitted
-work. This document records the evidence, the mechanism, and the mitigations.
+Coding-agent sessions in this workspace die mid-turn with this error. This
+document records the evidence, the mechanism, and the mitigations. (The original
+lede said the death loses all uncommitted work. It does not, and never did: the
+worktree survives and `--resume` re-enters it. What is lost is the turn's
+in-flight reasoning. See "Consequence for the user".)
 
-Status: closed. Cause identified, one mitigation shipped, one proposed.
+Status: closed. Cause identified, both mitigations shipped. Two conclusions
+below were overtaken by events and are corrected in-place; see the update note.
+
+## Update 2026-08-10: two conclusions below are wrong
+
+Re-read against three recurrences on 2026-08-10 (all three caused by the laptop
+idle-sleeping on battery, not by a provider stall) and against the installed
+`2.1.224` bundle rather than the `2.1.220` this document decompiled.
+
+1. **Mitigation B shipped.** It is no longer "specified but not built". A
+   stream-idle death now emits
+   `ContinuationRequested{reason: auto_resume_after_api_error}` roughly three
+   seconds later and resumes via `--resume`. The gate is
+   `auto_resume_after_api_error` in `engine/agent_session/lifecycle.rs`, keyed off
+   `is_transient_api_failure` (any terminal whose error starts with `API Error`)
+   and bounded by `MAX_API_ERROR_AUTO_RESUMES = 3` *consecutive* resumes, reset by
+   any successful turn. Design and follow-ups:
+   `docs/plans/2026-08-05-turn-survives-api-drop-and-resume-settle.md`,
+   `docs/plans/2026-08-05-api-drop-auto-resume-emit-site-unreachable.md`,
+   `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`.
+   So the consequence described under "Consequence for the user" no longer holds:
+   the turn's in-flight reasoning is still lost and re-derived, but the thread does
+   not park waiting for a human.
+
+2. **Mitigation A is inert on `2.1.224`.** There are *two* idle tiers, and the
+   effective deadline is the lower of them. Verified in the bundle:
+
+   ```js
+   qn = ee.CLAUDE_ENABLE_STREAM_WATCHDOG ?? true,
+   fn = Zfa(),                                    // max(CLAUDE_STREAM_IDLE_TIMEOUT_MS || 0, 300000)
+   bi = Math.min(ema(zn()), qn ? fn : Infinity),  // byte tier vs event tier
+   ...
+   zl = setTimeout(() => { ... tier: Ce("event") }, fn)   // aborts the stream at fn
+   ```
+
+   `ema(...)` is the byte tier and honours our `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`.
+   `fn` is the **event** tier, floored at 300 000 and moved only by
+   `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, which the engine never sets. The event timer
+   arms its own abort at `fn`, so raising the byte tier alone changes nothing: the
+   real deadline is still 300 s. Measured 2026-08-10, with
+   `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` confirmed present on the live
+   subprocess, a thread died **304.9 s** after its last byte. The user-visible
+   string this document is named for is the *event* tier's
+   (`Streaming idle timeout: no chunks received for ${fn/1000}s, aborting stream`),
+   not the byte tier's (`Streaming idle timeout (byte-level): ...`).
+
+   The corollary is that section A's preference between the two env knobs is
+   backwards for this build, and that the ordering invariant its test asserts
+   (`runtime/claude_code_tests/build_command.rs`) is true of the constant but false
+   of CC's behaviour, because the test only knows about the byte tier. Raising the
+   event tier as well was considered on 2026-08-10 and deliberately not done: with
+   Mitigation B shipped the residual cost is one wasted turn plus one of three
+   resume slots, and the 2026-08-10 recurrences were multi-minute machine
+   suspensions that no client-side deadline would have carried anyway.
+
+Everything else below stands, and the evidence sections are left as written.
 
 ## Answer in one page
 
@@ -26,9 +84,12 @@ Status: closed. Cause identified, one mitigation shipped, one proposed.
   non-destructive auto-resume, is slower than CC's 5-minute one, so the
   destructive handler always won.
 - **Shipped:** `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS = 1800000` on every
-  coding-agent spawn, which makes the engine watchdog the first responder.
-- **Proposed, needs approval:** auto-continue on this error class, bounded to one
-  attempt per turn.
+  coding-agent spawn, intended to make the engine watchdog the first responder.
+  **Inert on `2.1.224`**, which caps the deadline at the lower of a byte tier and
+  an event tier and leaves the event tier at 300 s. See the update note above.
+- **Shipped 2026-08-05 (was "proposed" here):** bounded auto-continue on this
+  error class, `MAX_API_ERROR_AUTO_RESUMES = 3` consecutive. This is the recovery
+  that actually catches the failure today.
 - **Upstream:** three closed issues, no fix, no maintainer reply. The watchdog
   itself shipped deliberately in 2.1.196 ("on by default for all providers",
   5 minutes). Nothing to wait for.
@@ -299,6 +360,11 @@ auto-commits on `Generated`. So a stream-idle death:
   (Continue resumes into the same worktree, so files are not destroyed; the lost
   thing is the turn and everything the agent had reasoned but not yet written).
 
+**Superseded 2026-08-05 by Mitigation B.** The first bullet no longer holds: the
+`ResponseFailed` is still emitted and still shows a red card, but the thread does
+not park. It auto-resumes about three seconds later. The other two bullets stand,
+which is why a stream-idle death still costs the turn's un-written reasoning.
+
 ### The revive path is the riskiest turn in a session
 
 A revive resumes with `--resume`, which replays the whole conversation. The first
@@ -310,6 +376,11 @@ inside a deadline that had already killed the thread twice.
 ## Upstream status
 
 ### Are we on the latest CLI? Yes, and ahead of the stable channel.
+
+**Version drift, noted 2026-08-10:** the installed CLI is now `2.1.224`, so the
+version numbers in this section are a snapshot of 2026-08-02, not a current fact.
+The conclusion holds (a version bump does not fix this), and `2.1.224` is where
+the two-tier deadline in the update note at the top was read.
 
 Checked deterministically rather than from prose: `npm view @anthropic-ai/claude-code dist-tags`
 returns `latest = 2.1.220`, `next = 2.1.220`, `stable = 2.1.212`. The installed
@@ -371,11 +442,18 @@ environment, so Lucidos can set them on the spawn.
 
 | Variable | Effect |
 |---|---|
-| `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` | Sets the byte-watchdog threshold directly. Clamped to `[10000, 1800000]`. Highest precedence. |
-| `CLAUDE_STREAM_IDLE_TIMEOUT_MS` | Sets the base, floored at `300000`; also suppresses the remote-gate override. Cannot lower the deadline below 5 minutes. |
-| `CLAUDE_ENABLE_BYTE_WATCHDOG` | `0`/`false`/`no`/`off` removes the watchdog entirely; truthy forces it on; unset defers to a remote gate that currently defaults on. |
+| `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` | Sets the **byte-tier** threshold directly. Clamped to `[10000, 1800000]`. Highest precedence *within that tier*, which is not the same as highest precedence overall. |
+| `CLAUDE_STREAM_IDLE_TIMEOUT_MS` | Sets the base, floored at `300000`; also suppresses the remote-gate override. Cannot lower the deadline below 5 minutes. **The only knob that moves the event tier**, and therefore the one that matters, see below. |
+| `CLAUDE_ENABLE_BYTE_WATCHDOG` | `0`/`false`/`no`/`off` removes the byte watchdog entirely; truthy forces it on; unset defers to a remote gate that currently defaults on. Leaves the event tier armed. |
+| `CLAUDE_ENABLE_STREAM_WATCHDOG` | Disarms the **event** tier (`qn` in the resolver), which is what makes the byte tier the effective deadline. Defaults on. |
 | `CLAUDE_SLOW_FIRST_BYTE_MS` | Threshold for the advisory `Slow first byte` warning only. Does not abort anything. |
 | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` | Unhelpful here: the non-streaming fallback is already skipped for watchdog errors. |
+
+**Two tiers, and the deadline is the lower one.** Read out of `2.1.224` on
+2026-08-10: the event tier is `max(CLAUDE_STREAM_IDLE_TIMEOUT_MS || 0, 300000)`
+and arms its own abort, so setting only the byte variable leaves the real deadline
+at 300 s. This row is the correction to the table above; the update note at the
+top of this document carries the code and the measurement.
 
 The ceiling matters: **30 minutes is the maximum**, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`
 is clamped and cannot be set to infinity. Fully disabling the watchdog is only
@@ -392,7 +470,7 @@ Sources:
 
 Five options were evaluated against the code. Two are worth doing, three are not.
 
-### A. Raise the client deadline on the spawn (done, this change)
+### A. Raise the client deadline on the spawn (done, this change; inert since)
 
 `build_command` sets `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` to `1800000` (the clamp
 maximum, 30 minutes) **before** `apply_lucidos_env`, so a workspace env var of the
@@ -426,14 +504,23 @@ Two rejected variants of the same idea:
   path. `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` is the direct, highest-precedence
   override for exactly the timer that fired.
 
-### B. Treat the error class as recoverable and auto-continue (proposed, not done)
+  **Corrected 2026-08-10:** this preference is backwards on `2.1.224`. The timer
+  that fires is the *event* tier, and `CLAUDE_STREAM_IDLE_TIMEOUT_MS` is the only
+  knob that moves it, so the variant rejected here is the one that would have
+  worked and the one chosen is inert. Table above notwithstanding, the "After"
+  column never happened: the effective deadline stayed at 5 minutes. Not fixed,
+  deliberately, because Mitigation B now catches the failure; see the update note
+  at the top.
+
+### B. Treat the error class as recoverable and auto-continue (SHIPPED 2026-08-05)
 
 Option A removes the trigger. This is the belt for when it fires anyway, and it is
 the thing issue #53730 asked upstream for and did not get.
 
-Today `classify_result` maps **any** `cc_error` to `TerminalKind::Failed { error }`,
-which emits `ResponseFailed` and parks the thread waiting for a human. The proposal
-is to carve out a narrow transient class and auto-continue instead:
+At the time of writing, `classify_result` mapped **any** `cc_error` to
+`TerminalKind::Failed { error }`, which emitted `ResponseFailed` and parked the
+thread waiting for a human. The proposal was to carve out a narrow transient class
+and auto-continue instead:
 
 - Add a predicate beside `is_definitive_session_not_found` in
   `agent_session/lifecycle.rs` matching CC's stream-idle wording. That file already
@@ -453,9 +540,33 @@ Touch points: `agent_session/lifecycle.rs` (predicate plus the decision function
 `agent_session/run_session/run.rs` (the `AgentEvent::Result` arm),
 `agent_recovery/helpers.rs` (the bound), `lifecycle_tests/classify.rs` (tests).
 
-Not implemented here because it changes the thread lifecycle: a turn that today
-ends and waits would start re-spawning work on its own. That is an implementation
-plan and a human approval, not a drive-by.
+Not implemented *here*, because it changes the thread lifecycle: a turn that ends
+and waits would start re-spawning work on its own. That is an implementation plan
+and a human approval, not a drive-by.
+
+**It shipped on 2026-08-05**, and the built shape differs from the sketch above in
+two ways worth knowing:
+
+- The predicate is `is_transient_api_failure`, and it matches the `API Error`
+  **prefix** rather than the stream-idle wording specifically, so it covers the
+  whole transient class (`API Error: 500 {…}`,
+  `API Error: Connection closed mid-response.`) with one rule shared with
+  `claude_code_parse.rs`. The decision function is `auto_resume_after_api_error`,
+  which additionally refuses on engine shutdown and on a conflict-resolution
+  session.
+- The bound is `MAX_API_ERROR_AUTO_RESUMES = 3` and it is **consecutive**, not one
+  per turn: a `ResponseGenerated` or a new user message resets it, so an
+  unattended session that hits a drop every few hours never exhausts it, while
+  three failures with no successful turn between them stop the loop.
+
+Plans: `docs/plans/2026-08-05-turn-survives-api-drop-and-resume-settle.md`, then
+`docs/plans/2026-08-05-api-drop-auto-resume-emit-site-unreachable.md` and
+`docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`
+for two follow-ups where the continuation was emitted but suppressed downstream.
+
+Observed working on 2026-08-10: three coding-agent threads took a stream-idle
+death and each resumed about three seconds later, with `CodingAgentIdled` carrying
+`has_changes: true` so no worktree state was at risk.
 
 ### C. An engine-side keepalive (rejected, not possible)
 
@@ -503,9 +614,15 @@ the operational version: what the error means, what to do when a thread hits it
 (Continue works), and the three things not to try (downgrade the CLI, disable the
 watchdog, or blame the length of the session).
 
-**Open.** Mitigation B above (bounded auto-continue on a transient stream error)
-is specified but not built. It needs an implementation plan and approval because
-it changes the thread lifecycle.
+**Nothing open.** Mitigation B (bounded auto-continue on a transient stream
+error) shipped on 2026-08-05 as `auto_resume_after_api_error`; see section B and
+the update note at the top. Mitigation A is inert on `2.1.224` and was left that
+way on purpose, so the "ordering invariant" claimed two paragraphs up holds for
+the constant the test reads but not for CC's effective deadline. If a future
+change makes the deadline matter again, the missing half is
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, and the test in
+`runtime/claude_code_tests/build_command.rs` has to assert both tiers or it will
+keep passing while the invariant is false.
 
 ## How to verify a recurrence is this and not something else
 

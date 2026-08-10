@@ -90,7 +90,8 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
             description: format!(
                 "Spawn a long-running shell command in the background and return a task_id immediately. \
                 Use it whenever the command may exceed run_bash's {MAX_TIMEOUT_SECS}s sync ceiling: long HTTP polls, builds, scrapers, npm/cargo installs, repo-wide migrations. \
-                Drain with bash_output(task_id), cancel with bash_kill(task_id). Never hand-roll a `time.sleep` polling loop in run_python. Default timeout {BG_DEFAULT_TIMEOUT_SECS}s, max {BG_MAX_TIMEOUT_SECS}s, then the child is killed. Same env-var injection as run_bash."
+                Drain with bash_output(task_id), cancel with bash_kill(task_id). Never hand-roll a `time.sleep` polling loop in run_python. Default timeout {BG_DEFAULT_TIMEOUT_SECS}s, max {BG_MAX_TIMEOUT_SECS}s, then the child is killed. Same env-var injection as run_bash. \
+                It OUTLIVES YOUR TURN: end the turn with it still running and the engine wakes this thread when it finishes. A shell poll loop cannot do that and dies with your turn."
             ),
             parameters: json!({
                 "type": "object",

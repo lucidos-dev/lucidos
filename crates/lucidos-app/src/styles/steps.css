@@ -1,26 +1,3 @@
-/* Details toggle (intermediate text chunks) */
-.details-toggle {
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-size: var(--font-size-sm);
-    color: var(--text-secondary);
-    padding: 0.125rem 0;
-}
-
-@media (hover: hover) {
-    .details-toggle:hover {
-        color: var(--text-primary);
-    }
-}
-
-/* Response toggles (More/Less + Show/Hide steps) */
-.response-toggles {
-    display: flex;
-    gap: 0.75rem;
-    margin-bottom: 0.25rem;
-}
-
 /* Inline steps (between text chunks). ONE row per action: the model's thinking
    and the call it produced share a row (see `nameThinkingRow` in
    `exchange-render.ts`), so the row carries TWO click targets, `.step-main`
@@ -593,8 +570,10 @@
    checkpoint (ADR 0002); the shared shell survives its extraction because the
    box earns its weight only for an inline AFFORDANCE (checkpoint carries an
    Undo button). The event-wait record used to share it and no longer does: it
-   was a full-width panel for one action the agent took, so it became an
-   ordinary step line instead (see `.inline-step-static`).
+   was a full-width panel for one action the agent took, so it became a step
+   line, and then (2026-08-10) an event row of its own, because a step line put
+   a green success check on a subscription that might still be sleeping. See
+   `styles/chat/event-rows.css`.
 
    Corners, not a centred row: the icon rides the summary's FIRST line and the
    actions sit on the LAST, so a card whose summary wraps to several lines still
@@ -678,30 +657,4 @@
    scrolls, rather than growing the modal past the viewport. */
 .checkpoint-diff-modal .folder-tree {
     overflow-x: auto;
-}
-
-/* An event wait, as one line in the step list (ADR 0047, amended 2026-08-06).
-   It was a boxed `.step-note-card` until the box was dropped: a park is one
-   action the agent took, and a full-width panel repeating what the subscription
-   indicator already shows live was the wrong weight for it in the transcript.
-
-   A step row with no click targets in it. `InlineStep` puts the row's text
-   inside `.step-main`, which opens the step-detail modal; there is none behind
-   an event wait, so this row keeps its text as bare spans and re-enables
-   selection, which the tap-suppression on `.inline-step` turns off. The nested
-   `.event-wait-jump` is the row's only real affordance. */
-.inline-step-static {
-    user-select: text;
-    -webkit-user-select: text;
-}
-
-.event-wait-jump {
-    background: none;
-    border: none;
-    padding: 0;
-    font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it
-       so a Fira Code user does not get ligatures back here. */
-    font-feature-settings: inherit;
-    cursor: pointer;
 }

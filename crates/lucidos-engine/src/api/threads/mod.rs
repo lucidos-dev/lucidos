@@ -32,7 +32,7 @@ pub(super) use list::{
     count_thread_summaries, get_archived_count, get_filter_facets, get_older_threads,
     get_thread_summary, list_thread_summaries, list_threads,
 };
-pub(super) use search::{combined_thread_search, search_threads};
+pub(super) use search::search_threads;
 
 /// Extract a `thread_id` UUID from a JSON body that uses the
 /// `{"thread_id": "<uuid>"}` shape. Used by save/unsave/rename/archive handlers.

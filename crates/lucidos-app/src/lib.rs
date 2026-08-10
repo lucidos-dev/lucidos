@@ -8,6 +8,7 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
+mod config_scalar;
 mod desktop;
 mod device_id_store;
 mod mobile;
@@ -17,6 +18,7 @@ mod notifications;
 /// never touched, which is a macOS packaging fact.
 #[cfg(target_os = "macos")]
 mod shell_env;
+mod traffic_lights;
 mod updater;
 
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
@@ -277,6 +279,11 @@ static WEBVIEW_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// while the always-on launchd service runs untouched. Packaged only.
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// Label of the app window declared in `tauri.conf.json`. It is the one window
+/// a packaged close only HIDES (so it can be reshown instantly), which is why it
+/// is also the window every "bring the client forward" path prefers.
+pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
+
 /// Label prefix for additional top-level app windows opened via File → New
 /// Window. The first window is `main` (declared in `tauri.conf.json`); each
 /// extra window gets `window-<n>`. Panel preview webviews use the
@@ -293,36 +300,56 @@ const APP_WINDOW_PREFIX: &str = "window-";
 /// behind-the-webview fallback so that band reads blue, not black, before the
 /// page paints. The frontend's `applyTheme` refines it to the exact per-theme
 /// blue via the `set_titlebar_color` command.
+///
+/// The FALLBACK only. Once the frontend has reported a color it is remembered
+/// (see [`TITLE_BAR_COLOR_FILE`]) and that value is what a later launch paints
+/// with, so a light-theme user is not launched into the dark-theme blue; this
+/// constant covers a first run and an unreadable file.
 const TITLE_BAR_DEFAULT_COLOR: &str = "#15549e";
 
 /// JS appended to every app window's startup injection. On macOS it sets the
 /// `--titlebar-inset` CSS variable (the macOS standard title-bar height) before
 /// the page paints, so under `titleBarStyle: "Overlay"` the reclaimed title-bar
-/// band — drawn by the `.titlebar-strip` element, which sizes to
-/// `var(--titlebar-inset, 0px)` — appears with no layout shift, while the header
+/// band, drawn by the `.titlebar-strip` element which sizes to
+/// `var(--titlebar-inset, 0px)`, appears with no layout shift while the header
 /// content below keeps its position. Empty on every other platform and the web
 /// build, where there is no native title bar: `--titlebar-inset` stays unset
 /// (0px) and the strip collapses to nothing.
 ///
-/// It also stamps `data-titlebar-overlay`, which is the same fact as a SELECTOR
+/// It also stamps `--titlebar-lights-x`, the x we place the traffic lights at
+/// ([`traffic_lights::LIGHTS_X_PX`], applied to the real window by
+/// [`traffic_lights::place`]). That is what makes the horizontal room the header
+/// row keeps clear DERIVED rather than guessed: `styles/panels/shell.css`
+/// computes `--titlebar-lights-reserve` as this x plus the cluster's measured
+/// width plus a gap, so the reserve moves with the placement instead of standing
+/// as an independent estimate of where the OS left buttons we did not control.
+/// It is stamped here, pre-paint, alongside the inset, because the reserve is
+/// read by the first frame the header lays out.
+///
+/// And it stamps `data-titlebar-overlay`, which is the same fact as a SELECTOR
 /// rather than a length. Two things need it, and neither can be expressed with
-/// the var alone. The header's leading control steps right by
-/// `--titlebar-lights-reserve`, a flat 80px clearing the traffic lights, with no
-/// `--titlebar-inset` term in it to collapse to nothing off this build: keyed on
-/// the var, a web header would be indented by the width of lights it does not
-/// have. And the header is SHORTENED by the band here, so the two desktop builds
-/// show one bar; that subtraction is only correct where a band exists. See the
-/// `[data-titlebar-overlay]` block in `styles/panels/shell.css`.
-fn titlebar_inset_script() -> &'static str {
+/// the vars alone. The header's leading control steps right by
+/// `--titlebar-lights-reserve`, which has no `--titlebar-inset` term in it to
+/// collapse to nothing off this build (and a fallback x, so it resolves even
+/// unstamped): keyed on a var, a web header would be indented by the width of
+/// lights it does not have. And the header is SHORTENED by the band here, so the
+/// two desktop builds show one bar; that subtraction is only correct where a
+/// band exists. See the `[data-titlebar-overlay]` block in
+/// `styles/panels/shell.css`.
+fn titlebar_inset_script() -> String {
     #[cfg(target_os = "macos")]
     {
-        "if(document.documentElement){\
-         document.documentElement.style.setProperty('--titlebar-inset','28px');\
-         document.documentElement.setAttribute('data-titlebar-overlay','');}"
+        format!(
+            "if(document.documentElement){{\
+             document.documentElement.style.setProperty('--titlebar-inset','28px');\
+             document.documentElement.style.setProperty('--titlebar-lights-x','{}px');\
+             document.documentElement.setAttribute('data-titlebar-overlay','');}}",
+            traffic_lights::LIGHTS_X_PX
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        ""
+        String::new()
     }
 }
 
@@ -337,8 +364,8 @@ fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
 
 /// True if `label` names a top-level Lucidos app window (the declared `main` or
 /// a New-Window child), as opposed to a `url-preview-*` panel webview.
-fn is_app_window(label: &str) -> bool {
-    label == "main" || label.starts_with(APP_WINDOW_PREFIX)
+pub(crate) fn is_app_window(label: &str) -> bool {
+    label == MAIN_WINDOW_LABEL || label.starts_with(APP_WINDOW_PREFIX)
 }
 
 /// Paint the macOS window background of every top-level app window the given
@@ -370,7 +397,75 @@ fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String
         .parse()
         .map_err(|e| format!("invalid color {color:?}: {e}"))?;
     paint_title_bars(&app, parsed);
+    // Remember it for the NEXT launch's pre-paint tint. Deliberately AFTER the
+    // parse, so the file can only ever hold a value the startup path accepts.
+    persist_title_bar_color(&app, &color);
     Ok(())
+}
+
+/// Remembers the last color the frontend asked for, so a cold launch can paint
+/// the window background in the user's theme instead of the compiled dark-theme
+/// default (a light-theme user otherwise watches dark blue correct itself once
+/// the frontend catches up). A bare hex string, no schema: one value, read back
+/// through the same color parse as any other, never trusted into anything else.
+///
+/// The file plumbing (where it lives, the trimmed read, the write that skips an
+/// unchanged value) is [`config_scalar`], shared with the header-bar height the
+/// traffic lights are placed against; what stays here is what the value MEANS.
+const TITLE_BAR_COLOR_FILE: &str = "titlebar-color";
+
+/// Write `color` for the next launch. Trimmed first, because the color parser
+/// tolerates surrounding whitespace while [`config_scalar::read`] strips it:
+/// storing the raw string would leave a value that never compares equal to what
+/// is read back, so the skip would miss and every theme apply would rewrite the
+/// file.
+fn persist_title_bar_color(app: &tauri::AppHandle, color: &str) {
+    config_scalar::write_if_changed(app, TITLE_BAR_COLOR_FILE, color.trim(), "title-bar color");
+}
+
+/// Pure: which color string to paint with before a page can report its theme.
+/// `persisted` is the raw file content from the last `set_titlebar_color`; it
+/// wins only if it still parses as a color, so a truncated or hand-edited file
+/// degrades to [`TITLE_BAR_DEFAULT_COLOR`] rather than to no tint at all.
+fn title_bar_color_or_default(persisted: Option<&str>) -> &str {
+    persisted
+        .filter(|c| c.parse::<tauri::utils::config::Color>().is_ok())
+        .unwrap_or(TITLE_BAR_DEFAULT_COLOR)
+}
+
+/// The pre-paint tint for a window that has not reported a theme yet: the color
+/// the frontend last asked for, else the compiled default. Used at startup and
+/// when a New-Window child is built, the two moments a window exists with
+/// nothing painted in it.
+fn pre_paint_title_bar_color(app: &tauri::AppHandle) -> Option<tauri::utils::config::Color> {
+    let persisted = config_scalar::path(app, TITLE_BAR_COLOR_FILE)
+        .as_deref()
+        .and_then(config_scalar::read);
+    title_bar_color_or_default(persisted.as_deref())
+        .parse()
+        .ok()
+}
+
+/// Frontend-driven traffic-light placement. The app calls this with the height
+/// of the header bar it just measured, and the macOS window buttons are centred
+/// on that bar (see [`traffic_lights`] for the arithmetic and for why Tauri
+/// 2.11.4 leaves us to do this through AppKit).
+///
+/// The bar height has to come from the page because only the page knows it:
+/// `--desktop-bar-height` is `3rem` and the root font size is the user's UI-scale
+/// preference, so the bar is 48px at 100% and 72px at 150%. It is also LIVE (the
+/// Style Remote retunes tokens over SSE), which is the whole reason this is a
+/// command rather than a value fixed when the window was built.
+///
+/// `window` is the calling window, so a New-Window child places its own lights.
+/// Remembered for the next cold launch, exactly as `set_titlebar_color` is.
+#[tauri::command]
+fn set_traffic_light_offset(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    bar_height_px: f64,
+) -> Result<(), String> {
+    traffic_lights::set_bar_height(&app, &window, bar_height_px)
 }
 
 /// Start a native window drag for the calling window. The frontend's
@@ -399,12 +494,21 @@ fn toggle_window_maximize(window: tauri::Window) -> Result<(), String> {
     }
 }
 
-/// Open an additional top-level app window (File → New Window / Cmd+N). Every
-/// window is just another client of the same engine — the engine + Postgres run
-/// as a shared launchd service (see `desktop`), so all windows share one
-/// workspace stack. The WKWebView crash-recovery watchdog stays scoped to
-/// `main`.
+/// Open an additional top-level app window (File → New Window / Cmd+N) on the
+/// window the user is looking at. Every window is just another client of the
+/// same engine (the engine + Postgres run as a shared launchd service, see
+/// `desktop`), so all windows share one workspace stack. The WKWebView
+/// crash-recovery watchdog stays scoped to `main`.
 fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
+    open_app_window(app, new_window_url(app))
+}
+
+/// Build a top-level app window at `url`. The one builder every extra window
+/// goes through, so a window opened for a notification tap is identical to a
+/// File → New Window one: same `window-<n>` label (which is what
+/// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
+/// pre-paint tint and traffic-light placement.
+fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String> {
     let counter = WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
 
@@ -421,7 +525,7 @@ fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     // rather than forwarding it, so no HTML5 `dragover`/`drop` ever reaches the
     // page and every file drop in the window is silently dead. We listen for no
     // Tauri drag-drop event, so nothing is given up by turning it off.
-    let builder = WebviewWindowBuilder::new(app, &label, new_window_url(app))
+    let builder = WebviewWindowBuilder::new(app, &label, url)
         .title("Lucidos")
         .inner_size(1024.0, 768.0)
         .disable_drag_drop_handler();
@@ -433,9 +537,13 @@ fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     // Tint the bar immediately (window layer only) so it's not black for the
     // moment before this window's frontend boots and calls `set_titlebar_color`.
     // The window is registered by `build()`, so paint_title_bars now covers it.
-    if let Ok(color) = TITLE_BAR_DEFAULT_COLOR.parse() {
+    if let Some(color) = pre_paint_title_bar_color(app) {
         paint_title_bars(app, color);
     }
+    // And put this window's traffic lights on its bar before its frontend boots,
+    // for the same reason: at the remembered bar height, so they are not centred
+    // for the default scale for the moment before it reports in.
+    traffic_lights::place_all(app);
     Ok(())
 }
 
@@ -1112,10 +1220,14 @@ fn __panel_content_report(
 ///
 /// Delegates to the [`notifications`] module, which drives Apple's modern
 /// `UserNotifications` framework (`UNUserNotificationCenter`). `link` is the
-/// SW-message shape (`notification_id` / `thread_id` / `event_id` / `tap`); on
-/// tap the delegate emits `native-notification-tapped` carrying it, and the
-/// page routes it through the SAME `dispatchDeepLink` the web-push tap uses (see
-/// `store/actions/native-push.ts`). No-op in `tauri dev` (unbundled binary) and
+/// SW-message shape (`notification_id` / `thread_id` / `event_id` / `tap`) plus
+/// the calling page's `workspace` (its gateway slug), which is what lets a tap
+/// be routed back to the workspace that raised it instead of into whichever one
+/// happens to be loaded; on tap the delegate emits `native-notification-tapped`
+/// carrying it, and the page routes it through the SAME `dispatchDeepLink` the
+/// web-push tap uses (see `store/actions/native-push.ts`). The workspace also
+/// composes the UN request identifier, see `notifications::show`.
+/// No-op in `tauri dev` (unbundled binary) and
 /// on non-macOS — see `notifications.rs` and `system-knowhow/notifications.md`
 /// §4.
 #[tauri::command]
@@ -1125,15 +1237,19 @@ fn show_native_notification(title: String, body: String, link: serde_json::Value
 
 /// Remove an already-delivered native banner — the cross-device dismiss
 /// counterpart of [`show_native_notification`]. `id = Some(notification_id)`
-/// removes that one banner; `None` removes ALL delivered banners (the
-/// mark-all-read path). Driven by the engine's `NativePushDismissRequested` SSE
-/// when a notification is read on any device (`store/actions/native-push.ts`).
+/// removes that one banner; `None` removes every delivered banner `workspace`
+/// raised (the mark-all-read path), leaving the other workspaces' banners alone.
+/// Driven by the engine's `NativePushDismissRequested` SSE when a notification
+/// is read on any device (`store/actions/native-push.ts`). `workspace` is the
+/// calling page's gateway slug, the same one [`show_native_notification`]
+/// stamped into the link, and BOTH arms need it: `Some(id)` rebuilds the
+/// composite request identifier, `None` scopes the sweep.
 /// Delegates to the [`notifications`] module, which also drops the stashed deep
 /// link so a tap on a now-removed banner can't route. No-op in `tauri dev`
-/// (unbundled binary) and on non-macOS — see `notifications.rs`.
+/// (unbundled binary) and on non-macOS, see `notifications.rs`.
 #[tauri::command]
-fn dismiss_native_notification(id: Option<String>) {
-    notifications::dismiss(id);
+fn dismiss_native_notification(workspace: Option<String>, id: Option<String>) {
+    notifications::dismiss(workspace, id);
 }
 
 /// Wake the unread-indicator loop for an immediate recompute. The frontend calls
@@ -1179,12 +1295,19 @@ fn get_native_window_active(app: tauri::AppHandle) -> bool {
 
 /// Drain the deep links from native-banner taps the page may not have been
 /// listening for (see `notifications::take_pending_taps`). The frontend calls
-/// this at startup (cold path) and on each `native-notification-tapped` signal
-/// (warm path); the drain is atomic, so each tap routes exactly once. Naturally
-/// empty in `tauri dev` / off-macOS. See `store/actions/native-push.ts`.
+/// this at startup (cold path), on each `native-notification-tapped` signal
+/// (warm path), and when its window regains focus / visibility; the drain is
+/// atomic, so each tap routes exactly once. Naturally empty in `tauri dev` /
+/// off-macOS.
+///
+/// `workspace` is the calling page's gateway slug (`null` on a legacy engine
+/// with no gateway). It scopes the drain: a page takes only the taps raised by
+/// the workspace it is actually serving, plus unattributable ones. Without it a
+/// window on one workspace could swallow another workspace's tap, which is what
+/// made which-window-handles-a-tap a race. See `store/actions/native-push.ts`.
 #[tauri::command]
-fn take_pending_native_taps() -> Vec<serde_json::Value> {
-    notifications::take_pending_taps()
+fn take_pending_native_taps(workspace: Option<String>) -> Vec<serde_json::Value> {
+    notifications::take_pending_taps(workspace.as_deref())
 }
 
 /// Bridge the native window's *active* state (focused AND on-screen) to that
@@ -1240,6 +1363,109 @@ fn should_show_window_at_startup(args: &[std::ffi::OsString], is_dev: bool) -> b
         || !args
             .iter()
             .any(|a| a == std::ffi::OsStr::new(desktop::LOGIN_FLAG))
+}
+
+/// How long `setup` waits for [`window_ready_to_show`] before putting the window
+/// on screen unpainted.
+///
+/// A healthy launch signals in well under a second: the first document is the
+/// bundled boot splash, which needs no network. So three seconds elapses only
+/// when the frontend is genuinely not coming (a webview crash, a JS exception
+/// before the signal, a bad bundle), and the cost of waiting it out is that the
+/// launch feels slow, never that it fails. It is also far below the 30s the
+/// WKWebView crash watchdog sleeps before its first check, so the window is on
+/// screen long before recovery would even look at it.
+const STARTUP_SHOW_FALLBACK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The one-shot gate on the deferred startup show.
+///
+/// The `main` window is declared hidden and stays hidden until the frontend says
+/// it has something to paint, so a cold launch never shows a window filled with
+/// nothing but the window-layer tint. Two racers can end that wait, and both are
+/// required: the frontend's [`window_ready_to_show`], and the
+/// [`STARTUP_SHOW_FALLBACK`] timer that covers a frontend which never signals.
+/// Whichever arrives first shows the window; the other becomes a no-op, so the
+/// window is shown at most once and a user who has since dismissed it to the
+/// menu bar does not get it back.
+///
+/// `wanted` is the launch decision, taken once in `setup` from
+/// [`should_show_window_at_startup`], and it gates BOTH racers: a login start
+/// leaves it false and neither one may show anything. It starts false so a
+/// missing `arm` shows no window rather than defeating the login-start
+/// suppression. The client being menu-bar-only ALREADY gates them too, which
+/// covers the dismissal that lands inside the wait rather than after it (see
+/// [`StartupShow::claim`]).
+struct StartupShow {
+    wanted: AtomicBool,
+    shown: AtomicBool,
+}
+
+impl StartupShow {
+    const fn new() -> Self {
+        Self {
+            wanted: AtomicBool::new(false),
+            shown: AtomicBool::new(false),
+        }
+    }
+
+    /// Record whether this launch gets a window at all. Called once, from `setup`.
+    fn arm(&self, wanted: bool) {
+        self.wanted
+            .store(wanted, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True for exactly one caller of an armed gate, false for every caller of an
+    /// unarmed one. The racers are deliberately indistinguishable here: the rule
+    /// is "first one wins", which is what makes both arrival orders safe.
+    ///
+    /// `menu_bar_only` stands both of them down, and it is read BEFORE the
+    /// one-shot is consumed so a legitimate later show can still have it. The app
+    /// menu is live from the moment the event loop starts, so the wait is long
+    /// enough for a user to Cmd+Q ("Close to Menu Bar"), or to open and close a
+    /// New-Window child, either of which drops the client to `Accessory` with no
+    /// visible window. Showing then would put a window on screen with no Dock
+    /// tile, behind the other apps and with an unclickable menu bar, which is the
+    /// state [`show_main_window`] restores `Regular` FIRST to avoid.
+    fn claim(&self, menu_bar_only: bool) -> bool {
+        self.wanted.load(std::sync::atomic::Ordering::SeqCst)
+            && !menu_bar_only
+            && !self.shown.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+static STARTUP_SHOW: StartupShow = StartupShow::new();
+
+/// Put the deferred startup window on screen, at most once. Returns whether this
+/// call was the one that did it, so the fallback timer can say that the frontend
+/// never signalled without the frontend's own path logging anything.
+fn show_startup_window(app: &tauri::AppHandle) -> bool {
+    if !STARTUP_SHOW.claim(MENU_BAR_ONLY.load(std::sync::atomic::Ordering::SeqCst)) {
+        return false;
+    }
+    match app.get_webview_window("main") {
+        Some(win) => {
+            if let Err(e) = win.show() {
+                eprintln!("[Tauri] Failed to show the main window: {e}");
+            }
+        }
+        None => eprintln!("[Tauri] No main window to show at startup"),
+    }
+    true
+}
+
+/// The frontend's "theme resolved, about to paint" signal (`windowReadyToShow`
+/// in `utils/tauri.ts`). Ends the deferred startup wait, so the first frame the
+/// user sees is a painted page rather than a bare window.
+///
+/// Scoped to `main`: it is the only window that starts hidden. A New-Window child
+/// is built visible and its frontend signals too, which must not consume the
+/// one-shot `main` is still waiting on.
+#[tauri::command]
+fn window_ready_to_show(window: tauri::Window) {
+    if window.label() != "main" {
+        return;
+    }
+    show_startup_window(window.app_handle());
 }
 
 /// Pure: which surfaces show the unread `count`, as `(dock_badge_label,
@@ -1382,23 +1608,131 @@ fn close_all_to_tray(app: &tauri::AppHandle) {
 /// the window can come forward with a clickable app menu, then emits
 /// `native-window-active = true` so the reshown page immediately counts as active.
 pub(crate) fn show_main_window(app: &tauri::AppHandle) {
-    // Leaving menu-bar-only: restore `Regular` BEFORE showing so the window can be
-    // fronted and the app menu is clickable (the AppKit `Accessory`→`Regular`
-    // transition otherwise leaves the app behind / the menu bar unclickable).
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
+        front_window(app, MAIN_WINDOW_LABEL);
+        return;
+    }
+    // Gone: build a replacement. Leaving menu-bar-only first for the same reason
+    // `front_window` does, since `Accessory` cannot front the new window either.
     set_menu_bar_only(app, false);
-
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-        // set_focus alone can leave an app that just left `Accessory` behind other
-        // apps / with an unclickable menu bar — explicitly activate frontmost.
-        activate_app_frontmost();
-        // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit
-        // explicitly so the reshow is deterministic regardless of event timing.
-        emit_window_active(app, "main", true);
-    } else if let Err(e) = open_new_window(app) {
+    if let Err(e) = open_new_window(app) {
         eprintln!("[Tauri] Failed to open window: {e}");
+    }
+}
+
+/// Show + focus one specific app window. The shared body of every "bring a
+/// window forward" path: [`show_main_window`] for the window it names, and
+/// `route_native_tap` for the one it picked for a banner tap.
+///
+/// Leaving menu-bar-only comes FIRST: the `Regular` activation policy has to be
+/// back before the window is fronted or the app menu is unclickable (the AppKit
+/// `Accessory` to `Regular` transition otherwise leaves the app behind others).
+/// For the same reason `set_focus` alone is not enough and the app is explicitly
+/// activated frontmost. `set_focus()` also fires `WindowEvent::Focused(true)`,
+/// but `native-window-active` is emitted explicitly so the reshow is
+/// deterministic regardless of event timing.
+fn front_window(app: &tauri::AppHandle, label: &str) {
+    set_menu_bar_only(app, false);
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        activate_app_frontmost();
+        emit_window_active(app, label, true);
+    }
+}
+
+/// Bring forward (or create) the window a native banner tap belongs in, given
+/// the workspace that RAISED the banner.
+///
+/// One packaged process fronts the gateway and each app window can sit on its
+/// own workspace (ADR 0014), so "the window that is frontmost" and "the
+/// workspace the tap came from" are unrelated. This used to be
+/// [`show_main_window`] plus a page-side hop, which fronted `main` whatever it
+/// was showing and then let whichever page drained the tap navigate ITSELF to
+/// the raising workspace, taking a window off the workspace the user had it on.
+/// The decision lives here now because only this process can see every window,
+/// read what each is pointed at, and open one.
+///
+/// Returns the label of an already-loaded window to send the warm
+/// `native-notification-tapped` wake to, or `None` when the target is a page
+/// that is about to load: a fresh page runs the startup drain itself, and an
+/// `emit` into a webview mid-navigation is dropped.
+///
+/// The caller must have stashed the tap BEFORE calling this. Showing or focusing
+/// a window fires that page's `focus` / `visibilitychange` drains, and a drain
+/// that runs first finds nothing.
+#[cfg(target_os = "macos")]
+pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> Option<String> {
+    let windows: Vec<(String, String)> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_app_window(label))
+        .map(|(label, window)| {
+            let url = window.url().map(|u| u.to_string()).unwrap_or_else(|e| {
+                // An unreadable URL reads as "not navigated", which sends the tap
+                // down the boot path. Say so: it is otherwise a silently
+                // stranded tap.
+                eprintln!("[Tauri] Could not read the URL of window {label}: {e}");
+                String::new()
+            });
+            (label, url)
+        })
+        .collect();
+
+    // Prefer an origin a window is actually on, so a client reached over
+    // something other than the stable loopback URL still targets itself.
+    let origin = notifications::gateway_origin(&windows)
+        .map(str::to_string)
+        .unwrap_or_else(|| desktop::gateway_url(desktop::engine_port()));
+
+    match notifications::choose_tap_target(&windows, owner, &origin) {
+        notifications::TapTarget::Focus(label) => {
+            front_window(app, &label);
+            Some(label)
+        }
+        notifications::TapTarget::Navigate { label, url } => {
+            match (app.get_webview_window(&label), url.parse::<tauri::Url>()) {
+                (Some(window), Ok(parsed)) => {
+                    if let Err(e) = window.navigate(parsed) {
+                        eprintln!("[Tauri] Failed to point {label} at {url}: {e}");
+                    }
+                }
+                // Never silent: the window would come forward on the wrong page
+                // and the tap would sit unroutable in the stash.
+                _ => eprintln!("[Tauri] Cannot point {label} at {url}: no such window / bad URL"),
+            }
+            front_window(app, &label);
+            None
+        }
+        notifications::TapTarget::NewWindow { url } => {
+            match url.parse::<tauri::Url>() {
+                Ok(parsed) => {
+                    set_menu_bar_only(app, false);
+                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed)) {
+                        eprintln!("[Tauri] Failed to open a window for {url}: {e}");
+                    }
+                    activate_app_frontmost();
+                }
+                Err(e) => eprintln!("[Tauri] Bad tap target URL {url}: {e}"),
+            }
+            None
+        }
+        notifications::TapTarget::LaunchInto { url } => {
+            // `desktop::launch` is still waiting on the gateway and owns the
+            // main window's first navigation; aim it rather than race it.
+            desktop::set_launch_target(url);
+            show_main_window(app);
+            None
+        }
+        notifications::TapTarget::MainWindow => {
+            show_main_window(app);
+            // An unattributed tap may be taken by any page, and `main` is the one
+            // just fronted. If it had to be recreated instead, the fresh page's
+            // startup drain is the trigger.
+            app.get_webview_window(MAIN_WINDOW_LABEL)
+                .map(|_| MAIN_WINDOW_LABEL.to_string())
+        }
     }
 }
 
@@ -1516,6 +1850,8 @@ pub fn run() {
             updater::install_app_update_and_restart,
             updater::cancel_app_update,
             set_titlebar_color,
+            set_traffic_light_offset,
+            window_ready_to_show,
             start_window_drag,
             toggle_window_maximize,
             mobile::get_connect_info,
@@ -1585,6 +1921,17 @@ pub fn run() {
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
                     if is_app_window(window.label()) =>
                 {
+                    // A RESIZE puts the macOS window buttons back where AppKit
+                    // wants them (measured: x back to 9, the titlebar container
+                    // back to 32pt), discarding our placement, so re-apply it.
+                    // Fullscreen enter/exit is a resize, which is what covers
+                    // the known reset there; wry and tao run their own version
+                    // of this from a view's `drawRect:` for the same reason.
+                    // Not on `Moved`: the placement is a function of the
+                    // window's HEIGHT, so moving it changes nothing.
+                    if matches!(event, tauri::WindowEvent::Resized(_)) {
+                        traffic_lights::place(window);
+                    }
                     let saver = app.state::<GeometrySaver>();
                     *saver.last_change.lock().unwrap() = Instant::now();
                     saver
@@ -1639,12 +1986,20 @@ pub fn run() {
             // Tint the window background to match the in-app header (window layer
             // only — no webview/page-bg flash). Under Overlay this is the
             // behind-the-webview fallback for the reclaimed title-bar band. This is
-            // the default dark-theme blue; the frontend's applyTheme refines it to
-            // the exact per-theme color via set_titlebar_color once it knows the
-            // theme.
-            if let Ok(color) = TITLE_BAR_DEFAULT_COLOR.parse() {
+            // the color the frontend last asked for, so a light-theme user does not
+            // launch into the dark-theme blue; applyTheme refines it via
+            // set_titlebar_color once this launch's theme is known.
+            if let Some(color) = pre_paint_title_bar_color(app.handle()) {
                 paint_title_bars(app.handle(), color);
             }
+
+            // Same idea, other half of the band: put the macOS traffic lights on
+            // the bar the frontend last measured, before it has booted to
+            // measure it again. Load first, then place, so the very first window
+            // is centred for the user's UI scale rather than for the compiled
+            // 48px default.
+            traffic_lights::load_persisted(app.handle());
+            traffic_lights::place_all(app.handle());
 
             // Packaged: a menu-bar status item keeps the client resident after the
             // window is dismissed and hosts the only full-teardown action. No-op
@@ -1663,16 +2018,32 @@ pub fn run() {
             // Ordered AFTER the tray on purpose: going `Accessory` with neither a
             // window nor a tray item would leave the client with no surface at
             // all.
+            //
+            // The DECISION stays here; only the moment of showing moves. Showing
+            // now would put an unpainted window on screen for as long as the
+            // webview takes to load, so the window waits for the frontend's
+            // `window_ready_to_show`, with the timer below as the safety net (see
+            // StartupShow). A login start arms the gate `false`, which stands both
+            // of them down.
             let launch_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-            if should_show_window_at_startup(&launch_args, tauri::is_dev()) {
-                match app.get_webview_window("main") {
-                    Some(win) => {
-                        if let Err(e) = win.show() {
-                            eprintln!("[Tauri] Failed to show the main window: {e}");
-                        }
+            let show_at_startup = should_show_window_at_startup(&launch_args, tauri::is_dev());
+            STARTUP_SHOW.arm(show_at_startup);
+            if show_at_startup {
+                // The safety net. Without it, a frontend that never signals (a
+                // webview crash, a JS exception before the signal, a bundle that
+                // does not load) leaves a client with a tray icon and no way to
+                // discover it has no window.
+                let show_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(STARTUP_SHOW_FALLBACK);
+                    if show_startup_window(&show_handle) {
+                        eprintln!(
+                            "[Tauri] No ready-to-show signal within {STARTUP_SHOW_FALLBACK:?}: \
+                             showing the window anyway. The page may have failed to load, so \
+                             check the engine log for [Client/ipc] lines."
+                        );
                     }
-                    None => eprintln!("[Tauri] No main window to show at startup"),
-                }
+                });
             } else {
                 eprintln!("[Tauri] Started at login: coming up menu-bar-only, no window");
                 set_menu_bar_only(app.handle(), true);
@@ -1889,21 +2260,31 @@ mod tests {
         assert!(!is_app_window(""));
     }
 
-    /// The injected script carries TWO facts the desktop header depends on, and
-    /// it is a string literal nothing else parses: a typo in it fails silently
-    /// in the webview, where the only symptom is a header that quietly lays out
-    /// like the web build. The attribute half is the one at risk, being the
-    /// newer of the two and the gate every `[data-titlebar-overlay]` rule in
-    /// `styles/panels/shell.css` hangs off.
+    /// The injected script carries THREE facts the desktop header depends on,
+    /// and it is a string nothing else parses: a typo in it fails silently in
+    /// the webview, where the only symptom is a header that quietly lays out
+    /// like the web build. The attribute is the gate every
+    /// `[data-titlebar-overlay]` rule in `styles/panels/shell.css` hangs off;
+    /// the lights x is what makes `--titlebar-lights-reserve` arithmetic on the
+    /// placement we actually applied rather than an estimate.
     #[test]
     #[cfg(target_os = "macos")]
-    fn the_titlebar_script_sets_both_the_inset_and_the_overlay_marker() {
+    fn the_titlebar_script_sets_the_inset_the_lights_x_and_the_overlay_marker() {
         let script = titlebar_inset_script();
         assert!(script.contains("--titlebar-inset"), "{script}");
         assert!(script.contains("28px"), "{script}");
         assert!(script.contains("data-titlebar-overlay"), "{script}");
-        // Both statements live inside the one `if(document.documentElement)`
-        // guard, so the braces have to balance or the second never runs.
+        // The stamped x has to BE the x the placement uses, rendered as a CSS
+        // length. Built from the constant, so this catches the rendering (a
+        // stray `10` with no unit is not a length and the reserve's calc would
+        // be invalid), not the value.
+        assert!(script.contains("--titlebar-lights-x"), "{script}");
+        assert!(
+            script.contains(&format!("'{}px'", traffic_lights::LIGHTS_X_PX)),
+            "{script}"
+        );
+        // All three statements live inside the one `if(document.documentElement)`
+        // guard, so the braces have to balance or the later ones never run.
         assert_eq!(
             script.matches('{').count(),
             script.matches('}').count(),
@@ -1932,10 +2313,11 @@ mod tests {
 
     #[test]
     fn the_declared_main_window_starts_hidden() {
-        // The other half of `should_show_window_at_startup`: `setup` is what puts
-        // the window on screen, which is only a choice while the config keeps it
-        // hidden. Make this window `"visible": true` again and every login start
-        // flashes a window before hiding it.
+        // The other half of `should_show_window_at_startup` and of
+        // [`StartupShow`]: WE put the window on screen, which is only a choice
+        // while the config keeps it hidden. Make this window `"visible": true`
+        // again and every login start flashes a window before hiding it, while
+        // every other launch is back to showing an unpainted one.
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(
@@ -1969,6 +2351,124 @@ mod tests {
         // In dev the flag is inert. There is no tray there (`install_tray` is
         // skipped), so a hidden dev window would have nothing to reopen it.
         assert!(should_show_window_at_startup(&login, true));
+    }
+
+    #[test]
+    fn the_ready_signal_shows_the_window_and_a_later_timeout_is_a_no_op() {
+        // The healthy launch: the frontend reports it is about to paint, and the
+        // fallback timer fires three seconds later into an already-shown window.
+        let gate = StartupShow::new();
+        gate.arm(true);
+        assert!(gate.claim(false), "the ready signal shows the window");
+        assert!(
+            !gate.claim(false),
+            "the fallback timer must not show it again"
+        );
+    }
+
+    #[test]
+    fn the_timeout_shows_the_window_and_a_later_ready_signal_is_a_no_op() {
+        // The frontend was slow rather than dead, so the signal lands after the
+        // safety net has already shown the window. Re-showing here is not merely
+        // redundant: by then the user may have dismissed it to the menu bar.
+        let gate = StartupShow::new();
+        gate.arm(true);
+        assert!(gate.claim(false), "the fallback timer shows the window");
+        assert!(
+            !gate.claim(false),
+            "the late ready signal must not show it again"
+        );
+    }
+
+    #[test]
+    fn a_login_start_shows_the_window_from_neither_racer() {
+        // `should_show_window_at_startup` said no, so the decision holds against
+        // BOTH paths: a login start is menu-bar-only however the frontend behaves.
+        let gate = StartupShow::new();
+        gate.arm(false);
+        assert!(!gate.claim(false));
+        assert!(!gate.claim(false));
+    }
+
+    #[test]
+    fn a_dismissal_inside_the_wait_stands_both_racers_down() {
+        // Cmd+Q ("Close to Menu Bar") in the second before the window appears
+        // drops the client to `Accessory` with nothing visible. Showing then
+        // would put a window on screen with no Dock tile behind every other app.
+        let gate = StartupShow::new();
+        gate.arm(true);
+        assert!(!gate.claim(true), "the ready signal must stand down");
+        assert!(!gate.claim(true), "and so must the fallback timer");
+        // The one-shot was NOT consumed while standing down, so reopening from
+        // the tray (which restores `Regular`) leaves a working gate rather than a
+        // spent one.
+        assert!(gate.claim(false));
+    }
+
+    #[test]
+    fn the_startup_show_gate_admits_exactly_one_concurrent_racer() {
+        // The two racers really do run on different threads (the IPC handler and
+        // the fallback timer), so the one-shot has to hold under a genuine race,
+        // not just under sequential calls.
+        let gate = StartupShow::new();
+        gate.arm(true);
+        let winners = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..8).map(|_| s.spawn(|| gate.claim(false))).collect();
+            racers
+                .into_iter()
+                .map(|r| r.join().expect("racer panicked"))
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(winners, 1, "exactly one racer may show the window");
+    }
+
+    #[test]
+    fn the_startup_color_prefers_the_value_the_frontend_last_asked_for() {
+        // The light-theme header blue, remembered from the last session: painting
+        // it is the whole point, so a cold launch is not dark blue correcting
+        // itself once the frontend catches up.
+        assert_eq!(title_bar_color_or_default(Some("#1a6fd0")), "#1a6fd0");
+        // Every shape the color parser accepts, since the file holds whatever the
+        // frontend sent.
+        assert_eq!(title_bar_color_or_default(Some("#fff")), "#fff");
+        assert_eq!(title_bar_color_or_default(Some("#15549eff")), "#15549eff");
+    }
+
+    #[test]
+    fn the_startup_color_falls_back_when_nothing_usable_was_remembered() {
+        // First run, or an unreadable file.
+        assert_eq!(title_bar_color_or_default(None), TITLE_BAR_DEFAULT_COLOR);
+        // Truncated, hand-edited, or not a color at all. The file is validated on
+        // read rather than trusted, and the value is only ever fed to a color
+        // parse, so garbage costs the default tint and nothing else.
+        assert_eq!(
+            title_bar_color_or_default(Some("")),
+            TITLE_BAR_DEFAULT_COLOR
+        );
+        assert_eq!(
+            title_bar_color_or_default(Some("#15549")),
+            TITLE_BAR_DEFAULT_COLOR
+        );
+        assert_eq!(
+            title_bar_color_or_default(Some("rgb(1,2,3)")),
+            TITLE_BAR_DEFAULT_COLOR
+        );
+        assert_eq!(
+            title_bar_color_or_default(Some("../../etc/passwd")),
+            TITLE_BAR_DEFAULT_COLOR
+        );
+    }
+
+    #[test]
+    fn the_compiled_default_title_bar_color_parses() {
+        // `title_bar_color_or_default` hands its answer straight to the parser, so
+        // a typo in the constant would leave a launch with NO tint rather than the
+        // wrong one, and only on the path that has no persisted value to fall back
+        // on (a first run).
+        assert!(TITLE_BAR_DEFAULT_COLOR
+            .parse::<tauri::utils::config::Color>()
+            .is_ok());
     }
 
     #[test]

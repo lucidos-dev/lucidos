@@ -5,8 +5,8 @@
  * !welcomeDismissed; the dismissal lives in the DB-backed
  * welcome_suggestions_dismissed preference). Content stays provider-aware: when
  * no LLM provider is configured the welcome guides the user to Settings → Models
- * → Providers instead of offering starter prompts that would chat into a "no
- * provider" error. These tests invoke the components directly and walk the
+ * → Providers instead of offering the setup interview, which would chat into a
+ * "no provider" error. These tests invoke the components directly and walk the
  * returned VNode tree (the repo idiom — no DOM render library), and unit-test
  * the pure gating predicate.
  */
@@ -34,7 +34,7 @@ vi.mock('../../../store/store', async (importOriginal) => ({
   showConfirm: vi.fn(async () => true),
 }));
 
-import { WelcomeMessage, ProviderSetupWelcome, SuggestionCarousel, SetupInterviewWelcome, suggestionView } from '../WelcomeMessage';
+import { WelcomeMessage, ProviderSetupWelcome, SetupInterviewWelcome } from '../WelcomeMessage';
 import { showWelcomeSurface } from '../CreateThreadView';
 import { threadHeaderActions } from '../../layout/ThreadHeaderActions';
 import { dialogParagraphs } from '../../shared/DialogMessage';
@@ -108,25 +108,25 @@ describe('WelcomeMessage — provider-aware variant selection', () => {
     expect(vnode.type).toBe(ProviderSetupWelcome);
   });
 
-  it('renders the suggestion carousel when a provider is configured', () => {
+  it('renders the setup-interview hero when a provider is configured', () => {
     llmConfigured.value = true;
     const vnode = WelcomeMessage() as AnyVNode;
     // Configured branch is the inline DOM tree, not the setup component.
     expect(vnode.type).toBe('div');
-    // Suggestions render via the chevron carousel (its own component, which makes
-    // each suggestion a clickable button that prefills the prompt — covered by
-    // e2e/welcome.spec.ts), with the lead-in label above it. The old standalone
-    // `welcome-suggestion-chip` markup is gone, and there's no provider-setup CTA.
-    expect(containsComponent(vnode, SuggestionCarousel)).toBe(true);
-    expect(textOf(vnode)).toContain('Or ask me anything');
+    // The interview is the ONLY action here. The starter suggestions that used
+    // to sit under an "Or ask me anything" lead-in are gone (chevron carousel,
+    // label and the older `welcome-suggestion-chip` markup alike), so the
+    // newcomer has one thing to press. No provider-setup CTA on this branch.
+    expect(textOf(vnode)).not.toContain('Or ask me anything');
+    expect(findByClass(vnode, 'welcome-carousel').length).toBe(0);
+    expect(findByClass(vnode, 'welcome-suggestions-label').length).toBe(0);
     expect(findByClass(vnode, 'welcome-suggestion-chip').length).toBe(0);
     expect(findByClass(vnode, 'welcome-provider-setup').length).toBe(0);
   });
 });
 
-/** The first-run entry point into the setup interview. It is the primary action
- *  on this surface, so it must render above the carousel and look like a
- *  sibling of the provider-setup CTA, not like a sixth suggestion. */
+/** The first-run entry point into the setup interview. It is the ONLY action on
+ *  this surface, and looks like a sibling of the provider-setup CTA. */
 describe('SetupInterviewWelcome: first-run entry point', () => {
   beforeEach(() => {
     vi.mocked(startSetupInterview).mockClear();
@@ -153,14 +153,16 @@ describe('SetupInterviewWelcome: first-run entry point', () => {
     expect(findByClass(ProviderSetupWelcome() as AnyVNode, 'welcome-setup-interview-btn').length).toBe(0);
   });
 
-  it('is a prominent confirm-styled button with a hint, matching the provider CTA', () => {
+  it('is a prominent blue button with a hint, matching the provider CTA', () => {
     const tree = SetupInterviewWelcome() as AnyVNode;
     const btns = findByClass(tree, 'welcome-setup-interview-btn');
     expect(btns.length).toBe(1);
-    // Additive variant: the base class must ride along or it renders as a plain
-    // grey browser button.
-    const klass = btns[0].props.class as string;
-    expect(klass.split(' ')).toEqual(expect.arrayContaining(['action-btn', 'action-btn-confirm']));
+    // Bare `.action-btn` is the blue default. The green `action-btn-confirm`
+    // variant is deliberately NOT on it: green reads as "accept what is already
+    // on screen", and this starts something.
+    const klass = (btns[0].props.class as string).split(' ');
+    expect(klass).toContain('action-btn');
+    expect(klass).not.toContain('action-btn-confirm');
     expect(textOf(btns[0])).toContain('Help me get the most out of Lucidos');
     expect(findByClass(tree, 'welcome-setup-interview-hint').length).toBe(1);
   });
@@ -301,28 +303,13 @@ describe('setup interview: cross-file wiring', () => {
 });
 
 describe('ProviderSetupWelcome — onboarding content', () => {
-  it('shows the setup CTA pointing at Settings → Models → Providers, and no starter prompts', () => {
+  it('shows the setup CTA pointing at Settings → Models → Providers, and nothing that needs a model', () => {
     const tree = ProviderSetupWelcome() as AnyVNode;
     const btns = findByClass(tree, 'welcome-provider-setup-btn');
     expect(btns.length).toBe(1);
     expect(textOf(btns[0])).toContain('Set up your AI provider');
-    // The fix must steer to provider setup, not offer agent-assuming prompts.
+    // The fix must steer to provider setup, not offer agent-assuming actions.
     expect(textOf(tree)).toContain('Settings → Models → Providers');
-    expect(containsComponent(tree, SuggestionCarousel)).toBe(false);
-  });
-});
-
-describe('suggestionView — chevron carousel view-model', () => {
-  const ideas = ['a', 'b', 'c'];
-
-  it('reports the current item and which chevrons apply', () => {
-    expect(suggestionView(ideas, 0)).toEqual({ current: 'a', index: 0, hasPrev: false, hasNext: true });
-    expect(suggestionView(ideas, 1)).toEqual({ current: 'b', index: 1, hasPrev: true, hasNext: true });
-    expect(suggestionView(ideas, 2)).toEqual({ current: 'c', index: 2, hasPrev: true, hasNext: false });
-  });
-
-  it('clamps an out-of-range index into bounds', () => {
-    expect(suggestionView(ideas, -5).index).toBe(0);
-    expect(suggestionView(ideas, 99).index).toBe(2);
+    expect(containsComponent(tree, SetupInterviewWelcome)).toBe(false);
   });
 });

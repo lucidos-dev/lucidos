@@ -91,7 +91,7 @@ describe('scroll-to-bottom button visibility', () => {
 // withScrollAnchor — scroll position preservation
 //
 // The transcript's ONE remaining right to move itself: holding the reader on
-// the same content while a global toggle (More/Less, Show steps) changes the
+// the same content while a turn control (full response, steps) changes the
 // height of everything around them.
 // ---------------------------------------------------------------------------
 describe('withScrollAnchor', () => {
@@ -176,7 +176,7 @@ describe('withScrollAnchor', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Toggling More / Show steps: the anchor is the WHOLE behaviour.
+// Toggling full response / steps: the anchor is the WHOLE behaviour.
 //
 // These cases used to come in pairs, one for a reader who was parked (position
 // preserved) and one for a reader at the bottom (auto-scroll re-pinned them to

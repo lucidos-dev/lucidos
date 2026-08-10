@@ -53,6 +53,9 @@ pub(crate) struct QueryFilters<'a> {
     pub until: Option<&'a str>,
     pub before_event_id: Option<&'a str>,
     pub after_event_id: Option<&'a str>,
+    /// One thread only. Absent is every thread, which is what this command
+    /// always sent before the filter existed.
+    pub thread_id: Option<&'a str>,
     pub limit: Option<u32>,
 }
 
@@ -116,6 +119,9 @@ fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)>
     }
     if let Some(id) = filters.after_event_id {
         params.push(("after_event_id", id.to_string()));
+    }
+    if let Some(id) = filters.thread_id {
+        params.push(("thread_id", id.to_string()));
     }
     if let Some(l) = filters.limit {
         params.push(("limit", l.to_string()));
@@ -181,6 +187,7 @@ mod tests {
             until: None,
             before_event_id: Some("11111111-1111-1111-1111-111111111111"),
             after_event_id: None,
+            thread_id: None,
             limit: Some(50),
         });
         assert!(
@@ -204,6 +211,7 @@ mod tests {
             until: None,
             before_event_id: None,
             after_event_id: None,
+            thread_id: None,
             limit: None,
         });
         assert!(params.is_empty(), "expected no params, got {:?}", params);
@@ -217,6 +225,7 @@ mod tests {
             until: None,
             before_event_id: None,
             after_event_id: Some("22222222-2222-2222-2222-222222222222"),
+            thread_id: None,
             limit: None,
         });
         assert_eq!(params.len(), 1);

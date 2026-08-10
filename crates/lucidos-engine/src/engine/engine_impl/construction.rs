@@ -217,8 +217,13 @@ impl LucidosEngine {
                                 .await;
                             let request_id = uuid::Uuid::new_v4();
                             let cancel_token = tokio_util::sync::CancellationToken::new();
-                            // Must stay non-empty — see CONTINUE_RESUME_USER_MESSAGE
-                            // doc for the empty-stdin zombie write-up.
+                            // Reason-dependent, and guaranteed non-empty by
+                            // `continue_input_for_reason` (see
+                            // CONTINUE_RESUME_USER_MESSAGE's doc for the
+                            // empty-stdin zombie write-up). An
+                            // `answered_after_idle` continuation carries the
+                            // answer it was spawned for; every other reason
+                            // gets the bare continue message.
                             //
                             // Direct run_direct_agent (bypasses
                             // process_message_with_steps): engine-driven
@@ -229,11 +234,18 @@ impl LucidosEngine {
                             // iteration. Continue is fundamentally a Claude
                             // Code session resurrection, not a new user
                             // message.
+                            let continue_input =
+                                crate::engine::agent_recovery::continue_input_for_reason(
+                                    engine.pool(),
+                                    thread_id,
+                                    continue_reason.as_deref(),
+                                )
+                                .await;
                             let mut result = engine
                                 .run_direct_agent(
                                     request_id,
                                     thread_id,
-                                    crate::engine::agent_recovery::CONTINUE_RESUME_USER_MESSAGE,
+                                    &continue_input,
                                     None,
                                     event_id,
                                     None,
@@ -275,6 +287,7 @@ impl LucidosEngine {
                                     crate::engine::agent_recovery::continue_retry_input(
                                         engine.pool(),
                                         thread_id,
+                                        continue_reason.as_deref(),
                                     )
                                     .await;
                                 result = engine
@@ -866,16 +879,8 @@ impl LucidosEngine {
         // installs the model.
 
         // Load user profile from artifacts, or use empty if doesn't exist
-        let profile_path = workspace_path
-            .join(crate::core::ARTIFACTS_DIR)
-            .join("user_profile.md");
-        let user_profile = std::fs::read_to_string(&profile_path).unwrap_or_default();
-        if !user_profile.is_empty() {
-            log!(
-                "[Memory] Loaded user profile ({} chars)",
-                user_profile.len()
-            );
-        }
+        let user_profile =
+            crate::engine::user_profile::UserProfileCache::load_from_workspace(&workspace_path);
 
         // Load user timezone from database, environment, or leave empty (LLM will ask)
         let user_timezone = match PreferenceStore::get(&pool, "timezone").await {
@@ -1265,7 +1270,7 @@ impl LucidosEngine {
             repo_root: repo_root.clone(),
             user_dir,
             system_knowhow_dir,
-            user_profile: tokio::sync::RwLock::new(user_profile),
+            user_profile,
             user_timezone: tokio::sync::RwLock::new(user_timezone),
             user_language: tokio::sync::RwLock::new(user_language),
             event_bus: {

@@ -120,6 +120,25 @@ pub fn workspace_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The port THIS engine serves on, from `LUCIDOS_API_PORT`. The gateway sets it
+/// alongside the two above, off the same registry row (`lucidos-gateway`
+/// `stack.rs`), and every direct launcher rewrites it per workspace
+/// (`scripts/lib/workspace.sh` `swap_ports`). `None` when unset or blank.
+///
+/// A sibling of [`gateway_port`] and [`workspace_id`] because the three are read
+/// as a set: the port is what lets a caller check that a slug reaching it
+/// through the environment really belongs to this engine (see
+/// `api::workspace_label`). Read through here rather than inline so all three
+/// treat a blank value the same way, which a bare `env::var().ok()` does not: an
+/// empty `LUCIDOS_API_PORT` would otherwise read as the port `""` and be
+/// reported as a mismatch rather than as "no identity to check".
+pub fn api_port() -> Option<String> {
+    std::env::var("LUCIDOS_API_PORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Insert `<meta name="lucidos-workspace-id" content="…">` as the first child of
 /// `<head>`. Paired with [`inject_gateway_port`], this is what lets a page served
 /// on the engine's OWN port address ITSELF on the gateway

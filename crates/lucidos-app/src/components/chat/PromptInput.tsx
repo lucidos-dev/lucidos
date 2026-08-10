@@ -21,8 +21,8 @@ import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
-import { followAnsweredQuestion, followSentMessage } from './scrollState';
-import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
+import { followAnsweredQuestion, followSentMessage, followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
+import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, FollowLiveEdgeIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { PromptRowControls } from './PromptRowControls';
@@ -379,12 +379,14 @@ export function PromptInput() {
     } else {
       el.style.height = 'auto';
     }
-    // Take the reader to what they just wrote and keep them at the live edge
-    // while it is answered. Here as well as in `addPendingMessage` because this
-    // is the composer's own tap and it must not wait on the awaited send below;
-    // the second call is a no-op refresh of the same request (see
-    // `followSentMessage`). A reader already at the live edge is not scrolled
-    // at all, only armed.
+    // Keep the reader at the live edge while what they just wrote is answered:
+    // the bottom if they were already riding it, their own message otherwise.
+    // Here as well as in `addPendingMessage` because this is the composer's own
+    // tap and it must not wait on the awaited send below; the second call is a
+    // no-op refresh of the same request (see `followSentMessage`). A reader
+    // already at the live edge is not scrolled at all, only armed, and a send
+    // into a thread that is entirely on screen (this compose view's, above all)
+    // is not even armed: there is nowhere to take them.
     followSentMessage();
     if (isMobile()) el.blur();
 
@@ -747,10 +749,11 @@ export function PromptInput() {
       ...(text.length > 0 ? { text } : {}),
     };
     setPendingAnswer(pendingMultiQ.toolUseId, answer);
-    // Same ask as the composer's Send: take the reader to what they just
-    // answered and hold them at the live edge while the agent resumes. Before
-    // the awaited answer below, because this is the button's own tap. A reader
-    // already at the live edge is not scrolled at all, only armed.
+    // Same ask as the composer's Send: hold the reader at the live edge while
+    // the agent resumes, landing on what they just answered when they were not
+    // already riding it. Before the awaited answer below, because this is the
+    // button's own tap. A reader already at the live edge is not scrolled at
+    // all, only armed.
     followAnsweredQuestion(pendingMultiQ.toolUseId);
     if (el) {
       el.value = '';
@@ -1058,6 +1061,47 @@ export function PromptInput() {
             lucidosThreadId={focusedThreadId.value ?? undefined}
             composeContext={inComposeContext}
           />
+          {/* The FOLLOW TOGGLE: the one thing that arms the standing follow (see
+              `scrollState`'s "The standing request to ride the live edge"). It
+              lives here rather than on the down chevron because the chevron
+              cannot hold both jobs, and rather than in the turn header because
+              that header repeats per turn while this is one transcript-wide
+              mode. Being in the prompt area is also what lets it be armed BEFORE
+              a send, which is exactly when a reader knows they want to be
+              carried through the answer.
+
+              It RENDERS the follow rather than owning it: `followingLiveEdge` is
+              a read-only signal the reader's own scroll also writes, so the
+              button goes off by itself when they scroll away from a live reply.
+
+              ALWAYS RENDERED, the compose view included, and that is the whole
+              point of it being here rather than over the transcript: a brand-new
+              thread is exactly where a reader knows they want to be carried
+              through the answer, and it is the one place the follow could not be
+              armed while the button was hidden. The compose view has no
+              transcript for `followingLiveEdge` to describe, so there it shows
+              (and the press writes) the FOLLOW SEED instead, which is what the
+              thread this compose becomes will start as. Everywhere else the live
+              flag is what shows, so the button can never sit lit over a
+              transcript nothing is following. */}
+          {(() => {
+            const followOn = inComposeContext ? followLiveEdgeSeed.value : followingLiveEdge.value;
+            return (
+              <button
+                class={`icon-btn header-icon${followOn ? ' active' : ''}`}
+                data-tooltip={followOn
+                  ? 'Following the live edge. Click to stop, and stay where you are.'
+                  : 'Follow the live edge: go to the newest content and stay with it as the agent writes.'}
+                aria-pressed={followOn}
+                aria-label={followOn ? 'Stop following the live edge' : 'Follow the live edge'}
+                onClick={() => setFollowLiveEdge(!followOn)}
+                data-role="follow-live-edge"
+                data-row-item
+              >
+                <FollowLiveEdgeIcon />
+              </button>
+            );
+          })()}
           {(() => {
             // WIP app preview toggle: visible whenever the focused thread is an
             // app coding-agent thread that has an in-flight diff

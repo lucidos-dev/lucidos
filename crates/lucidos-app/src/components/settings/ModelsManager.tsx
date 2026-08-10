@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import { chatModels } from '../../store/store';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
+import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { setModelEnabled, deleteModel, submitNewModel, isProviderConfigured } from '../../store/actions/models';
 import { formatContextWindow } from '../../utils/formatTokens';
 
@@ -144,10 +145,7 @@ export function ModelsManager() {
               </div>
             </div>
           ) : (
-            <div class="list-row-add-card" onClick={() => setAdding(true)}>
-              <div class="list-row-add-icon">+</div>
-              <div class="list-row-add-label">Add Model</div>
-            </div>
+            <ListRowAddCard label="Add Model" onClick={() => setAdding(true)} />
           )}
         </>
       )}

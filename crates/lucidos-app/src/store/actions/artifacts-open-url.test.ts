@@ -24,6 +24,7 @@ const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
   openExternal,
   setTitlebarColor: () => Promise.resolve(),
+  windowReadyToShow: () => {},
 }));
 
 // The engine-log breadcrumb channel would fire a real fetch from the blocked

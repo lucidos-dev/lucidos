@@ -94,8 +94,19 @@
        everything else pushed back.
        The gap below the header is NOT here: it is --header-surface-gap in
        global/base.css, beside the --app-header-bottom it pairs with, because
-       every surface hung from the header shares it. */
-    --brand-menu-width: 15rem;
+       every surface hung from the header shares it.
+       The width is a BUDGET, not a taste: the Workspaces row is the widest thing
+       the panel has to hold (its glyph, the word "Workspaces", and a value pill
+       carrying the workspace name), and everything in it is rem-sized in a
+       monospace face whose advance is ~0.6em, so the room a name gets is
+       arithmetic rather than a guess. 15rem left the name 7 characters and
+       ellipsised "development" down to "develo…", which identifies nothing. This
+       holds 13, so an ordinary workspace name is spelled whole and only a long
+       one falls back to the ellipsis. Widening it further is cheap on desktop
+       and is not on a phone: at the 18px mobile root (styles/mobile.css) this
+       is 315px, so on a handset narrower than ~350px the `min()` below already
+       takes over and the name ellipsises whatever this value says. */
+    --brand-menu-width: 17.5rem;
     --brand-menu-radius: 1.25rem;
     --brand-menu-frame: 0.375rem;
     --brand-menu-item-radius: calc(var(--brand-menu-radius) - var(--brand-menu-frame));
@@ -114,6 +125,24 @@
        exceeds a bare text line even at the smaller font. Sized to clear it
        (border-box, so this includes the row's own padding). */
     --brand-menu-row-min-height: 2.5rem;
+    /* A workspace row is a satellite of the row above it, so it is shorter than
+       a menu item and reads at the value pill's size. */
+    --brand-menu-ws-row-min-height: 2rem;
+    /* How much of the screen the unfolded workspace list may take before it
+       scrolls inside the panel. The panel is `position: fixed` under the header
+       and `overflow: hidden`, so an uncapped list is CLIPPED rather than
+       scrolled and its last rows, Manage workspaces among them, become
+       unreachable.
+       Derived from the row height rather than eyeballed: seven and a half rows,
+       so a machine with half a dozen workspaces shows all of them AND the
+       Manage row without scrolling, and anything past that cuts a row in half,
+       which is what says there is more below. The vh term is the one that holds
+       on a phone in landscape, where the rem term alone would overrun the
+       viewport. */
+    --brand-menu-ws-list-max-height: min(
+        calc(7.5 * var(--brand-menu-ws-row-min-height)),
+        40vh
+    );
 }
 
 /* ── The centred cluster ──────────────────────────────────────────────────
@@ -376,6 +405,27 @@
     height: var(--header-mark-size);
     display: block;
     color: var(--header-fg-muted);
+    /* ALWAYS transformed, and the identity matrix is the whole point. The press
+       cue below scales this box, and `transform: none` to `scale(0.93)` is not a
+       change of VALUE, it is a change of KIND: a box with no transform is
+       neither a stacking context nor a containing block nor a candidate for its
+       own compositing layer, and one with a transform is all three. So every
+       press built that structure inside the brand cluster and every release tore
+       it down again.
+       Safari, and therefore the packaged macOS app, re-rasterised the enclosing
+       cluster when that happened, and the whole brand label (the mark, both
+       thread chevrons and the workspace name) visibly shifted while the button
+       was held and dropped back on release. Reported three times against that
+       build. Starting from `scale(1)` leaves the press a plain matrix
+       interpolation with no structural change to make, and `will-change` says
+       the same thing to the compositor a frame earlier, so the layer exists
+       before the finger lands rather than being conjured by it.
+       Nothing here is defensive: the mark is the ONLY control in the header with
+       an `:active` transform, and it was the only one that moved. The identity
+       matrix changes no geometry, so there is nothing to see at rest.
+       Pinned by styles/__tests__/header-mark-geometry.test.ts. */
+    transform: scale(1);
+    will-change: transform;
     transition: color var(--duration-normal) ease,
                 opacity var(--duration-normal) ease,
                 transform var(--duration-fast) ease;
@@ -507,7 +557,18 @@
     border-radius: var(--brand-menu-radius);
     box-shadow: var(--shadow-lg);
     padding: var(--brand-menu-frame);
-    overflow: hidden;
+    /* The panel hangs from the header, so the room it has is whatever is left
+       below it, and it must never claim more: it is `position: fixed`, so
+       anything past the bottom edge is simply unreachable. Seven rows already
+       overrun a phone held in landscape, before the workspace list unfolds
+       under one of them. `hidden auto` keeps the horizontal clip the rounded
+       corners rely on and lets the panel scroll on the axis it can grow in;
+       `contain` stops that scroll chaining out to the app behind it. The list's
+       own cap is the inner bound and normally the only one in play, so this is
+       the floor rather than the mechanism. */
+    max-height: calc(var(--app-height, 100dvh) - var(--app-header-bottom) - 2 * var(--header-surface-gap));
+    overflow: hidden auto;
+    overscroll-behavior: contain;
     z-index: calc(var(--z-toast) + 50);
     animation: modal-in var(--duration-fast) ease;
 }
@@ -548,9 +609,11 @@
        token's own note. */
     line-height: var(--brand-menu-row-line-height);
     text-align: left;
-    /* The Workspaces row is an <a href>, the rest are <button>s. Without this it
-       is the one row wearing the user agent's link underline, which reads as a
-       different KIND of row rather than as the one that can navigate. */
+    /* The Workspaces row is an <a href> wherever the picker is reachable but the
+       control plane is not (a direct engine port), and the rest are <button>s.
+       Without this it is the one row wearing the user agent's link underline,
+       which reads as a different KIND of row rather than as the one that can
+       navigate. */
     text-decoration: none;
     border-radius: var(--brand-menu-item-radius);
     cursor: pointer;
@@ -602,14 +665,21 @@
    switcher used to mark the workspace you were on. Muted grey text said "extra
    information about Workspaces"; this says "Workspaces, and you are in dev".
    `max-width` + the ellipsis on the name keep a long workspace name from
-   widening the panel, which is fixed-width by construction. */
+   widening the panel, which is fixed-width by construction.
+
+   The cap is what a pill may take of the row, not what it does take: a pill is
+   sized to its content and only a long name ever reaches this. So the cap is
+   the second thing rationing the name, beside the panel width, and at 50% it
+   was the one that bound: it held back room the row's own label had already
+   left free. 60% hands that back, and still stops a pill from reading as the
+   row rather than as its value. */
 .brand-menu-value {
     margin-left: auto;
     display: inline-flex;
     align-items: center;
     gap: var(--space-xs);
     min-width: 0;
-    max-width: 50%;
+    max-width: 60%;
     padding: 0.125rem var(--space-sm);
     border-radius: var(--brand-menu-item-radius);
     background: var(--bg-tertiary);
@@ -617,7 +687,11 @@
     font-size: var(--font-size-sm);
 }
 
-.brand-menu-value-check {
+/* The accent check marking what you are on: in the collapsed row's value pill,
+   and on the current workspace's row in the unfolded list. One rule, because
+   they are the same mark at the same size doing the same job. */
+.brand-menu-value-check,
+.brand-menu-ws-check {
     width: 0.75rem;
     height: 0.75rem;
     flex: 0 0 auto;
@@ -628,6 +702,154 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* ── The workspace switcher ───────────────────────────────────────────────
+ * The Workspaces row unfolds the list of workspaces this gateway serves, so
+ * switching costs a tap instead of a trip out to the picker page and back. The
+ * rows below are SATELLITES of that row rather than more menu items: inset from
+ * its text column, shorter, and at the value pill's size, so the panel still
+ * reads as four or seven items with a list hanging off one of them.
+ */
+
+/* Which way the list is about to go, in the pill and at exactly the check's
+   footprint. It is not beside the pill: the panel width is a budget (see
+   --brand-menu-width) that an extra 0.75rem plus its gap overspends by about a
+   character and a half, which is what ellipsised "development" the first time
+   this was built. Taking the marker slot instead is free, and the check it
+   replaces is not lost, the unfolded list marks the current workspace with
+   one. */
+.brand-menu-value-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    width: 0.75rem;
+    height: 0.75rem;
+    color: var(--text-secondary);
+    transition: transform var(--duration-fast) ease;
+}
+
+.brand-menu-value-chevron svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.brand-menu-ws-toggle.is-expanded .brand-menu-value-chevron {
+    transform: rotate(180deg);
+}
+
+.brand-menu-ws-list {
+    display: flex;
+    flex-direction: column;
+    /* Hangs under the row's text column, so the list belongs to the row above
+       it rather than reading as more menu items. */
+    margin-left: var(--space-md);
+    /* The one thing in this panel that can outgrow it: the panel is
+       `position: fixed` under the header and `overflow: hidden`, so without a
+       cap a long list is CLIPPED rather than scrolled and its last rows, Manage
+       workspaces among them, cannot be reached at all. `contain` keeps the
+       scroll from chaining out to the page behind the menu once it bottoms out.
+       Pinned by styles/__tests__/header-mark-geometry.test.ts. */
+    max-height: var(--brand-menu-ws-list-max-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.brand-menu-ws-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    width: 100%;
+    min-height: var(--brand-menu-ws-row-min-height);
+    /* Asymmetric on purpose. The left is the indent that makes these satellites
+       of the row above; the right resolves to the SAME column that row's value
+       pill ends on (--space-md from the panel frame, which the list's own
+       margin does not eat into), so the checks and counts here line up under
+       the pill rather than sitting a few pixels outside it. */
+    padding: 0 var(--space-md) 0 var(--space-sm);
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    /* Stated for the reason the menu rows state theirs: a <button>, an <a> and
+       a <div> all wear this class, and a button does not inherit the document's
+       line-height. */
+    line-height: var(--brand-menu-row-line-height);
+    text-align: left;
+    /* Two of these rows are <a href>s (an unhealthy workspace, and Manage
+       workspaces). Without this they are the rows wearing the user agent's link
+       underline, which reads as a different KIND of row rather than as the ones
+       that navigate. */
+    text-decoration: none;
+    border-radius: var(--brand-menu-item-radius);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+/* Only the rows that DO something react. The current workspace and an
+   unreachable one render as <div>s, so the element selector is what tells them
+   apart without a modifier class. Unwrapped by `@media (hover: hover)` for the
+   reason `.brand-menu-item:hover` is: see that rule. */
+button.brand-menu-ws-row:hover,
+a.brand-menu-ws-row:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+div.brand-menu-ws-row {
+    cursor: default;
+}
+
+/* Where you are: at the panel's full strength, with the accent check the pill
+   above carries. */
+.brand-menu-ws-row.is-current {
+    color: var(--text-primary);
+}
+
+.brand-menu-ws-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* This workspace's unread count. The same blue every count in the app uses (see
+   `.badge` in header.css), but not that rule: `.badge` is `position: absolute`,
+   for pinning to an icon's corner, and this one sits in the row's flow. */
+.brand-menu-ws-badge {
+    flex: 0 0 auto;
+    min-width: 1.125rem;
+    padding: 0 var(--space-xs);
+    border-radius: 0.5625rem;
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+
+/* The way to everything the menu deliberately cannot do: create, rename,
+   delete, restore, start, stop, auto-start. Quieter than the workspaces above
+   it, since it is the list's footer rather than one of its entries. */
+.brand-menu-ws-manage {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.brand-menu-ws-note {
+    margin: 0;
+    padding: var(--space-xs) var(--space-sm);
+    font-size: var(--font-size-sm);
+    /* Wraps, unlike a row: an error names what failed and why, and a clipped
+       reason is not a reason. */
+    overflow-wrap: anywhere;
+}
+
+.brand-menu-ws-error {
+    color: var(--accent-red);
 }
 
 /* ── The Refresh and Restart rows ─────────────────────────────────────────

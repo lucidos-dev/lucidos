@@ -11,10 +11,15 @@ import { overlayStack, dismissTopOverlay, pushOverlay, _resetOverlayStackForTest
  *  it does not dismiss on an outside click and makes nothing inert. Escape is
  *  the one overlay behavior it keeps, and Escape has a single owner app-wide
  *  (the LIFO `overlayStack`), so the panel registers there while open. These
- *  tests pin that the registration follows the state exactly. */
+ *  tests pin that the registration follows the state exactly. The reload half
+ *  (restoring open, and taking an Escape entry when it does) is in
+ *  `threadFilterPanel-persistence.test.ts`, which needs a fresh module per case.
+ *
+ *  Reset through the real closer rather than by writing the signal, so the
+ *  persisted key is cleared with it and no case inherits the previous one's. */
 beforeEach(() => {
+  closeThreadFilterPanel();
   _resetOverlayStackForTesting();
-  threadFilterPanelOpen.value = false;
 });
 
 describe('thread filter panel state', () => {

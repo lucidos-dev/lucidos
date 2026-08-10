@@ -15,6 +15,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **`cancel_event_wait`'s `on` ending a whole multi-type subscription is the
+  intended reading, not a leak.** `LiveWait::watches` (`event_wait/mod.rs`) is
+  an `any` over the `on` list, so a wait armed with `--on A --on B` answers yes
+  to both and `cancel --on A` takes the whole row. A reviewer reasonably reads
+  that as contradicting the verb's promise to leave other watches alone (Codex
+  flagged exactly this on 2026-08-10). It does not: a wait is ONE rendezvous
+  with several triggers, spent by the first match, so there is no `B` leg left
+  to be woken by once `A` is stood down. Keeping "the rest" would mean
+  replacing it with a subscription the caller never armed, and nothing in this
+  family mutates a wait: the persisted `EventWaitStarted` IS the wait, and
+  there is no update verb. The report is honest about it, because
+  `describe_subscriptions` names every event type it ended. Re-flag only if a
+  wait stops being one-shot, or if the surface grows a way to narrow one.
+  (ADR 0059 § Alternatives; `event_wait/agent_surface.rs`.)
+
 - **`graceful_kill_child_process_group`'s SIGTERM→sleep→SIGKILL does NOT race
   pid recycling.** The function (`runtime/spawn_env.rs`) signals a process
   *group* (`-pid`), sleeps the grace, then signals again — and a fresh reviewer
@@ -1304,6 +1319,58 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `components/layout/ThreadPane.tsx`; raised by the Codex reviewer on
   2026-08-09 against the live-edge reading position.)
 
+- **`AppHeader`'s local `isInteractive` is NOT a duplicate of `utils/dom.ts`'s
+  `isInteractiveTarget`, and consolidating them would change behavior in both
+  directions** (2026-08-10, the workspace picker's window drag region). The two
+  read as copy-paste and a reviewer will reach for the DRY rule, especially once
+  a second drag region imports the shared one. Compare the selectors before
+  doing it. The header's carries two header-only surfaces the shared one has no
+  business knowing about, `.hamburger-panel` and `.thread-toggle`, so switching
+  would make both draggable and break the gate they exist for; and the shared
+  one carries `textarea`, `label`, `[role="button"]` and `[contenteditable]`,
+  which the header would newly exempt. A drag gate is a per-surface policy, not
+  one predicate: the picker wants the broad DOM answer because its whole
+  background is the region, the header wants its own list because it is a strip
+  of named controls. The DRY rule binds "when you touch a file" anyway, and a
+  diff that adds a caller of the shared helper elsewhere has not touched
+  `AppHeader.tsx`. Re-flag only with the two selector lists shown to be equal.
+  (`components/layout/AppHeader.tsx`, `utils/dom.ts`,
+  `components/picker/WorkspacePicker.tsx`.)
+
+- **`followSentMessage` deciding BEFORE the optimistic row renders is the
+  point, not a timing bug** (2026-08-10, the brand-new-thread pin). It asks
+  `hasLiveEdgeToRide` about the transcript as it stands at send time, and both
+  call sites (`PromptInput.submit`, `addPendingMessage`) run before the row is
+  in the DOM, deliberately: `addPendingMessage` calls before its own
+  `threadMap` write for exactly this reason. A reviewer reasonably observes
+  that a thread which currently fits can be pushed past the fold by the new
+  message itself (a long paste, or a brand-new thread's long first message),
+  so nothing arms and the tail of what they just wrote sits below the viewport
+  (Codex flagged this on the commit that added the rule). The observation is
+  accurate and the proposed fix, deferring the decision until the row exists,
+  re-creates the reported bug: a brand-new thread then reads as "one turn, and
+  scrollable", arms, and drags the reader down through the first reply, which
+  is the entire complaint. Leaving them at the top of their own long message is
+  the intended outcome: they wrote it, they read down through it, and the
+  chevron is one tap. Re-flag only with evidence that the two call sites moved
+  after the render, or that the rule itself changed.
+  (`components/chat/scrollState.ts`, `store/actions/chat.ts`.)
+
+- **A superseded deep-link's late resolve retiring the standing follow is
+  consistent with the landing it is attached to** (2026-08-10, same commit).
+  `tryResolve` runs `stopFollowingBottom()` on the line above
+  `smoothScrollToElement`, unconditionally, while the resolve BROADCAST below
+  it is gated on `_pendingEventScrollClaim === claim`. A reviewer reasonably
+  proposes gating the retirement the same way, since a first link superseded by
+  a second keeps observing until its own deadline and can resolve late. Gating
+  only the retirement makes it worse, not better: the stale call scrolls the
+  container either way (the pin, the scroll and the pulse are all ungated by
+  design, so a link that finally finds its target still lands), and a reader who
+  has just been moved must not be left following. The two belong on the same
+  line so they cannot disagree. Re-flag only if the late landing itself is made
+  to stand down, in which case the retirement goes with it.
+  (`components/chat/scrollState.ts`.)
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
@@ -1983,3 +2050,119 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   a value that is already re-read at every use. Re-flag only with evidence that a
   site's timer can now outlive a slider change without re-reading it.
   (`store/store.ts`, `components/layout/ContentPane.tsx`.)
+
+- **A `SpawnRequest::Continue` spawn does NOT get a recovery system prompt, so
+  `RESTART_NOT_REJECTION_RULE` does not reach it** (2026-08-10,
+  answered-after-idle answer delivery). A reviewer looking at the
+  `answered_after_idle` resume will reasonably assume the restart-not-rejection
+  note from `docs/plans/2026-06-26-cc-restart-not-a-rejection.md` already covers
+  it and flag the resume message's own framing as duplication, or flag "soft
+  tension" between the two texts. It is neither: `resolve_run_worktree_context`
+  selects `recovery_system_prompt` **only** when its `recovery_worktree`
+  argument is `Some`, and the SpawnConsumer's Continue call passes
+  `conflict_worktree` into that slot, which is `None` unless
+  `resolve_continue_conflict_duty` found a merge duty. So an ordinary
+  continuation runs on the plain `worktree_system_prompt` and carries no
+  restart-not-rejection note at all, which is exactly why the framing has to
+  ride in the message. Count the positional arguments before concluding
+  otherwise: `run_direct_agent` takes sixteen, and `recovery_worktree` is the
+  ninth. Re-flag only with evidence that the Continue path started passing a
+  real recovery worktree or a `system_prompt_override`.
+  (`engine/engine_impl/construction.rs`,
+  `engine/agent_session/run_session/spawn_context.rs`.)
+
+- **A fold key left in `collapsedExchanges` while `canCollapse` is false is
+  intended, not a leak** (2026-08-10, turn collapse control). Reviewers land on
+  this twice, from opposite ends: "the key is never pruned, so the fold
+  re-applies and snaps a live turn shut with no user action", and "the reveals
+  clear the key unconditionally, discarding a fold the user made deliberately".
+  Both describe the same design and neither is a bug. `isCollapsed` is
+  `canCollapse && has(key)`, so a step-only turn with the steps control off
+  reads as unfolded while it is drawing nothing, and folds again when a row
+  becomes drawable. That is the fold being honoured, and the two states are
+  visually identical anyway (folded shows `⋯`, unfolded shows an empty body),
+  which is what makes the transition invisible in practice. Pruning the key on
+  the `canCollapse` false edge would silently discard the user's fold on every
+  steps toggle; gating `expandExchange` on `canCollapse` would reintroduce the
+  dead click it was added to remove, because the turn a reveal fires on is
+  usually uncollapsible *because* the thing being revealed is hidden. Re-flag
+  only with evidence that the two states became visually distinguishable, or
+  that a key can be created for a turn the user never folded.
+  (`components/chat/ChatExchange.tsx`, `store/store.ts`.)
+
+- **The turn header's `align-items: flex-start` does NOT un-centre its icons,
+  because every field is pinned to one row unit** (2026-08-10, turn header
+  alignment; supersedes the entry that defended the centred version). This file
+  carried the opposite prior for half a day: with `align-items: center`, a
+  wrapped `.response-meta` / `.initiator-meta` is the tallest item on the row,
+  so the chip and the turn controls centre against BOTH its lines and the
+  executor's name lands half a line below the status. That was defended as a
+  trade, on the grounds that flex-start would un-centre the icons against the
+  label on every ordinary one-row header. The user reported the drop anyway,
+  and the trade turned out to be avoidable: the headers now align at flex-start
+  AND size every field to `--turn-header-line` (the chip via a min-height that
+  adds back the padding its negative margin cancels, the turn controls
+  directly, the cluster's first field directly), so the fields are equal-height
+  and flex-start resolves to what centring gave. Measured in Chromium and
+  WebKit: the one-row header is unchanged to the pixel, and the stacked status
+  moves from 6.5px above the name's centre to exactly on it. So a reviewer
+  proposing a return to `center`, or reading a lone field's min-height as
+  redundant, is reading half the pair: neither half works alone, and dropping
+  one field's unit drifts that field alone off the line. Pinned as a set in
+  `styles/__tests__/turn-meta-stacking.test.ts`. Re-flag only with evidence
+  that a field stopped resolving to the unit.
+  (`styles/chat/response.css`, `styles/chat/input-messages.css`,
+  `styles/global/base.css`.)
+
+- **`was_attached: true` is unreachable, so an "attached wake loses its jump"
+  finding is refuted by ADR 0049** (2026-08-10, the jump moved to the wake
+  card). The reasoning is sound on its face and Codex produced it: an attached
+  `EventWaitDelivered` is followed by the paired `await_event` `ToolResult`
+  rather than by the `UserPromptInjected` that renders `EventDeliveryBody`, so
+  moving the `Go to event` link off the arming row would leave such a delivery
+  with no route to its matched event. What makes it moot is that the attached
+  shape was retired on 2026-08-06 (ADR 0049, *Every event wait is detached*):
+  **`was_attached` appears in no Rust file at all**, so the engine cannot emit
+  one, and every delivery writes a `UserPromptInjected` wake anchor. The field
+  survives only on the frontend wire type and its fixtures, for rows persisted
+  before that date. Putting the link back on the arming card to serve those is
+  the wrong trade twice over: the user removed it from there deliberately (it
+  pointed at something that happened hours after the moment that card records),
+  and a link appearing only on pre-2026-08-06 threads is inconsistent by
+  construction. Re-flag only with evidence that the engine emits an attached
+  delivery again, which would mean ADR 0049 was reversed.
+  (`components/chat/chat-exchange-parts.tsx`,
+  `store/thread-events/thread-event-types.ts`.)
+
+- **`tryRestore` asking nothing about the container's position is the guard, not
+  a missing one** (2026-08-10, scroll-memory restore window). The restore's
+  retries write a saved offset over whatever `scrollTop` currently is, with no
+  "has the reader moved" test beside them, and that reads as the yank the
+  reader-owns-the-scroll rule exists to prevent. The test is there, one level up
+  and asked correctly: the whole wait is retired by the reader's first GESTURE
+  (`watchUserAction`, wheel / touchmove / pointerdown / keydown), so a retry can
+  only ever run for a reader who has done nothing. A position test was tried
+  first and removed after three reviewers independently refuted it: the app
+  writes `scrollTop` all through that window without a navigation stamp (the
+  browser clamping a shared container when shorter content swaps in,
+  `restoreAfterReflow` across a pane resize, the render window compensating for
+  prepended height, the iOS repaint nudge's ±1px five times per open), so a
+  pixel delta reads our own writes as the reader and abandons the position for
+  good. Re-flag only with evidence that an input event can reach `document`
+  without the reader, or that a path arms the observers without arming the
+  watch. (`hooks/useScrollMemory.ts`, `utils/userAction.ts`.)
+
+- **The reduced-motion send landing evaluating its anchor ONCE is not a reader
+  stranded one row short** (2026-08-10, Codex). `landOnOwnTurn`
+  (`components/chat/scrollState.ts`) re-asks for the turn's agent status line on
+  every frame of its tween, so an animated landing extends to the row when the
+  response panel mounts late; the reduced-motion branch above it writes once and
+  returns, which reads as the same case left unhandled. It is not, because that
+  branch runs no tween and the growth branch only stands down FOR a tween: the
+  response panel mounting is itself a growth round, and by then the landing has
+  been consumed, so `followTheLiveEdge` writes the live edge and the reader ends
+  below the status line rather than above it. The armed follow is what covers
+  the gap, and it can only be reached by a reader the send armed. Re-flag only
+  if the reduced-motion path starts arming no follow, or if a landing can be
+  consumed without a growth round following it.
+  (`components/chat/scrollState.ts`.)

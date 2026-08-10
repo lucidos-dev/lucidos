@@ -27,7 +27,12 @@ pub(crate) mod inline_question_repair;
 pub(crate) mod inline_tool_call_repair;
 pub(crate) mod loaded_knowhow;
 pub mod mcp_permission;
-mod memory;
+/// `pub(crate)` for `relevance_score` / `age_in_days`: the `/memory/search`
+/// endpoint ranks with the SAME formula as the pre-turn injection, so a
+/// follow-up search cannot come back in a different order from the facts
+/// already in context. Two orderings for one corpus is a thing the agent would
+/// have to reconcile, and nothing would tell it which to trust.
+pub(crate) mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
 pub(crate) mod preferences;
@@ -37,6 +42,7 @@ pub mod supervisor_respawn_sidecar;
 pub mod thread_events;
 pub mod thread_lifecycle;
 pub mod thread_queue;
+pub(crate) mod thread_search;
 pub mod thread_state;
 pub mod todo_consumer;
 pub(crate) mod tool_arg_entity_repair;
@@ -44,6 +50,7 @@ pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;
 pub mod types;
+pub(crate) mod user_profile;
 pub mod worktree_cleanup;
 
 pub(crate) use agentic_loop::{
@@ -501,8 +508,10 @@ pub struct LucidosEngine {
     /// see `core::system_knowhow::resolve_system_knowhow_dir`).
     /// Read-only; never overrideable by a workspace's local knowhow.
     system_knowhow_dir: Option<PathBuf>,
-    /// User profile - always included in context for broad queries
-    user_profile: tokio::sync::RwLock<String>,
+    /// User profile - always included in context for broad queries.
+    /// Kept coherent with `artifacts/user_profile.md` by every write route that
+    /// can touch the file: see [`user_profile::UserProfileCache`].
+    user_profile: user_profile::UserProfileCache,
     /// User's timezone (IANA format, e.g., "America/New_York")
     user_timezone: tokio::sync::RwLock<String>,
     /// User's preferred language (e.g., "English", "Spanish")

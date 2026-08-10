@@ -1,8 +1,9 @@
 /**
- * Source scans over the mobile header's three structural promises. Each is a
- * property of the STYLESHEET rather than of a rendered frame, so each is
- * cheaper and sharper to assert here than in a browser: the e2e specs measure
- * the painted result, this pins the rule that produces it.
+ * Source scans over the mobile header's structural promises, plus the one the
+ * desktop brand span repeats verbatim. Each is a property of the STYLESHEET
+ * rather than of a rendered frame, so each is cheaper and sharper to assert
+ * here than in a browser: the e2e specs measure the painted result, this pins
+ * the rule that produces it.
  *
  * 1. All three mobile header rows are the same height BY CONSTRUCTION. Under
  *    the `min-height` this replaces, each row was as tall as its own tallest
@@ -20,6 +21,12 @@
  *    content pane put them in the same two places, and the threads pane's mark
  *    takes that same span's trailing edge, so all three rows agree on where
  *    that column is.
+ * 5. A transparent centred span restores pointer events to its members, and
+ *    STANDS DOWN while an overlay owns the screen. Two hosts carry that pair now
+ *    (the mobile cluster here, the desktop brand span in panels/shell.css), and
+ *    the gate is the half that gets forgotten: the inert-behind contract only
+ *    inherits, so an ungated restore quietly leaves that span live behind a
+ *    scrim. Scanned together so the second host cannot drift from the first.
  *
  * Plus an orphan check on the two custom properties the deleted mobile collapse
  * measurement used to publish. That one is not fussiness: an `env`-style
@@ -43,6 +50,7 @@ const styles = (rel: string): string => readFileSync(resolve(stylesDir, rel), 'u
 
 const markCss = styles('header-mark.css');
 const mobileCss = styles('mobile.css');
+const shellCss = styles('panels/shell.css');
 
 /** The menu carries the Restart control, and the toast most likely to be on
  *  screen when a user reaches for it is the persistent "Restart needed" /
@@ -59,6 +67,39 @@ describe('the menu paints above a persistent toast', () => {
   it('the panel and its scrim are rebased above --z-toast, panel over scrim', () => {
     expect(decl(block(markCss, '.brand-menu {'), 'z-index')).toBe('calc(var(--z-toast) + 50)');
     expect(decl(block(markCss, '.brand-menu-scrim {'), 'z-index')).toBe('calc(var(--z-toast) + 40)');
+  });
+});
+
+/** The unfolded workspace list is the one thing in the panel whose height the
+ *  panel does not control: it is as long as the machine has workspaces. The
+ *  panel is `position: fixed` under the header and `overflow: hidden`, so an
+ *  uncapped list is CLIPPED rather than scrolled, and the rows past the cut,
+ *  Manage workspaces among them, cannot be reached at all. Both halves are
+ *  required and each is useless alone: a cap with no scroll hides the tail, a
+ *  scroll with no cap never engages. */
+describe('the unfolded workspace list scrolls instead of overflowing the panel', () => {
+  it('.brand-menu-ws-list caps its height and scrolls', () => {
+    const list = block(markCss, '.brand-menu-ws-list {');
+    expect(decl(list, 'max-height')).toBe('var(--brand-menu-ws-list-max-height)');
+    expect(decl(list, 'overflow-y')).toBe('auto');
+  });
+
+  it('the panel itself is bounded by the room below the header', () => {
+    // The floor under the list's own cap, and the fix for a shape that predates
+    // it: the panel is `position: fixed`, so a phone in landscape could not
+    // reach its last rows at all. Horizontal stays clipped, since the rounded
+    // corners are what clip the rows' hover backgrounds.
+    const panel = block(markCss, '.brand-menu {');
+    expect(decl(panel, 'max-height')).toContain('var(--app-header-bottom)');
+    expect(decl(panel, 'overflow')).toBe('hidden auto');
+  });
+
+  it('the cap is bounded by the viewport, not by rem alone', () => {
+    // A rem-only cap is a fixed number of rows, which still overruns a phone in
+    // landscape (and any scaled root), where the panel has far less room below
+    // the header than a desktop window does.
+    const cap = decl(block(markCss, ':root {'), '--brand-menu-ws-list-max-height');
+    expect(cap).toContain('vh');
   });
 });
 
@@ -172,6 +213,52 @@ describe('the mark says its connection in strength alone', () => {
     expect(row?.selector, 'a bare .icon-btn.brand-mark-row loses to the bar')
       .toBe('.app-header .icon-btn.brand-mark-row');
     expect(row?.props.get('color')).toBe('var(--header-fg)');
+  });
+});
+
+describe('the press cue changes a transform value, never creates one', () => {
+  // The mark is the only control in the header with an `:active` transform, and
+  // it was the only one whose press moved anything. `transform: none` to
+  // `scale(0.93)` is a change of KIND, not of value: an untransformed box is
+  // neither a stacking context nor a containing block nor a candidate for its
+  // own compositing layer, and a transformed one is all three. So a press built
+  // that structure inside the brand cluster and a release tore it down, and
+  // Safari (hence the packaged macOS app) re-rasterised the enclosing cluster
+  // each time: the mark, both thread chevrons and the workspace name shifted
+  // while the button was held and dropped back on release.
+  //
+  // A source scan because nothing this repo can drive reproduces it. It is not
+  // a LAYOUT move (`getBoundingClientRect` is identical held and at rest, in
+  // both engines), and Playwright's WebKit is a different port from Safari and
+  // paints it steady. So the assertion is on the rule that removes the
+  // structural change, not on a frame.
+  //
+  // Parsed rather than string-matched, and that is not fussiness here: the
+  // reduced-motion note further down this same stylesheet quotes
+  // `.brand-mark .brand-mark-glyph { animation: none }`, which CONTAINS the
+  // needle a `block()` lookup would search for. It resolves correctly today only
+  // because the real rule happens to come first.
+  const rule = (selector: string) => {
+    const found = cssRules(markCss).filter(r => r.selector === selector);
+    expect(found.length, `expected exactly one \`${selector}\` rule`).toBe(1);
+    return found[0].props;
+  };
+
+  it('the glyph is always transformed, so the press interpolates a matrix', () => {
+    const glyph = rule('.brand-mark-glyph');
+    expect(glyph.get('transform'), 'and it must be the identity, so it changes no geometry')
+      .toBe('scale(1)');
+    expect(glyph.get('will-change'), 'the layer must exist before the finger lands')
+      .toBe('transform');
+  });
+
+  it('and the pressed state is a value on the same property', () => {
+    // If the cue ever moves to another property (or the resting transform is
+    // dropped as "dead code"), the pairing above stops meaning anything.
+    expect(rule('.brand-mark:active .brand-mark-glyph').get('transform')).toBe('scale(0.93)');
+    expect(rule('.brand-mark-glyph').get('transition'),
+      'the transform must still be the animated property')
+      .toContain('transform var(--duration-fast)');
   });
 });
 
@@ -351,6 +438,41 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the chevrons and the mark cannot be squeezed by a long title', () => {
     const fixed = cssRules(markCss).find(r => r.selector.includes('.header-nav-cluster > .icon-btn'));
     expect(fixed?.props.get('flex')).toBe('0 0 auto');
+  });
+});
+
+describe('the desktop brand span pays for the same pattern the same way', () => {
+  it('none on the box, auto on the members, and the restore stands down behind an overlay', () => {
+    // `.pane-header-brand-label` is the desktop copy of the cluster above: a
+    // fixed span absolutely centred over the row, mostly transparent, so it
+    // takes the same pair (none on the box, auto back on the members) for the
+    // same reason. It therefore inherits the same trap, and it inherited it
+    // UNGATED: the inert-behind half of the overlay contract sets
+    // `pointer-events: none` on an ANCESTOR and lets it inherit, and a value
+    // applied directly to a child beats an inherited one at any specificity, so
+    // with the Lucidos menu up the two thread chevrons and the brand centre were
+    // the only things behind the scrim still answering the pointer.
+    //
+    // Only the overlay gate here, where the mobile twin also carries
+    // `[data-keyboard-active]`: that regime is a mobile.css rule inside the
+    // mobile breakpoint and this one lives in the desktop breakpoint, so the two
+    // can never co-apply. Asserting a gate that can never fire would be noise.
+    const label = cssRules(shellCss).find(
+      r => r.selector === '.app-header .pane-header-brand .pane-header-brand-label',
+    );
+    expect(label?.props.get('pointer-events'), 'the span must pass clicks through').toBe('none');
+
+    const restore = cssRules(shellCss)
+      .filter(r => /\.pane-header-brand-label > \*$/.test(r.selector))
+      .filter(r => r.props.get('pointer-events') === 'auto');
+    expect(
+      restore.length,
+      'the members must get their events back, or nothing in the brand is clickable',
+    ).toBe(1);
+    expect(
+      restore[0].selector,
+      'the restore must not apply under [data-overlay-open], whose inert only inherits',
+    ).toContain(':not([data-overlay-open])');
   });
 });
 

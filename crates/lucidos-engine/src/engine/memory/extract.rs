@@ -13,9 +13,13 @@ use uuid::Uuid;
 
 impl LucidosEngine {
     pub(crate) async fn extraction_context_base(&self) -> String {
-        let profile = self.user_profile.read().await;
-        let user_summary: String = profile.chars().take(300).collect();
-        drop(profile);
+        let user_summary: String = self
+            .user_profile
+            .snapshot()
+            .await
+            .chars()
+            .take(300)
+            .collect();
 
         let user_language = self.user_language.read().await.clone();
 

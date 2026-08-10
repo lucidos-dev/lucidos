@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 // `@media (max-width: 768px)` block. A vertical scroll re-enabled in there
 // would be invisible to a first-match scan while breaking exactly the surface
 // the report came from.
-import { rulesTargeting, type CssRule } from '../../styles/__tests__/css-rule-helpers';
+import { cssRules, rulesTargeting, type CssRule } from '../../styles/__tests__/css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, './SearchEverywhere.css'), 'utf-8');
@@ -104,5 +104,52 @@ describe('the Search Everywhere tab strip pans on one axis only', () => {
     expect(effective(TAB, 'flex-shrink')).toBe('0');
     expect(effective(TAB, 'white-space')).toBe('nowrap');
     neverOverridden(TAB, 'flex-shrink', '0');
+  });
+});
+
+/**
+ * The active category and a keyboard-focused one are the same plain line under
+ * the label, differing only in colour, so the only thing keeping a focused tab
+ * distinguishable is which of the two `::after` rules the cascade lands on.
+ * They carry EQUAL specificity, so that is decided by source order alone, and
+ * getting it backwards breaks exactly ONE of the seven tabs: the focus line
+ * still shows on the other six, so the bug hides behind them. The one it breaks
+ * is the active tab, which already wears a line of its own and would simply
+ * keep it, and which is also the tab a user Tabbing into the strip lands on
+ * first. Nothing else in the gate reads a cascade, and no test renders this
+ * strip.
+ *
+ * `rulesTargeting` deliberately drops pseudo-element rules (it answers "what
+ * styles this BOX"), so this reads the sheet's rule list directly.
+ */
+describe('the Search Everywhere tab strip always shows where the keyboard is', () => {
+  const ACTIVE_LINE = '.search-everywhere-tab.active::after';
+  const FOCUS_LINE = '.search-everywhere-tab:focus-visible::after';
+
+  const rules = cssRules(css);
+
+  function indicator(selector: string): { at: number; rule: CssRule } {
+    const at = rules.findIndex(r => r.selector === selector);
+    expect(at, `no rule for ${selector}`).toBeGreaterThanOrEqual(0);
+    return { at, rule: rules[at] };
+  }
+
+  it('resolves the focus line last, so a focused active tab still moves', () => {
+    const active = indicator(ACTIVE_LINE);
+    const focus = indicator(FOCUS_LINE);
+    // Both at top level: an @media copy of either would reorder the cascade
+    // somewhere this comparison cannot see.
+    expect(active.rule.atRules, `${ACTIVE_LINE} is nested`).toBe('');
+    expect(focus.rule.atRules, `${FOCUS_LINE} is nested`).toBe('');
+    expect(focus.at, `${FOCUS_LINE} must be written after ${ACTIVE_LINE}`)
+      .toBeGreaterThan(active.at);
+  });
+
+  it('paints the two lines in different colours', () => {
+    const activeColor = indicator(ACTIVE_LINE).rule.props.get('background');
+    const focusColor = indicator(FOCUS_LINE).rule.props.get('background');
+    expect(activeColor, `${ACTIVE_LINE} sets no background`).toBeTruthy();
+    expect(focusColor, `${FOCUS_LINE} sets no background`).toBeTruthy();
+    expect(focusColor).not.toBe(activeColor);
   });
 });

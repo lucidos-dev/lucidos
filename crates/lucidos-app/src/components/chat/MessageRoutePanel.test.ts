@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
 import {
   resolveOrigin,
   executorExtras,
@@ -6,10 +7,12 @@ import {
   renderChannelSection,
   renderAuditSection,
   renderEngineExplainerSection,
+  renderExecutorSection,
   renderInitiatorRow,
   renderOriginSection,
 } from './MessageRoutePanel';
-import type { Exchange, StoredEvent } from '../../store/thread-events';
+import { appsList, repositories } from '../../store/store';
+import type { Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
 
 /** Wrap a single StoredEvent as an Exchange so each test can keep declaring
  *  the userEvent inline — `resolveOrigin` takes the full exchange (it walks
@@ -769,5 +772,141 @@ describe('renderInitiatorRow', () => {
     expect(renderInitiatorRow({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toBeNull();
     expect(renderInitiatorRow({ type: 'TriggerStarted', trigger_id: 't' })).toBeNull();
     expect(renderInitiatorRow({ type: 'ChangeApplied', change_id: 'c1' })).toBeNull();
+  });
+});
+
+/** Drop the nodes preact renders as nothing, and flatten arrays, so what's left
+ *  is exactly the elements the browser lays out. */
+function renderedChildren(node: ComponentChildren): ComponentChildren[] {
+  if (node === null || node === undefined || node === '' || typeof node === 'boolean') return [];
+  if (Array.isArray(node)) return node.flatMap(renderedChildren);
+  return [node];
+}
+
+/** Child count of every `.route-row` in the tree, in document order. */
+function routeRowChildCounts(node: ComponentChildren, out: number[] = []): number[] {
+  for (const child of renderedChildren(node)) {
+    if (typeof child !== 'object') continue;
+    const v = child as VNode<{ class?: string; children?: ComponentChildren }>;
+    const children = v.props?.children;
+    if (v.props?.class === 'route-row') out.push(renderedChildren(children).length);
+    routeRowChildCounts(children, out);
+  }
+  return out;
+}
+
+/** A `.route-row` is `display: contents` (styles/panels/previews.css), so its
+ *  children ARE the label and value cells of the section's shared two-column
+ *  grid. That grid is what keeps every value starting at the same x, and it
+ *  only holds while each row contributes exactly two items: a row that renders
+ *  a third pushes every row below it one cell along and the panel goes ragged
+ *  again. A multi-part value (app icon + name, user-agent + spawning-thread
+ *  link) therefore has to bring its own `.route-value-group` box. */
+describe('route rows contribute exactly two grid cells', () => {
+  // The executor case seeds the repo + app registries so the render path reads
+  // them instead of firing a fetch. Put them back, or a later test in this file
+  // inherits a loaded registry it never asked for.
+  afterEach(() => {
+    repositories.value = { status: 'not-loaded' };
+    appsList.value = { status: 'not-loaded' };
+  });
+
+  const expectTwoCellRows = (node: ComponentChildren, expectedRows: number): void => {
+    const counts = routeRowChildCounts(node);
+    expect(counts).toHaveLength(expectedRows);
+    expect(counts.filter(n => n !== 2)).toEqual([]);
+  };
+
+  it('holds for every origin kind', () => {
+    const section = (userEvent: StoredEvent): ComponentChildren =>
+      renderOriginSection(exch(userEvent), 'Parent title', () => 'Live title');
+    expectTwoCellRows(section({
+      type: 'MessageReceived', text: 'hi', mode: 'human',
+      origin: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
+    }), 1);
+    // The row that broke the grid before it was wrapped: an API origin from a
+    // Lucidos subprocess renders a user-agent AND a deep-link to the spawning
+    // thread, which used to be two siblings of the label.
+    expectTwoCellRows(section({
+      type: 'MessageReceived', text: 'hi', mode: 'human',
+      origin: { kind: 'api', user_agent: 'curl/8.7.1', source_thread_id: 'src-thread' },
+    }), 1);
+    expectTwoCellRows(section({
+      type: 'MessageReceived', text: 'hi', mode: 'human',
+      origin: { kind: 'workspace', workspace: 'myws', thread_id: 't1', event_id: 'e1' },
+    }), 2);
+    expectTwoCellRows(section({
+      type: 'MessageReceived', text: 'hi', mode: 'agent', parent_thread_id: 'p1',
+    }), 1);
+    expectTwoCellRows(section({ type: 'ContinuationStarted', branch: '' }), 1);
+    expectTwoCellRows(section({ type: 'ResponseAborted', cause: 'engine_shutdown' }), 1);
+    expectTwoCellRows(section({ type: 'ResponseCanceled', cause: 'user_stop' }), 1);
+    expectTwoCellRows(section({
+      type: 'CodingAgentPermissionRequest',
+      request_id: 'r1', tool_use_id: 'tu', tool_name: 'Bash', input: {}, summary: 'ls',
+    }), 1);
+  });
+
+  it('holds for a trigger origin (its rows are a fragment, not a wrapper div)', () => {
+    const node = renderOriginSection(
+      exch({
+        type: 'TriggerStarted',
+        trigger_id: 'tr1',
+        trigger_name: 'nightly',
+        invocation: { kind: 'Event', event_type: 'ChangeProposed', event_id: 'ev1' },
+      }),
+      undefined,
+      () => undefined,
+    );
+    expectTwoCellRows(node, 2);
+    // A wrapper element would take the whole grid row and leave the label and
+    // value stacked inside it, so assert the rows really are section-level.
+    expect(routeRowChildCounts(
+      renderedChildren((node as VNode<{ children?: ComponentChildren }>).props?.children),
+    )).toHaveLength(2);
+  });
+
+  it('holds for every executor row', () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Lucidos', path: '/tmp/lucidos' }],
+    };
+    appsList.value = {
+      status: 'loaded',
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', icon: '\u{1F9ED}' }],
+    };
+    const created = '2026-08-10T12:00:00.000Z';
+    const userEvent: StoredEvent = { type: 'MessageReceived', text: 'go', created };
+    const session: StoredEvent = {
+      type: 'SessionStarted', session_id: '', branch: 'agent/turn-1', repo_id: 'repo-1',
+      created: '2026-08-10T12:00:01.000Z',
+    };
+    const settings: StoredEvent = {
+      type: 'CodingAgentSettingsChanged', cc_session_id: 'sid-1', permission_mode: 'plan',
+      created: '2026-08-10T12:00:02.000Z',
+    };
+    const context: StoredEvent = {
+      type: 'ContextCaptured', producer: 'claude_code', model: 'claude-opus-5[1m]',
+      context_window: 1_000_000, estimated_total_tokens: 652_662, trimmed: true,
+      created: '2026-08-10T12:00:03.000Z',
+    };
+    const exchange: Exchange = {
+      userEvent,
+      userSeq: 1,
+      steps: [{ seq: 2, event: session }, { seq: 3, event: settings }, { seq: 4, event: context }],
+    };
+    const events = new Map<number, StoredEvent>([
+      [1, userEvent], [2, session], [3, settings], [4, context],
+    ]);
+    const meta = {
+      codingAgentKind: 'app',
+      codingAgentFolder: 'data/apps/habit-tracker',
+    } as unknown as ThreadMeta;
+
+    // Model, Effort, Context, Permission, Repository, App, Branch, Session.
+    expectTwoCellRows(
+      renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
+      8,
+    );
   });
 });

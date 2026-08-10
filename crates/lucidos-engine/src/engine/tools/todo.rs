@@ -207,6 +207,7 @@ pub async fn settle_open_todos(
     pool: &PgPool,
     thread_id: Uuid,
     terminator_seq: i64,
+    holds_background_work: bool,
 ) {
     // SELECT the latest TodoListWritten in the thread regardless of sequence,
     // then decide. If `sequence > terminator_seq` a fresh turn has already
@@ -267,6 +268,20 @@ pub async fn settle_open_todos(
         return;
     }
 
+    // Unfinished background work parks the thread just as a subscription does,
+    // and it is checked FIRST because the subscription over it cannot be seen
+    // from here. The chat turn tail arms that wait after the loop has already
+    // emitted this terminator, so its `EventWaitStarted` is always above
+    // `terminator_seq`; worse, this consumer is async and can run before the
+    // arming happens at all. Either way the anti-join below would answer "no
+    // wait" for a thread demonstrably parked on a running build, which is
+    // exactly the reported bug the Waiting split exists to fix. Read from the
+    // in-memory registry, so it depends on no ordering.
+    if holds_background_work {
+        settle_to(event_bus, pool, thread_id, items, TodoStatus::Waiting).await;
+        return;
+    }
+
     // Only asked once there is something to settle, so an all-completed list
     // (the common case) never pays for it.
     let settled_status = match thread_held_event_wait(pool, thread_id, terminator_seq).await {
@@ -283,6 +298,22 @@ pub async fn settle_open_todos(
         }
     };
 
+    settle_to(event_bus, pool, thread_id, items, settled_status).await;
+}
+
+/// Rewrite every OPEN item to `settled_status` and re-emit the list.
+///
+/// Extracted so the two ways a thread can be parked reach one writer: an
+/// unresolved *event wait* at the terminator, and unfinished background work
+/// the tail is about to subscribe to. `pool` is unused today and is taken so
+/// the signature does not change if the no-op check ever needs the store.
+async fn settle_to(
+    event_bus: &EventBus,
+    _pool: &PgPool,
+    thread_id: Uuid,
+    items: Vec<TodoItem>,
+    settled_status: TodoStatus,
+) {
     // A list already settled to this exact status is left alone. Without this
     // the two terminators of one turn (e.g. ResponseAborted then the safety
     // net's ResponseCanceled) would each re-emit an identical list.
@@ -598,7 +629,7 @@ mod tests {
         let (bus, mut rx, pool, db) = setup().await;
         let thread_id = Uuid::new_v4();
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -621,7 +652,7 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -638,7 +669,7 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -662,7 +693,7 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
 
         let flipped = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(flipped.len(), 3, "list preserved, got {:?}", flipped);
@@ -697,7 +728,7 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
 
         let flipped = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(flipped.len(), 2);
@@ -728,11 +759,11 @@ mod tests {
         drain_todo_events_for(&mut rx, thread_id).await;
 
         // First call flips.
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let _flipped = next_todo_event(&mut rx, thread_id).await;
 
         // Second call is a no-op.
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -765,7 +796,7 @@ mod tests {
             .expect("seed fresh");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -816,7 +847,7 @@ mod tests {
 
         // Consumer finally processes turn A's terminator. It should see the
         // newer turn-B list and skip — turn B owns its list.
-        settle_open_todos(&bus, &pool, thread_id, terminator_seq).await;
+        settle_open_todos(&bus, &pool, thread_id, terminator_seq, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -940,7 +971,7 @@ mod tests {
         seed_event_wait(&bus, thread_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
 
         let settled = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(settled.len(), 3, "list preserved, got {:?}", settled);
@@ -982,14 +1013,14 @@ mod tests {
         let wait_id = seed_event_wait(&bus, thread_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let parked = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(parked[0].status, TodoStatus::Waiting);
 
         deliver_event_wait(&bus, thread_id, wait_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let settled = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(
             settled[0].status,
@@ -1028,7 +1059,7 @@ mod tests {
         deliver_event_wait(&bus, thread_id, wait_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, terminator_seq).await;
+        settle_open_todos(&bus, &pool, thread_id, terminator_seq, false).await;
 
         let settled = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(
@@ -1061,10 +1092,10 @@ mod tests {
         seed_event_wait(&bus, thread_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let _parked = next_todo_event(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;
@@ -1089,14 +1120,14 @@ mod tests {
             .expect("seed write");
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         let abandoned = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(abandoned[0].status, TodoStatus::Abandoned);
 
         seed_event_wait(&bus, thread_id).await;
         drain_todo_events_for(&mut rx, thread_id).await;
 
-        settle_open_todos(&bus, &pool, thread_id, i64::MAX).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
 
         pool.close().await;

@@ -32,6 +32,7 @@ vi.mock('../../utils/tauri', () => ({
   focusCallingWindow,
   openExternal,
   setTitlebarColor: () => Promise.resolve(),
+  windowReadyToShow: () => {},
 }));
 
 vi.mock('./credentials', () => ({ openCredentialRequest: vi.fn() }));

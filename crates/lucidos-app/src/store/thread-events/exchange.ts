@@ -591,10 +591,20 @@ export function describeEngineTool(name: string, args: unknown): string {
       if (a === 'drop') return 'Drop queued entry';
       return 'List Thread Queue';
     }
-    case 'memory': return 'Correct memory';
+    // `memory` and `threads` both gained READ actions, so an arm that ignores
+    // `action` labels a lookup as a mutation: "Correct memory" for a search
+    // tells the user their long-term memory was written to when it was only
+    // read. Mirrors the same split in `core::mod::tool_label`.
+    case 'memory': {
+      const a = str('action');
+      if (a === 'search') return 'Search memory';
+      if (a === 'source') return 'Trace memory to its conversation';
+      return 'Correct memory';
+    }
     case 'threads': {
       const a = str('action');
       if (a === 'count') return 'Count threads';
+      if (a === 'search') return 'Search past conversations';
       return 'List threads';
     }
     case 'enable_push_notifications': return 'Enable push notifications';

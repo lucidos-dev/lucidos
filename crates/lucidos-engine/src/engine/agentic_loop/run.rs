@@ -27,7 +27,7 @@ impl LucidosEngine {
     /// `trim_context_if_needed`'s image pins) so the model can still see the
     /// image after intervening tool calls. The description is a record of what
     /// was shown, never a substitute for the bytes. Callers run this only at
-    /// `iterations == 1`, and `take()` empties the handle, so a second call is
+    /// `rounds == 1`, and `take()` empties the handle, so a second call is
     /// a no-op.
     async fn emit_image_descriptions_after_first_llm_call(
         &self,
@@ -140,15 +140,17 @@ impl LucidosEngine {
             crate::engine::command_guard::JudgedClassification,
         > = std::collections::HashMap::new();
 
-        let mut iterations = 0;
+        // Rounds run so far this turn. A *round* is one LLM API call plus the
+        // execution of every tool call its response carried (see `docs/glossary.md`
+        // § Round); this is the unit the loop iterates in.
+        let mut rounds = 0;
         // Tool calls made so far this turn, against `max_tool_calls`. Distinct
-        // from `iterations`, which counts LLM round-trips: one response can
-        // carry several tool calls, so the two diverge and only this one
-        // matches what the setting, the prompt and the terminator all call a
-        // "tool call".
+        // from `rounds`: one response can carry several tool calls, so the two
+        // diverge and only this one matches what the setting, the prompt and
+        // the terminator all call a "tool call".
         let mut tool_calls_made = 0usize;
         // Capture before the loop pushes assistant/tool messages and shifts the index.
-        // Maintained across iterations: trim pass 2 may remove older messages, which
+        // Maintained across rounds: trim pass 2 may remove older messages, which
         // shifts the captured index down by the number removed (handled below).
         let mut user_message_idx = messages.len().saturating_sub(1);
         // Messages whose image bytes must survive trim pass 0 for the whole turn.
@@ -192,7 +194,7 @@ impl LucidosEngine {
 
         // Agent loop
         loop {
-            iterations += 1;
+            rounds += 1;
             if cancel_token.is_cancelled() {
                 crate::engine::thread_events::emit_response_canceled(
                     &self.event_bus,
@@ -231,8 +233,8 @@ impl LucidosEngine {
             // `NON_TOOL_ROUND_SLACK`.
             let cap_message = if tool_calls_made >= max_tool_calls {
                 Some(tool_call_cap_message(max_tool_calls))
-            } else if iterations > max_tool_calls.saturating_add(NON_TOOL_ROUND_SLACK) {
-                Some(round_backstop_message(iterations))
+            } else if rounds > max_tool_calls.saturating_add(NON_TOOL_ROUND_SLACK) {
+                Some(round_backstop_message(rounds))
             } else {
                 None
             };
@@ -260,7 +262,7 @@ impl LucidosEngine {
             // Pin the current turn's user message so pass 2 cannot drop it
             // (`Some(user_message_idx)`), and keep every tracked image-bearing
             // message's bytes for the whole turn (`keep_image_idxs`). The
-            // recent-tail rule alone fails once enough tool iterations shift a
+            // recent-tail rule alone fails once enough tool rounds shift a
             // message out of the last PRESERVE_RECENT_MESSAGES slots; losing it
             // strips the request line from every subsequent call (model reports
             // "I lost track of what you asked"), and stripping its image blinds
@@ -880,7 +882,7 @@ impl LucidosEngine {
                     user_image_idxs.extend(appended.image_message_idxs);
                     if appended.appended {
                         user_message_idx = messages.len().saturating_sub(1);
-                        if iterations == 1 {
+                        if rounds == 1 {
                             self.emit_image_descriptions_after_first_llm_call(
                                 &mut image_description_handle,
                                 origin_id,
@@ -1320,7 +1322,7 @@ impl LucidosEngine {
             for tool_call in response.tool_calls.iter() {
                 // Count the CALL, not the round. One response can carry several
                 // tool calls (the system prompt asks for exactly that when
-                // writing N files), so counting iterations would let a cap of
+                // writing N files), so counting rounds would let a cap of
                 // 500 pass well over 500 calls while every user-facing string
                 // says "tool calls".
                 tool_calls_made += 1;
@@ -1440,6 +1442,7 @@ impl LucidosEngine {
                             .and_then(|v| v.as_str())
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
+                        let on = tool_call.arguments.get("on").and_then(|v| v.as_str());
                         let all = tool_call
                             .arguments
                             .get("all")
@@ -1459,7 +1462,10 @@ impl LucidosEngine {
                             ),
                             parsed => {
                                 let id = parsed.and_then(Result::ok);
-                                match self.cancel_event_waits_for_agent(thread_id, id, all).await {
+                                match self
+                                    .cancel_event_waits_for_agent(thread_id, id, on, all)
+                                    .await
+                                {
                                     crate::engine::event_wait::CancelEventWaitOutcome::Stopped(
                                         msg,
                                     ) => (msg, true),
@@ -1890,7 +1896,7 @@ impl LucidosEngine {
             // message (preserved by trim's image pins) so the model can
             // still see the image after intervening tool calls — the description
             // is only recorded as a past-tense fact, never swapped in for the bytes.
-            if iterations == 1 {
+            if rounds == 1 {
                 self.emit_image_descriptions_after_first_llm_call(
                     &mut image_description_handle,
                     origin_id,

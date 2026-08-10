@@ -112,6 +112,22 @@ describe('Explainer: host-only, never served to app iframes', () => {
   });
 });
 
+describe("Explainer: the glyph sits on the label's cap height", () => {
+  it('corrects `vertical-align: middle`, which centres on the x-height', () => {
+    // `middle` is defined as "baseline plus half the parent's x-height", so on
+    // its own it parks a glyph that is taller than the text a good half a
+    // lowercase letter low: the circle hangs into the descender space while its
+    // top only just reaches the cap (reported on the Appearance page, where the
+    // icon follows "Push notifications" and "Open links in"). The paired
+    // negative `top` is what raises it to the cap-height centre, and it is in
+    // `em` so it tracks whatever size label it rides.
+    const rule = hostCss.match(/\.explainer-btn \{[\s\S]*?\n\}/);
+    expect(rule, 'found the .explainer-btn rule').not.toBeNull();
+    expect(rule![0]).toMatch(/vertical-align:\s*middle/);
+    expect(rule![0]).toMatch(/\n\s*top:\s*-0?\.\d+em;/);
+  });
+});
+
 describe('Explainer: the dialog is a named, focus-trapping modal', () => {
   it('names the panel, so a screen reader does not meet an unnamed dialog', () => {
     // The visible <h2> is not an accessible name. aria-label rather than

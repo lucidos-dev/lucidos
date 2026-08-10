@@ -14,7 +14,7 @@ import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
-import { invoke } from './utils/tauri';
+import { invoke, windowReadyToShow } from './utils/tauri';
 import { setBootStatus } from './utils/bootSplash';
 import { startStartupStatusPolling } from './utils/startupStatus';
 import { reconcileDesktopDeviceId } from './store/actions/devices';
@@ -211,6 +211,18 @@ async function boot() {
   // preview resolves the same device-scoped preferences as the app the user came
   // from instead of registering as a new device. A no-op everywhere else.
   adoptDeviceIdFromUrl();
+
+  // Packaged desktop: the shell keeps the launch window hidden until a page says
+  // it has something to paint (lib.rs `window_ready_to_show`). Signal here, not
+  // only from `applyTheme`, because EVERY boot path reaches this line while the
+  // theme is already resolved on the document (index.html's FOUC script ran
+  // before the bundle) and the inline boot splash is in the markup, so the next
+  // paint carries it. `applyTheme` covers neither of the two launches that
+  // matter: the pre-gateway shell below returns before `<App/>` mounts, so it
+  // never runs at all there, and in the workspace document `loadPreferences`
+  // deliberately skips it when the stored theme is unchanged. Waiting for it
+  // would mean sitting out the shell's fallback timer on every cold launch.
+  if (isTauri()) windowReadyToShow();
 
   // Packaged desktop shell before it has navigated to the gateway: stay on the
   // boot splash instead of booting a broken `<App/>` against the asset scheme

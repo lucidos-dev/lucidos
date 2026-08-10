@@ -176,11 +176,13 @@ $ lucidos events emit AnalysisCompleted \
 
 The CLI prints the server's JSON response on stdout (`{"success": true, "event_id": "..."}`).
 
-### `lucidos events query [--type T] [--since iso] [--until iso] [--before-event-id UUID | --after-event-id UUID] [--limit N]`
+### `lucidos events query [--type T] [--since iso] [--until iso] [--thread-id UUID] [--before-event-id UUID | --after-event-id UUID] [--limit N]`
 
 GET events from the parent workspace's event store. Outputs the raw JSON array on stdout, newest-first.
 
 This reads the **whole** store, not only what the workspace emitted: engine thread and system events (`ChildThreadCompleted`, `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`) are rows in the same table and come back from the same query. See `system-knowhow/thread-events.md` § "One table, two enums".
+
+`--thread-id` narrows to one thread, which is how you READ a past conversation: pair it with `--type MessageReceived` (or `ResponseGenerated`) after finding the thread, or the query returns that thread's entire transcript including every streamed token. Omitting it queries every thread, exactly as before.
 
 ```bash
 $ lucidos events query --type AnalysisCompleted --limit 1 | jq '.[0]'
@@ -446,7 +448,7 @@ $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}
     --timeout-secs 1800 --reason "waiting for the refactor to propose its change"
 ```
 
-### `lucidos event-waits list` / `lucidos event-waits cancel [--wait-id <ID>] [--all]`
+### `lucidos event-waits list` / `lucidos event-waits cancel [--wait-id <ID>] [--on <EVENT_TYPE>] [--all]`
 
 Read and stop the **calling thread's** own subscriptions, the ones
 `lucidos await-event` armed. The coding-agent counterparts of the chat agent's
@@ -481,25 +483,51 @@ thread later whatever you told the user, so when they say to stop, drop it, or
 never mind, run this rather than promising. Use it too when the thing turns out
 to have already happened, or when a new subscription supersedes an old one.
 
-Pass exactly one of `--wait-id <ID>` (from `list`) or `--all`. Neither is
-defaulted: a bare call would have to guess between stopping one and stopping
-every one, and both guesses are wrong. Stopping is silent, so nothing interrupts
-you: the subscription simply ends, the user sees it leave the subscription
-indicator, and the transcript records what was stopped.
+Pass exactly one of `--wait-id <ID>` (from `list`), `--on <EVENT_TYPE>`, or
+`--all`. None is defaulted: a bare call would have to guess between stopping one
+and stopping every one, and both guesses are wrong. Stopping is silent, so
+nothing interrupts you: the subscription simply ends, the user sees it leave the
+subscription indicator, and the transcript records what was stopped.
+
+**`--on` is the one to reach for when the answer arrived some other way**, and
+it is the safe middle: it needs no id, so nothing has to be read out of `list`
+first, and it leaves every other watch on this thread standing, which `--all`
+does not. It ends every subscription watching that event type, whatever
+`--condition` each one carries.
+
+One sharp edge, because a subscription can watch several event types at once
+(repeated `--on` at `await-event`): naming ONE of them ends that whole
+subscription, the other names included. A wait is a single rendezvous with
+several triggers, spent by the first match, so there is no leg left to be woken
+by once you have stopped watching for the other. The result names every type it
+ended, so read it rather than assuming; when you meant to keep watching for the
+rest, arm a new subscription for them.
 
 ```bash
 # The user changed their mind about one of several watches.
 $ lucidos event-waits cancel --wait-id 3f2b1c04-...
 {"status":"stopped","message":"Stopped watching for ChangeProposed. It will not wake this thread."}
 
+# The release build finished while you were doing something else.
+$ lucidos event-waits cancel --on ReleasePublished
+{"status":"stopped","message":"Stopped watching for ReleasePublished. Nothing on this thread watches ReleasePublished any more. 1 other subscription(s) on this thread is still live."}
+
 # Stand everything down.
 $ lucidos event-waits cancel --all
 ```
 
-Refusals arrive as a `400` carrying the reason: both flags or neither, and a
-`--wait-id` that is not live on this thread (already fired, timed out, already
-stopped, or belonging to another thread, which are indistinguishable and equally
-mean "not yours to stop").
+Refusals arrive as a `400` carrying the reason: more than one flag or none of
+them; a `--wait-id` that is not live on this thread (already fired, timed out,
+already stopped, or belonging to another thread, which are indistinguishable and
+equally mean "not yours to stop"); and an `--on` nothing on this thread is
+watching, which is worth reading rather than shrugging off, because it means a
+watch you thought was armed is not.
+
+Scripts use this too, and `scripts/lib/e2e_lock.sh` is the worked example: the
+moment a run takes the machine-wide e2e lock it runs
+`lucidos event-waits cancel --on E2ELockReleased`, because holding the lock is
+the answer to any watch this thread had for its release. That call is best
+effort and its refusal is discarded, since most runs never subscribed.
 
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
 
@@ -703,21 +731,32 @@ Get an entry id from `list` (`entries[].id`). Mirrors the chat agent's grouped
 `PUT /thread-queue/policy` replaces omitted caps with defaults (the LLM tool
 merges with the live policy instead).
 
-### `lucidos memory stats | entries [--limit N] [--offset N] [--source-type T] [--sort S] [--importance L] | source [--source-id UUID] [--source-type T] [--path P] [--commit C]`
+### `lucidos memory stats | entries [...] | search --q <Q> [--limit N] | source [--source-id UUID] [--source-type T] [--path P] [--commit C]`
 
-Read long-term memory — `stats` (index counts), `entries` (paginated entries
-with importance + source), `source` (the originating event/artifact for one
-memory plus the entries derived from it). All read-only.
+Read long-term memory. `stats` (index counts), `entries` (paginated, with
+importance and source), `search` (rank entries against a question), `source`
+(the originating event or artifact for one memory, plus the entries derived
+from it). All read-only.
 
 ```bash
 $ lucidos memory stats
 $ lucidos memory entries --limit 20 --importance high,critical
-$ lucidos memory source --source-type event --source-id <uuid>
+$ lucidos memory search --q "launch outcome" --limit 5
+$ lucidos memory source --source-id <uuid>
 ```
 
+`search` ranks with the same `similarity * importance * recency` the chat
+agent's injected memory block uses, so the CLI and the agent cannot disagree
+about an order.
+
+**`source` takes either id.** Pass the memory's own `[id: <uuid>]` (what a
+memory bullet shows) or the source event's uuid; it resolves either. The
+response carries the event's `thread_id`, which is what turns a fact back into
+the conversation it came from.
+
 Correcting memory is the chat agent's grouped `memory` tool (`correct` /
-`correct_by_id`), not a CLI op — and the agent gets memory injected into its
-context, so these reads are for subprocess inspection.
+`correct_by_id`), not a CLI op. The agent has `search` and `source` too; what
+it does not have is `stats` and `entries`, which are operator reads.
 
 ### `lucidos env-vars list | set --name <NAME> --value <V> | delete --name <NAME>`
 

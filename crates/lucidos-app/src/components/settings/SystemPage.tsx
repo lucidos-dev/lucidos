@@ -181,12 +181,12 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             {path && name && (
               <div class="system-info-row">
                 <span class="system-info-label">Path</span>
-                <span class="system-info-value system-info-path">{path}</span>
+                <span class="system-info-value system-info-long">{path}</span>
               </div>
             )}
             <div class="system-info-row">
               <span class="system-info-label">API</span>
-              <button class="system-info-value system-api-url accent-link" onClick={copyApiUrl}>
+              <button class="system-info-value system-info-long system-api-url accent-link" onClick={copyApiUrl}>
                 {getApiUrl()}
               </button>
             </div>

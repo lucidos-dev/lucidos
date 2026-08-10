@@ -69,8 +69,12 @@ Three properties of that job are load-bearing:
   the job cannot produce a duplicate client no matter what kickstarts it. `-g`
   keeps the launch out of the foreground.
 - **`--login` means menu-bar-only.** The `main` window is declared
-  `"visible": false` in `tauri.conf.json` and shown in `setup` on every launch
-  except this one, so a login start never flashes a window before hiding it. It
+  `"visible": false` in `tauri.conf.json`, and this is the one launch that never
+  shows it, so a login start never flashes a window before hiding it. `setup`
+  still takes that decision (`should_show_window_at_startup`), but it now arms
+  the show gate rather than showing the window itself: every other launch waits
+  for the frontend to say it is about to paint, with a 3s fallback timer behind
+  it, and a login start arms the gate false so neither path fires. It
   comes up in exactly the state closing the window leaves the client in:
   tray item, no window, `Accessory` (no Dock icon). The hidden window still
   loads the gateway page, which is what keeps SSE, notifications and the unread

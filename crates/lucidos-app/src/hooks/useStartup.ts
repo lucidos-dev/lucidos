@@ -570,6 +570,15 @@ export function useStartup(): void {
       // suspended PWA missed every transient status frame, so re-read the
       // snapshot rather than trusting the last one seen before backgrounding.
       void loadEmbeddingModelStatus();
+      // And the name the user gave this workspace, which they may have changed
+      // in the picker on another device while this one slept. Behind the
+      // gateway the in-app switcher re-adopts on every unfold, so this is
+      // belt-and-braces there; on a direct engine port it is the ONLY thing
+      // that can correct the name, because the switcher gates itself off (no
+      // control plane on that origin) and the "next load" the label otherwise
+      // waits for is the load this whole handler exists because iOS never
+      // does. See store/actions/workspace-label.ts.
+      void loadWorkspaceDisplayName();
       // Re-send any compose draft the engine never received, for the same
       // reason as the preference writes above. A draft lives only in memory
       // (`store/composeDrafts.ts`), so the server is its storage and an

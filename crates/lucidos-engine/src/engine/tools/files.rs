@@ -399,6 +399,13 @@ impl LucidosEngine {
             .map_err(|e| format!("Failed to commit: {}", e))?;
 
         if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+            // Before the announcement, not after: the cache tracks the file,
+            // and the emit below can fail on a transient pool timeout while the
+            // edit is already committed. Refreshing after the `?` would leave
+            // exactly the stale profile this cache exists to prevent.
+            self.user_profile
+                .artifact_written(artifact_path, new_content.as_bytes())
+                .await;
             self.event_bus
                 .emit(BusEvent::System(SystemEvent::ArtifactUpdated {
                     artifact_path: artifact_path.to_string(),
@@ -407,9 +414,6 @@ impl LucidosEngine {
                 }))
                 .await
                 .map_err(|e| format!("Failed to emit event: {}", e))?;
-            if artifact_path == "user_profile.md" {
-                *self.user_profile.write().await = new_content;
-            }
         }
 
         self.emit_app_event_for_data_path(path, app_existed_before, false)
@@ -836,6 +840,13 @@ impl LucidosEngine {
                     .await?;
 
                 if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+                    // Keep in-memory profile cache in sync. Not memory indexing:
+                    // this is the user_profile read-cache backing extraction
+                    // context. Ahead of the emit, which can fail once the write
+                    // is already committed and would take the refresh with it.
+                    self.user_profile
+                        .artifact_written(artifact_path, content.as_bytes())
+                        .await;
                     self.event_bus
                         .emit(BusEvent::System(SystemEvent::artifact_change(
                             file_exists,
@@ -844,12 +855,6 @@ impl LucidosEngine {
                             None,
                         )))
                         .await?;
-
-                    // Keep in-memory profile cache in sync (not memory indexing —
-                    // this is the user_profile read-cache backing extraction context).
-                    if artifact_path == "user_profile.md" {
-                        *self.user_profile.write().await = content.to_string();
-                    }
                 }
 
                 self.emit_app_event_for_data_path(path, app_existed_before, false)
@@ -1043,6 +1048,13 @@ impl LucidosEngine {
                 // Emit event for artifacts
                 if dst_data_path.starts_with("artifacts/") {
                     let artifact_path = dst_data_path.strip_prefix("artifacts/").unwrap();
+                    // A copy can land ON the profile, and the new bytes exist
+                    // only on disk here, so re-read rather than assume the
+                    // source content is what arrived. Before the emit, which can
+                    // fail with the copy already committed.
+                    self.user_profile
+                        .artifact_written_on_disk(self.workspace_path(), artifact_path)
+                        .await;
                     self.event_bus
                         .emit(BusEvent::System(SystemEvent::artifact_change(
                             file_exists,
@@ -1122,6 +1134,12 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                         .delete_data_path_and_commit(&self.event_bus, path, &commit_msg)
                         .await?
                 };
+
+                // A deleted profile has to leave the cache too, or the engine
+                // keeps rendering it into every chat turn forever.
+                if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+                    self.user_profile.artifact_deleted(artifact_path).await;
+                }
 
                 self.emit_app_event_for_data_path(path, app_existed_before, true)
                     .await?;

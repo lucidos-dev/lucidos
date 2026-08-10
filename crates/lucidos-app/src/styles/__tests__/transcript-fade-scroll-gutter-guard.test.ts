@@ -36,6 +36,7 @@ import { block, decl } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const inputMessagesCss = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf-8');
 const contentCss = readFileSync(resolve(here, '../panels/content.css'), 'utf-8');
+const responseCss = readFileSync(resolve(here, '../chat/response.css'), 'utf-8');
 
 /** The desktop `.thread-content` rule, i.e. the one that carries the top fade. */
 function maskedTranscript(): string {
@@ -82,5 +83,18 @@ describe('the transcript fades leave the scroll gutter alone', () => {
 
   it('casts no shadow from the composer, which no inset could keep off the gutter', () => {
     expect(decl(block(contentCss, '.prompt-area {'), 'box-shadow')).toBeNull();
+  });
+
+  it('keeps the send landing clear of that dissolve, sized from the same token', () => {
+    // The one thing the app deliberately parks AT the transcript's bottom edge:
+    // `landOnOwnTurn` (components/chat/scrollState.ts) rests a turn's agent
+    // status line there on a send or an answer. That edge is under the band
+    // above, so the row names the room it needs and the landing reads the
+    // resolved px off this property. Written as the token rather than a literal
+    // for the same reason the band's own height is: the two have to move
+    // together, and a number copied into either place drifts.
+    const clearance = decl(block(responseCss, '.response-header {'), 'scroll-margin-bottom');
+    expect(clearance, '.response-header declares no landing clearance').not.toBeNull();
+    expect(clearance).toContain('var(--prompt-fade)');
   });
 });

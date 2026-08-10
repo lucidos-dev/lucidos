@@ -77,15 +77,25 @@ export function formatRemaining(seconds: number): string {
   return `${s}s`;
 }
 
-/** The subscription in one line, using the same words the agent used in `on:`.
- *  A condition is summarised as "filtered" rather than dumped: the raw operator
- *  JSON is developer-facing, and this row is read by whoever is waiting.
+/** The subscription as one label per watched event type, using the same words
+ *  the agent used in `on:`. A condition is summarised as "filtered" rather than
+ *  dumped: the raw operator JSON is developer-facing, and this is read by
+ *  whoever is waiting.
+ *
+ *  A list rather than a sentence, because the transcript's event row renders
+ *  each type as its own chip (`.event-name`, the one way an event type is
+ *  spelled anywhere in the transcript) and cannot recover the types from a
+ *  joined string without parsing its own output back apart.
  *
  *  Takes the `on:` list rather than a whole wait, because that is all it reads:
- *  the transcript's step line renders from the persisted `EventWaitStarted` and
- *  has no wait to hand it. */
+ *  the transcript row renders from the persisted `EventWaitStarted` and has no
+ *  wait to hand it. */
+export function waitSubscriptionLabels(on: EventSubscription[]): string[] {
+  return on.map((s) => (s.condition ? `${s.event_type} (filtered)` : s.event_type));
+}
+
+/** The same labels as one line, for a surface with no room to chip them: the
+ *  subscription panel's row, which already stacks a reason above it. */
 export function describeWaitSubscription(on: EventSubscription[]): string {
-  return on
-    .map((s) => (s.condition ? `${s.event_type} (filtered)` : s.event_type))
-    .join(' or ');
+  return waitSubscriptionLabels(on).join(' or ');
 }

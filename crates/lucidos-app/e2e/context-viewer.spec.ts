@@ -5,6 +5,7 @@ import {
   sendMessage,
   waitForResponse,
   assertHealthy,
+  revealSteps,
 } from './helpers';
 
 /**
@@ -38,13 +39,9 @@ test.describe('LLM Context Viewer two-layer grouping', () => {
     await sendMessage(page, 'Say "hello world" and nothing else.');
     await waitForResponse(page);
 
-    // Inline steps are collapsed by default — open them to surface the
+    // Inline steps are collapsed by default: open them to surface the
     // context counter on the latest step, which is the viewer's door.
-    const showStepsBtn = page
-      .locator('button.details-toggle:visible', { hasText: 'Show steps' })
-      .first();
-    await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
-    await showStepsBtn.click();
+    await revealSteps(page);
 
     const counter = page
       .locator('[data-role="inline-step"]:visible [data-role="step-context"]')

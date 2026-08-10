@@ -1516,7 +1516,15 @@ export const detailsExpanded = signal(
   localStorage.getItem('lucidos-details-expanded') === 'true'
 );
 
-/** Signal + toggle pair backed by a localStorage-persisted Set of "threadId:userSeq" keys. */
+/** Signal + toggle + expand triple, backed by a localStorage-persisted Set of
+ *  "threadId:userSeq" keys.
+ *
+ *  `expand` is the one-way half, and it is one-way on purpose: a fold is an
+ *  explicit act, so something else may lift it but nothing may impose it. Its
+ *  caller is the pair of transcript-wide reveals in the response header, which
+ *  draw nothing on a turn that is folded (see `toggleDetails` / `toggleSteps`
+ *  in ChatExchange.tsx). Turning one ON lifts the fold on the turn it was
+ *  clicked from; turning one off never re-folds anything. */
 function createCollapsedStore(storageKey: string) {
   const sig = signal<Set<string>>(loadStringSet(storageKey));
   function toggle(threadId: string, userSeq: number): void {
@@ -1526,7 +1534,14 @@ function createCollapsedStore(storageKey: string) {
     else next.add(key);
     sig.value = next;
   }
-  return [sig, toggle] as const;
+  function expand(threadId: string, userSeq: number): void {
+    const key = `${threadId}:${userSeq}`;
+    if (!sig.value.has(key)) return;
+    const next = new Set(sig.value);
+    next.delete(key);
+    sig.value = next;
+  }
+  return [sig, toggle, expand] as const;
 }
 
 function loadStringSet(storageKey: string): Set<string> {
@@ -1538,7 +1553,7 @@ function loadStringSet(storageKey: string): Set<string> {
   }
 }
 
-export const [collapsedExchanges, toggleExchangeCollapsed] =
+export const [collapsedExchanges, toggleExchangeCollapsed, expandExchange] =
   createCollapsedStore('lucidos-collapsed-exchanges');
 export const [collapsedInitiators, toggleInitiatorCollapsed] =
   createCollapsedStore('lucidos-collapsed-initiators');

@@ -1,4 +1,4 @@
-import { type VNode } from 'preact';
+import { type ComponentChildren, type VNode } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import {
   backupPreferencesVersion,
@@ -22,7 +22,10 @@ import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
-import { Dropdown } from '../shared/Dropdown';
+import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
+import { Explainer } from '../shared/Explainer';
+import { LoadingFade } from '../shared/LoadingFade';
+import { SkeletonProvider, SkText } from '../shared/Skeleton';
 import {
   getBackupProviders,
   getBackupKey,
@@ -42,7 +45,7 @@ import {
 } from '../../api/client';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 
 // Restore lives in the workspace picker now (it provisions the new workspace);
@@ -208,6 +211,96 @@ export function backupHealthCard(props: {
   );
 }
 
+/** Should the "Ask Lucidos to set this up" hand-off render at rest?
+ *
+ *  Only when the page KNOWS backups are not working yet, which is what makes the
+ *  offer a next action rather than reference material. Working means exactly
+ *  what `backupHealthCard` renders its plain idle state for: a ready
+ *  destination, a backup that really is in the cloud, not stale, and no failed
+ *  run since. Anything short of that is something the agent can still help with,
+ *  so the offer stays.
+ *
+ *  **Every unknown answers no**, and that half is load-bearing rather than
+ *  cautious. `loadStatus` blanks the status back to `loading` on mount and
+ *  after each terminal backup SSE, so reading "not loaded" as "not working"
+ *  would flash the offer onto a healthy page and shove the health card down for
+ *  the length of each of those round trips. */
+export function showBackupSetupOffer(
+  providers: Loadable<BackupProviderInfo[]>,
+  providerReady: boolean,
+  status: Loadable<BackupStatus>,
+): boolean {
+  // Nothing is known about the destination until its registry lands.
+  if (providers.status !== 'loaded') return false;
+  // No usable destination is a verdict on its own, and the only one status
+  // cannot supply: it is never fetched at all until a provider is ready.
+  if (!providerReady) return true;
+  if (status.status !== 'loaded') return false;
+  const s = status.data;
+  // An unreadable destination is not a verdict either way, and the card already
+  // says so in its own line. A transient cloud outage must not read as "your
+  // backups were never set up".
+  if (s.list_error) return false;
+  if (!s.latest_backup || s.stale) return true;
+  return s.last_run != null && s.last_run.status !== 'success';
+}
+
+/**
+ * The health card as a loading skeleton: its own box, with a shimmer standing in
+ * for each of the two lines the settled card shows.
+ *
+ * Listing the cloud folder is the slowest read on this page and the card is at
+ * the TOP of it, so without this the card arrives last and shoves everything
+ * under it down. It is built from the same box and the same line class as the
+ * real card, immediately beside it, so the placeholder cannot drift away from
+ * what it stands in for (`.claude/rules/frontend.md` on self-skeletonizing
+ * surfaces). `data-state` is the neutral idle hue: a skeleton must not
+ * pre-announce a verdict, least of all the red one.
+ */
+export function backupHealthCardSkeleton(): VNode {
+  return (
+    <SkeletonProvider>
+      <div class="backup-health-card" data-state="idle" aria-hidden="true">
+        <SkText class="backup-health-line" w="12rem" />
+        <SkText class="backup-health-line" w="15rem" />
+      </div>
+    </SkeletonProvider>
+  );
+}
+
+/**
+ * A dropdown that shows a skeleton while its own value is still being read.
+ *
+ * Every control on this page is fed by a separate request, and each one used to
+ * be conditionally rendered on its own flag, so the row grew a control at a time
+ * and the page under it stepped down with each arrival. The slot reserves the
+ * space instead: the skeleton is the trigger's own box, so the real control lands
+ * in it rather than beside it.
+ *
+ * The delay gate and the crossfade are the standard pair from
+ * `.claude/rules/frontend.md`: a load that beats `SPINNER_DELAY_MS` shows no
+ * skeleton at all, and a slower one dissolves rather than snapping.
+ */
+function DropdownSlot({
+  pending,
+  skeletonWidth,
+  children,
+}: {
+  pending: boolean;
+  /** Width of the widest label this slot will settle on. */
+  skeletonWidth: string;
+  children: ComponentChildren;
+}) {
+  const showSkeleton = useDelayedFlag(pending);
+  return (
+    <LoadingFade class="dropdown-slot" showSkeleton={showSkeleton} skeleton={<DropdownSkeleton w={skeletonWidth} />}>
+      {/* Withheld only while genuinely unknown. Once the read settles the
+          control renders immediately, and the skeleton fades out over it. */}
+      {pending ? null : children}
+    </LoadingFade>
+  );
+}
+
 /** Whether to keep polling `/backup/status`. The engine holds
  *  `backup_in_progress` set through post-backup pruning, so a refetch fired by
  *  the terminal SSE can still read `running:true` and wedge the card on "Backup
@@ -233,7 +326,6 @@ export function backupKeyButtonLabel(keyExists: boolean | null, showingKey: bool
 
 export function BackupSection() {
   const [providersLoadable, setProvidersLoadable] = useState<Loadable<BackupProviderInfo[]>>({ status: 'not-loaded' });
-  const showProvidersLoading = useDelayedLoading(providersLoadable);
   const [selectedProvider, setSelectedProvider] = useState<string>('');
   const [keyInfo, setKeyInfo] = useState<BackupKeyResponse | null>(null);
   const [showKey, setShowKey] = useState(false);
@@ -245,7 +337,12 @@ export function BackupSection() {
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const [retention, setRetention] = useState<string>('5');
-  const [retentionLoaded, setRetentionLoaded] = useState(false);
+  // SETTLED, not "loaded": set on both the success and the failure path, because
+  // it answers "is the read still in flight?" (which drives the skeleton) rather
+  // than "is the value known?". Its neighbour `scheduleLoaded` deliberately
+  // means the other thing: a failed schedule read leaves it false so the 'off'
+  // default is never mistaken for a real setting and written back.
+  const [retentionSettled, setRetentionSettled] = useState(false);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
@@ -315,9 +412,9 @@ export function BackupSection() {
 
     getBackupRetention().then((r) => {
       setRetention(String(r.keep));
-      setRetentionLoaded(true);
+      setRetentionSettled(true);
     }).catch((err) => {
-      setRetentionLoaded(true);
+      setRetentionSettled(true);
       showToast(`Failed to load backup retention: ${errorDetail(err)}`, 'error');
     });
 
@@ -402,17 +499,19 @@ export function BackupSection() {
       setSelectedProvider(seed.provider);
       if (retention.status === 'fulfilled') {
         setRetention(String(retention.value.keep));
-        setRetentionLoaded(true);
+        setRetentionSettled(true);
       }
     })();
   }, [backupPreferencesVersion.value, backupPairSaving, retentionSaving, granting]);
 
   const loadedProviders = providersLoadable.status === 'loaded' ? providersLoadable.data : null;
 
+  // No "Loading providers..." entry any more: while the read is in flight the
+  // row shows a skeleton in place of the whole control, so a dropdown carrying
+  // its own progress report as its only option would be saying it twice.
   const providerOptions: { value: string; label: string }[] = (() => {
     if (loadedProviders) return loadedProviders.map((p) => ({ value: p.id, label: p.name }));
     if (providersLoadable.status === 'failed') return [{ value: '', label: 'Failed to load providers' }];
-    if (providersLoadable.status === 'loading' && showProvidersLoading) return [{ value: '', label: 'Loading providers...' }];
     return [];
   })();
 
@@ -437,7 +536,11 @@ export function BackupSection() {
   useEffect(() => {
     if (!selectedProvider || !selectedReady) return;
     if (!shouldPollBackupStatus(statusLoadable, progress)) return;
-    const t = setTimeout(() => { void loadStatus(); }, STATUS_POLL_MS);
+    // A REFRESH of a destination already on screen, so it keeps what is there.
+    // Blanking would swap the running card for the loading skeleton every 4s for
+    // as long as pruning takes, and the card it is replacing is the one thing
+    // on the page saying a backup is still going.
+    const t = setTimeout(() => { void loadStatus({ keepPrevious: true }); }, STATUS_POLL_MS);
     return () => clearTimeout(t);
   }, [statusLoadable, progress, selectedProvider, selectedReady]);
 
@@ -550,9 +653,16 @@ export function BackupSection() {
     }
   }
 
-  async function loadStatus() {
+  /** `keepPrevious` leaves whatever is on screen there while the new answer is
+   *  fetched, for a poll that is re-reading the SAME destination. The default
+   *  blanks, and that is what the other two callers need: a provider change
+   *  would otherwise report one destination's health under another's name, and
+   *  a terminal-backup SSE refetch would hold the pre-backup verdict as if it
+   *  still stood. Blanking is what the health card's skeleton keys off, so this
+   *  flag is also the choice between "shimmer" and "leave it alone". */
+  async function loadStatus({ keepPrevious = false }: { keepPrevious?: boolean } = {}) {
     if (!selectedProvider) return;
-    setStatusLoadable({ status: 'loading' });
+    if (!keepPrevious) setStatusLoadable({ status: 'loading' });
     try {
       const status = await getBackupStatus(selectedProvider);
       setStatusLoadable({ status: 'loaded', data: status });
@@ -655,49 +765,88 @@ export function BackupSection() {
     !!providerInfo?.connected && !providerInfo.ready,
   );
   const backingUp = progress !== null;
+  const offerSetup = showBackupSetupOffer(providersLoadable, !!providerInfo?.ready, statusLoadable);
+
+  // Which reads are still in flight, and therefore which controls show a
+  // skeleton. The destination registry and the schedule are ONE
+  // `Promise.allSettled` that is applied together, so they are in flight at
+  // exactly the same times and share a flag rather than each guessing at the
+  // other's. Retention is its own request and answers for itself. The
+  // background refresh on `backupPreferencesVersion` deliberately does NOT go
+  // through here: it keeps what is already loaded, so no settled control ever
+  // falls back to a skeleton under the user.
+  const providersPending =
+    providersLoadable.status === 'not-loaded' || providersLoadable.status === 'loading';
+  const schedulePending = providersPending;
+
+  const healthCard = backupHealthCard({
+    status: statusLoadable,
+    liveProgress: progress,
+    providerName: providerInfo?.name ?? selectedProvider,
+  });
+  // Gated on the card having nothing to draw, not merely on the status being in
+  // flight: a refetch while a backup runs keeps rendering the live progress
+  // card, and stacking a skeleton in the same grid cell would smear the two.
+  const showHealthCardSkeleton = useDelayedLoading(statusLoadable) && healthCard === null;
 
   return (
     <div class="settings-section">
+      {/* What backups ARE is static reference material, so it lives behind the
+          icon rather than permanently above the controls (see `<Explainer>` and
+          `docs/plans/2026-08-09-shared-explainer-info-icon.md`). The section
+          carries its own title purely so the icon has something to hang on, the
+          same shape Debugging uses under the System switcher. */}
+      <div class="settings-section-title">
+        Backup
+        <Explainer title="Backup">
+          <p>Encrypted backups of this workspace, uploaded to your own cloud storage.</p>
+          <p>Restore happens from the workspace picker, not from here.</p>
+        </Explainer>
+      </div>
       {/* Backup setup is spread over two pages (the schedule here, the provider
           account in Settings → Accounts) and one irreversible obligation (save
           the encryption key). That is exactly the shape the agent is good at
           walking someone through, and it can do the connecting itself, so offer
-          the hand-off instead of leaving the page as the only route. */}
-      <p class="settings-section-desc">
-        Encrypted backups of this workspace, uploaded to your own cloud storage. Restore
-        happens from the workspace picker, not from here.
-        {/* The offer starts its own line. A `<br />` rather than a second
-            paragraph because .settings-section-desc carries a 0.5rem bottom
-            margin, which between two paragraphs reads as two sections rather
-            than a description and the offer that belongs to it. The `{' '}`
-            after the button stays: its label and the clause following it are
-            one sentence, and a bare JSX newline there collapses to nothing. */}
-        <br />
-        <button class="accent-link" onClick={askLucidosToSetUpBackups}>
-          Ask Lucidos to set this up
-        </button>{' '}
-        if you would rather be walked through it.
-      </p>
+          the hand-off instead of leaving the page as the only route.
 
-      {backupHealthCard({
-        status: statusLoadable,
-        liveProgress: progress,
-        providerName: providerInfo?.name ?? selectedProvider,
-      })}
+          It is a NEXT ACTION, not an explanation, which is why it stays at rest
+          instead of joining the copy behind the icon: it is worth a line of the
+          page only while there is something left to set up. Once the health card
+          below is green there is nothing to walk anyone through, and the offer
+          is what made a working page still read as a wall of text. */}
+      {offerSetup && (
+        <p class="settings-section-desc">
+          {/* The `{' '}` after the button stays: its label and the clause
+              following it are one sentence, and a bare JSX newline there
+              collapses to nothing. */}
+          <button class="accent-link" onClick={askLucidosToSetUpBackups}>
+            Ask Lucidos to set this up
+          </button>{' '}
+          if you would rather be walked through it.
+        </p>
+      )}
+
+      {/* Listing the cloud folder is the slowest read here, and the card is at
+          the TOP, so its late arrival pushed the whole page down. The skeleton
+          holds its place. Only when the card itself has nothing to draw: while
+          a backup runs, `liveProgress` fills the card from SSE and a shimmer
+          over it would be hiding live information behind a placeholder. */}
+      <LoadingFade showSkeleton={showHealthCardSkeleton} skeleton={backupHealthCardSkeleton()}>
+        {healthCard}
+      </LoadingFade>
 
       <div class="settings-row" data-search-anchor="backup:provider">
         <span class="settings-row-label">Provider</span>
-        <Dropdown
-          options={providerOptions}
-          value={selectedProvider}
-          disabled={!loadedProviders || !scheduleLoaded || backupPairSaving}
-          onChange={(v) => void handleProviderChange(v)}
-        />
+        <DropdownSlot pending={providersPending} skeletonWidth="5rem">
+          <Dropdown
+            options={providerOptions}
+            value={selectedProvider}
+            disabled={!loadedProviders || !scheduleLoaded || backupPairSaving}
+            onChange={(v) => void handleProviderChange(v)}
+          />
+        </DropdownSlot>
         {providersLoadable.status === 'failed' && (
           <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
-        )}
-        {providersLoadable.status === 'loading' && showProvidersLoading && (
-          <span class="form-hint">Loading providers...</span>
         )}
       </div>
 
@@ -772,22 +921,30 @@ export function BackupSection() {
         >
           {backingUp ? 'Backing up...' : 'Back up now'}
         </button>
-        {scheduleLoaded && (
-          <Dropdown
-            options={SCHEDULE_OPTIONS}
-            value={schedule}
-            disabled={backupPairSaving || !selectedProvider}
-            onChange={handleScheduleChange}
-          />
+        {/* The schedule picker keeps its "render nothing once we know there is
+            nothing to show" behaviour: a failed read leaves no control at all,
+            because the 'off' default is not a value we may claim. So the SLOT
+            has to disappear with it rather than staying as an empty child, or
+            the row's gap would open twice where the control used to be. The
+            skeleton covers only the window before that verdict exists. */}
+        {(schedulePending || scheduleLoaded) && (
+          <DropdownSlot pending={schedulePending} skeletonWidth="6.5rem">
+            <Dropdown
+              options={SCHEDULE_OPTIONS}
+              value={schedule}
+              disabled={backupPairSaving || !selectedProvider}
+              onChange={handleScheduleChange}
+            />
+          </DropdownSlot>
         )}
-        {retentionLoaded && (
+        <DropdownSlot pending={!retentionSettled} skeletonWidth="3rem">
           <Dropdown
             options={RETENTION_OPTIONS}
             value={retention}
             disabled={retentionSaving || !selectedProvider}
             onChange={handleRetentionChange}
           />
-        )}
+        </DropdownSlot>
       </div>
       {scheduleLoaded && schedule !== 'off' && (
         <div class="backup-schedule-hint">

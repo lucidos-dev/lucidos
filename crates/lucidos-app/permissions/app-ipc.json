@@ -31,6 +31,8 @@
           "install_app_update_and_restart",
           "cancel_app_update",
           "set_titlebar_color",
+          "set_traffic_light_offset",
+          "window_ready_to_show",
           "start_window_drag",
           "toggle_window_maximize",
           "get_connect_info",

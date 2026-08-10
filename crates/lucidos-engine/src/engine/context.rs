@@ -1,4 +1,4 @@
-use super::memory::jaccard_similarity;
+use super::memory::{jaccard_similarity, KEYWORD_BOOST, KEYWORD_SIMILARITY_PROXY};
 use super::LucidosEngine;
 use crate::core::store::types::Step;
 use crate::llm::{ContentBlock, Message, MessageContent};
@@ -734,8 +734,6 @@ impl LucidosEngine {
         };
         const RESULTS_PER_QUERY: usize = 50;
         const MAX_FACTS: usize = 25;
-        const KEYWORD_SIMILARITY_PROXY: f64 = 0.6;
-        const KEYWORD_BOOST: f64 = 1.2;
         const JACCARD_DEDUP_THRESHOLD: f32 = 0.8;
 
         let mut context = String::new();
@@ -805,20 +803,11 @@ impl LucidosEngine {
             }
         }
 
-        // Keyword search: boost entries found by keyword match
-        let mut keywords: Vec<String> = Vec::new();
-        for sub_query in &sub_queries {
-            for word in sub_query.split_whitespace() {
-                let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
-                // No uppercase filter: Norwegian common nouns like "bil"/"hund"
-                // are valid entity tags but never capitalize.
-                if trimmed.len() >= 3 {
-                    keywords.push(trimmed.to_string());
-                }
-            }
-        }
-        keywords.sort();
-        keywords.dedup();
+        // Keyword search: boost entries found by keyword match. Tokenizer and
+        // both constants are shared with the on-demand search
+        // (`engine::memory::read`), which is what makes the two rank one corpus
+        // the same way rather than merely claiming to.
+        let keywords = super::memory::keywords_for(&sub_queries);
 
         let keyword_futures: Vec<_> = keywords
             .iter()

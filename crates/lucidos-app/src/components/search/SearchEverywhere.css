@@ -134,6 +134,7 @@
 }
 
 .search-everywhere-tab {
+    position: relative;
     padding: 0.375rem 0.75rem;
     font-size: var(--font-size-sm);
     font-family: var(--font-ui);
@@ -141,32 +142,69 @@
     border: none;
     color: var(--text-muted);
     cursor: pointer;
+    /* Transparent, and never given a colour: it reserves the indicator's track
+       so nothing shifts when a tab becomes active. The line itself is ::after. */
     border-bottom: 0.125rem solid transparent;
     transition: color var(--duration-fast);
     /* A flex item shrinks by default, which is what wrapped "Triggers" onto two
        lines and let the labels compress instead of overflowing. */
     flex-shrink: 0;
     white-space: nowrap;
-    /* The focus ring below is an INSET box-shadow, so it takes this radius: a
-       square-cornered tab drew the ring as a hard rectangle. Rounded on all four
-       corners rather than the top two, because the ring is the only thing the
-       radius is for and half of it rounded reads as a mistake. At 0.25rem
-       against the 0.125rem active underline the curve is a taper, not a bow. */
-    border-radius: 0.25rem;
 }
 
-/* The shared --focus-ring band, but `inset`: the strip is a scroll container
-   now and its content box is exactly one tab tall, so the usual outward band
-   would be clipped away top and bottom. The transparent outline is the
-   forced-colors fallback, same as .icon-btn:focus-visible. */
-.search-everywhere-tab:focus-visible {
-    outline: 0.125rem solid transparent;
-    box-shadow: inset var(--focus-ring);
+/* Both indicators this strip has, the active category and a keyboard-focused
+   one, are the SAME plain line: one rounded bar under the label, differing only
+   in colour. Focus used to be an inset --focus-ring band instead, which drew a
+   tab-shaped rectangle around the label and read as chrome the strip has
+   nowhere else.
+   The bar is a pseudo-element rather than the border-bottom above, because
+   `border-radius` rounds the element's CORNER, tapering the whole box, and a
+   2px-tall border under a 35px-tall tab barely picks the curve up at all. It
+   rides ON the transparent border (`bottom` is negative because an absolutely
+   positioned child is placed against the PADDING box, so -0.125rem puts its
+   bottom edge on the border box's) and is therefore inside the tab's own box,
+   out of reach of the strip's `overflow-y: hidden`. */
+.search-everywhere-tab::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -0.125rem;
+    height: 0.125rem;
+    /* Half the height: the ends are fully round rather than merely eased. */
+    border-radius: 0.0625rem;
+    background: transparent;
+    transition: background-color var(--duration-fast);
 }
 
 .search-everywhere-tab.active {
     color: var(--accent);
-    border-bottom-color: var(--accent);
+}
+
+.search-everywhere-tab.active::after {
+    background: var(--accent);
+}
+
+/* The transparent outline is the forced-colors fallback, same as
+   .icon-btn:focus-visible. */
+.search-everywhere-tab:focus-visible {
+    outline: 0.125rem solid transparent;
+}
+
+/* AFTER the active rule, not before, and that ordering is the whole focus
+   indicator: the two ::after selectors carry equal specificity, so whichever is
+   written second wins. Written first, focus was invisible on the ONE tab a user
+   is most likely to Tab onto, the active one, which already wore an accent line
+   and would have kept it.
+   --text-primary rather than a tint of the accent because this line is now the
+   entire indicator and has to clear the 3:1 non-text contrast floor alone. A
+   tint does not, in either theme, and the --focus-ring band it replaced was no
+   better (the same accent at 55%); a tint dark enough to pass would be the
+   active line with a rounding error. The active category is still marked while
+   focused, by its accent LABEL, which the focus state leaves alone. Ratios are
+   not quoted here because both sides of them are theme tokens. */
+.search-everywhere-tab:focus-visible::after {
+    background: var(--text-primary);
 }
 
 @media (hover: hover) {

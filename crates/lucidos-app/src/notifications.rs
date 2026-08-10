@@ -19,17 +19,85 @@
 //! `native-notification-tapped` — the SAME event + payload shape the page
 //! already routes through `dispatchDeepLink` (`store/actions/native-push.ts`).
 
-/// The notification request identifier carried by a deep link: the engine
-/// `notification_id` string, or `""` when absent / not a string. It keys the
-/// pending-link map and IS the UN request identifier, so a repeat for the same
-/// notification REPLACES its banner (matching the web-push `tag`). Pure +
-/// platform-independent so the extraction is unit-testable off macOS.
+/// Separator between the workspace slug and the engine notification id inside a
+/// UN request identifier. Safe on both sides: a uuid never contains it, and a
+/// gateway slug is `[a-z0-9]+(-[a-z0-9]+)*` (`SLUG_RE` in `utils/basePath.ts`).
+#[cfg(any(target_os = "macos", test))]
+const IDENTIFIER_SEPARATOR: char = '|';
+
+/// The UN request identifier for a notification: `<workspace>|<notification_id>`,
+/// or the bare id when there is no workspace (a legacy direct engine served with
+/// no gateway, where `WORKSPACE_ID` is null and there is only one workspace).
+///
+/// **The workspace has to live in the IDENTIFIER, not only in the stashed deep
+/// link.** One packaged client process fronts the gateway and can point any
+/// window at any workspace (ADR 0014), so a tap has to say which workspace
+/// raised it. The stash is in-process and empty after a relaunch; the identifier
+/// travels inside the delivered notification, so it is what [`split_identifier`]
+/// can still recover then. It also keeps replace-by-id (the web-push `tag`
+/// equivalent) scoped: a repeat from the SAME workspace replaces its banner, and
+/// two workspaces can never collide.
+///
+/// An empty `notification_id` yields an empty identifier whatever the workspace,
+/// so [`show`]'s `is_empty` guard keeps meaning "no usable id".
+///
+/// Pure + platform-independent so it is unit-testable off macOS.
+#[cfg(any(target_os = "macos", test))]
+fn notification_identifier(workspace: &str, notification_id: &str) -> String {
+    if notification_id.is_empty() {
+        return String::new();
+    }
+    if workspace.is_empty() {
+        return notification_id.to_string();
+    }
+    format!("{workspace}{IDENTIFIER_SEPARATOR}{notification_id}")
+}
+
+/// Inverse of [`notification_identifier`]: `(workspace, notification_id)`.
+/// `None` workspace for a bare identifier (no gateway, or a banner delivered by
+/// a build older than the composite). Splits on the FIRST separator, so a stray
+/// one inside an id still yields the right workspace.
+#[cfg(any(target_os = "macos", test))]
+fn split_identifier(identifier: &str) -> (Option<&str>, &str) {
+    match identifier.split_once(IDENTIFIER_SEPARATOR) {
+        Some((workspace, id)) if !workspace.is_empty() => (Some(workspace), id),
+        Some((_, id)) => (None, id),
+        None => (None, identifier),
+    }
+}
+
+/// Does a delivered banner's identifier belong to `workspace` (`""` = the
+/// no-gateway single workspace)? Drives the scoped dismiss-all, so a
+/// mark-all-read in one workspace leaves every other workspace's banners alone.
+///
+/// A bare identifier belongs only to the no-gateway case, which means a banner
+/// left over from a build older than the composite is NOT swept by a
+/// workspace's dismiss-all. It stays until the user swipes it: strictly better
+/// than the blunt `removeAllDeliveredNotifications` that used to clear every
+/// workspace's, and it ages out with the next notification.
+#[cfg(any(target_os = "macos", test))]
+fn identifier_belongs_to(identifier: &str, workspace: &str) -> bool {
+    match split_identifier(identifier).0 {
+        Some(owner) => owner == workspace,
+        None => workspace.is_empty(),
+    }
+}
+
+/// A string field of a deep link, or `""` when absent / not a string.
+#[cfg(any(target_os = "macos", test))]
+fn link_field<'a>(link: &'a serde_json::Value, key: &str) -> &'a str {
+    link.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+}
+
+/// The UN request identifier a deep link maps to. The page stamps `workspace`
+/// (its gateway slug) alongside `notification_id` at [`show`] time; see
+/// [`notification_identifier`] for why both are needed.
 #[cfg(any(target_os = "macos", test))]
 fn link_identifier(link: &serde_json::Value) -> String {
-    link.get("notification_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string()
+    notification_identifier(
+        link_field(link, "workspace"),
+        link_field(link, "notification_id"),
+    )
 }
 
 /// True when a UN response action identifier is the swipe-away dismiss
@@ -41,9 +109,223 @@ fn is_dismiss_action(action: &str) -> bool {
     action.ends_with("DismissActionIdentifier")
 }
 
+/// The workspace a deep link names, or `None` when it carries none (a legacy
+/// direct engine with no gateway, or a banner delivered by a build older than
+/// the stamp). `""` and a non-string both read as absent.
+#[cfg(any(target_os = "macos", test))]
+fn link_workspace(link: &serde_json::Value) -> Option<&str> {
+    let workspace = link_field(link, "workspace");
+    (!workspace.is_empty()).then_some(workspace)
+}
+
+/// May the page serving `workspace` take this stashed tap? True for its OWN
+/// taps, and for an unattributable one (no workspace on the link), which is the
+/// legacy / pre-stamp case there is nothing better to do with.
+///
+/// This is what makes the process-global stash safe to share across windows:
+/// every window drains with its own slug, so a tap raised by one workspace is
+/// LEFT IN PLACE by every other window's drain rather than consumed by whichever
+/// page happened to wake first. Before it, the drain was an unconditional take
+/// and which window handled a tap was a race.
+#[cfg(any(target_os = "macos", test))]
+fn tap_belongs_to(link: &serde_json::Value, workspace: Option<&str>) -> bool {
+    match link_workspace(link) {
+        None => true,
+        Some(owner) => Some(owner) == workspace,
+    }
+}
+
+/// A workspace slug the gateway would serve. Mirrors `SLUG_RE` in
+/// `utils/basePath.ts` (lowercase alphanumerics joined by single hyphens, no
+/// leading/trailing hyphen), which is itself `registry::slugify`'s output shape.
+/// The gateway's reserved sigil (`/~/…`, ADR 0014) fails it on the character
+/// class, which is why nothing tests for `~` separately.
+#[cfg(any(target_os = "macos", test))]
+fn is_workspace_slug(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('-')
+        && !segment.ends_with('-')
+        && !segment.contains("--")
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// What an app window's current URL says about where it is pointed.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowContext<'a> {
+    /// Not pointed at the gateway yet: the declared `main` window still on the
+    /// bundled `tauri://localhost` before `desktop::launch` navigates it.
+    Unnavigated,
+    /// On the gateway but inside no workspace: the picker (`/~/…`) or the bare
+    /// root the picker is reached through. Not a workspace, so reusing it steps
+    /// on nobody.
+    Neutral,
+    /// Serving this workspace (`/<slug>/…`).
+    Workspace(&'a str),
+}
+
+/// Everything after `http://` / `https://`, or `None` for any other scheme.
+/// A non-http URL is the bundled app URL, i.e. a window that has not been
+/// navigated to the gateway.
+#[cfg(any(target_os = "macos", test))]
+fn strip_http_scheme(url: &str) -> Option<&str> {
+    ["http://", "https://"].into_iter().find_map(|prefix| {
+        let (head, rest) = url.split_at_checked(prefix.len())?;
+        head.eq_ignore_ascii_case(prefix).then_some(rest)
+    })
+}
+
+/// The `scheme://host[:port]` a window is served off, or `None` when it is not
+/// on an http(s) URL at all (an unnavigated window). Backs the origin every tap
+/// target URL is built on: the client is normally on the stable loopback
+/// gateway, but a window reached some other way should target itself.
+///
+/// **Deliberately NOT `tauri::Url::origin()`.** That returns the *opaque* origin
+/// for any non-special scheme, which serializes to the literal `"null"`, and the
+/// one URL a window is most likely to be on when a tap arrives during startup is
+/// `tauri://localhost`. Building `null/<slug>/` from that produces a URL nothing
+/// can parse, so `desktop::launch` would fail to navigate and leave the client
+/// on the boot splash for good. Restricting to http(s) by construction is what
+/// makes that unrepresentable.
+#[cfg(any(target_os = "macos", test))]
+fn window_origin(url: &str) -> Option<&str> {
+    let rest = strip_http_scheme(url)?;
+    let authority = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    (authority > 0).then(|| &url[..url.len() - rest.len() + authority])
+}
+
+/// The origin to build tap-target URLs on: the first window actually served off
+/// one. `None` when no window is (every window unnavigated, or none open), in
+/// which case the caller falls back to this install's stable gateway URL.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn gateway_origin(windows: &[(String, String)]) -> Option<&str> {
+    windows.iter().find_map(|(_, url)| window_origin(url))
+}
+
+/// Classify a window by its URL. Pure + platform-independent so the whole
+/// targeting decision is unit-testable off macOS (the UN delegate that drives it
+/// is not).
+#[cfg(any(target_os = "macos", test))]
+fn window_context(url: &str) -> WindowContext<'_> {
+    let Some(after_scheme) = strip_http_scheme(url) else {
+        return WindowContext::Unnavigated;
+    };
+    // The authority runs to the first '/', '?' or '#'. Anything but a '/' means
+    // there is no path at all (`http://host`, `http://host?x`), i.e. the root.
+    let path = match after_scheme.find(['/', '?', '#']) {
+        Some(i) if after_scheme.as_bytes()[i] == b'/' => &after_scheme[i + 1..],
+        _ => return WindowContext::Neutral,
+    };
+    let segment = &path[..path.find(['/', '?', '#']).unwrap_or(path.len())];
+    if is_workspace_slug(segment) {
+        WindowContext::Workspace(segment)
+    } else {
+        // Empty (the root), the `~` sigil (the picker), or a path the gateway
+        // would not resolve to a workspace at all.
+        WindowContext::Neutral
+    }
+}
+
+/// Where a native banner tap should land. Decided in Rust because only the
+/// client process can see every window, read what workspace each is on, and
+/// create one; a page can only ever navigate ITSELF, which is how a tap used to
+/// yank a window off the workspace the user had it on.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TapTarget {
+    /// This window is already on the raising workspace: show + focus it.
+    Focus(String),
+    /// This window is on no workspace (picker / root): point it at `url`.
+    Navigate { label: String, url: String },
+    /// Every window is on some OTHER workspace: open a fresh one at `url`.
+    NewWindow { url: String },
+    /// The client is still booting, so its first navigation is ours to aim.
+    LaunchInto { url: String },
+    /// The tap names no workspace: bring the main window forward, as before.
+    MainWindow,
+}
+
+/// The gateway URL serving `workspace`, e.g. `http://localhost:3210/myws/`.
+/// `origin` carries no trailing slash; the slug is known-safe (callers gate on
+/// [`is_workspace_slug`]), so nothing needs escaping.
+#[cfg(any(target_os = "macos", test))]
+fn workspace_url(origin: &str, workspace: &str) -> String {
+    format!("{origin}/{workspace}/")
+}
+
+/// The window a tap prefers among equally eligible ones: `main` when it is in
+/// the running (it is the window a trayed client hides, so reusing it is what
+/// the user sees come back), else the lowest label, so the choice is
+/// deterministic rather than dependent on map iteration order.
+#[cfg(any(target_os = "macos", test))]
+fn preferred_label<'a>(labels: &[&'a str]) -> Option<&'a str> {
+    if labels.contains(&crate::MAIN_WINDOW_LABEL) {
+        return Some(crate::MAIN_WINDOW_LABEL);
+    }
+    labels.iter().min().copied()
+}
+
+/// Pick the window a tap raised by `owner` belongs in, given every top-level app
+/// window as `(label, url)`.
+///
+/// **This is the native counterpart of `clientInScope` + `clients.openWindow` in
+/// `public/sw.js`**, and it enforces the same rule the service worker does for
+/// web push: a tap lands in the workspace that RAISED it, or in a window opened
+/// for it, and never in a window sitting on a different workspace.
+///
+/// Priority:
+///  1. no `owner` (legacy / pre-stamp banner) → the main window, as before;
+///  2. a window already on `owner` → focus it;
+///  3. `main` not navigated yet → aim the boot navigation at `owner`;
+///  4. a picker / root window → point it at `owner`;
+///  5. otherwise → a new window.
+///
+/// A malformed `owner` is treated as no owner rather than used to build a URL.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn choose_tap_target(
+    windows: &[(String, String)],
+    owner: Option<&str>,
+    origin: &str,
+) -> TapTarget {
+    let Some(owner) = owner.filter(|o| is_workspace_slug(o)) else {
+        return TapTarget::MainWindow;
+    };
+    let url = workspace_url(origin, owner);
+
+    let labels_where = |want: WindowContext<'_>| -> Vec<&str> {
+        windows
+            .iter()
+            .filter(|(_, url)| window_context(url) == want)
+            .map(|(label, _)| label.as_str())
+            .collect()
+    };
+
+    if let Some(label) = preferred_label(&labels_where(WindowContext::Workspace(owner))) {
+        return TapTarget::Focus(label.to_string());
+    }
+    // Deliberately BEFORE the neutral branch: `main` is unnavigated only while
+    // `desktop::launch` is still waiting on the gateway, and its pending
+    // navigation would clobber anything we pointed another window at.
+    if windows.iter().any(|(label, url)| {
+        label == crate::MAIN_WINDOW_LABEL && window_context(url) == WindowContext::Unnavigated
+    }) {
+        return TapTarget::LaunchInto { url };
+    }
+    if let Some(label) = preferred_label(&labels_where(WindowContext::Neutral)) {
+        return TapTarget::Navigate {
+            label: label.to_string(),
+            url,
+        };
+    }
+    TapTarget::NewWindow { url }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::collections::HashMap;
+    use std::ptr::NonNull;
     use std::sync::{Mutex, OnceLock};
 
     use block2::RcBlock;
@@ -70,7 +352,8 @@ mod imp {
     const MAX_PENDING: usize = 256;
 
     /// Deep links awaiting a tap, keyed by the notification request identifier
-    /// (= the engine `notification_id`). Set at [`show`], consumed on tap.
+    /// (`<workspace>|<notification_id>`, see [`super::notification_identifier`]).
+    /// Set at [`show`], consumed on tap.
     /// In-process only — a tap after the app fully quit can't route (matches the
     /// old `mac-notification-sys` behaviour; the bell badge driven by
     /// `NotificationCreated` stays the durable signal). See notifications.md §4.
@@ -119,13 +402,22 @@ mod imp {
 
                 let link = pending().lock().unwrap().remove(&identifier).or_else(|| {
                     // Relaunch / evicted-map fallback: the UN request identifier
-                    // IS the engine notification_id, and a modal-default tap only
-                    // needs that to open the notification detail. So a tap on a
-                    // banner from a previous client process (empty in-process map)
-                    // still routes to the inbox modal — graceful degradation: a
-                    // navigate-kind tap falls back to modal. Empty id → nothing.
-                    (!identifier.is_empty())
-                        .then(|| serde_json::json!({ "notification_id": identifier }))
+                    // carries the workspace AND the engine notification_id, and a
+                    // modal-default tap only needs those to open the notification
+                    // detail in the right workspace. So a tap on a banner from a
+                    // previous client process (empty in-process map) still routes
+                    // to the inbox modal, degrading gracefully: a navigate-kind
+                    // tap falls back to modal. Rebuilding the workspace here is
+                    // what keeps the fallback ATTRIBUTABLE: without it the page
+                    // would dispatch it into whatever workspace happens to be
+                    // loaded. Empty id → nothing.
+                    let (workspace, notification_id) = super::split_identifier(&identifier);
+                    (!notification_id.is_empty()).then(|| {
+                        serde_json::json!({
+                            "notification_id": notification_id,
+                            "workspace": workspace,
+                        })
+                    })
                 });
                 eprintln!(
                     "[Tauri] native notification tap: id={identifier:?} routed={routed} \
@@ -134,25 +426,33 @@ mod imp {
                 );
                 if routed {
                     if let Some(app) = APP.get() {
-                        // Any tap (not a dismiss) brings the app forward, even if
-                        // the deep link is missing — matches the prior behaviour.
-                        // show_main_window also emits `native-window-active = true`
-                        // so the reshown page counts as active again.
-                        crate::show_main_window(app);
-                        if let Some(link) = link {
-                            // Stash for DURABLE delivery, then fire the warm-path
-                            // wake. The page drains the stash (take_pending_taps)
-                            // on BOTH the startup cold path and this signal, so the
-                            // tap routes exactly once even if this emit lands on a
-                            // page whose listener isn't registered yet.
-                            {
-                                let mut taps = pending_taps().lock().unwrap();
-                                if taps.len() >= MAX_PENDING {
-                                    taps.remove(0);
-                                }
-                                taps.push(link.clone());
+                        // STASH FIRST, then touch a window. Showing or focusing one
+                        // fires that page's `focus` / `visibilitychange` drains, and
+                        // a drain that runs before the stash lands finds nothing and
+                        // the tap is lost. The stash is the DURABLE carrier; the
+                        // emit below is only a warm-path wake.
+                        let owner = link
+                            .as_ref()
+                            .and_then(super::link_workspace)
+                            .map(str::to_string);
+                        if let Some(link) = &link {
+                            let mut taps = pending_taps().lock().unwrap();
+                            if taps.len() >= MAX_PENDING {
+                                taps.remove(0);
                             }
-                            let _ = app.emit("native-notification-tapped", link);
+                            taps.push(link.clone());
+                        }
+                        // Any tap (not a dismiss) brings the app forward, even if
+                        // the deep link is missing (matching the prior behaviour):
+                        // with no link there is no workspace to target, so that
+                        // case routes to the main window.
+                        let wake = crate::route_native_tap(app, owner.as_deref());
+                        // Only an ALREADY-LOADED page gets the warm signal. The
+                        // other targets are a page about to load, whose startup
+                        // drain is the trigger, and an emit into a webview
+                        // mid-navigation is dropped.
+                        if let (Some(label), Some(link)) = (wake, link) {
+                            let _ = app.emit_to(label, "native-notification-tapped", link);
                         }
                     }
                 }
@@ -230,9 +530,11 @@ mod imp {
     }
 
     /// Show a banner. `link` is the SW-message-shaped deep link emitted back on
-    /// tap. No-op in dev (see [`setup`]). The `notification_id` from `link` is
-    /// the request identifier, so a repeat for the same notification REPLACES its
-    /// banner (matching the web-push `tag`) and keys the pending-link map.
+    /// tap, plus the `workspace` (gateway slug) the calling page is served under.
+    /// No-op in dev (see [`setup`]). Those two fields compose the request
+    /// identifier ([`super::notification_identifier`]), which keys the
+    /// pending-link map and scopes replace-by-id (the web-push `tag` equivalent)
+    /// to the raising workspace.
     pub fn show(title: &str, body: &str, link: serde_json::Value) {
         if tauri::is_dev() {
             return;
@@ -263,32 +565,85 @@ mod imp {
     /// Remove already-delivered native banner(s) — the cross-device dismiss
     /// counterpart of [`show`]. `id = Some(notification_id)` removes the one
     /// banner whose request identifier matches (set at [`show`] time); `None`
-    /// removes ALL delivered banners (the mark-all-read path). Also drops the
-    /// stashed deep link(s) from [`pending`] so a tap on a now-removed banner
-    /// can't route. No-op in dev (see [`setup`]). An empty `Some("")` is a
-    /// malformed single id → no-op (never an accidental dismiss-all), matching
-    /// [`show`]'s empty-identifier handling.
+    /// removes every delivered banner **`workspace` raised** (the mark-all-read
+    /// path). Also drops the stashed deep link(s) from [`pending`] so a tap on a
+    /// now-removed banner can't route. No-op in dev (see [`setup`]). An empty
+    /// `Some("")` is a malformed single id → no-op (never an accidental
+    /// dismiss-all), matching [`show`]'s empty-identifier handling.
+    ///
+    /// **Both arms are workspace-scoped, and both need to be.** `Some(id)`
+    /// rebuilds the same composite identifier [`show`] posted, or it would match
+    /// nothing. (Which is also why a banner delivered by a build older than the
+    /// composite outlives BOTH arms: its identifier is bare, and every rebuilt
+    /// one is composite. Transitional and self-healing, the same tolerance
+    /// [`super::identifier_belongs_to`] documents for the sweep.) The dismiss-all
+    /// arm used to call `removeAllDeliveredNotifications`,
+    /// which wiped every OTHER workspace's banners on one workspace's
+    /// mark-all-read; it now enumerates delivered banners and removes only the
+    /// ones this workspace owns. The enumeration (rather than reading [`pending`],
+    /// which holds only what THIS process showed) is what keeps a dismiss-all
+    /// working across a client relaunch.
     ///
     /// UN's remove methods are safe to call from any thread (like
     /// `addNotificationRequest` in [`show`]), so no main-thread marshaling.
-    pub fn dismiss(id: Option<String>) {
+    pub fn dismiss(workspace: Option<String>, id: Option<String>) {
         if tauri::is_dev() {
             return;
         }
+        let workspace = workspace.unwrap_or_default();
         let center = UNUserNotificationCenter::currentNotificationCenter();
         match id {
-            Some(identifier) if !identifier.is_empty() => {
+            Some(notification_id) => {
+                let identifier = super::notification_identifier(&workspace, &notification_id);
+                // Empty id: nothing actionable, and NEVER a fall-through to all.
+                if identifier.is_empty() {
+                    return;
+                }
                 let ids = NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
                 center.removeDeliveredNotificationsWithIdentifiers(&ids);
                 pending().lock().unwrap().remove(&identifier);
             }
-            // Empty single id — nothing actionable; do NOT fall through to all.
-            Some(_) => {}
-            None => {
-                center.removeAllDeliveredNotifications();
-                pending().lock().unwrap().clear();
-            }
+            None => dismiss_all_for_workspace(&center, workspace),
         }
+    }
+
+    /// Remove every delivered banner belonging to `workspace`, leaving other
+    /// workspaces' banners on screen. Backs the dismiss-all arm of [`dismiss`].
+    ///
+    /// [`pending`] is pruned synchronously (it is this process's own record, and
+    /// a phantom tap on a banner we are about to remove must not route), then the
+    /// delivered set is enumerated so banners from an earlier client process are
+    /// swept too.
+    fn dismiss_all_for_workspace(center: &UNUserNotificationCenter, workspace: String) {
+        pending()
+            .lock()
+            .unwrap()
+            .retain(|identifier, _| !super::identifier_belongs_to(identifier, &workspace));
+
+        let handler = RcBlock::new(move |delivered: NonNull<NSArray<UNNotification>>| {
+            // SAFETY: UN hands the completion handler a live, non-null array that
+            // is valid for the duration of the call.
+            let delivered = unsafe { delivered.as_ref() };
+            let ids: Vec<Retained<NSString>> = delivered
+                .iter()
+                .map(|notification| notification.request().identifier())
+                .filter(|identifier| {
+                    super::identifier_belongs_to(&identifier.to_string(), &workspace)
+                })
+                .collect();
+            if ids.is_empty() {
+                return;
+            }
+            UNUserNotificationCenter::currentNotificationCenter()
+                .removeDeliveredNotificationsWithIdentifiers(&NSArray::from_retained_slice(&ids));
+        });
+        center.getDeliveredNotificationsWithCompletionHandler(&handler);
+        // Escaping completion handler, leaked for the same reason as `setup`'s
+        // authorization block: UN copies it per ObjC convention, but that cannot
+        // be runtime-tested here, so we guarantee it outlives the async callback
+        // under any copy semantics. One tiny one-shot block per mark-all-read,
+        // which is a rare user action.
+        std::mem::forget(handler);
     }
 
     /// Set the dock-icon badge to `label`, or clear it with `None`. The caller
@@ -360,14 +715,26 @@ mod imp {
         NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
     }
 
-    /// Drain (and clear) every deep link stashed by a tap the page may not have
-    /// been listening for. The frontend calls this on startup (cold path) AND on
-    /// each `native-notification-tapped` signal (warm path); the Mutex makes the
-    /// drain atomic so each tap routes exactly once across both paths and can't
-    /// re-fire on a later reload. Naturally empty in dev (the delegate never
-    /// fires) and once every tap has been consumed. See `native-push.ts`.
-    pub fn take_pending_taps() -> Vec<serde_json::Value> {
-        std::mem::take(&mut *pending_taps().lock().unwrap())
+    /// Drain the deep links stashed by taps the page serving `workspace` may not
+    /// have been listening for. The frontend calls this on startup (cold path)
+    /// AND on each `native-notification-tapped` signal (warm path); the Mutex
+    /// makes the drain atomic so each tap routes exactly once across both paths
+    /// and can't re-fire on a later reload. Naturally empty in dev (the delegate
+    /// never fires) and once every tap has been consumed.
+    ///
+    /// **Scoped to the calling page's workspace** ([`super::tap_belongs_to`]).
+    /// The stash is process-global while every window can sit on its own
+    /// workspace, so an unconditional take let whichever page woke first swallow
+    /// a tap raised by a workspace it is not serving. Another workspace's tap is
+    /// LEFT IN PLACE for the window this tap's router is bringing up. See
+    /// `native-push.ts` and `system-knowhow/notifications.md` §4.
+    pub fn take_pending_taps(workspace: Option<&str>) -> Vec<serde_json::Value> {
+        let mut taps = pending_taps().lock().unwrap();
+        let (mine, theirs) = std::mem::take(&mut *taps)
+            .into_iter()
+            .partition(|link| super::tap_belongs_to(link, workspace));
+        *taps = theirs;
+        mine
     }
 }
 
@@ -388,7 +755,7 @@ pub fn show(_title: &str, _body: &str, _link: serde_json::Value) {}
 /// No native banner removal off macOS (no native notification path here); a
 /// no-op so the Tauri command stays platform-agnostic.
 #[cfg(not(target_os = "macos"))]
-pub fn dismiss(_id: Option<String>) {}
+pub fn dismiss(_workspace: Option<String>, _id: Option<String>) {}
 
 /// No dock badge off macOS (the native app-icon badge is a macOS dock-tile
 /// concept). Browser / PWA clients still get the Badging API on every platform.
@@ -403,7 +770,7 @@ pub fn set_tray_title(_app: &tauri::AppHandle, _title: &str) {}
 /// No native tap stash off macOS (no native notification path here); always
 /// empty so the Tauri command stays platform-agnostic.
 #[cfg(not(target_os = "macos"))]
-pub fn take_pending_taps() -> Vec<serde_json::Value> {
+pub fn take_pending_taps(_workspace: Option<&str>) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
@@ -413,18 +780,299 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn link_identifier_reads_the_notification_id_string() {
-        // Present → the id IS the request identifier (replace-by-id semantics).
+    fn link_identifier_composes_the_workspace_and_the_notification_id() {
+        // Both present → the composite IS the request identifier, so a repeat
+        // from the same workspace replaces its banner and two workspaces never
+        // collide.
         assert_eq!(
-            link_identifier(&json!({"notification_id": "abc-123", "thread_id": "t1"})),
+            link_identifier(
+                &json!({"workspace": "myws", "notification_id": "abc-123", "thread_id": "t1"})
+            ),
+            "myws|abc-123"
+        );
+        // No workspace (legacy direct engine, no gateway) → the bare id, exactly
+        // as before this field existed.
+        assert_eq!(
+            link_identifier(&json!({"notification_id": "abc-123"})),
             "abc-123"
         );
-        // Absent → empty (the caller then skips the pending-link insert).
+        // Absent id → empty (the caller then skips the pending-link insert),
+        // whatever the workspace says.
         assert_eq!(link_identifier(&json!({"thread_id": "t1"})), "");
+        assert_eq!(link_identifier(&json!({"workspace": "myws"})), "");
         // Non-string → empty (defensive: a number/null is not a usable id).
         assert_eq!(link_identifier(&json!({"notification_id": 42})), "");
         assert_eq!(link_identifier(&json!({"notification_id": null})), "");
         assert_eq!(link_identifier(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn notification_identifier_round_trips_through_split_identifier() {
+        // The property the relaunch fallback depends on: whatever `show` posted,
+        // a tap can recover from the delivered notification's identifier alone.
+        for (workspace, id) in [("myws", "abc-123"), ("", "abc-123")] {
+            let identifier = notification_identifier(workspace, id);
+            let (parsed_ws, parsed_id) = split_identifier(&identifier);
+            assert_eq!(parsed_ws, (!workspace.is_empty()).then_some(workspace));
+            assert_eq!(parsed_id, id);
+        }
+    }
+
+    #[test]
+    fn split_identifier_reads_a_bare_identifier_as_workspaceless() {
+        // A banner from a build older than the composite, or a no-gateway engine.
+        assert_eq!(split_identifier("abc-123"), (None, "abc-123"));
+        // Defensive: a leading separator is not a workspace named "".
+        assert_eq!(split_identifier("|abc-123"), (None, "abc-123"));
+        // First separator wins, so a stray one inside an id keeps the workspace.
+        assert_eq!(split_identifier("myws|a|b"), (Some("myws"), "a|b"));
+        assert_eq!(split_identifier(""), (None, ""));
+    }
+
+    #[test]
+    fn identifier_belongs_to_scopes_the_dismiss_all() {
+        assert!(identifier_belongs_to("myws|abc-123", "myws"));
+        // The bug this fixes: another workspace's banner must survive a
+        // mark-all-read here.
+        assert!(!identifier_belongs_to("otherws|abc-123", "myws"));
+        // A bare identifier belongs only to the no-gateway single workspace, so a
+        // pre-composite leftover is never swept by a named workspace.
+        assert!(identifier_belongs_to("abc-123", ""));
+        assert!(!identifier_belongs_to("abc-123", "myws"));
+        assert!(!identifier_belongs_to("myws|abc-123", ""));
+    }
+
+    /// `(label, url)` pairs in the shape `choose_tap_target` takes.
+    fn windows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(label, url)| ((*label).to_string(), (*url).to_string()))
+            .collect()
+    }
+
+    const ORIGIN: &str = "http://localhost:3210";
+
+    #[test]
+    fn tap_belongs_to_leaves_another_workspaces_tap_in_the_stash() {
+        let mine = json!({"notification_id": "n-1", "workspace": "myws"});
+        let theirs = json!({"notification_id": "n-2", "workspace": "otherws"});
+        // Unattributable: a legacy direct engine, or a pre-stamp banner. Nothing
+        // to route it by, so any page may take it (the behaviour before the stamp).
+        let unstamped = json!({"notification_id": "n-3"});
+
+        assert!(tap_belongs_to(&mine, Some("myws")));
+        // The bug this closes: whichever window drained first used to consume
+        // every tap, including one raised by a workspace it is not serving.
+        assert!(!tap_belongs_to(&theirs, Some("myws")));
+        assert!(tap_belongs_to(&unstamped, Some("myws")));
+
+        // A page with no workspace (legacy root engine) takes only unstamped taps.
+        assert!(tap_belongs_to(&unstamped, None));
+        assert!(!tap_belongs_to(&mine, None));
+
+        // A null / non-string workspace reads as absent, not as a workspace named "".
+        assert!(tap_belongs_to(&json!({"workspace": null}), Some("myws")));
+        assert!(tap_belongs_to(&json!({"workspace": 42}), Some("myws")));
+    }
+
+    #[test]
+    fn window_context_reads_the_workspace_out_of_a_window_url() {
+        assert_eq!(
+            window_context("http://localhost:3210/myws/"),
+            WindowContext::Workspace("myws")
+        );
+        assert_eq!(
+            window_context("https://host:8443/my-ws-2/#thread=abc"),
+            WindowContext::Workspace("my-ws-2")
+        );
+        // The picker and the gateway root are not workspaces, so a tap may reuse
+        // them without stepping on anything.
+        assert_eq!(
+            window_context("http://localhost:3210/~/"),
+            WindowContext::Neutral
+        );
+        assert_eq!(
+            window_context("http://localhost:3210/~/?pick"),
+            WindowContext::Neutral
+        );
+        assert_eq!(
+            window_context("http://localhost:3210/"),
+            WindowContext::Neutral
+        );
+        assert_eq!(
+            window_context("http://localhost:3210"),
+            WindowContext::Neutral
+        );
+        assert_eq!(
+            window_context("http://localhost:3210?x=1"),
+            WindowContext::Neutral
+        );
+        // Not a slug the gateway would resolve to a workspace.
+        assert_eq!(
+            window_context("http://localhost:3210/Not_A_Slug/"),
+            WindowContext::Neutral
+        );
+        // The bundled app URL: `desktop::launch` has not navigated this window yet.
+        assert_eq!(
+            window_context("tauri://localhost"),
+            WindowContext::Unnavigated
+        );
+        assert_eq!(window_context(""), WindowContext::Unnavigated);
+    }
+
+    #[test]
+    fn gateway_origin_is_the_first_window_actually_served_off_one() {
+        // An unnavigated window contributes NO origin. `tauri::Url::origin()` on
+        // `tauri://localhost` returns the opaque origin, which serializes to the
+        // literal "null": building `null/<slug>/` from that yields a URL nothing
+        // can parse, and `desktop::launch` would then never leave the boot splash.
+        // Skipping it and falling back to the stable gateway URL is the fix.
+        assert_eq!(
+            gateway_origin(&windows(&[("main", "tauri://localhost")])),
+            None
+        );
+        assert_eq!(gateway_origin(&windows(&[("main", "")])), None);
+        assert_eq!(gateway_origin(&[]), None);
+
+        assert_eq!(
+            gateway_origin(&windows(&[
+                ("main", "tauri://localhost"),
+                ("window-1", "http://localhost:3210/myws/#thread=t1"),
+            ])),
+            Some("http://localhost:3210")
+        );
+        // No path, https, and a bracketed IPv6 authority all keep their port.
+        assert_eq!(
+            gateway_origin(&windows(&[("main", "http://localhost:3210")])),
+            Some("http://localhost:3210")
+        );
+        assert_eq!(
+            gateway_origin(&windows(&[("main", "https://host.example:8443/~/?pick")])),
+            Some("https://host.example:8443")
+        );
+        assert_eq!(
+            gateway_origin(&windows(&[("main", "http://[::1]:3210/myws/")])),
+            Some("http://[::1]:3210")
+        );
+        // A scheme with no authority at all is not an origin.
+        assert_eq!(gateway_origin(&windows(&[("main", "http://")])), None);
+    }
+
+    #[test]
+    fn a_tap_focuses_the_window_already_on_its_workspace() {
+        // The whole point: `main` is on another workspace, so the OLD behaviour
+        // (always show `main`) would have fronted the wrong window and then let
+        // that page navigate itself away from what the user had open.
+        let open = windows(&[
+            ("main", "http://localhost:3210/otherws/"),
+            ("window-1", "http://localhost:3210/myws/#thread=t1"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::Focus("window-1".to_string())
+        );
+    }
+
+    #[test]
+    fn main_wins_when_several_windows_are_on_the_raising_workspace() {
+        let open = windows(&[
+            ("window-2", "http://localhost:3210/myws/"),
+            ("main", "http://localhost:3210/myws/"),
+            ("window-1", "http://localhost:3210/myws/"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::Focus("main".to_string())
+        );
+        // Without `main`, the choice is the lowest label rather than whatever
+        // order the window map happened to yield.
+        let open = windows(&[
+            ("window-2", "http://localhost:3210/myws/"),
+            ("window-1", "http://localhost:3210/myws/"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::Focus("window-1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_picker_window_is_pointed_at_the_raising_workspace() {
+        // The trayed login-agent client: a hidden `main` parked on the picker.
+        // Reusing it is what keeps a tap from opening a window every time.
+        let open = windows(&[("main", "http://localhost:3210/~/")]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::Navigate {
+                label: "main".to_string(),
+                url: "http://localhost:3210/myws/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tap_opens_a_window_rather_than_taking_one_off_another_workspace() {
+        // Every window is on some other workspace. The old page-side hop yanked
+        // one of them to the raising workspace; this must open a fresh window and
+        // leave both of these alone.
+        let open = windows(&[
+            ("main", "http://localhost:3210/otherws/"),
+            ("window-1", "http://localhost:3210/thirdws/"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::NewWindow {
+                url: "http://localhost:3210/myws/".to_string(),
+            }
+        );
+        // And with no windows at all (every one closed), same answer.
+        assert_eq!(
+            choose_tap_target(&[], Some("myws"), ORIGIN),
+            TapTarget::NewWindow {
+                url: "http://localhost:3210/myws/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_still_booting_client_aims_its_first_navigation_at_the_workspace() {
+        // `desktop::launch` is waiting on the gateway and will navigate `main`
+        // itself, so pointing any window at the workspace here would be clobbered.
+        let open = windows(&[("main", "tauri://localhost")]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::LaunchInto {
+                url: "http://localhost:3210/myws/".to_string(),
+            }
+        );
+        // A window ALREADY on the workspace still wins over the boot branch.
+        let open = windows(&[
+            ("main", "tauri://localhost"),
+            ("window-1", "http://localhost:3210/myws/"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("myws"), ORIGIN),
+            TapTarget::Focus("window-1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tap_with_no_usable_workspace_falls_back_to_the_main_window() {
+        let open = windows(&[("main", "http://localhost:3210/otherws/")]);
+        // Legacy direct engine / pre-stamp banner: nothing to target by.
+        assert_eq!(
+            choose_tap_target(&open, None, ORIGIN),
+            TapTarget::MainWindow
+        );
+        // A malformed slug is never used to build a URL to open.
+        assert_eq!(
+            choose_tap_target(&open, Some("Not A Slug"), ORIGIN),
+            TapTarget::MainWindow
+        );
+        assert_eq!(
+            choose_tap_target(&open, Some(""), ORIGIN),
+            TapTarget::MainWindow
+        );
     }
 
     #[test]

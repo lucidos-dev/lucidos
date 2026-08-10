@@ -108,10 +108,12 @@ Determine:
 - needs_file_list: Does answering this require knowing what files exist in the workspace? false for greetings, time queries, memory-only questions.
 - needs_credentials: Does this conversation involve external APIs, tokens, authentication, or services that might need credentials? Consider the full conversation topic, not just the latest message. A follow-up like "try again" or "the token should be active" in a conversation about API access still needs credentials.
 - sub_queries: If needs_memory is true, decompose into search queries about the TOPIC or CONTENT being referenced, NOT about the action being requested. Strip away action verbs like "save", "summarize", "write" and focus on the subject matter. For example, "save research about Example Org" → ["Example Org", "Example Org company analysis"]. If needs_memory is false, return empty array.
+  A BARE SUBJECT NAME IS A BAD QUERY when the workspace is largely about that subject: it matches thousands of entries equally and the results come back arbitrary. So when the message asks for a JUDGEMENT, an OPINION, a COMPARISON or ADVICE about something, query that subject's STATE and OUTCOME (progress, results, adoption, recent milestones, setbacks, what happened lately), never the name on its own. "should I give up on Example Project and do something else?" → ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction", "Example Project setbacks"], NOT ["Example Project"]. Queries about the decision itself ("job application", "career change") retrieve nothing useful: the facts that answer such a question are facts about how the subject is going.
 
 Return ONLY a JSON object, no markdown fences, no extra text.
 Example (memory needed): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["habit tracker progress", "weekly exercise routine"]}
 Example (referencing past content): {"needs_memory": true, "needs_file_list": true, "needs_credentials": false, "sub_queries": ["Example Org", "Example Org company analysis"]}
+Example (asking for a judgement): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction"]}
 Example (no memory): {"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,6 +605,71 @@ mod tests {
         let c: QueryClassification = serde_json::from_str(json).unwrap();
         assert!(!c.needs_memory);
         assert!(c.sub_queries.is_empty());
+    }
+
+    /// The evaluative-question failure, at the layer where it happens.
+    ///
+    /// A question of the shape "should I give up on Example Project and do
+    /// something else?" decomposed to `["Example Project", "<the alternative>",
+    /// "Example Project job application", "<the alternative> career"]`. The last
+    /// two are about the frame rather than the subject, which the prompt already
+    /// forbade. The first two obeyed it and were worse: in a workspace of tens of
+    /// thousands of memory entries that are overwhelmingly about one project, a
+    /// query of that project's bare name separates nothing, so the top 25 comes
+    /// back arbitrary. The facts that would have answered the question were in
+    /// memory the whole time.
+    ///
+    /// Ranking was not the problem and is untouched: recency is already
+    /// weighted, and the entries that won were the same age as the ones that
+    /// lost. What was missing is a rule for the evaluative case, so this pins
+    /// the prompt's two halves of it.
+    #[test]
+    fn the_prompt_forbids_a_bare_subject_name_for_an_evaluative_question() {
+        assert!(
+            QUERY_CLASSIFICATION_PROMPT.contains("A BARE SUBJECT NAME IS A BAD QUERY"),
+            "the non-discriminating-query rule must be stated"
+        );
+        assert!(
+            QUERY_CLASSIFICATION_PROMPT.contains("STATE and OUTCOME"),
+            "it must say what to query instead of the name"
+        );
+        assert!(
+            QUERY_CLASSIFICATION_PROMPT.contains("JUDGEMENT"),
+            "it must name the case that triggers the rule"
+        );
+    }
+
+    /// The worked example carries the whole rule for a model that skims, so it
+    /// has to show BOTH mistakes being avoided: no bare subject name, and no
+    /// query about the decision rather than the subject.
+    #[test]
+    fn the_evaluative_example_shows_state_queries_and_not_the_bare_name() {
+        let example = QUERY_CLASSIFICATION_PROMPT
+            .lines()
+            .find(|l| l.starts_with("Example (asking for a judgement)"))
+            .expect("the evaluative example must exist");
+
+        let c: QueryClassification =
+            serde_json::from_str(example.split_once(": ").expect("example has a JSON body").1)
+                .expect("the example must be valid JSON, or it teaches a broken shape");
+
+        assert!(c.needs_memory);
+        assert!(
+            c.sub_queries.len() >= 2,
+            "one query cannot show a decomposition"
+        );
+        assert!(
+            !c.sub_queries.iter().any(|q| q == "Example Project"),
+            "the example must not contain the bare subject name: {:?}",
+            c.sub_queries
+        );
+        assert!(
+            c.sub_queries
+                .iter()
+                .all(|q| q.starts_with("Example Project ")),
+            "every query must be about the subject, not the decision: {:?}",
+            c.sub_queries
+        );
     }
 
     #[test]

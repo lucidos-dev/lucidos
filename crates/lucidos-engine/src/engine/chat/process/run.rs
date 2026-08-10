@@ -958,7 +958,7 @@ impl LucidosEngine {
         // Snapshot RwLock values once per request
         let user_timezone = self.user_timezone.read().await.clone();
         let user_language = self.user_language.read().await.clone();
-        let user_profile = self.user_profile.read().await.clone();
+        let user_profile = self.user_profile.snapshot().await;
 
         // Read memory model preference once for use in summarization and classification
         let memory_model_pref = PreferenceStore::get(&self.pool, PREF_MODEL_MEMORY)
@@ -1410,6 +1410,25 @@ impl LucidosEngine {
                 response_channel,
             )
             .await;
+        }
+
+        // The turn is over and this thread may still own running background
+        // work. Unlike a coding-agent session, nothing will push its completion
+        // at us (`spawn_bash_completion_watcher` skips the wake for a chat-mode
+        // background bash, having no parked session to push to), so unless the
+        // model armed a subscription itself the finish lands with nobody
+        // watching and the thread simply stops. That is the five-hour release
+        // stall of 2026-08-09. Arming here is the engine noticing on the
+        // model's behalf; it no-ops when there is no background work or when a
+        // wait already covers it.
+        //
+        // Gated on a CLEAN end, both halves load-bearing. A cancelled turn is
+        // the user pressing Stop or a follow-up superseding this turn: in the
+        // first case re-opening the thread later resurrects work they abandoned,
+        // and in the second the next turn runs its own tail in a moment. An
+        // errored turn is not a state to schedule a wake from either.
+        if result.is_ok() && !cancel_token.is_cancelled() {
+            self.arm_wait_for_running_background_tasks(thread_id).await;
         }
 
         let orphans = self

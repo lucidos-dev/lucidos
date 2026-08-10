@@ -187,10 +187,11 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   const onPick = async (optionId: string) => {
     localPending.value = { kind: 'Selected', option_id: optionId };
-    // Answering is a send: take the reader to what they just answered and keep
-    // them at the live edge while the agent resumes underneath it. Before the
-    // await, because the scroll is the composer's-tap half of the action and
-    // must not wait on the round trip. See `followAnsweredQuestion`.
+    // Answering is a send: keep the reader at the live edge while the agent
+    // resumes, landing on what they just answered when they were not already
+    // riding it. Before the await, because the scroll is the composer's-tap half
+    // of the action and must not wait on the round trip. See
+    // `followAnsweredQuestion`.
     followAnsweredQuestion(toolUseId);
     const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
     if (!ok) {

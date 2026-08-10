@@ -8,7 +8,8 @@ import { createFailureCounter } from '../../utils/failureCounter';
 import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
 import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
-import { setTitlebarColor } from '../../utils/tauri';
+import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
+import { pushTrafficLightOffset } from './trafficLights';
 import {
   STYLE_OVERRIDES_KEY, STYLE_OVERRIDES_STORAGE_KEY, STYLE_RESET_PARAM,
   isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
@@ -316,6 +317,17 @@ export function applyUiScale(scale: number): void {
   clampThreadDrawerWidth();
   // This just wrote --user-ui-scale inline, which the remote may be overriding.
   reapplyStyleOverrides();
+  // And the same reason a third time, this one outside the page: the macOS
+  // traffic lights are centred on the header bar, whose height this line just
+  // changed, and only we can tell the shell what it now is.
+  //
+  // AFTER the re-assert, and that is load-bearing: it MEASURES the rendered
+  // header rather than reading the value written above, so with an active
+  // --user-ui-scale override it would otherwise measure the preference scale a
+  // moment before the override put the real one back, and centre the lights for
+  // a bar that never paints. The two measurements above run before the re-assert
+  // deliberately, so the gutter they publish is the one actually reserved.
+  pushTrafficLightOffset();
 }
 
 export function currentUiScale(): number {
@@ -385,6 +397,11 @@ export function applyTheme(theme: Theme): void {
   if (isTauri()) {
     const titlebar = resolved === 'light' ? '#1a6fd0' : '#15549e';
     setTitlebarColor(titlebar).catch((e) => console.warn('[titlebar] tint failed', e));
+    // The theme is resolved and on the document, so a window shown now shows a
+    // page in the user's theme. The shell keeps the launch window hidden until
+    // it hears this. One-shot inside the wrapper, since this line also runs on
+    // every toggle and system-appearance change.
+    windowReadyToShow();
   }
 
   syncSystemThemeListener(theme);
@@ -491,6 +508,10 @@ export function applyStyleOverrides(map: Record<string, string>): void {
   // Same reason again: --user-ui-scale is itself overridable, and the thread
   // drawer's floor is what its rem-authored header row needs.
   clampThreadDrawerWidth();
+  // And so is the bar the macOS traffic lights are centred on: a retuned
+  // --user-ui-scale or --desktop-bar-height moves it, and the shell only learns
+  // that from here.
+  pushTrafficLightOffset();
 }
 
 /** Re-assert the overrides after something else has written the same

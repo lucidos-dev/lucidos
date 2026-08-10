@@ -185,12 +185,21 @@ async fn search_threads_internal(
             .collect());
     }
 
-    let results = super::threads::combined_thread_search(state, query, limit as i64)
-        .await
-        .map_err(|e| format!("Thread search failed: {}", e))?;
+    let results =
+        crate::engine::thread_search::combined_thread_search(&state.engine, query, limit as i64)
+            .await
+            .map_err(|e| format!("Thread search failed: {}", e))?;
+    // `limit` bounds each ARM inside the merge, not the merge, so two arms that
+    // agree on nothing yield up to twice it and this category would out-fill
+    // every sibling in the palette. Truncated here, like `files` / `apps` /
+    // `triggers` / `changes` each do in their own `*_internal`, so the
+    // `apply_recency_boosts` the caller runs next sees the same shape for every
+    // category. Threads relied on the shared merge truncating for it, which
+    // made the promise an accident of that function rather than this one's.
     Ok(results
         .into_iter()
         .map(|r| thread_summary_to_item(&r.info, r.score))
+        .take(limit)
         .collect())
 }
 

@@ -204,6 +204,19 @@ html {
        hand this padding back as margin when it tightens a focused turn's box to a
        uniform gap (chat/response.css .nav-focus-stuck rule). */
     --turn-feed-pad-y: 0.85rem;
+    /* One line of a turn header (.initiator-header / .response-header): the box
+       every field on that row is sized to, so the actor chip, the turn controls
+       and the status all resolve to the SAME height and their content centres on
+       one line. It is what lets the headers align at flex-start rather than
+       centre: once the status + timestamp cluster stacks, centring measured the
+       chip against BOTH its lines and dropped the executor's name half a line
+       below the status beside it. Sized above every field's natural height (the
+       tallest is a turn control, a 0.875rem glyph in 0.25rem of padding), so
+       pinning them to it grows nothing and the one-row header is unchanged.
+       Was the headers' bare `min-height: 1.2rem`, which is still one of its
+       jobs; named because the fields now have to agree with it.
+       See styles/__tests__/turn-meta-stacking.test.ts. */
+    --turn-header-line: 1.2rem;
 
     /* Icon sizes (used by .icon-btn variants) */
     --icon-size-sm: 0.875rem;

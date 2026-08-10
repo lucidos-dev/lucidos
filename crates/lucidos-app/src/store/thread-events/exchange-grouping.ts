@@ -207,7 +207,7 @@ function dividerStillAwaitsUser(exchange: Exchange): boolean {
  *  exchange leaks into that exchange's steps via the `current.steps.push`
  *  fallthrough — breaking the absorbed-UPI single-step shape that
  *  exchangeStatus relies on to short-circuit to 'done', and on a CC thread
- *  flipping a trailing child-completion card to a phantom
+ *  flipping a trailing child-completion row to a phantom
  *  'coding-agent-working' (real thread 276f5580: a background `WorktreeCleaned`
  *  landed in the `ChildThreadCompleted` exchange an hour after the thread
  *  idled, so the UI showed "Working" forever — persisting across reloads since

@@ -16,7 +16,10 @@ vi.mock('../../utils/platform', () => ({
   isTauri: () => platformMocks.isTauri,
   isIOSPwa: () => platformMocks.isIOSPwa,
 }));
-vi.mock('../../utils/tauri', () => ({ setTitlebarColor: vi.fn(() => Promise.resolve()) }));
+vi.mock('../../utils/tauri', () => ({
+  setTitlebarColor: vi.fn(() => Promise.resolve()),
+  windowReadyToShow: vi.fn(),
+}));
 
 describe('applyStyleOverrides', () => {
   let inlineProps: Record<string, string>;

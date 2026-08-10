@@ -423,19 +423,21 @@ export function renderChannelSection(
       return (
         <div class="route-row">
           <strong>API client</strong>
-          <span>{origin.user_agent ?? '(no user-agent)'}</span>
-          {sourceThreadId && (
-            <button
-              type="button"
-              class="accent-link"
-              onClick={() => {
-                focusThreadOrBootstrap(sourceThreadId);
-                closeMessageRoutePanel();
-              }}
-            >
-              {sourceTitle ?? 'spawning thread'}
-            </button>
-          )}
+          <span class="route-value-group">
+            <span>{origin.user_agent ?? '(no user-agent)'}</span>
+            {sourceThreadId && (
+              <button
+                type="button"
+                class="accent-link"
+                onClick={() => {
+                  focusThreadOrBootstrap(sourceThreadId);
+                  closeMessageRoutePanel();
+                }}
+              >
+                {sourceTitle ?? 'spawning thread'}
+              </button>
+            )}
+          </span>
         </div>
       );
     }
@@ -551,7 +553,10 @@ export function renderEngineExplainerSection(reason: EngineReason): preact.JSX.E
   return renderExplainer('Why the engine acted', describeEngineReason(reason));
 }
 
-function renderExecutorSection(
+/** The popover's Executor half: WHICH agent ran the turn, on what model, in
+ *  which repo/branch/session. Exported for the row-shape guard in
+ *  MessageRoutePanel.test.ts. */
+export function renderExecutorSection(
   exchange: Exchange,
   threadEvents: Map<number, StoredEvent>,
   meta: ThreadMeta,
@@ -610,7 +615,7 @@ function renderExecutorSection(
       {appInfo && extras.branch && (
         <div class="route-row">
           <strong>App</strong>
-          <span class="route-app">
+          <span class="route-value-group">
             <span class="route-app-icon" aria-hidden="true">{appInfo.icon}</span>
             <span class={appInfo.failed ? 'route-app-name error-text' : 'route-app-name'}>{appInfo.name}</span>
           </span>
@@ -687,8 +692,10 @@ function renderTriggerOrigin(userEvent: Extract<StoredEvent, { type: 'TriggerSta
   const name = trigger?.name ?? userEvent.trigger_name ?? userEvent.trigger_id;
   const knownDeleted = ts.status === 'loaded' && !trigger;
   const invocation = userEvent.invocation;
+  // A fragment, not a wrapper element: the rows have to be direct children of
+  // `.route-section` to join its label/value grid.
   return (
-    <div>
+    <>
       <div class="route-row">
         <strong>Trigger</strong>
         {knownDeleted ? (
@@ -715,6 +722,6 @@ function renderTriggerOrigin(userEvent: Extract<StoredEvent, { type: 'TriggerSta
       {invocation?.kind === 'Event' && invocation.event_id && (
         <div class="muted mono">event: {invocation.event_id}</div>
       )}
-    </div>
+    </>
   );
 }

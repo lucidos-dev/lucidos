@@ -222,6 +222,8 @@ impl LucidosEngine {
             tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
             tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args).await),
             tn::CORRECT_MEMORY_BY_ID => to_outcome(self.execute_correct_memory_by_id(args).await),
+            tn::SEARCH_MEMORY => to_outcome(self.execute_search_memory(args).await),
+            tn::MEMORY_SOURCE => to_outcome(self.execute_memory_source(args).await),
             tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
             tn::SAVE_THREAD_IMAGE => {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)
@@ -240,6 +242,7 @@ impl LucidosEngine {
             }
             tn::LIST_THREADS => self.execute_list_threads(args, thread_id).await,
             tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
+            tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
             tn::LIST_CHANGES => self.execute_list_changes().await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
             tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
@@ -631,10 +634,46 @@ impl LucidosEngine {
         let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
         let byte_limit =
             QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
+        // Refused rather than ignored. This is the read half of "we talked
+        // about this": the model finds a thread with `threads` 'search' and
+        // asks for its messages here, so silently widening a malformed id to
+        // EVERY thread would hand it another conversation entirely and it
+        // would have no way to tell.
+        // Matched on the VALUE, not on `as_str()`. Filtering to strings first
+        // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
+        // arm, which widens the query to every thread: silently the wrong
+        // conversation, which is the failure this refusal exists to prevent.
+        let thread_id = match args.get("thread_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(raw)) => match uuid::Uuid::parse_str(raw.trim()) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    return Err(format!(
+                        "Error: thread_id '{raw}' is not a uuid. Copy it from the \
+                         `threads` tool's 'search' or 'list' result."
+                    ))
+                }
+            },
+            Some(other) => {
+                return Err(format!(
+                    "Error: thread_id must be a uuid string, got {other}. Copy it from \
+                     the `threads` tool's 'search' or 'list' result."
+                ))
+            }
+        };
 
         match self
             .event_store
-            .query_events(event_type, since, until, limit)
+            .query_events(
+                crate::core::store::EventQueryFilters {
+                    event_type,
+                    since,
+                    until,
+                    thread_id,
+                    ..Default::default()
+                },
+                limit,
+            )
             .await
         {
             Ok(events) => Ok(build_query_events_response(&events, byte_limit)),

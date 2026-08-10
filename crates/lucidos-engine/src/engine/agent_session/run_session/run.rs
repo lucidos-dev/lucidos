@@ -43,6 +43,25 @@ fn release_tool_slot(tools_in_flight: &std::sync::atomic::AtomicI32) {
     }
 }
 
+/// Is a `Result` whose turn streamed no assistant text carrying the agent's own
+/// prose, worth emitting as `CodingAgentTextStreamed`?
+///
+/// Yes for the case that branch exists for: a slash command (`/model`) answers
+/// through `result.result` with no preceding Message. No when the text IS the
+/// turn's failure reason, because that string is about to be emitted as
+/// `ResponseFailed` and the transcript renders it in the failure card. Printing
+/// it as a paragraph too states one failure twice.
+///
+/// Deliberately an equality check rather than an `API Error` prefix test: it can
+/// only ever drop text the card is already showing verbatim, so no shape of
+/// genuine model prose is at risk. A failure whose reason was derived from
+/// somewhere else (CC's `errors[]`, a subtype label) leaves the text alone and
+/// falls through to the frontend's own echo drop.
+fn result_text_is_own_prose(text: &str, cc_error: Option<&str>) -> bool {
+    let text = text.trim();
+    !text.is_empty() && cc_error.map(str::trim) != Some(text)
+}
+
 /// The coding-agent driver dropped its input receiver before the engine could
 /// send the first prompt — which only happens when the driver task already
 /// wound down (the agent process failed to start, exited immediately, or its
@@ -1711,7 +1730,7 @@ impl LucidosEngine {
                                                     meta: meta.clone(),
                                                 }, "[AgentSession] CodingAgentTextStreamed (Result flush)").await;
                                             }
-                                        } else if !text.trim().is_empty() {
+                                        } else if result_text_is_own_prose(&text, cc_error.as_deref()) {
                                             // Slash commands (e.g. /model) produce a Result
                                             // without any preceding Message events. Emit the
                                             // result text as CodingAgentTextStreamed so the
@@ -2887,5 +2906,50 @@ mod startup_failure_tests {
         drop(tx);
 
         assert_eq!(drain_startup_failure_reason(&mut rx), None);
+    }
+}
+
+/// A turn that streamed no assistant text states its failure ONCE: in the
+/// failure card, never also as a paragraph of the response.
+#[cfg(test)]
+mod result_text_prose_tests {
+    use super::result_text_is_own_prose;
+
+    /// The case the branch exists for: `/model` answers through `result.result`
+    /// with no preceding Message, and no failure to collide with.
+    #[test]
+    fn a_slash_command_answer_is_prose() {
+        assert!(result_text_is_own_prose("Set model to claude-opus-5", None));
+    }
+
+    /// The duplicate. With CC's own banner no longer buffered as text, a turn
+    /// whose only output was that banner reaches this branch with the failure
+    /// reason sitting in `result.result`, and emitting it would put the card's
+    /// sentence back in the response body.
+    #[test]
+    fn the_turns_failure_reason_is_not_prose() {
+        let err = "API Error: Stream idle timeout - no chunks received";
+        assert!(!result_text_is_own_prose(err, Some(err)));
+        assert!(
+            !result_text_is_own_prose(&format!("\n\n{err}\n"), Some(err)),
+            "compared trimmed: the buffered copy carries the stream's leading newlines"
+        );
+    }
+
+    /// Equality, not an `API Error` prefix test. A failure whose reason was
+    /// derived elsewhere (CC's `errors[]`, a subtype label) leaves the text
+    /// alone rather than guessing, and the frontend's echo drop is the backstop.
+    #[test]
+    fn text_the_card_will_not_show_verbatim_stays() {
+        assert!(result_text_is_own_prose(
+            "API Error: 500 upstream said no",
+            Some("error_during_execution")
+        ));
+    }
+
+    #[test]
+    fn empty_text_is_never_emitted() {
+        assert!(!result_text_is_own_prose("", None));
+        assert!(!result_text_is_own_prose("   \n ", None));
     }
 }

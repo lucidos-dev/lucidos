@@ -8,6 +8,7 @@ import {
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { LoadingFade } from '../shared/LoadingFade';
 import type { EnvironmentVariable } from '../../api/types';
 
@@ -21,12 +22,7 @@ function AddEnvVarForm() {
   const [saving, setSaving] = useState(false);
 
   if (!adding) {
-    return (
-      <div class="list-row-add-card" onClick={() => setAdding(true)}>
-        <div class="list-row-add-icon">+</div>
-        <div class="list-row-add-label">Add Environment Variable</div>
-      </div>
-    );
+    return <ListRowAddCard label="Add Environment Variable" onClick={() => setAdding(true)} />;
   }
 
   function reset() {

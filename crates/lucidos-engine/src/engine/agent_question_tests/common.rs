@@ -161,6 +161,53 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
     .expect("UserQuestionAsked persisted");
 }
 
+/// Seed one asked-and-answered sub-question, the pair
+/// `answered_question_recap` rebuilds the resume message from. Options are
+/// synthesized as `opt-0`, `opt-1`, ... from `option_labels`, matching what
+/// the real hook persists, so a `Selected { option_id }` answer resolves back
+/// to its label the same way in the test as in production.
+pub(crate) async fn emit_answered_question(
+    bus: &EventBus,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    question: &str,
+    option_labels: &[&str],
+    answer: AnswerKind,
+) {
+    let options: Vec<QuestionOption> = option_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| opt(&format!("opt-{i}"), label))
+        .collect();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: tool_use_id.into(),
+            cc_session_id: "sid-test".into(),
+            question: question.into(),
+            options,
+            worktree_path: None,
+            multi_select: matches!(answer, AnswerKind::MultiSelected { .. }),
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .expect("UserQuestionAsked emit")
+    .expect("UserQuestionAsked persisted");
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: tool_use_id.into(),
+            answer,
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .expect("UserQuestionAnswered emit")
+    .expect("UserQuestionAnswered persisted");
+}
+
 /// Drives both regression tests below. Seeds the question, emits the
 /// caller's chosen terminator, and asserts that:
 ///   - the active-only lookup skips the orphaned question (so

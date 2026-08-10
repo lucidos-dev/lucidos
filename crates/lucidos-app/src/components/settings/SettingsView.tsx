@@ -34,6 +34,7 @@ import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
+import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { AllowlistEditor } from './AllowlistEditor';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
@@ -301,12 +302,7 @@ function AddRepositoryForm() {
   const [showPicker, setShowPicker] = useState(false);
 
   if (!adding) {
-    return (
-      <div class="list-row-add-card" onClick={() => setAdding(true)}>
-        <div class="list-row-add-icon">+</div>
-        <div class="list-row-add-label">Add Repository</div>
-      </div>
-    );
+    return <ListRowAddCard label="Add Repository" onClick={() => setAdding(true)} />;
   }
 
   function cancel() {
@@ -581,10 +577,7 @@ export function SettingsView() {
         {credLoadable.data.map((cred) => (
           <CredentialItem key={cred.id} credential={cred} />
         ))}
-        <div class="list-row-add-card" onClick={openAddCredential}>
-          <div class="list-row-add-icon">+</div>
-          <div class="list-row-add-label">Add Credential</div>
-        </div>
+        <ListRowAddCard label="Add Credential" onClick={openAddCredential} />
       </div>
     );
   }
@@ -1451,10 +1444,17 @@ export function SettingsView() {
           {group !== SETTINGS_NAV_ITEMS[i - 1]?.group && (
             <div class="settings-nav-group-title">{group}</div>
           )}
-          <div class="settings-section-title settings-nav-row" onClick={() => openSettingsSubview(key)}>
+          {/* A real <button>, not a clickable div: these rows are the only way
+              into a settings category, so a div here puts every category out of
+              keyboard reach (and with it every control inside one). */}
+          <button
+            type="button"
+            class="settings-section-title settings-nav-row"
+            onClick={() => openSettingsSubview(key)}
+          >
             <span>{label}</span>
             <ChevronRightIcon />
-          </div>
+          </button>
         </div>
       ))}
     </div>

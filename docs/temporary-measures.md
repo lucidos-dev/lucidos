@@ -435,11 +435,26 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   whose response is a non-destructive kill plus auto-resume, becomes the first
   responder. If CC either retried this error class itself or defaulted above our
   watchdog, we would set nothing.
+- **Inert since at least `2.1.224` (found 2026-08-10):** CC has two idle tiers and
+  the effective deadline is the lower of them. The env write moves the **byte**
+  tier; the **event** tier is `max(CLAUDE_STREAM_IDLE_TIMEOUT_MS || 0, 300000)`,
+  arms its own abort, and is the one that actually fires. So the real deadline is
+  still 300 s and the intended ordering was never achieved (measured: a death at
+  304.9 s with `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` confirmed on the live
+  subprocess). The test in `build_command.rs` asserts the ordering against the
+  *constant*, so it passes while the invariant is false. Left as-is deliberately,
+  because `auto_resume_after_api_error` (shipped 2026-08-05) now catches this
+  error class three seconds later and makes the ordering close to moot. Fixing it
+  means also writing `CLAUDE_STREAM_IDLE_TIMEOUT_MS` and widening that test to
+  both tiers.
 - **Removal / resolution condition:** drop the env write when EITHER (a) Claude
   Code auto-resumes a stream-idle failure rather than ending the turn, verified by
   seeing a session recover from the error with no `ResponseFailed`, or (b) its
   default byte-idle deadline exceeds `WATCHDOG_INACTIVITY_LIMIT_MS`, verified by
-  re-reading the resolver in the installed bundle. On removal, delete
+  re-reading the resolver in the installed bundle. Note that neither is satisfied
+  by the engine's own `auto_resume_after_api_error`: that recovers the thread but
+  says nothing about CC's deadline, and it is a Lucidos behaviour rather than the
+  upstream change both arms are waiting on. On removal, delete
   `CC_BYTE_STREAM_IDLE_TIMEOUT_MS`, both tests in
   `runtime/claude_code_tests/build_command.rs`, and the `pub(crate)` justification
   paragraph added to `WATCHDOG_INACTIVITY_LIMIT_MS`.

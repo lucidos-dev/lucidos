@@ -22,11 +22,14 @@
  *    the three controls that can hold it steps SIDEWAYS to clear them, and that
  *    step is now the only thing the build does to any of them. It has to be,
  *    rather than a vertical dodge: a 2.25rem box centred on the bar reaches up
- *    into the band whatever else is true, so a leading control at the row's own
- *    padding would paint over a light. Every rule stays gated on
- *    `[data-titlebar-overlay]`, never on `--titlebar-inset` being `0px` -- the
- *    reserve is a flat 80px that would indent a web header by the width of
- *    lights it does not have.
+ *    into the band whatever else is true, and the lights are centred on that
+ *    same bar now (we place them, `src/traffic_lights.rs`), so a leading control
+ *    at the row's own padding would paint over one. Every rule stays gated on
+ *    `[data-titlebar-overlay]`, never on `--titlebar-inset` being `0px`: the
+ *    reserve resolves to 80px everywhere and would indent a web header by the
+ *    width of lights it does not have. The reserve is DERIVED from the x the
+ *    shell places the cluster at rather than stated as a literal, which is the
+ *    other half of what these scans pin.
  * 3. `.threads-header` clips SIDEWAYS ONLY, and with the leading control back on
  *    the row every edge is flush, so the clip is `inset(0)` on both builds. It
  *    must stay a `clip-path` anyway: `overflow-x: clip` is not available,
@@ -34,7 +37,13 @@
  *    is `clip`, which is the very build this file is about.
  * 4. Both desktop builds resolve to the same bar, and no override escapes the
  *    desktop media query into a mobile viewport.
- * 5. The Threads title is centred on the PANE rather than on the gap between
+ * 5. The brand region reserves the height of the label it centres, rather than
+ *    taking whatever height its trailing actions cluster happens to have. Same
+ *    build again, and the same "no rendered frame can see it" problem: the
+ *    shipped mark fits the region exactly, and only a retuned --header-mark-tap
+ *    makes the label hang out of a box whose clip that webview implements as a
+ *    scroll container.
+ * 6. The Threads title is centred on the PANE rather than on the gap between
  *    the two buttons flanking it, which is the same distinction and the same
  *    build: the sideways step in (2) is exactly what pushed the gap's middle
  *    off the pane's. This one DOES paint differently off the overlay build, but
@@ -49,7 +58,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { cssRules, rulesTargeting, type CssRule } from './css-rule-helpers';
+import { block, cssRules, decl, rulesTargeting, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -120,15 +129,145 @@ describe('the desktop header centers on the whole bar, not on the header alone',
   });
 });
 
+describe('the brand region is as tall as the label it centres', () => {
+  // Same rule as above, the other vertical fact about it. `.pane-header-brand`
+  // declares no height, so it shrinks to its one IN-FLOW child, the actions
+  // cluster (one --header-icon-box). What it has to hold is the brand label,
+  // which is OUT of flow and centred on it, and which is as tall as the taller
+  // of the chevrons (--header-icon-box) and the mark's tap target
+  // (--header-mark-tap). Those two are 2.25rem and 2.1rem as shipped, so the
+  // label fits exactly and the region looks correctly sized; --header-mark-tap
+  // is a style-remote tunable, and past the icon box the label hangs out of the
+  // box top and bottom.
+  //
+  // The overflow is what the user sees, by a route that is invisible here: the
+  // region's `overflow-x: clip` sits beside an `overflow-y: visible` that the
+  // packaged macOS webview does not honour, and its clip behaves as a scroll
+  // container, so a few pixels of vertical overflow are scrolled away when a
+  // control inside is clicked and restored after. That is the mark and both
+  // chevrons jumping up and coming back, reported twice against that build. No
+  // WebDriver reaches WKWebView (ADR 0016) and the shipped tuning overflows by
+  // zero, so a rendered frame cannot pin this on any surface the repo has. The
+  // stylesheet can.
+  it('the region reserves the label height, so a retuned mark cannot overflow it', () => {
+    const brand = desktopRule('.app-header .pane-header-brand');
+    expect(brand.props.get('min-height'))
+      .toBe('max(var(--header-icon-box), var(--header-mark-tap))');
+    // `min-height`, never `height`: a taller in-flow cluster must still grow the
+    // region rather than overflow it in the other direction.
+    expect(brand.props.get('height'), 'a fixed height would re-open the overflow')
+      .toBeUndefined();
+  });
+
+  it('both terms are the real box heights, not numbers that once matched them', () => {
+    // CSS cannot read a rule's own declaration back out, so each term above is a
+    // reference to a token that some OTHER stylesheet has to keep pointed at the
+    // control it names. --header-icon-box is checked against the button further
+    // down this file; this is the mark's half. If `.brand-mark` ever stops being
+    // sized by --header-mark-tap, the reserve silently covers the wrong box.
+    const markRules = cssRules(readFileSync(resolve(stylesDir, 'header-mark.css'), 'utf-8'));
+    const mark = markRules.find(r => r.selector === '.brand-mark');
+    expect(mark?.props.get('height'), '.brand-mark drifted from --header-mark-tap')
+      .toBe('var(--header-mark-tap)');
+  });
+});
+
 describe('on the overlay build the leading control only steps sideways', () => {
-  it('the lights reserve is px, because the lights do not scale with the UI', () => {
-    // rem here is a real bug: at UI_SCALE_MIN (75%) a 5rem reserve computes to
-    // 60px, inside the ~66px the OS cluster occupies whatever our root font size
-    // is, and the control lands on the lights.
+  it('the lights reserve is derived from the x the shell places them at', () => {
+    // The whole point of the arrangement: --titlebar-lights-x is stamped
+    // pre-paint by `titlebar_inset_script` from the SAME constant
+    // src/traffic_lights.rs places the real cluster with, so the room the row
+    // keeps clear is arithmetic on a placement we made rather than an estimate
+    // of where the OS left buttons we did not control. A literal here would be
+    // free to drift from the placement the moment either moved.
     const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
-    const reserve = root?.props.get('--titlebar-lights-reserve');
-    expect(reserve).toMatch(/^\d+px$/);
-    expect(parseInt(reserve!, 10)).toBeGreaterThanOrEqual(70);
+    expect(root?.props.get('--titlebar-lights-reserve')).toBe(
+      'calc(var(--titlebar-lights-x, 10px) + var(--titlebar-lights-cluster)'
+      + ' + var(--titlebar-lights-gap))',
+    );
+  });
+
+  it('every term of the reserve is px, because the lights do not scale with the UI', () => {
+    // rem in ANY of the three is a real bug: at UI_SCALE_MIN (75%) a 5rem
+    // reserve computes to 60px, inside the 60px the OS cluster occupies whatever
+    // our root font size is, and the control lands on the lights. The x is
+    // checked at its fallback here and at its source below.
+    const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
+    const reserve = root!.props.get('--titlebar-lights-reserve')!;
+    expect(/var\(--titlebar-lights-x, (\d+px)\)/.exec(reserve)?.[1]).toMatch(/^\d+px$/);
+    for (const term of ['--titlebar-lights-cluster', '--titlebar-lights-gap']) {
+      expect(root?.props.get(term), term).toMatch(/^\d+px$/);
+    }
+  });
+
+  it('the derived reserve still comes out at the 80px every reader was sized for', () => {
+    // Nothing may move horizontally: five call sites are laid out against this
+    // number (three leading controls, the centred threads title's clamp, and
+    // store/paneMinimums.ts's drawer floor), and neither the change that derived
+    // it nor the one that re-split it was about spending more room. So the sum
+    // is pinned, not just the shape. 10 (our x) + 60 (the cluster: three 14pt
+    // button frames at a 23pt pitch, measured) + 10 (what is left over).
+    const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
+    const reserve = root!.props.get('--titlebar-lights-reserve')!;
+    const terms = [...reserve.matchAll(/(\d+)px/g)].map(m => Number(m[1]));
+    // The x's fallback plus the two named terms, resolved from this same rule.
+    const [x] = terms;
+    const cluster = parseInt(root!.props.get('--titlebar-lights-cluster')!, 10);
+    const gap = parseInt(root!.props.get('--titlebar-lights-gap')!, 10);
+    expect(x + cluster + gap).toBe(80);
+  });
+
+  it('splits that slack evenly, so the lights are centred in the room they get', () => {
+    // The user's report, and the one thing the sum above cannot see: with the
+    // whole 20px in front of the cluster the leading control's box began
+    // exactly where the zoom button's ended, and the row read as cramped
+    // against the lights. Equal terms put 11px of air on each side of the drawn
+    // cluster (the 12pt circle sits 1pt inside its 14pt frame) while leaving the
+    // reserve, and therefore every reader of it, untouched. Split it unevenly
+    // again and the sum still passes.
+    const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
+    const reserve = root!.props.get('--titlebar-lights-reserve')!;
+    const x = Number(/var\(--titlebar-lights-x, (\d+)px\)/.exec(reserve)?.[1]);
+    expect(parseInt(root!.props.get('--titlebar-lights-gap')!, 10)).toBe(x);
+  });
+
+  it('the reserve is registered, so its JS reader still gets a length', () => {
+    // The fifth reader is `store/paneMinimums.ts`, which parseFloats the
+    // property off the root to keep the thread drawer's floor from restating a
+    // number the CSS owns. An UNREGISTERED custom property computes to its
+    // token sequence with vars substituted and the calc UNEVALUATED, so the
+    // moment the reserve stopped being a literal that read started answering
+    // `calc(20px + 60px + 0px)`, i.e. NaN, i.e. the fallback, silently and
+    // forever. Registering restores it. Verified in both shipped engines.
+    const body = block(shellCss, '@property --titlebar-lights-reserve');
+    expect(decl(body, 'syntax')).toBe("'<length>'");
+    // The initial value covers a viewport below the desktop breakpoint, where
+    // the block that declares the reserve does not run. It must be the same sum
+    // the arithmetic produces, or the drawer's floor would differ across the
+    // breakpoint for no reason.
+    expect(decl(body, 'initial-value')).toBe('80px');
+    // And it must sit OUTSIDE the media query, which is not a style choice:
+    // `@property` is not a conditional rule and is dropped if nested in one.
+    const at = shellCss.indexOf('@property --titlebar-lights-reserve');
+    expect(at, 'the registration is missing').toBeGreaterThanOrEqual(0);
+    expect(at, 'the registration must precede the desktop media query')
+      .toBeLessThan(shellCss.indexOf(`${DESKTOP} {`));
+  });
+
+  it('the fallback x is the x the shell actually places the lights at', () => {
+    // CSS cannot read Rust, so the fallback inside the var() is a COPY of
+    // LIGHTS_X_PX and free to rot: it is what a document that somehow was not
+    // stamped resolves to, and a stale one would reserve room for a cluster
+    // that is somewhere else. Scanned rather than imported, like the
+    // UI_SCALE_MIN read further down this file.
+    const rust = readFileSync(resolve(stylesDir, '../traffic_lights.rs'), 'utf-8');
+    const placed = Number(/LIGHTS_X_PX:\s*f64\s*=\s*([\d.]+)/.exec(rust)?.[1]);
+    expect(placed, 'LIGHTS_X_PX not found in traffic_lights.rs').toBeGreaterThan(0);
+
+    const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
+    const reserve = root!.props.get('--titlebar-lights-reserve')!;
+    const fallback = Number(/var\(--titlebar-lights-x, (\d+)px\)/.exec(reserve)?.[1]);
+    expect(fallback).toBe(placed);
   });
 
   it('the reserve still clears a control that is centred on the bar', () => {
@@ -213,9 +352,11 @@ describe('on the overlay build the leading control only steps sideways', () => {
   });
 
   it('every rule that moves a control is gated on the attribute, never on the var', () => {
-    // The reserve is a flat 80px with no `--titlebar-inset` term to zero it out,
-    // so a rule keyed on the var alone would indent a web header by the width of
-    // traffic lights it does not have. The attribute is the only safe gate.
+    // The reserve resolves to 80px everywhere: it has no `--titlebar-inset` term
+    // to zero it out, and its one stamped input carries a fallback so an
+    // unstamped document resolves it too. So a rule keyed on a var alone would
+    // indent a web header by the width of traffic lights it does not have. The
+    // attribute is the only safe gate.
     const movers = shellRules.filter(
       r => r.atRules === DESKTOP && r.props.get('--titlebar-lights-reserve') === undefined
         && [...r.props.values()].some(v => v.includes('--titlebar-lights-reserve')),

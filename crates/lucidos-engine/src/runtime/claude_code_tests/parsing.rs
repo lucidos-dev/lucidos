@@ -180,6 +180,55 @@ fn parse_assistant_no_usage_block() {
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
 }
 
+/// CC's own error banner is a SYNTHETIC assistant message flagged
+/// `is_api_error_message: true`. It is CC's error surface, and the identical
+/// string returns as the turn's `result` error, which the transcript renders in
+/// the failure card. Taking it as prose printed the failure twice: a paragraph
+/// mashed into the response body, then the red card underneath it (reported
+/// 2026-08-10, the exact line below).
+#[test]
+fn parse_assistant_skips_cc_own_api_error_banner() {
+    let line = r#"{"type":"assistant","is_api_error_message":true,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Stream idle timeout - no chunks received"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+    assert!(
+        parse_line(line).is_empty(),
+        "CC's API-error banner must not become assistant text: the failure card already states it"
+    );
+}
+
+/// A sub-agent's banner rides the PARENT's stream carrying the same flag (plus a
+/// `parent_tool_use_id`), so it was leaking into the parent's prose too. It never
+/// reaches the parent's `result`, so it is dropped rather than moved.
+#[test]
+fn parse_assistant_skips_subagent_api_error_banner() {
+    let line = r#"{"type":"assistant","is_api_error_message":true,"parent_tool_use_id":"toolu_1","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Response stalled mid-stream. The response above may be incomplete."}]}}"#;
+    assert!(parse_line(line).is_empty());
+}
+
+/// The flag is what disqualifies the text, not its wording. A turn where the
+/// model itself writes about an API error is ordinary prose and stays.
+#[test]
+fn parse_assistant_keeps_text_that_merely_looks_like_an_api_error() {
+    let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: Stream idle timeout - no chunks received"}]}}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        AgentEvent::Message { text, .. } => {
+            assert_eq!(text, "API Error: Stream idle timeout - no chunks received");
+        }
+        other => panic!("Expected Message, got {:?}", other),
+    }
+}
+
+/// `is_api_error_message: false` is the ordinary shape for every non-error
+/// assistant line CC bothers to stamp, so it must read as "keep".
+#[test]
+fn parse_assistant_keeps_text_when_the_error_flag_is_false() {
+    let line = r#"{"type":"assistant","is_api_error_message":false,"message":{"role":"assistant","content":[{"type":"text","text":"Reading the file."}]}}"#;
+    let events = parse_line(line);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], AgentEvent::Message { .. }));
+}
+
 #[test]
 fn parse_legacy_tool_result() {
     let line = r#"{"type":"tool_result","content":"file contents here","is_error":false,"tool_use_id":"toolu_legacy"}"#;

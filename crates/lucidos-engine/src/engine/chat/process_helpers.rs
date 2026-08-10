@@ -66,6 +66,25 @@ pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGH
 /// never restarts it, so promising that dance there is simply wrong.
 pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AND VERIFY RATHER THAN ASK:\nYou have the `changes` tool (action 'list' / 'apply'), so never bounce a yes/no question back at the user about state you can check yourself.\n- NEVER ask \"have you applied it?\". Call action 'list' and read whether it is `pending` or `applied`. If they asked for it to be applied, call action 'apply' rather than asking permission for what they just told you to do.\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css`, never a bare `/api/v1/...`: a bare path makes the gateway read the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- State what you verified, objectively, and never close an apply loop with \"does it look right now?\". Reserve `ask_user_question` for a genuine decision, not to confirm a step you could check.";
 
+/// Establish the state BEFORE forming an assessment, and never assert that
+/// something did not happen without having looked.
+///
+/// Same shape as [`APPLY_VERIFY_RULE`], which forbids asking whether a change
+/// was applied and requires calling `list` instead: both replace a guess with a
+/// lookup the agent already has. The difference is what triggers it. That one
+/// fires on a question the agent is about to ASK the user; this one fires on a
+/// claim it is about to MAKE, which nothing before the turn can see.
+///
+/// **It states an ORDER, not a review step.** An "audit what you wrote" rule
+/// fires once the model has decided what it thinks, which is when it is least
+/// likely to go and check. On 2026-08-09 the failure was exactly that shape:
+/// asked whether to give up on the project, the agent asserted there had been
+/// no traction, and the facts contradicting it were in memory the whole time.
+/// It only looked one turn later, after the user objected, by which point they
+/// had supplied the fact themselves and the lookup could do nothing but agree
+/// with them.
+pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. Injected memories come first; when they are thin, the `memory` and `threads` tools both have a 'search'. An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- For answering, not browsing: stop once you have what you need.";
+
 /// The half of the apply/verify rule that is only true on an install launched
 /// from a Lucidos source checkout: the engine rebuild+restart choreography for
 /// a Rust change, and the "this user does this daily" framing.
@@ -76,7 +95,18 @@ pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AN
 /// changes never restart the engine, so an agent reciting this would be
 /// instructing the user through a flow that does not exist — which is precisely
 /// what happened in the reported failure.
-pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold, so do not re-explain it or ask them to confirm they did it.\n- NEVER ask \"did you restart?\". You CANNOT restart the engine yourself: only the user triggers the rebuild, and Lucidos shows them the toast. For a change touching Rust or backend files (`requires_restart: true`), apply it, say plainly that the USER must trigger the restart rather than promising the change is live, then VERIFY the new build YOURSELF by probing the served asset. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\").";
+///
+/// **It supplies no sentence for an unverified outcome, deliberately.** It used
+/// to close with a parenthetical example of what to say when the probe still
+/// showed the old build, and on 2026-08-09 a thread wrote that sentence
+/// verbatim about an engine the user HAD restarted, without running any probe.
+/// A pre-written conclusion is the cheapest thing in the prompt to reach for,
+/// so the rule now names where the answer actually is (the per-turn ENGINE
+/// BUILD section, which states it as a fact) and leaves the wording to the
+/// agent. The served-asset probe stays, scoped to what it can really answer: a
+/// change that altered a served asset. It says nothing about a backend-only
+/// change, which is exactly the kind the failure involved.
+pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold, so do not re-explain it or ask them to confirm they did it.\n- NEVER ask \"did you restart?\", and never infer it from what you applied earlier: the ENGINE BUILD section states it, fresh every turn. They restart whenever they like, including mid-turn.\n- You cannot restart the engine yourself. So after applying a `requires_restart: true` change, say what that section says, live or waiting on their switch, and never assert either without reading it.\n- Probing a served asset verifies a change that ALTERED a served asset, nothing else. A backend-only change alters none, so the section is the whole answer.";
 
 /// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
 /// run. Extracted as a pure function so the wiring rule "the `config.id`

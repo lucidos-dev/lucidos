@@ -8,6 +8,7 @@ import type { TriggerInfo } from '../../store/types';
 import { TriggerItem } from './TriggerItem';
 import { TriggerGroupHeader } from './TriggerGroupHeader';
 import { LoadableError } from '../shared/LoadableError';
+import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
@@ -156,14 +157,11 @@ function TriggersLoaded({
         </div>
       )}
       <div class="trigger-add-row">
-        <div class="list-row-add-card" onClick={openAddTrigger}>
-          <div class="list-row-add-icon">+</div>
-          <div class="list-row-add-label">Add Trigger</div>
-        </div>
-        <div class="list-row-add-card" onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}>
-          <div class="list-row-add-icon">+</div>
-          <div class="list-row-add-label">New Group</div>
-        </div>
+        <ListRowAddCard label="Add Trigger" onClick={openAddTrigger} />
+        <ListRowAddCard
+          label="New Group"
+          onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}
+        />
       </div>
     </>
   );

@@ -61,6 +61,29 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         "assistant" => {
             let mut events = Vec::new();
             let message = val.get("message");
+            // CC's own error banner ("API Error: Stream idle timeout - no chunks
+            // received", "API Error: Response stalled mid-stream. …") arrives as a
+            // SYNTHETIC assistant message: `message.model` is `<synthetic>` and the
+            // line carries `is_api_error_message: true`, the stream-json name for
+            // CC's internal `isApiErrorMessage`, documented in its SDK schema as
+            // "True when this assistant message wraps an API error".
+            //
+            // It is CC's error SURFACE, not model prose. The same string comes back
+            // as the turn's `result` error and becomes `ResponseFailed`, which the
+            // transcript already renders in the failure card. Ingesting it as text
+            // therefore printed the failure twice: once as a paragraph glued into
+            // the response body (the engine concatenates consecutive assistant
+            // messages with no separator, so it ran on mid-sentence), and again in
+            // the red card right beneath it.
+            //
+            // Only the text is skipped. A synthetic error line carries no tool_use
+            // and zeroed usage, so nothing else is lost, and a sub-agent's banner,
+            // which rides the parent's stream with the same flag, stops leaking into
+            // the parent's prose too.
+            let is_api_error_banner = val
+                .get("is_api_error_message")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Some(content) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_array())
@@ -68,7 +91,7 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 for block in content {
                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match block_type {
-                        "text" => {
+                        "text" if !is_api_error_banner => {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                 events.push(AgentEvent::Message {
                                     role: "assistant".to_string(),

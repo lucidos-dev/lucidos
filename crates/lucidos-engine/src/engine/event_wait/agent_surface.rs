@@ -114,37 +114,59 @@ pub(crate) enum CancelEventWaitOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CancelTarget {
     One(Uuid),
+    /// Every subscription on the thread that watches this event type, whatever
+    /// `condition` each one carries. The middle ground the surface was missing:
+    /// see [`resolve_cancel_target`].
+    On(String),
     All,
 }
 
-/// Read `wait_id` / `all` into a target, or refuse.
+/// Read `wait_id` / `on` / `all` into a target, or refuse.
 ///
-/// A pure seam so both refusals are testable without an engine, and so the two
+/// A pure seam so every refusal is testable without an engine, and so the two
 /// callers (the LLM tool and the HTTP route) cannot disagree about which
 /// argument combinations are legal.
 ///
-/// The two are mutually exclusive and one is required. Neither silent default
-/// is right for a destructive verb: defaulting a bare call to `all` would stop
-/// four subscriptions when the agent meant one, and defaulting it to a no-op
-/// would report success for nothing.
+/// # Why there are three and not two
+///
+/// `on` is the middle ground, and it exists because its absence had a cost. A
+/// caller that has got its answer about ONE thing could previously say only
+/// "stop this exact id" (which it must first read out of a list) or "stop
+/// everything" (which silently ends watches nobody asked about, the harm ADR
+/// 0052 exists to prevent). "I no longer need to be told about X" was not
+/// expressible at all, so the one caller that cannot read a list and pick an id
+/// out of it, a script, had no safe verb: `scripts/lib/e2e_lock.sh` stands down
+/// the acquiring thread's watch for `E2ELockReleased` the moment it takes the
+/// lock, because holding the lock IS the answer to that watch, and it must
+/// touch nothing else the thread is waiting on.
+///
+/// Exactly one is required. No silent default is right for a destructive verb:
+/// defaulting a bare call to `all` would stop four subscriptions when the agent
+/// meant one, and defaulting it to a no-op would report success for nothing.
 pub(crate) fn resolve_cancel_target(
     wait_id: Option<Uuid>,
+    on: Option<&str>,
     all: bool,
 ) -> Result<CancelTarget, String> {
-    match (wait_id, all) {
-        (Some(_), true) => Err(
-            "Error: pass either `wait_id` or `all`, not both. `all` stops every \
-             subscription on this thread, so naming one alongside it is ambiguous."
+    // Whitespace-only `on` is absent, not an event type nothing watches: it
+    // would otherwise refuse with "nothing is watching for ` `", which reads as
+    // a state of the thread rather than as the caller's own typo.
+    let on = on.map(str::trim).filter(|s| !s.is_empty());
+    match (wait_id, on, all) {
+        (None, None, false) => Err(
+            "Error: pass `wait_id` to stop one subscription, `on` to stop the ones \
+             watching a given event type, or `all: true` to stop every one on this \
+             thread. Call list_event_waits first if you do not have the id."
                 .to_string(),
         ),
-        (None, false) => Err(
-            "Error: pass `wait_id` to stop one subscription, or `all: true` to stop \
-             every one on this thread. Call list_event_waits first if you do not have \
-             the id."
+        (Some(id), None, false) => Ok(CancelTarget::One(id)),
+        (None, Some(event_type), false) => Ok(CancelTarget::On(event_type.to_string())),
+        (None, None, true) => Ok(CancelTarget::All),
+        _ => Err(
+            "Error: pass exactly one of `wait_id`, `on` or `all`, not several. They \
+             address different sets, so naming more than one is ambiguous."
                 .to_string(),
         ),
-        (Some(id), false) => Ok(CancelTarget::One(id)),
-        (None, true) => Ok(CancelTarget::All),
     }
 }
 
@@ -179,11 +201,13 @@ pub(crate) fn render_event_wait_list(waits: &[EventWaitView]) -> String {
     text
 }
 
-/// What an `all` stop reports, from what was live before it and what is still
-/// live after.
+/// What a stop covering SEVERAL subscriptions reports, from what was live
+/// before it and what is still live after. `settled` is the sentence that
+/// closes the success case, and it is the only thing the `all` and `on` scopes
+/// say differently.
 ///
 /// **A partial stop is a refusal, not a success with a caveat**, which is the
-/// whole reason this is its own function. An `all` stop is one emit per
+/// whole reason this is its own function. Such a stop is one emit per
 /// subscription, so one can fail while the rest land, and a failed one is
 /// re-armed and will still wake the thread. Reporting "nothing is subscribed
 /// any more" there would be precisely the lie this surface exists to stop the
@@ -192,8 +216,15 @@ pub(crate) fn render_event_wait_list(waits: &[EventWaitView]) -> String {
 ///
 /// Pure over the two lists, so every arm is testable without an engine, and
 /// keyed on what is STILL LIVE rather than on a success count, because the
-/// cache is the thing that decides whether the thread wakes.
-pub(crate) fn all_stop_outcome(before: &[String], still_live: &[String]) -> CancelEventWaitOutcome {
+/// cache is the thing that decides whether the thread wakes. Both lists are
+/// scoped to what the call addressed, so an `on` stop is judged on the watches
+/// for that event type and is not made to look partial by the unrelated ones it
+/// deliberately left alone.
+pub(crate) fn stop_outcome(
+    before: &[String],
+    still_live: &[String],
+    settled: &str,
+) -> CancelEventWaitOutcome {
     if still_live.len() == before.len() {
         return CancelEventWaitOutcome::Refused(
             "Error: could not record the stop. The subscriptions are still live and \
@@ -218,9 +249,42 @@ pub(crate) fn all_stop_outcome(before: &[String], still_live: &[String]) -> Canc
         ));
     }
     CancelEventWaitOutcome::Stopped(format!(
-        "Stopped watching for {}. Nothing is subscribed on this thread any more.",
-        before.join("; "),
+        "Stopped watching for {}. {settled}",
+        before.join("; ")
     ))
+}
+
+/// The subscriptions in `waits` that watch `event_type`, as the agent reads
+/// them.
+///
+/// Both halves of an `on` stop need exactly this list: what it is about to end,
+/// and what is still standing afterwards. One function so the two cannot come
+/// to describe different sets, which is the way a partial stop would start
+/// reporting the wrong thing.
+fn names_watching(waits: &[LiveWait], event_type: &str) -> Vec<String> {
+    waits
+        .iter()
+        .filter(|w| w.watches(event_type))
+        .map(|w| describe_subscriptions(&w.on))
+        .collect()
+}
+
+/// The sentence that closes a successful `on` stop.
+///
+/// Two clauses, and the second is why this is not a literal. What the caller
+/// asked for is now true ("nothing here watches X any more"), but an `on` stop
+/// deliberately leaves other watches standing, and an agent that reads only the
+/// first clause tells the user it stood everything down. So the survivors are
+/// counted in the same breath, and a thread with none says so by their absence.
+fn on_stop_settled(event_type: &str, others_still_live: usize) -> String {
+    let mut settled = format!("Nothing on this thread watches {event_type} any more.");
+    if others_still_live > 0 {
+        settled.push_str(&format!(
+            " {others_still_live} other subscription(s) on this thread {} still live.",
+            if others_still_live == 1 { "is" } else { "are" },
+        ));
+    }
+    settled
 }
 
 impl LucidosEngine {
@@ -244,16 +308,21 @@ impl LucidosEngine {
         render_event_wait_list(&self.list_event_waits_for_thread(thread_id).await)
     }
 
-    /// Stand down one of this thread's subscriptions, or all of them.
+    /// Stand down one of this thread's subscriptions, the ones watching a given
+    /// event type, or all of them.
     pub(crate) async fn cancel_event_waits_for_agent(
         &self,
         thread_id: Uuid,
         wait_id: Option<Uuid>,
+        on: Option<&str>,
         all: bool,
     ) -> CancelEventWaitOutcome {
-        match resolve_cancel_target(wait_id, all) {
+        match resolve_cancel_target(wait_id, on, all) {
             Err(msg) => CancelEventWaitOutcome::Refused(msg),
             Ok(CancelTarget::One(id)) => self.cancel_one_for_agent(thread_id, id).await,
+            Ok(CancelTarget::On(event_type)) => {
+                self.cancel_watching_for_agent(thread_id, &event_type).await
+            }
             Ok(CancelTarget::All) => self.cancel_all_for_agent(thread_id).await,
         }
     }
@@ -297,6 +366,45 @@ impl LucidosEngine {
         }
     }
 
+    /// Stand down every subscription on this thread that watches `event_type`,
+    /// and nothing else.
+    ///
+    /// The empty case is a refusal rather than a quiet success, on the same
+    /// footing as an `all` stop with nothing live: a caller that believed it was
+    /// watching for something and was not has learned the thing this surface
+    /// exists to tell it. The e2e lock calls this on every acquire and most
+    /// runs never subscribed, so that refusal is its ordinary path and is
+    /// discarded there; see `scripts/lib/e2e_lock.sh`.
+    async fn cancel_watching_for_agent(
+        &self,
+        thread_id: Uuid,
+        event_type: &str,
+    ) -> CancelEventWaitOutcome {
+        let named = names_watching(&self.live_waits.for_thread(thread_id).await, event_type);
+        if named.is_empty() {
+            return CancelEventWaitOutcome::Refused(format!(
+                "Error: nothing on this thread is watching for {event_type}, so there was \
+                 nothing to stop. Call list_event_waits to see what is actually live."
+            ));
+        }
+        self.cancel_event_waits_watching(
+            thread_id,
+            event_type,
+            EventWaitCancelCause::AgentStandDown,
+            None,
+        )
+        .await;
+        // Re-read for the same reason `all` does: the cache is what will or
+        // will not wake this thread, and a cancel whose emit failed is put
+        // straight back into it. Split by scope, so the ones this call was
+        // never allowed to touch are counted rather than read as survivors of a
+        // partial stop.
+        let after = self.live_waits.for_thread(thread_id).await;
+        let still_live = names_watching(&after, event_type);
+        let others = after.len() - still_live.len();
+        stop_outcome(&named, &still_live, &on_stop_settled(event_type, others))
+    }
+
     async fn cancel_all_for_agent(&self, thread_id: Uuid) -> CancelEventWaitOutcome {
         let live = self.live_waits.for_thread(thread_id).await;
         if live.is_empty() {
@@ -319,7 +427,11 @@ impl LucidosEngine {
             .iter()
             .map(|w| describe_subscriptions(&w.on))
             .collect();
-        all_stop_outcome(&named, &still_live)
+        stop_outcome(
+            &named,
+            &still_live,
+            "Nothing is subscribed on this thread any more.",
+        )
     }
 }
 

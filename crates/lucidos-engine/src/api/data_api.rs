@@ -37,12 +37,34 @@ static MUTATE_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// A path spelling that resolves to the same file as another one.
+/// `artifacts/./notes.md`, `artifacts//notes.md` and `artifacts/notes.md/` all
+/// reach the same inode as `artifacts/notes.md`.
+///
+/// One spelling per file, because everything downstream keys on the STRING it
+/// was handed rather than on the inode: the `ArtifactUpdated` event, the memory
+/// index that consumes it, and the engine's user-profile cache. A `.` segment
+/// slips a write past all three, so the file changes while every reader still
+/// believes the old one. `is_path_traversal` does not cover this, because it is
+/// asking a different question (can this escape the tree), and the answer there
+/// is correctly no.
+fn is_noncanonical_path(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment.is_empty() || segment == ".")
+}
+
 fn validate_path_basics(path: &str) -> Result<(), (StatusCode, String)> {
     if path.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Path is required".to_string()));
     }
     if is_path_traversal(path) {
         return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
+    }
+    if is_noncanonical_path(path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Path must not contain empty or '.' segments".to_string(),
+        ));
     }
     Ok(())
 }
@@ -196,6 +218,67 @@ pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<St
     }
 }
 
+/// The `artifacts/` arm of [`write_data`]: store the file, commit it, announce
+/// the entity event, and refresh the engine's user-profile read-cache.
+///
+/// The cache refresh belongs here rather than in the store: `ArtifactManager`
+/// is the shared write sink, but it is built from a workspace path alone and
+/// has no route back to the engine that serves the profile to every chat turn,
+/// so only a caller holding both can keep the two coherent. Taking the cache as
+/// a parameter is also what makes the refresh testable: an `AppState` needs a
+/// booted engine, this needs a tempdir.
+async fn write_artifact_data(
+    am: &ArtifactManager,
+    event_bus: &crate::engine::event_bus::EventBus,
+    profile_cache: &crate::engine::user_profile::UserProfileCache,
+    artifact_path: &str,
+    body: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // `write_and_commit` takes `impl AsRef<[u8]>`, so pass the raw bytes: a
+    // binary upload (PNG, PDF, …) would otherwise be silently mangled by a
+    // lossy UTF-8 round-trip that replaces every non-UTF-8 byte with U+FFFD.
+    // The store announces the Artifact* entity event; the DataFileWritten the
+    // caller emits is the API-origin audit event on top of it. Before this the
+    // entity event was missing entirely for a data-API write, so a CLI-written
+    // artifact never reached the memory index and the frontend carried a
+    // workaround arm for the gap.
+    let commit = am
+        .write_and_commit(
+            event_bus,
+            artifact_path,
+            body,
+            &format!("Update {}", artifact_path),
+            crate::core::WriteAnnouncement::Entity {
+                source: Some("data_api".to_string()),
+            },
+        )
+        .await?;
+    // Only once the write has landed: a failed one must not publish content
+    // that never reached disk.
+    profile_cache.artifact_written(artifact_path, body).await;
+    Ok(commit)
+}
+
+/// The `artifacts/` arm of [`delete_data`], the mirror of
+/// [`write_artifact_data`]. Deleting the profile clears the cache: without it
+/// the deleted profile stays in every chat turn's context until a restart.
+async fn delete_artifact_data(
+    am: &ArtifactManager,
+    event_bus: &crate::engine::event_bus::EventBus,
+    profile_cache: &crate::engine::user_profile::UserProfileCache,
+    artifact_path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = am
+        .delete_and_commit(
+            event_bus,
+            artifact_path,
+            &format!("Delete {}", artifact_path),
+        )
+        .await?;
+    profile_cache.artifact_deleted(artifact_path).await;
+    Ok(commit)
+}
+
 /// PUT /api/v1/data/*path — write a data file (body is raw content)
 pub(super) async fn write_data(
     State(state): State<AppState>,
@@ -215,25 +298,14 @@ pub(super) async fn write_data(
     let _repo_guard = state.engine.lock_workspace_repo().await;
 
     let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
-        // `write_and_commit` takes `impl AsRef<[u8]>` — pass the raw bytes so
-        // binary uploads (PNG, PDF, …) aren't silently mangled by a lossy
-        // UTF-8 round-trip that replaces every non-UTF-8 byte with U+FFFD.
-        // The store announces the Artifact* entity event; the DataFileWritten
-        // below is the API-origin audit event on top of it. Before this the
-        // entity event was missing entirely for a data-API write, so a
-        // CLI-written artifact never reached the memory index and the frontend
-        // carried a workaround arm for the gap.
-        match am
-            .write_and_commit(
-                &state.engine.event_bus,
-                artifact_path,
-                body.as_ref(),
-                &format!("Update {}", artifact_path),
-                crate::core::WriteAnnouncement::Entity {
-                    source: Some("data_api".to_string()),
-                },
-            )
-            .await
+        match write_artifact_data(
+            &am,
+            &state.engine.event_bus,
+            state.engine.user_profile_cache(),
+            artifact_path,
+            body.as_ref(),
+        )
+        .await
         {
             Ok(commit) => (
                 Some(commit.clone()),
@@ -327,13 +399,13 @@ pub(super) async fn delete_data(
     let _repo_guard = state.engine.lock_workspace_repo().await;
 
     let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
-        match am
-            .delete_and_commit(
-                &state.engine.event_bus,
-                artifact_path,
-                &format!("Delete {}", artifact_path),
-            )
-            .await
+        match delete_artifact_data(
+            &am,
+            &state.engine.event_bus,
+            state.engine.user_profile_cache(),
+            artifact_path,
+        )
+        .await
         {
             Ok(commit) => (
                 Some(commit.clone()),
@@ -518,6 +590,7 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::user_profile::UserProfileCache;
 
     fn pat(p: &str) -> glob::Pattern {
         glob::Pattern::new(p).expect("valid pattern")
@@ -619,6 +692,30 @@ mod tests {
         assert!(validate_data_path_mutate("/etc/passwd").is_err());
     }
 
+    /// A second spelling of a path is not a traversal, so the traversal guard
+    /// waves it through: no `..`, no leading slash. It still has to be rejected,
+    /// because the file it reaches and the string every consumer keys on stop
+    /// agreeing. `artifacts/./user_profile.md` would rewrite the profile while
+    /// the engine's cache, the artifact event, and the memory index all recorded
+    /// a different artifact, which is the stale-profile bug by another door.
+    #[test]
+    fn validate_rejects_a_second_spelling_of_the_same_file() {
+        for p in [
+            "artifacts/./user_profile.md",
+            "artifacts//user_profile.md",
+            "artifacts/user_profile.md/",
+            "artifacts/sub/./notes.md",
+            "./artifacts/notes.md",
+        ] {
+            assert!(validate_data_path_read(p).is_err(), "read accepted {}", p);
+            assert!(
+                validate_data_path_mutate(p).is_err(),
+                "mutate accepted {}",
+                p
+            );
+        }
+    }
+
     #[test]
     fn validate_rejects_unknown_prefix() {
         assert!(validate_data_path_read("postgres/data").is_err());
@@ -679,5 +776,128 @@ mod tests {
         let req: DataEditRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.operations.len(), 1);
         assert_eq!(req.operations[0].json_path.as_deref(), Some("title"));
+    }
+
+    /// A workspace to write through, plus the profile cache the running engine
+    /// would be serving from: the same pair `write_data` holds when it reaches
+    /// the artifacts arm.
+    fn write_fixture(
+        seeded_profile: Option<&str>,
+    ) -> (tempfile::TempDir, ArtifactManager, UserProfileCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join(crate::core::ARTIFACTS_DIR);
+        std::fs::create_dir_all(&artifacts).unwrap();
+        if let Some(content) = seeded_profile {
+            std::fs::write(artifacts.join("user_profile.md"), content).unwrap();
+        }
+        let am = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+        // Loaded from disk the way engine startup does, so the test starts from
+        // the state a running engine is actually in.
+        let cache = UserProfileCache::load_from_workspace(dir.path());
+        (dir, am, cache)
+    }
+
+    fn profile_on_disk(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(
+            dir.path()
+                .join(crate::core::ARTIFACTS_DIR)
+                .join("user_profile.md"),
+        )
+        .unwrap()
+    }
+
+    /// The bug this guards: a profile written through the data API landed on
+    /// disk while the engine kept serving the copy it loaded at startup, so
+    /// every chat turn rendered a stale (usually empty) profile until a restart.
+    #[tokio::test]
+    async fn writing_the_profile_through_the_data_api_refreshes_the_engine_cache() {
+        let (dir, am, cache) = write_fixture(None);
+        let bus = crate::test_support::offline_event_bus();
+        assert_eq!(cache.snapshot().await, "");
+
+        write_artifact_data(
+            &am,
+            &bus,
+            &cache,
+            "user_profile.md",
+            b"# Profile\n\nDrinks tea.\n",
+        )
+        .await
+        .expect("write must land");
+
+        assert_eq!(cache.snapshot().await, "# Profile\n\nDrinks tea.\n");
+        assert_eq!(profile_on_disk(&dir), "# Profile\n\nDrinks tea.\n");
+    }
+
+    /// The match is on the whole artifact path, so an imported profile or a
+    /// same-suffix sibling is a different artifact and leaves the cache alone.
+    #[tokio::test]
+    async fn writing_another_artifact_through_the_data_api_leaves_the_profile_cache_alone() {
+        let (_dir, am, cache) = write_fixture(Some("mine"));
+        let bus = crate::test_support::offline_event_bus();
+
+        for path in [
+            "notes.md",
+            "imported/user_profile.md",
+            "old_user_profile.md",
+        ] {
+            write_artifact_data(&am, &bus, &cache, path, b"theirs")
+                .await
+                .expect("write must land");
+            assert_eq!(cache.snapshot().await, "mine", "{} touched the cache", path);
+        }
+    }
+
+    /// Deleting the profile has to clear the cache too: otherwise the deleted
+    /// profile keeps being rendered into every chat turn, forever.
+    #[tokio::test]
+    async fn deleting_the_profile_through_the_data_api_clears_the_engine_cache() {
+        let (_dir, am, cache) = write_fixture(Some("mine"));
+        let bus = crate::test_support::offline_event_bus();
+
+        delete_artifact_data(&am, &bus, &cache, "user_profile.md")
+            .await
+            .expect("delete must land");
+
+        assert_eq!(cache.snapshot().await, "");
+    }
+
+    #[tokio::test]
+    async fn deleting_another_artifact_leaves_the_profile_cache_alone() {
+        let (dir, am, cache) = write_fixture(Some("mine"));
+        let bus = crate::test_support::offline_event_bus();
+        let imported = dir.path().join(crate::core::ARTIFACTS_DIR).join("imported");
+        std::fs::create_dir_all(&imported).unwrap();
+        std::fs::write(imported.join("user_profile.md"), "theirs").unwrap();
+
+        delete_artifact_data(&am, &bus, &cache, "imported/user_profile.md")
+            .await
+            .expect("delete must land");
+
+        assert_eq!(cache.snapshot().await, "mine");
+    }
+
+    /// A write that never reached disk must not be published to the cache: the
+    /// engine would then serve a profile no restart could reproduce.
+    #[tokio::test]
+    async fn a_failed_profile_write_leaves_the_cache_at_what_landed() {
+        let (dir, am, cache) = write_fixture(Some("mine"));
+        let bus = crate::test_support::offline_event_bus();
+
+        // Make the write fail at the filesystem: a directory where the file
+        // should go is the cheapest reachable failure.
+        let path = dir
+            .path()
+            .join(crate::core::ARTIFACTS_DIR)
+            .join("user_profile.md");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let result = write_artifact_data(&am, &bus, &cache, "user_profile.md", b"never landed")
+            .await
+            .err();
+
+        assert!(result.is_some(), "the write must report failure");
+        assert_eq!(cache.snapshot().await, "mine");
     }
 }

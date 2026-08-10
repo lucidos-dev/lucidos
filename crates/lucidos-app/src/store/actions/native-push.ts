@@ -12,6 +12,7 @@
 import type { Tap } from '@lucidos/sdk';
 import { isTauri } from '../../utils/platform';
 import { isPageActive } from '../../utils/pageActive';
+import { WORKSPACE_ID } from '../../utils/basePath';
 import {
   showNativeNotification,
   dismissNativeNotification,
@@ -19,7 +20,7 @@ import {
   listen,
 } from '../../utils/tauri';
 import { dispatchDeepLink } from './in-app-notification-toast';
-import { parseDeepLinkFromSwMessage } from './notification-deeplink';
+import { parseDeepLinkFromSwMessage, type DeepLinkTarget } from './notification-deeplink';
 import { postClientLog } from '../../utils/liveness';
 
 /** Wall-clock budget after which a `NativePushRequested` is too stale to show.
@@ -72,10 +73,10 @@ export interface NativePushDismissRequestedPayload {
  *     Safari revokes a subscription after 3 silent pushes — so browser / PWA
  *     banners persist until manually swiped; in-app unread still syncs via
  *     `NotificationRead`);
- *   - stale frame → no-op (a late SSE-queue flush; this bounds — does not fully
- *     eliminate, since `removeAllDeliveredNotifications` is blunt — the window in
- *     which a late dismiss-all could clear a banner for a notification created
- *     after the all-read).
+ *   - stale frame → no-op (a late SSE-queue flush; this bounds, without fully
+ *     eliminating, the window in which a late dismiss-all could clear a banner
+ *     for a notification created after the all-read. A dismiss-all is scoped to
+ *     the calling workspace but still sweeps all of ITS delivered banners).
  *  NO `isPageActive()` gate (unlike show): a banner exists only because the
  *  device was inactive when shown; by dismiss time it may be active again, and
  *  removeDeliveredNotifications is a harmless no-op when nothing matches.
@@ -88,7 +89,13 @@ export function handleNativePushDismiss(payload: NativePushDismissRequestedPaylo
 
 async function dismissNativeBanner(payload: NativePushDismissRequestedPayload): Promise<void> {
   try {
-    await dismissNativeNotification({ notificationId: payload.notification_id });
+    await dismissNativeNotification({
+      // Same workspace `showNativeBanner` stamped: the Rust side rebuilds the
+      // composite request identifier from it, and scopes a dismiss-all to the
+      // banners this workspace raised rather than clearing every workspace's.
+      workspace: WORKSPACE_ID,
+      notificationId: payload.notification_id,
+    });
   } catch (err) {
     // Telemetry carve-out (.claude/rules/frontend.md): runs on a background SSE
     // frame without user intent. A failed dismiss is non-fatal — the stale OS
@@ -111,11 +118,19 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
       // SW-message shape so the tap routes through the same dispatchDeepLink the
       // web-push tap uses (parseDeepLinkFromSwMessage). `app_id` is omitted on
       // purpose — when the tap navigates to an app, the id lives in tap.to.app_id.
+      //
+      // `workspace` is NOT part of that shape: it is routing metadata this
+      // client adds, naming the workspace that RAISED the banner. One packaged
+      // process fronts the gateway and can point any window at any workspace
+      // (ADR 0014), so without it a drained tap lands wherever the page happens
+      // to be (see `nativeTapRoute`). It also composes the UN request
+      // identifier, which is what carries the identity across a client relaunch.
       deepLink: {
         notification_id: payload.notification_id,
         thread_id: payload.thread_id ?? null,
         event_id: payload.event_id ?? null,
         tap: payload.tap ?? null,
+        workspace: WORKSPACE_ID,
       },
     });
   } catch (err) {
@@ -148,30 +163,44 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
  *  Why focus/visibility matter: a native banner only shows while the page is
  *  INACTIVE (handleNativePushRequested gates on isPageActive), so a banner tap
  *  ALWAYS lands on a backgrounded/hidden — often JS-throttled — WKWebView.
- *  `show_main_window` then SHOWS the existing window WITHOUT reloading, so the
- *  startup cold drain never re-runs, and the warm `app.emit` is a fire-and-forget
+ *  `route_native_tap` then SHOWS that window WITHOUT reloading it, so the startup
+ *  cold drain never re-runs, and the warm `emit_to` is a fire-and-forget
  *  eval that WebKit can drop onto a just-resumed webview. The `focus` /
  *  `visibilitychange` events WebKit dispatches IN the webview when the window is
  *  brought forward are eval-independent, so they reliably catch the stash the
  *  warm signal missed (the "tap focuses the window but never deep-links" bug).
  *  The Rust drain is atomic, so every tap routes exactly once across all triggers
- *  and never re-fires on a later reload. Tauri-only; returns an unlisten that
- *  removes every trigger. Call once at startup. See notifications.rs +
- *  system-knowhow/notifications.md §4. */
+ *  and never re-fires on a later reload.
+ *
+ *  WORKSPACE-SCOPED, AND THE PAGE NO LONGER DECIDES WHERE A TAP GOES. The stash
+ *  is process-global and any window can be pointed at any workspace, so the
+ *  drain passes this page's `WORKSPACE_ID` and Rust hands back only the taps
+ *  this workspace raised (plus unattributable ones); another workspace's tap is
+ *  left in the stash. Which window a tap belongs in is chosen in Rust
+ *  (`route_native_tap`), the only layer that can see every window and open one.
+ *  The page used to make that call itself and could only ever act on ITSELF, so
+ *  a foreign tap navigated this window to the other workspace, taking it off
+ *  whatever the user had open.
+ *
+ *  Tauri-only; returns an unlisten that removes every trigger. Call once at
+ *  startup. See notifications.rs + system-knowhow/notifications.md §4. */
 export async function setupNativePushTapRouting(): Promise<() => void> {
   if (!isTauri()) return () => {};
   const drainAndDispatch = async (
     source: 'signal' | 'startup' | 'focus' | 'visibility',
   ): Promise<void> => {
     try {
-      const taps = await takePendingNativeTaps();
-      if (taps.length > 0) {
-        postClientLog('native-tap', 'drain', { source, count: taps.length });
-      }
-      for (const raw of taps) {
-        const target = parseDeepLinkFromSwMessage(raw);
-        if (target) dispatchDeepLink(target);
-      }
+      const taps = await takePendingNativeTaps(WORKSPACE_ID);
+      if (taps.length === 0) return;
+      const targets = taps
+        .map((raw) => parseDeepLinkFromSwMessage(raw))
+        .filter((target): target is DeepLinkTarget => target !== null);
+      postClientLog('native-tap', 'drain', {
+        source,
+        count: taps.length,
+        dispatched: targets.length,
+      });
+      for (const target of targets) dispatchDeepLink(target);
     } catch (err) {
       // Telemetry carve-out (.claude/rules/frontend.md): runs at startup or on a
       // background signal, no user intent. A failed drain leaves taps stashed for

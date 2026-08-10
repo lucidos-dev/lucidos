@@ -25,7 +25,7 @@ import { dirname, join, resolve } from 'node:path';
  *  Two shapes of site, checked PER SITE rather than by a total, because a total
  *  cannot tell two scrolls in one handler apart from one in each of two:
  *   - an `onToggle` handler (a collapsible panel, a `<details>` disclosure), and
- *   - a `withScrollAnchor` call (More/Less, Show steps/Hide steps), which is the
+ *   - a `withScrollAnchor` call (the two turn controls), which is the
  *     legitimate way to hold the reader still across a turn's own growth.
  *
  *  Scanned across every component in `components/chat`, not just the one that
@@ -43,17 +43,30 @@ describe('no transcript toggle scrolls the reader', () => {
    *  here: it COMPENSATES for a toggle's growth to hold the reader on the same
    *  content, which is the opposite of moving them.
    *
-   *  `followSentMessage` and `followAnsweredQuestion` are here for a reason worth
-   *  stating: they move the reader LESS than the others (a reader already at the
-   *  live edge is not scrolled at all) but they also arm the standing follow, so
-   *  a toggle reaching for one would hand every later growth the reader's
-   *  position too. That is strictly more than a one-off scroll, not less. */
+   *  It is also the ONE place a reveal may legitimately move somebody, and the
+   *  exception proves the rule rather than bending it. A reader riding the live
+   *  edge asked to be kept there, and a transcript-wide reveal grows the turns
+   *  below them, so `honourAnchoredMutation` glides them back to it (armed only,
+   *  gently, and never as something a toggle HANDLER decided). Everyone else is
+   *  left exactly where the correction put them, which is what this scan is
+   *  about: the failure it exists for is a new handler reaching for
+   *  `scrollToBottom()` to "make sure you see it".
+   *
+   *  All four SUBMIT entry points are here, and they are worth listing in full
+   *  even though each moves the reader LESS than a chevron does (a reader already
+   *  at the live edge is not scrolled at all, and neither is one whose whole
+   *  thread is on screen). A submit is the reader handing the agent something and
+   *  being shown it picked up; a disclosure is the reader looking at what is
+   *  already there. A toggle reaching for one would glide the transcript for an
+   *  act nobody submitted. */
   const SCROLL_CALLS = [
     'scrollToBottom',
     'scrollToBottomAnimated',
     'scrollToTop',
     'followSentMessage',
     'followAnsweredQuestion',
+    'followResolvedPermission',
+    'followContinuedThread',
     'pinToBottomNow',
     'scrollIntoView',
     'scrollTop =',
@@ -115,7 +128,12 @@ describe('no transcript toggle scrolls the reader', () => {
    *  wearing a smaller hat. Adding or removing a toggle means changing these
    *  numbers deliberately, in the same commit. */
   const EXPECTED_PANEL_TOGGLES = 2;    // ChatExchange: the initiator panel, the response panel
-  const EXPECTED_ANCHORED_TOGGLES = 2; // ChatExchange: More/Less, Show steps/Hide steps
+  // ChatExchange's `reveal`, which the full-response and steps turn controls
+  // both route through. It was one anchored site per control until they grew a
+  // shared second half (turning either ON also lifts this turn's fold), which
+  // has to happen inside the SAME anchor or the anchor measures a height the
+  // unfold then changes.
+  const EXPECTED_ANCHORED_TOGGLES = 1;
 
   it('no onToggle handler moves the transcript', () => {
     const offenders: string[] = [];

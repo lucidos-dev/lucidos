@@ -124,7 +124,12 @@ function channelIcon(value: ThreadChannel): VNode {
  *  over the thread or content panes, so a click over there is the user's own
  *  click and must not be dismissed-and-swallowed, and nothing behind goes inert.
  *  The one overlay behavior it keeps is Escape, registered on the central
- *  `overlayStack` by `openThreadFilterPanel` (store/threadFilterPanel.ts).
+ *  `overlayStack` alongside the open state itself (store/threadFilterPanel.ts),
+ *  restores from localStorage included.
+ *
+ *  Being up IS a state of the drawer, so it survives a reload the way the
+ *  drawer's selected view and channel selection do: a reload lands the user back
+ *  on the filters they were editing rather than on the list.
  *
  *  It carries neither a title row nor a footer: the pane header two rows up says
  *  "Filters" while this is up, and the way OUT is the header's own Filter

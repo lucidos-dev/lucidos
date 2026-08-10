@@ -295,8 +295,9 @@
 
 /* Compose-empty welcome: a COMPACT surface that flows at its natural height, so
    the centered group (welcome + prompt) keeps the prompt near the middle on
-   desktop, and on mobile (where `.thread-pane-body` is bottom-docked) the
-   welcome sits just above the prompt. `.thread-content` is normally a fill +
+   desktop. Mobile keeps the compact surface but gives the wrap the free space
+   and centres the welcome in it, the prompt staying bottom-docked (mobile.css).
+   `.thread-content` is normally a fill +
    scroll container (desktop `position: absolute; inset: 0`; mobile `flex: 1`);
    here it flows at content height so the welcome is only as tall as it needs to
    be. Only the compose-empty welcome is affected — a real transcript keeps its
@@ -325,11 +326,18 @@
        clearance. The horizontal inset still has to match `.prompt-area`'s so the
        welcome lines up with the composer directly below it, scroll gutter
        included: `overflow: visible` here means the base rule's
-       `scrollbar-gutter: stable` reserves nothing, so add it explicitly. */
+       `scrollbar-gutter: stable` reserves nothing, so add it explicitly.
+       The bottom is much the larger of the two, on purpose. Nothing docks above
+       this surface (the space over it is the pane's own, and on mobile the wrap
+       centres the surface in it), so the top only has to stop the greeting
+       butting against that space and stays tight. The bottom is the entire gap
+       between the welcome's last line and the composer docked under it, since
+       `.prompt-area` zeroes its own top padding just below, and it has to read
+       as a breath between two surfaces rather than as inner padding. */
     padding:
         0.5rem
         calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width))
-        0.75rem
+        3.5rem
         var(--thread-pane-gutter);
 }
 
@@ -469,6 +477,41 @@
     position: relative;
 }
 
+/* --titlebar-lights-reserve is REGISTERED, because one of its five readers is
+   JavaScript and an unregistered custom property is a token sequence rather than
+   a length.
+
+   `store/paneMinimums.ts` reads the reserve off the root and `parseFloat`s it,
+   which is what keeps the thread drawer's floor from restating a number the CSS
+   owns. That worked while the reserve was the literal `80px`. It stops the
+   moment the reserve becomes arithmetic: `getComputedStyle().getPropertyValue()`
+   returns an UNREGISTERED custom property's value with its vars substituted but
+   its calc NOT evaluated, so the reader would get the string
+   `calc(20px + 60px + 0px)` and `parseFloat` would give NaN. Verified in both
+   engines the app ships on (Chromium and WebKit): the four CSS readers resolve
+   the same 80px they always did, and only the JS one goes dark, silently, into
+   its fallback. Registering with a `<length>` syntax is what makes the computed
+   value an actual length again.
+
+   OUTSIDE the media query on purpose, and not by choice: `@property` is not a
+   conditional rule and may not be nested in one. The consequence is that below
+   769px, where the block below does not run, the reserve resolves to this
+   initial value instead of to nothing. That is the same 80px the JS fallback
+   restates for exactly that viewport, so the drawer floor is unchanged; and no
+   CSS rule reads the reserve outside `[data-titlebar-overlay]`, which the suite
+   pins.
+
+   An engine too old for `@property` (WKWebView below Safari 16.4, reachable at
+   the app's macOS 11 floor) ignores this block, and the JS read degrades to the
+   fallback literal, which is the same number again. So the registration
+   improves the mechanism where it is supported and costs nothing where it is
+   not. */
+@property --titlebar-lights-reserve {
+    syntax: '<length>';
+    inherits: true;
+    initial-value: 80px;
+}
+
 /* Desktop: position burger, brand, and panel title to track the split layout */
 @media (min-width: 769px) {
     /* Compute the divider x-position accounting for thread drawer offset.
@@ -525,7 +568,15 @@
            controls that can hold that slot were once raised clear into the band
            beside the traffic lights instead, and read as sitting higher than
            their neighbours. They clear the lights sideways now
-           (--titlebar-lights-reserve below) and share this centring. */
+           (--titlebar-lights-reserve below) and share this centring.
+
+           So do the LIGHTS, which is newer still and is why this rule finally
+           covers the whole row. We place them ourselves (src/traffic_lights.rs)
+           with the cluster's centre on the bar's centre, which is the same
+           centre this expression resolves to for everything else, so the one
+           control we do not draw is no longer the one control sitting high. The
+           bar height that placement needs is the one thing CSS cannot hand to
+           AppKit, so the frontend measures it and pushes it over IPC. */
         --header-band-lift: calc(var(--titlebar-inset, 0px) / 2);
         /* The one desktop bar height (48px at the default UI scale). Web and PWA
            have no band, so the header IS the bar; the overlay build subtracts
@@ -544,35 +595,68 @@
            untouched. No desktop viewport has a notch, so these drop it. */
         --desktop-bar-height: 3rem;
         --app-header-height: var(--desktop-bar-height);
-        /* Horizontal room the macOS traffic lights need. Their three 12px
-           buttons sit 20px apart starting 20px from the window's left edge, so
-           the cluster's right edge lands near 66px; 80px clears it with room for
-           the leading control's own hover box. Only ever read under
-           [data-titlebar-overlay], where the lights actually exist.
+        /* The macOS traffic lights: where WE put them, and therefore how much
+           horizontal room the header row keeps clear of them. Only ever read
+           under [data-titlebar-overlay], where the lights actually exist.
+
+           DERIVED, not guessed. --titlebar-lights-x is stamped pre-paint by
+           `titlebar_inset_script` (src/lib.rs) from LIGHTS_X_PX, the SAME
+           constant src/traffic_lights.rs places the real cluster with, so the
+           reserve is arithmetic on an x we applied rather than an estimate of
+           where the OS left buttons we did not control. The literal inside the
+           var() is the fallback for a document that somehow was not stamped, so
+           it has to track that constant; the CSS suite checks it by reading the
+           Rust, since nothing else can.
+
+           The cluster's WIDTH is not a choice, it is a measured AppKit fact,
+           which is why it lives here rather than beside the x in Rust (the
+           placement never needs it: it reads AppKit's own pitch off the buttons
+           at apply time). The three buttons carry 14pt frames, each holding a
+           12pt drawn circle, at a 23pt pitch, so the cluster spans
+           2 * 23 + 14 = 60pt from its left edge. The comment this replaces said
+           12px buttons 20px apart ending near 66px, and all three of those
+           numbers were wrong: AppKit's own default put the cluster at x 9 to 69.
+
+           The gap is the slack, and it is EQUAL to the x: 10 + 60 + 10 is the
+           same 80px this has always reserved, with the cluster centred in it
+           rather than shoved against the leading control. What the user sees is
+           symmetric to the pixel, since the 12pt circle sits 1pt inside its
+           14pt frame: 11px of air from the window's edge to the red light, and
+           11px from the green one to where the leading control's box begins.
+           The gap was 0 for one change, with all 20px of the slack in front of
+           the lights, and the row read as cramped against them; that is the
+           report this splits. It stays a named term rather than being folded
+           into the sum because it IS the slack, so a later change to either of
+           the other two spends it here visibly instead of quietly landing a
+           control on a light.
 
            This is the WHOLE of what the overlay build does to the leading
-           control now: it is centered on the bar like every other control in the
-           row (--header-band-lift), and it steps sideways to clear the lights.
-           It used to RISE out of the header and pin itself to the window's top
-           edge beside them, which is the macOS unified-toolbar convention but
-           read as one icon sitting higher than its neighbours; the user rejected
-           it on the packaged build. The reserve survives the removal because the
-           row's controls reach UP into the band once they are centered on it: a
-           36px box centered on the 48px bar spans window y 6 to 42, so it covers
-           most of the 28px band and would paint over a light (x 20 to 66, y 8 to
-           20) at the row's own 0.5rem, whatever its vertical centring. That is
-           why NOTHING in this row is left at 0.5rem on this build, the search
-           field included.
+           control: it is centered on the bar like every other control in the row
+           (--header-band-lift), and it steps sideways to clear the lights. It
+           used to RISE out of the header and pin itself to the window's top edge
+           beside them, which is the macOS unified-toolbar convention but read as
+           one icon sitting higher than its neighbours; the user rejected it on
+           the packaged build. The reserve survives that removal, and matters
+           MORE now that the lights are centered on the bar too: a 36px box
+           centered on the 48px bar spans window y 6 to 42, and the lights now
+           sit at y 17 to 31 (14pt frames centered on the same 24px), so the two
+           overlap almost completely in y and only this sideways step keeps them
+           apart. That is why NOTHING in this row is left at 0.5rem on this
+           build, the search field included.
 
            PX, NOT REM, and that is load-bearing rather than an oversight: the
            lights are OS chrome at a fixed size, so they do not move when the
            user changes the UI scale, while everything of ours authored in rem
            does. At UI_SCALE_MIN (75%, preferences.ts) a 5rem reserve computes to
            60px and puts the control ON the lights, which is the one thing this
-           whole arrangement exists to avoid. Same reasoning as --titlebar-inset,
-           which is a px literal from `titlebar_inset_script` for the same
-           reason. */
-        --titlebar-lights-reserve: 80px;
+           whole arrangement exists to avoid. That the y is now ours changes
+           nothing here: placing the cluster does not resize it. Same reasoning
+           as --titlebar-inset, which is a px literal from
+           `titlebar_inset_script` for the same reason. */
+        --titlebar-lights-cluster: 60px;
+        --titlebar-lights-gap: 10px;
+        --titlebar-lights-reserve:
+            calc(var(--titlebar-lights-x, 10px) + var(--titlebar-lights-cluster) + var(--titlebar-lights-gap));
     }
 
     /* The packaged macOS build (titleBarStyle:"Overlay"), stamped pre-paint by
@@ -1033,6 +1117,37 @@
         position: absolute;
         left: calc(var(--co) + var(--ddo));
         width: calc(var(--divider-x) - var(--co) - var(--ddo));
+        /* As tall as the tallest thing it HOLDS, which is not the same as the
+           tallest thing in its FLOW. The region declares no height, so it
+           shrinks to its one in-flow child, the actions cluster, and that is one
+           --header-icon-box. The brand label is out of flow and centred on the
+           region, and it is as tall as the taller of the chevrons
+           (--header-icon-box) and the mark's tap target (--header-mark-tap). At
+           the shipped tuning those are 2.25rem and 2.1rem, so the label fits
+           exactly and nothing here reads as wrong. But --header-mark-tap is a
+           style-remote tunable, and the moment it passes the icon box the label
+           hangs past this box, top and bottom.
+
+           That overflow is not cosmetic, and it is why this line exists. The
+           clip below is an `overflow-x: clip` beside an `overflow-y: visible`
+           that the packaged macOS webview does not honour (see the note on it),
+           and a clip you cannot tell apart from `hidden` is a SCROLL container.
+           A few pixels of vertical overflow are then something the webview can
+           scroll away when a control inside is clicked and restore afterwards,
+           which is the Lucidos mark and both chevrons jumping up and coming
+           back: reported twice against the packaged build, and invisible to
+           every automated surface here, since no WebDriver reaches WKWebView
+           (ADR 0016) and the shipped tuning has no overflow to scroll.
+
+           Sizing the box to what it centres leaves nothing to scroll, on any
+           engine and at any tuning. `min-height` rather than `height`, so a
+           taller in-flow cluster still grows the region. The region has no
+           paint of its own, so growing it moves nothing: both it and the label
+           stay centred on the same line (each is `top: 50%` plus a -50%
+           translate of its own height, so neither centre depends on a height).
+           Pinned by styles/__tests__/header-band-centering.test.ts and
+           e2e/lucidos-menu-desktop.spec.ts. */
+        min-height: max(var(--header-icon-box), var(--header-mark-tap));
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
         z-index: var(--z-control-panel);
@@ -1070,7 +1185,13 @@
        clips both axes as soon as one of them is `clip`, so anything that has to
        be seen stays inside this box. The badge does: it rides the mark's own
        corner, inside the mark's tap target, rather than lifting out of the flex
-       line the way the retired wordmark's superscript did. */
+       line the way the retired wordmark's superscript did.
+       And NOTHING MAY OVERFLOW THE PARENT vertically, which is a stronger rule
+       than "may be clipped": that webview's clip behaves as a scroll container,
+       so overflow there is not merely hidden, it is scrollable, and a click on a
+       control inside scrolls it away and back. The parent's `min-height` is what
+       keeps this box inside it however --header-mark-tap is retuned; do not drop
+       it without reading its note. */
     .app-header .pane-header-brand .pane-header-brand-label {
         position: absolute;
         left: 50%;
@@ -1087,7 +1208,33 @@
         pointer-events: none;
     }
 
-    .app-header .pane-header-brand .pane-header-brand-label > * {
+    /* …and the members are targets again, EXCEPT while an overlay owns the
+       screen. The gate is the desktop copy of the one `.header-nav-cluster > *`
+       carries in styles/header-mark.css, and it is load-bearing rather than
+       cautious for the same reason: the inert-behind half of the overlay
+       contract works by setting `pointer-events: none` on an ANCESTOR
+       (`:root[data-overlay-open] .app-shell > *`, global/modal-overlay.css) and
+       letting it inherit down, and a value applied DIRECTLY to a child beats an
+       inherited one at any specificity. Ungated, this punched a live hole
+       through that inert exactly the width of the brand span: with the Lucidos
+       menu up, the two thread chevrons and everything in the brand centre were
+       the only things behind the scrim still answering the pointer, so they kept
+       their hover highlight and were one swallowed click away from navigating
+       thread history instead of dismissing.
+
+       Gating instead of naming this box in the inert rule is what keeps the
+       overlay's ANCHOR exemption working. A chevron is itself the anchor while
+       its own long-press history menu is open, and `[data-overlay-anchor]` is
+       (0,2,0): it can beat inheritance, but it would lose to a rule reaching in
+       here to re-assert `none`. With this rule simply not applying, the anchor
+       is the only declaration on the element and re-tapping it still closes its
+       own menu. Same for the mark, which is the anchor for the menu in question.
+
+       Only `[data-overlay-open]`, where the mobile twin also gates on
+       `[data-keyboard-active]`: that regime is `:root[data-keyboard-active]
+       .app-header` in mobile.css, inside the mobile breakpoint, so it can never
+       co-apply with a rule that lives in the desktop one. */
+    :root:not([data-overlay-open]) .app-header .pane-header-brand .pane-header-brand-label > * {
         pointer-events: auto;
     }
 

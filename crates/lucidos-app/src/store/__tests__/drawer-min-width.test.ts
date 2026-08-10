@@ -216,8 +216,20 @@ describe('the TS mirror of the row still matches the CSS', () => {
     expect(row?.props.get('padding')).toBe('0 0.5rem');
   });
 
-  it('the lights reserve is the px value the fallback restates', () => {
-    expect(desktopRoot?.props.get('--titlebar-lights-reserve')).toBe(`${LIGHTS_RESERVE_PX}px`);
+  it('the lights reserve still SUMS to the px value the fallback restates', () => {
+    // The CSS no longer states the reserve as a literal: it is the x the shell
+    // places the traffic lights at (stamped pre-paint, with a fallback here),
+    // plus the cluster's measured width, plus what is left over. What
+    // `paneMinimums.ts` restates is the SUM, which is what this checks, because
+    // the sum is what a viewport too narrow to declare the property falls back
+    // to. The shape of the arithmetic is pinned next door, in
+    // styles/__tests__/header-band-centering.test.ts.
+    const reserve = desktopRoot!.props.get('--titlebar-lights-reserve')!;
+    const x = Number(/var\(--titlebar-lights-x, (\d+)px\)/.exec(reserve)?.[1]);
+    expect(x, 'the reserve no longer derives from a stamped x').toBeGreaterThan(0);
+    const cluster = parseInt(desktopRoot!.props.get('--titlebar-lights-cluster')!, 10);
+    const gap = parseInt(desktopRoot!.props.get('--titlebar-lights-gap')!, 10);
+    expect(x + cluster + gap).toBe(LIGHTS_RESERVE_PX);
   });
 
   it('the overlay build reserves exactly the lead the floor assumes', () => {

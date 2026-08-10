@@ -245,8 +245,16 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   /** A detached event wake is the ONE injection whose text is not its content:
    *  the prose is the model's prompt and carries the matched payload as
    *  pretty-printed JSON, which is a screen of raw JSON in a transcript. When
-   *  the resolved delivery is in hand, the panel names the event instead. */
-  it('UserPromptInjected (detached event wake): summary names the delivered event', () => {
+   *  the resolved delivery is in hand, the event row in the body names the event
+   *  instead.
+   *
+   *  **No panel summary line**, because that row already reads "Woke on
+   *  <event>". Carrying one printed the same words twice, once as plain prose in
+   *  the header and once in the card underneath (reported 2026-08-10). Same as
+   *  `TriggerStarted` and `ChildThreadCompleted` above, whose rows own their
+   *  prefixes too. A wake with no resolved delivery is NOT this case and keeps
+   *  its prose summary, covered by the test below. */
+  it('UserPromptInjected (detached event wake): the row names the event, the header stays quiet', () => {
     const ex = exchangeWith({
       type: 'UserPromptInjected',
       text: 'An event you subscribed to has arrived …\n\nCodingAgentIdled:\n{ … }',
@@ -254,10 +262,20 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
     const desc = describeInitiator(
       ex, '<p>raw json</p>', [], 'tid', false, false, 'claude-code', undefined, undefined,
-      'CodingAgentIdled', '{\n  "has_changes": true\n}',
+      { eventType: 'CodingAgentIdled', eventId: 'evt-src-1', payloadJson: '{\n  "has_changes": true\n}' },
     );
-    expect(desc.summary).toBe('Woke on CodingAgentIdled');
-    expect(desc.details).toBeDefined();
+    expect(desc.summary).toBeUndefined();
+    const body = desc.details as { type?: { name?: string }; props?: Record<string, unknown> };
+    expect(body?.type?.name).toBe('EventDeliveryBody');
+    // Each field lands on its own prop. They were three trailing
+    // `string | undefined` positionals until 2026-08-10, and adding one in the
+    // middle re-bound the payload to it with no type error and no failing
+    // assertion; one object argument makes that unrepresentable.
+    expect(body?.props).toMatchObject({
+      eventType: 'CodingAgentIdled',
+      eventId: 'evt-src-1',
+      payloadJson: '{\n  "has_changes": true\n}',
+    });
   });
 
   /** The link can dangle: the delivery sits in an earlier exchange, so a long
@@ -352,7 +370,12 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.accent).toBe('change-failed');
   });
 
-  it('TriggerStarted: label is engine, summary "Trigger fired" (trigger name surfaces in the popover Origin row)', () => {
+  /** No panel summary line: the event row in the body reads "Trigger fired:
+   *  morning-summary", so a header saying "Trigger fired" above it would state
+   *  the same thing twice. Same shape as `ChildThreadCompleted` below, whose row
+   *  has owned its own prefix all along. The popover's Origin row is unaffected:
+   *  it renders the trigger through `renderTriggerOrigin`, not through this. */
+  it('TriggerStarted: label is engine, no panel summary line (the event row owns the prefix)', () => {
     const ex = exchangeWith({
       type: 'TriggerStarted',
       trigger_id: 't1',
@@ -360,8 +383,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Trigger fired');
+    expect(desc.summary).toBeUndefined();
     expect(desc.variant).toBe('trigger');
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('TriggerFiredBody');
   });
 
   it('ChildThreadCompleted: label is "Lucidos Engine" (engine fan-in raises it), system variant, no panel summary line (card owns the prefix)', () => {
@@ -379,7 +403,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  it('ChildThreadCompleted: details embed the ChildCompletionCard with child_thread_id, title, status, and summary', () => {
+  it('ChildThreadCompleted: details embed the ChildCompletionRow with child_thread_id, title, status, and summary', () => {
     const ex = exchangeWith({
       type: 'ChildThreadCompleted',
       child_thread_id: 'child-1',
@@ -392,7 +416,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     const node = desc.details as AnyVNode | undefined;
     expect(node).toBeDefined();
     expect(typeof node!.type).toBe('function');
-    expect((node!.type as { name?: string }).name).toBe('ChildCompletionCard');
+    expect((node!.type as { name?: string }).name).toBe('ChildCompletionRow');
     const props = node!.props as Record<string, unknown>;
     expect(props.childThreadId).toBe('child-1');
     expect(props.childThreadTitle).toBe('Refactor foo');

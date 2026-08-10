@@ -570,6 +570,141 @@ fn answer_kind_to_hook_value(
     }
 }
 
+/// SQL behind [`answered_question_recap`]: every `UserQuestionAsked` of one
+/// batch, joined to its answer, in ask order.
+///
+/// The batch is matched on the `{outer}#q` prefix (see [`synth_question_id`])
+/// with `left(…, length($2)) = $2` rather than `LIKE $2 || '%'`, because a
+/// `tool_use_id` is a `toolu_vrtx_…` string and `_` is a `LIKE` single-character
+/// wildcard: `LIKE` would also match a *different* batch whose id happens to
+/// agree everywhere the literal characters do.
+const ANSWERED_BATCH_SQL: &str = "SELECT q.payload->>'question' AS question, \
+            COALESCE(q.payload->'options', '[]'::jsonb) AS options, \
+            a.payload->'answer' AS answer \
+     FROM events q \
+     JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
+       AND left(q.payload->>'tool_use_id', length($2)) = $2 \
+     ORDER BY q.sequence";
+
+/// One answered sub-question, read back out of the event store.
+#[derive(Debug, sqlx::FromRow)]
+struct AnsweredSubQuestion {
+    question: String,
+    /// The `UserQuestionAsked.options` array, needed to turn a persisted
+    /// `opt-N` id back into the label the user actually saw.
+    options: serde_json::Value,
+    /// The `UserQuestionAnswered.answer` object (an `AnswerKind`).
+    answer: serde_json::Value,
+}
+
+/// How the user produced this answer, said in words the resumed agent cannot
+/// misread. The `FreeText` line is the load-bearing one: a typed reply that
+/// happens not to be "Approve" is NOT approval, and an agent resumed next to a
+/// teardown-stamped rejection will otherwise reach for exactly that inference.
+fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
+    let has_text = answer_kind
+        .get("text")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| !t.is_empty());
+    match answer_kind.get("kind").and_then(|k| k.as_str()) {
+        Some("Selected") => "The user picked that option.",
+        Some("MultiSelected") if has_text => {
+            "The user picked those options and typed the rest themselves."
+        }
+        Some("MultiSelected") => "The user picked those options.",
+        Some("FreeText") => {
+            "The user typed that themselves. It is not one of the options you \
+             offered, so it picks none of them: read it as what they actually want."
+        }
+        Some("Canceled") => "The question was canceled.",
+        _ => "That is the user's answer.",
+    }
+}
+
+/// The user's answer to the most recent question batch on `thread_id`, rendered
+/// as `Q:` / `A:` pairs for a resumed coding agent, or `None` when the thread
+/// has no answered question to recap.
+///
+/// This exists because the answer cannot always reach the agent the normal way.
+/// A coding agent blocked on a question is answered *in band*: the engine wakes
+/// the blocked hook (Claude Code) or MCP call (Codex) and the answer returns as
+/// that tool's result. But when the subprocess was torn down while the card was
+/// on screen, there is no blocked call left to wake, and the agent's own
+/// transcript has already closed the tool call, so the hook does not re-fire on
+/// `--resume` and its crash-recovery lookup never runs. The answer then reaches
+/// the model only if the engine puts it in the resume message, which is what
+/// `agent_recovery::continue_input_for_reason` does with this.
+///
+/// Read back out of the `events` table rather than carried in memory, so an
+/// engine restart between the answer and the respawn changes nothing
+/// (`CLAUDE.md` § Engine Statelessness).
+pub(crate) async fn answered_question_recap(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<String> {
+    let newest = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload->>'tool_use_id' FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // A DB error is not "this thread has no answer": say so, and fall
+        // through to the bare continue message rather than inventing silence.
+        log!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
+        None
+    })
+    .flatten()
+    .filter(|id| !id.is_empty())?;
+
+    // `{outer}#q{i}` back to `{outer}#q`, the prefix shared by the whole batch.
+    // An id with no `#q` at all yields a prefix nothing can match (`left()`
+    // clamps to the string's length, so `id` never equals `id#q`), and the
+    // caller falls back to the bare continue message. That is only reachable
+    // for rows predating `synth_question_id`, which cannot be the newest answer
+    // on a live continuation, and falling back is the safe direction anyway.
+    let (outer, _) = newest.rsplit_once("#q").unwrap_or((newest.as_str(), ""));
+    let prefix = format!("{outer}#q");
+
+    let rows: Vec<AnsweredSubQuestion> = sqlx::query_as(ANSWERED_BATCH_SQL)
+        .bind(thread_id)
+        .bind(&prefix)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
+            Vec::new()
+        });
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for row in &rows {
+        // `answer_kind_to_hook_value` resolves `opt-N` against a questions
+        // ARRAY at a given index, so wrap this row's options as a one-entry
+        // array: one definition of option-label resolution, not two.
+        let one = serde_json::json!([{ "options": row.options }]);
+        let rendered = answer_kind_to_hook_value(&row.answer, &one, 0);
+        let value = rendered.as_str().unwrap_or_default();
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "Q: {}\nA: {}\n   ({})\n",
+            row.question,
+            value,
+            answer_kind_note(&row.answer)
+        ));
+    }
+    Some(out)
+}
+
 /// Build the `{question_text: answer_label}` map both channels send back to
 /// their LLM (CC via the hook tool result; chat via the tool result string).
 /// A question with no collected answer (loop short-circuited on cancel)
@@ -844,10 +979,15 @@ pub async fn answer_pending_question(
     arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer).await;
 
     // Wake the blocked hook (if any). No-op if nothing is registered:
-    // - Engine restart killed the hook; on resume the endpoint's crash-recovery
-    //   path reads the just-persisted UserQuestionAnswered from the DB instead.
-    // - User answered before the hook re-registered after a transient error;
-    //   same crash-recovery path covers it.
+    // - The subprocess died with the hook (teardown, restart, kill). Nothing
+    //   re-runs that hook: the agent's transcript has already closed the tool
+    //   call, so the answer travels instead as the body of the
+    //   `answered_after_idle` resume message (`answered_question_recap`).
+    // - User answered before the hook re-registered after a transient error.
+    //   Here the subprocess IS alive and the tool call still open, so the hook
+    //   really does re-fire and the endpoint's crash-recovery path reads the
+    //   just-persisted UserQuestionAnswered from the DB. This is the one case
+    //   that lookup still serves.
     notify_and_release_waiter(engine, &tool_use_id, &answer).await;
 
     ensure_resume_after_answer(
@@ -963,9 +1103,10 @@ pub(crate) fn resume_anchor_for_ask(
 /// Re-enter a chat thread's agentic loop after its `ask_user_question` was
 /// answered with NO live in-process loop — the loop died on an engine restart
 /// while the card was on screen. This is the chat parity of the coding-agent
-/// resume: CC re-fires its hook via `--resume` and reads the persisted answer;
-/// chat has no subprocess, so we reconstruct the tool pair and re-run the
-/// agentic loop as a continuation.
+/// resume: each lane hands the answer back itself rather than waiting for the
+/// agent to ask again. The coding-agent lane puts it in the `--resume`
+/// message ([`answered_question_recap`]); chat has no subprocess, so we
+/// reconstruct the tool pair and re-run the agentic loop as a continuation.
 ///
 /// Emits the `ToolResult{ask_user_question}` the dead loop never got to emit —
 /// pairing the dangling `ToolCalled` with the REAL answer (built from the
@@ -1155,10 +1296,16 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
 }
 
 /// If no live Claude Code subprocess exists for `thread_id`, emit a `ContinuationRequested`
-/// so the spawn dispatcher boots a fresh subprocess via `--resume`. The new
-/// subprocess re-runs the `AskUserQuestion` PreToolUse hook, whose
-/// crash-recovery path reads the just-persisted `UserQuestionAnswered` from
-/// the DB and lets CC continue the turn.
+/// so the spawn dispatcher boots a fresh subprocess via `--resume`.
+///
+/// **The answer travels in that continuation's resume message**, built by
+/// `agent_recovery::continue_input_for_reason` from
+/// [`answered_question_recap`]. It does NOT travel by the resumed subprocess
+/// re-running its `AskUserQuestion` hook: on teardown Claude Code closes the
+/// pending tool call in its own transcript as rejected, so there is nothing
+/// dangling to re-run, the hook never fires, and `walk_question_batch`'s
+/// crash-recovery lookup never executes. This doc asserted that dead mechanism
+/// until 2026-08-10; do not "simplify" the recap away on the strength of it.
 ///
 /// `AnswerKind::Canceled` is the engine-internal sentinel used by
 /// `archive_thread` to resolve a pending question card before tearing the

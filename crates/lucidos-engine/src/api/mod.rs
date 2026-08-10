@@ -54,6 +54,7 @@ mod threads;
 mod threads_compose;
 mod trigger_groups;
 mod triggers;
+mod workspace_label;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -1124,6 +1125,7 @@ pub fn create_router(
         .merge(data_api::router())
         .merge(blobs::router())
         .merge(plugins::router())
+        .merge(workspace_label::router())
         .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
         // Axum's 2 MiB default rejects mobile screenshots in chat/app-capture

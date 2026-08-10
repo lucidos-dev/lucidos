@@ -580,7 +580,8 @@ pub(in crate::api) async fn list_thread_event_waits(
 /// deciding whose action the event log attributes it to, which is exactly the
 /// thing an actor must not be.
 ///
-/// Body: `{"wait_id": "..."}` or `{"all": true}`, exactly one.
+/// Body: `{"wait_id": "..."}`, `{"on": "EventType"}` or `{"all": true}`,
+/// exactly one.
 pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -591,6 +592,9 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
     let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Trimmed and emptied by `resolve_cancel_target`, which is the one place
+    // that decides what counts as "an argument was passed" for all three.
+    let on = args.get("on").and_then(|v| v.as_str());
     let wait_id = match args
         .get("wait_id")
         .and_then(|v| v.as_str())
@@ -611,7 +615,7 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     // agent would read. The two agents get identical wording by construction.
     match state
         .engine
-        .cancel_event_waits_for_agent(thread_uuid, wait_id, all)
+        .cancel_event_waits_for_agent(thread_uuid, wait_id, on, all)
         .await
     {
         crate::engine::event_wait::CancelEventWaitOutcome::Stopped(message) => Ok(Json(

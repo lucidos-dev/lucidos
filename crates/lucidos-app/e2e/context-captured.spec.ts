@@ -5,6 +5,7 @@ import {
   sendMessage,
   waitForResponse,
   assertHealthy,
+  revealSteps,
 } from './helpers';
 
 test.describe('ContextCaptured modal', () => {
@@ -20,11 +21,7 @@ test.describe('ContextCaptured modal', () => {
     await waitForResponse(page);
 
     // Inline steps are hidden by default (`stepsExpanded` in localStorage).
-    const showStepsBtn = page
-      .locator('button.details-toggle:visible', { hasText: 'Show steps' })
-      .first();
-    await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
-    await showStepsBtn.click();
+    await revealSteps(page);
 
     // The context counter on the step row is the viewer's only door: the rest
     // of the row opens the step detail instead (asserted at the end).
@@ -98,11 +95,7 @@ test.describe('ContextCaptured modal', () => {
       }
     });
 
-    const showStepsBtn = page
-      .locator('button.details-toggle:visible', { hasText: 'Show steps' })
-      .first();
-    await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
-    await showStepsBtn.click();
+    await revealSteps(page);
 
     const counter = page
       .locator('[data-role="inline-step"]:visible [data-role="step-context"]')

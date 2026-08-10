@@ -457,6 +457,11 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     // Mobile passes `forceVisible`, so this never fires there: the threads pane
     // keeps whichever view it was showing when the user swiped away, which is
     // what every other pane does.
+    //
+    // It runs at mount too, which is what keeps the panel's persisted open state
+    // honest across a reload: booting with the drawer closed clears it, so the
+    // stored "showing filters" can only ever be a drawer that was visible with
+    // the panel up.
     useEffect(() => {
         if (!visible) closeThreadFilterPanel();
     }, [visible]);

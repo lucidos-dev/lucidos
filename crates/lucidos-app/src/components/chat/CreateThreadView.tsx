@@ -13,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isNavigationScroll } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -62,7 +62,7 @@ const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeInfo>();
  *  The payload is stringified HERE, once per grouping pass, for two reasons: a
  *  string is a primitive the memo can compare without a deep walk, and the
  *  formatting is a pure function of the value with nothing per-render about it. */
-type DeliveredEventInfo = { eventType: string; payloadJson?: string };
+type DeliveredEventInfo = { eventType: string; eventId?: string; payloadJson?: string };
 
 function buildDeliveredEventInfo(exchanges: Exchange[]): Map<string, DeliveredEventInfo> {
   const map = new Map<string, DeliveredEventInfo>();
@@ -71,6 +71,10 @@ function buildDeliveredEventInfo(exchanges: Exchange[]): Map<string, DeliveredEv
       if (event.type !== 'EventWaitDelivered' || !event._eventId) continue;
       map.set(event._eventId, {
         eventType: event.event_type,
+        // The event that MATCHED, not this delivery's own id: it is what the
+        // wake card's jump navigates to. Absent on a delivery the engine wrote
+        // without one.
+        eventId: event.event_id,
         payloadJson: formatDeliveredPayload(event.payload),
       });
     }
@@ -222,6 +226,7 @@ export function renderExchanges(
         proposedChangeDesc={proposedSeed?.description}
         proposedChangeFileCount={proposedSeed?.fileCount}
         wakeEventType={wakeDelivery?.eventType}
+        wakeEventId={wakeDelivery?.eventId}
         wakePayloadJson={wakeDelivery?.payloadJson}
       />
     );
@@ -293,7 +298,7 @@ export function renderExchanges(
   return nodes;
 }
 
-// --- Scroll anchoring for toggle changes (More/Less, Show/Hide Steps) ---
+// --- Scroll anchoring for turn-control changes (full response, steps) ---
 //
 // When toggling global signals (stepsExpanded, detailsExpanded), ALL ChatExchange
 // components re-render, changing content height. Without compensation, the scroll
@@ -345,13 +350,24 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // black until a scroll forces a repaint. Trigger that repaint proactively.
     forceIOSRepaint(container);
 
-    // iOS may adjust after unfreeze — re-check in next frame.
+    // Tell the transcript that THIS correction was ours, so it cannot read as the
+    // reader scrolling away and retire their standing follow (only a scroll may
+    // do that), and glide them back to the live edge if they were riding it.
+    // After the unfreeze and the repaint nudge, so the glide it may start is not
+    // fighting either. See `honourAnchoredMutation`.
+    honourAnchoredMutation(container);
+
+    // iOS may adjust after unfreeze, so re-check in the next frame. Skipped while
+    // the app is driving this container's scroll: `honourAnchoredMutation` may
+    // have started a glide, and re-asserting the pre-glide offset against it is a
+    // frame of jitter for a correction the tween makes moot anyway.
     if (delta !== 0) {
       requestAnimationFrame(() => {
-        if (!el.isConnected) return;
+        if (!el.isConnected || isNavigationScroll(container)) return;
         const target = scrollBefore + (el.offsetTop - offsetBefore);
         if (Math.abs(container.scrollTop - target) > 1) {
           container.scrollTop = target;
+          honourAnchoredMutation(container);
         }
       });
     }

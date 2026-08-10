@@ -4,6 +4,7 @@ import { isMobile } from '../../utils/viewport';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
+import { SkeletonProvider, SkText } from './Skeleton';
 
 export interface DropdownOption {
   value: string;
@@ -447,5 +448,42 @@ export function Dropdown({
           ))}
       </Overlay>
     </div>
+  );
+}
+
+/**
+ * A dropdown-shaped loading skeleton, for a control whose value is still in flight.
+ *
+ * It lives here, beside the real thing, and it wears the trigger's OWN
+ * `.dropdown-trigger` box rather than a hand-sized `SkBlock`: padding, border,
+ * radius, the flex gap and the font metrics then come from one rule, so the
+ * skeleton is the size of the control that replaces it and the row does not jump
+ * on settle. A `SkBlock` measured by eye is right only until someone re-pads
+ * the trigger.
+ *
+ * The chevron is drawn as its real glyph for the same reason. Everything about
+ * its footprint (`.dropdown-chevron`'s own smaller font size, and the gap the
+ * trigger puts before it) is then the trigger's rule rather than a second
+ * guess, and the skeleton is not narrower than the control by exactly a chevron.
+ * It is the one part shown rather than shimmered: a skeleton is meant to read as
+ * the shape of what is coming, and this part of the shape is already known.
+ *
+ * Only the LABEL is guessed. `w` is the width of the widest label the slot will
+ * show, since nothing can know that before the options land.
+ *
+ * Gate it behind `useDelayedFlag` and wrap it in `<LoadingFade>` like every
+ * other skeleton (`.claude/rules/frontend.md`), so a fast load never shows it
+ * and a slow one crossfades out instead of snapping.
+ */
+export function DropdownSkeleton({ w }: { w: string }) {
+  return (
+    <SkeletonProvider>
+      {/* A span, not the real <button>: a skeleton must not be focusable or
+          announced, and `.dropdown-skeleton` drops the trigger's hover tell. */}
+      <span class="dropdown-trigger dropdown-skeleton" aria-hidden="true">
+        <SkText w={w} />
+        <span class="dropdown-chevron">{'▾'}</span>
+      </span>
+    </SkeletonProvider>
   );
 }

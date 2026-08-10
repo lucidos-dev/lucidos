@@ -12,7 +12,7 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // scrollToBottom() needs document.querySelector and requestAnimationFrame
+  // setFollowLiveEdge() needs document.querySelector and requestAnimationFrame
   if (typeof globalThis.document === 'undefined') {
     (globalThis as any).document = {};
   }
@@ -30,7 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
-import { awayFromBottom, isFollowScroll, notAtTop, scrollToBottom, setActiveScrollElement, stopFollowingBottom } from '../../components/chat/scrollState';
+import { awayFromBottom, isFollowScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -129,10 +129,15 @@ describe('focusThread', () => {
   // itself is not lost: it is recorded as that thread's reading position and
   // resumed on re-entry (see `hooks/useScrollMemory.ts`).
   describe('the standing follow and the thread being opened', () => {
+    /** A transcript whose reader is already AT the live edge, so arming the
+     *  follow writes no scroll and runs no tween. These tests are about
+     *  `focusThread` retiring the follow, not about how the toggle travels, and
+     *  the rAF stub at the top of this file runs its callback synchronously,
+     *  which a tween would recurse on forever. */
     function makeTranscript() {
       return {
         parentElement: null,
-        scrollTop: 0,
+        scrollTop: 8500, // 9000 - 500, the live edge
         scrollHeight: 9000,
         clientHeight: 500,
         getBoundingClientRect: () => ({ width: 400, height: 500 }),
@@ -153,7 +158,7 @@ describe('focusThread', () => {
     it('retires it when the reader opens a DIFFERENT thread', () => {
       withTranscript((el) => {
         focusThread('t1');
-        scrollToBottom(); // the reader arms it here
+        setFollowLiveEdge(true); // the reader arms it here
         expect(isFollowScroll(el)).toBe(true);
 
         focusThread('t2');
@@ -167,7 +172,7 @@ describe('focusThread', () => {
       // the follow with nothing left to resume it.
       withTranscript((el) => {
         focusThread('t1');
-        scrollToBottom();
+        setFollowLiveEdge(true);
 
         focusThread('t1');
         expect(isFollowScroll(el)).toBe(true);
@@ -179,7 +184,7 @@ describe('focusThread', () => {
       // the active one, so a follow left armed would ride its growth instead.
       withTranscript((el) => {
         focusThread('t1');
-        scrollToBottom();
+        setFollowLiveEdge(true);
 
         unfocusThread();
         expect(isFollowScroll(el)).toBe(false);

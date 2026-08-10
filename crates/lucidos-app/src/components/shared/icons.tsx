@@ -201,6 +201,146 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
+/** An arrow coming down onto a LINE it cannot pass: the *standing follow*'s
+ *  toggle, in the prompt area. The line is the live edge and the arrow is the
+ *  reader being held against it, which is the conventional stick-to-the-end mark.
+ *
+ *  Deliberately NOT `ChevronDownIcon`, which the scroll button keeps. The two
+ *  controls do two different things and stopped being one button precisely
+ *  because they cannot be: the chevron NAVIGATES to the bottom, this one STAYS
+ *  there. Sharing a glyph would say they are the same act.
+ *
+ *  No inline size, unlike the two chevrons above: this renders inside `.icon-btn`,
+ *  whose class sizes the svg and whose rule bans an inline size for that reason
+ *  (see `FullResponseIcon`). Drawn with the shaft short and the line full width,
+ *  so at `--icon-size-md` the two marks stay separate rather than smudging, which
+ *  is the failure `CollapseTurnIcon` records for three horizontal marks. */
+export function FollowLiveEdgeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="12" y1="4" x2="12" y2="13"/>
+      <polyline points="7 9 12 14 17 9"/>
+      <line x1="5" y1="19" x2="19" y2="19"/>
+    </svg>
+  );
+}
+
+/** One chevron: there is more of this response than you are being shown.
+ *  Worn by the response header's full-response toggle.
+ *
+ *  It does NOT change with the toggle's state, which took two goes to get
+ *  right. It started as an unfold/fold pair, on the reasoning that the text
+ *  link it replaced said which way the next click went ("More" / "Less") and a
+ *  fixed glyph cannot. But the two forms have the same box and very different
+ *  ink (points at the extremes against bars at the extremes), so the mark
+ *  visibly changed size on every click while the body under it was also
+ *  moving: reported as the layout dancing. Brightness already answers "is it
+ *  on" (see `.response-controls` in styles/chat/response.css), which is
+ *  exactly how the neighbouring steps control has always worked.
+ *
+ *  Kept here rather than reusing `ChevronDownIcon`, which hardcodes a 1.25rem
+ *  inline width/height for the scroll-to-bottom button. Inside `.icon-btn` the
+ *  class has to override that, and the CSS rule bans an inline size for
+ *  exactly that reason. Drawn a touch wider and deeper than that one, which is
+ *  what keeps it legible at the 0.875rem this renders at. */
+export function FullResponseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="5 9 12 16 19 9"/>
+    </svg>
+  );
+}
+
+/** Two arrowheads, pointing at each other to fold this turn away and apart to
+ *  unfold it. The third of the response header's controls, and the odd one out:
+ *  the other two flip a setting that spans the transcript, this one folds THIS
+ *  turn to its `⋯` stub.
+ *
+ *  It was drawn with a full-width line between the two, on the reasoning that
+ *  the line is what the arrows are being squashed onto. Three horizontal marks
+ *  do not survive the size this renders at. `--icon-size-sm` is 0.875rem, so
+ *  the 24-unit box is 14px on a plain desktop root: the tips sat 3.5 units off
+ *  the line, the 2-unit stroke ate 2 of those, and the ~0.9px left over is
+ *  under a device pixel. The three marks smudged into one blob, while both
+ *  neighbours are single open marks with air around them and read fine at the
+ *  same size. Dropping the line leaves the two arrowheads a clear channel
+ *  between them, and the convergence carries the meaning on its own.
+ *
+ *  Deliberately shallower and narrower than `FullResponseIcon`, which is one
+ *  wide chevron two buttons to the left in the same group: these read as
+ *  arrowheads pointing at each other, not as a chevron and its mirror.
+ *
+ *  **This is the one control whose glyph moves with its state, and that is a
+ *  deliberate exception to the rule `FullResponseIcon` above records.** Not a
+ *  loophole in it: the banned `UnfoldIcon` was built exactly like this, two
+ *  arrowheads each reflected about its own midline, and its two forms shared a
+ *  span (x 5 to 19, y 2 to 22), a summed segment length and a stroke count just
+ *  as these do. So "same box, same ink" is NOT what distinguishes this case, and
+ *  an argument from geometry here would be false. What made that mark look like
+ *  it changed size is the property both pairs have: converging puts the two wide
+ *  endpoints at the extremes of the box, diverging puts the two apexes there.
+ *
+ *  The exception is bought with a different currency. That flip was pure cost,
+ *  because `aria-pressed` plus the brightness rule already answered "is it on",
+ *  so the movement bought nothing. This control is exempt from that brightness
+ *  rule (see `.response-controls` in styles/chat/response.css), because bright
+ *  meaning FOLDED inverts what bright means on the two controls beside it. So
+ *  direction is not one state cue among two here, it is the only one there is.
+ *  It also points the way the next click goes, agreeing with the tooltip
+ *  ("Collapse this turn" / "Expand this turn").
+ *
+ *  What IS carried over is the other half of that commit's complaint, which was
+ *  that the mark was simply too big: 22 of 24 units of ink against the log
+ *  glyph's 12, towering over the label and its neighbour. This one is 14 with
+ *  its round caps, two units over the log glyph and no longer standing out of
+ *  the row. It was 18 first, on the reasoning that a 6-unit gap between the
+ *  apexes is what stops the two arrowheads fusing at 14px. The gap IS the thing
+ *  that has to survive, but 6 was overpaying for it, and the reported complaint
+ *  was precisely the air in the middle: 4 units leaves 2 of daylight after the
+ *  stroke, ~1.2px at 14px and a clear channel on any 2x display.
+ *
+ *  Note what the smudge that started this is NOT evidence for. It was the same
+ *  SHAPE as this: those arrowheads pinched at one x too (their tips 3.5 units
+ *  off the line, opening to 7.5 at the wing tips), so "point pinch, not a
+ *  uniform channel" distinguishes nothing and would be a false argument here.
+ *  Three things separate them, and all three are quantities. Its 3.5 left 1.5
+ *  of daylight, ~0.9px, UNDER a device pixel where 2 units clears one. There
+ *  were two such pinches, because there were three marks. And it opened to 5.5
+ *  units of daylight at its widest against this one's 10, since the pair now
+ *  spans the full 12 units where those arrowheads spanned 8. The waist runs
+ *  both ways: converging it is 4 where the apexes meet in the middle and 12 out
+ *  at the wing tips, diverging it is the mirror. The arrowheads lost a unit of
+ *  depth each in the same pass (rise 4 over run 6, from 5), since the ask was
+ *  total height and halving the gap alone would have left the mark tall and the
+ *  two chevrons nearly touching.
+ *  `__tests__/turn-controls.test.tsx` pins the envelope so it cannot drift
+ *  back toward the banned mark's size. */
+export function CollapseTurnIcon({ collapsed = false }: { collapsed?: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points={collapsed ? '6 10 12 6 18 10' : '6 6 12 10 18 6'}/>
+      <polyline points={collapsed ? '6 14 12 18 18 14' : '6 18 12 14 18 18'}/>
+    </svg>
+  );
+}
+
+/** Step-log glyph: three leader-dot lines, the shape of the tool-by-tool log
+ *  the steps toggle reveals. Deliberately not `TodoListIcon`'s ticked box,
+ *  which already means the todo list; the two would otherwise sit within a
+ *  few rem of each other on the same turn. */
+export function StepLogIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="4.5" cy="7" r="1.15" fill="currentColor" stroke="none"/>
+      <line x1="8.5" y1="7" x2="20" y2="7"/>
+      <circle cx="4.5" cy="12" r="1.15" fill="currentColor" stroke="none"/>
+      <line x1="8.5" y1="12" x2="20" y2="12"/>
+      <circle cx="4.5" cy="17" r="1.15" fill="currentColor" stroke="none"/>
+      <line x1="8.5" y1="17" x2="16" y2="17"/>
+    </svg>
+  );
+}
+
 export function FileIcon({ size = '1rem' }: { size?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -524,7 +664,7 @@ export function PowerIcon() {
 // muted variant is exactly the same shape in a different colour.
 export function LucidosMarkIcon() {
   return (
-    <svg viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">
+    <svg class="lucidos-mark-icon" viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">
       <g transform="translate(13 13) scale(0.74)">
         <rect x="17" y="17" width="29" height="29" rx="7" />
         <rect x="17" y="54" width="29" height="29" rx="7" />

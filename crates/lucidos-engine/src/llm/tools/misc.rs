@@ -450,17 +450,21 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::CANCEL_EVENT_WAIT.to_string(),
-            description: "Stand down a subscription this thread armed with `await_event`: one by `wait_id`, or all with `all: true`. THIS IS HOW YOU STOP WATCHING, and one you leave live wakes this thread later whatever you told the user. Stopping is silent, so carry straight on in this turn. Pass exactly one argument.".to_string(),
+            description: "Stand down a subscription this thread armed with `await_event`: one by `wait_id`, the ones watching an event type with `on`, or all with `all: true`. THIS IS HOW YOU STOP WATCHING, and one you leave live wakes this thread later whatever you told the user. Stopping is silent, so carry straight on in this turn. Pass exactly one argument.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "wait_id": {
                         "type": "string",
-                        "description": "The subscription to stop, from `list_event_waits`. Omit when passing `all`."
+                        "description": "The subscription to stop, from `list_event_waits`. Omit when passing `on` or `all`."
+                    },
+                    "on": {
+                        "type": "string",
+                        "description": "Stop the ones watching this event type, no id needed. Use it over `all` when you got the answer about one thing and are still waiting on others."
                     },
                     "all": {
                         "type": "boolean",
-                        "description": "Stop every live subscription on this thread. Prefer a `wait_id` when one of several is meant."
+                        "description": "Stop every live subscription on this thread. Prefer `wait_id` or `on` when only some of them are meant."
                     }
                 },
                 "required": []
@@ -473,7 +477,7 @@ pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::TODO_WRITE.to_string(),
-            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away).".to_string(),
+            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you call this again.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -809,7 +809,23 @@
         pointer-events: none;
     }
 
-    :root[data-keyboard-active] .thread-content {
+    /* The transcript's CONTENT, never the scroller itself. `pointer-events` is
+       an inherited property, so blocking the children inerts the whole subtree
+       while `.thread-content` stays a hit target, and that difference is the
+       whole point: a touch is hit-tested to the deepest element that answers
+       the pointer, and the browser then pans that element's nearest scrollable
+       ancestor. Blocking the scroller sent the touch to `.thread-content-wrap`,
+       which scrolls nothing, so the transcript FROZE the moment a textarea took
+       focus: no scrolling, and no reaching a live question card's options. The
+       horizontal pane swipe kept working (its handler is on the swipe
+       container, above the wrap), which is exactly how the report read: "swipe
+       up/down did not work, frozen, swipe left/right worked".
+
+       Stray taps are still blocked, which is all this block was ever for: with
+       every child inert the tap lands on the scroller, a non-focusable element,
+       so WebKit blurs the composer and the keyboard drops instead of a message,
+       step, or option being activated behind it. */
+    :root[data-keyboard-active] .thread-content > * {
         pointer-events: none;
     }
 
@@ -821,7 +837,7 @@
        here it killed the suggestions the moment the user typed anything, so
        tapping one silently did nothing on iOS. Same carve-out shape as the
        title row's pin button above and `.prompt-area` below. */
-    :root[data-keyboard-active] .compose-empty .thread-content {
+    :root[data-keyboard-active] .compose-empty .thread-content > * {
         pointer-events: auto;
     }
 
@@ -1207,6 +1223,30 @@
        Centering causes the prompt to jump when the first message is sent. */
     .compose-empty .thread-pane-body {
         justify-content: flex-end;
+    }
+
+    /* The welcome floats in the middle of the free space instead of docking on
+       the composer: the wrap takes everything between the header and the prompt
+       and centres the surface in it. The PROMPT is untouched and stays pinned to
+       the bottom by the rule above, so the reason that rule exists (a centered
+       prompt jumps when the first message is sent) is not reopened: the welcome
+       is gone entirely the moment a thread has an exchange, and the composer
+       never moves. Scoped to the wrap that actually holds the welcome
+       (`:has(> .thread-content.visible)`), so a dismissed welcome renders no wrap
+       and the bottom dock above is all that applies. Specificity (0,5,0) beats
+       shell.css's content-height `flex: 0 0 auto` on the same wrap, which is what
+       keeps the DESKTOP group (welcome + prompt, centered as a unit) compact.
+
+       `safe center` is the overflow fallback: the wrap is `overflow: hidden`, so
+       a welcome taller than the free space (the keyboard up on a short phone)
+       would otherwise be clipped at BOTH ends, losing the greeting and the
+       action at the top. Safe alignment falls back to `start` there, keeping the
+       top intact. The plain `center` before it is the value an engine without
+       safe-alignment support keeps. */
+    .mobile-swipe-pane .compose-empty .thread-content-wrap:has(> .thread-content.visible) {
+        flex: 1 1 auto;
+        justify-content: center;
+        justify-content: safe center;
     }
 
     /* File search overlay starts below the mobile header. max() ensures it

@@ -1,7 +1,8 @@
 //! Unit tests for the agent's own subscription surface.
 //!
 //! The pure seams are here: what a subscription looks like to the agent, how
-//! the list reads, and which `wait_id` / `all` combinations are legal. The
+//! the list reads, which `wait_id` / `on` / `all` combinations are legal, and
+//! which subscriptions an `on` stop addresses. The
 //! engine-level halves (thread scoping and the `AgentStandDown` cause) need a
 //! real engine and a real bus, so they live in the e2e-api suite
 //! (`crates/lucidos-e2e/tests/api_support/event_wait_test.rs`), which drives
@@ -150,35 +151,131 @@ fn the_list_names_each_subscription_its_reason_and_both_ages() {
 // ── the cancel arguments ────────────────────────────────────────────
 
 #[test]
-fn a_cancel_names_either_one_subscription_or_all_of_them() {
+fn a_cancel_names_one_subscription_an_event_type_or_all_of_them() {
     let id = Uuid::new_v4();
     assert_eq!(
-        resolve_cancel_target(Some(id), false).unwrap(),
+        resolve_cancel_target(Some(id), None, false).unwrap(),
         CancelTarget::One(id)
     );
     assert_eq!(
-        resolve_cancel_target(None, true).unwrap(),
+        resolve_cancel_target(None, Some("E2ELockReleased"), false).unwrap(),
+        CancelTarget::On("E2ELockReleased".into())
+    );
+    assert_eq!(
+        resolve_cancel_target(None, None, true).unwrap(),
         CancelTarget::All
     );
 }
 
-/// Neither silent default is right for a destructive verb: `all` would stop
-/// four subscriptions when the agent meant one, and a no-op would report
-/// success for nothing.
+/// No silent default is right for a destructive verb: `all` would stop four
+/// subscriptions when the agent meant one, and a no-op would report success for
+/// nothing.
 #[test]
 fn a_cancel_with_no_target_is_refused_rather_than_defaulted() {
-    let err = resolve_cancel_target(None, false).unwrap_err();
+    let err = resolve_cancel_target(None, None, false).unwrap_err();
     assert!(err.starts_with("Error:"), "{err}");
     assert!(err.contains("wait_id"), "{err}");
+    assert!(err.contains("on"), "{err}");
     assert!(err.contains("all"), "{err}");
     // Actionable: it says where to get the id.
     assert!(err.contains("list_event_waits"), "{err}");
 }
 
+/// Every pair, and the triple. They address different sets, so more than one is
+/// a caller that has not decided which set it means.
 #[test]
-fn a_cancel_naming_both_is_refused_as_ambiguous() {
-    let err = resolve_cancel_target(Some(Uuid::new_v4()), true).unwrap_err();
-    assert!(err.contains("not both"), "{err}");
+fn a_cancel_naming_several_targets_is_refused_as_ambiguous() {
+    let id = Uuid::new_v4();
+    for (wait_id, on, all) in [
+        (Some(id), None, true),
+        (Some(id), Some("E2ELockReleased"), false),
+        (None, Some("E2ELockReleased"), true),
+        (Some(id), Some("E2ELockReleased"), true),
+    ] {
+        let err = resolve_cancel_target(wait_id, on, all).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+}
+
+/// A whitespace-only `on` is the caller's typo, not an event type nothing is
+/// watching. Reading it as present would refuse with "nothing is watching for
+/// ` `", which reads as a fact about the thread rather than about the call.
+#[test]
+fn a_blank_on_is_absent_rather_than_an_event_type() {
+    let err = resolve_cancel_target(None, Some("   "), false).unwrap_err();
+    assert!(err.contains("list_event_waits"), "{err}");
+    // And a padded one still names the event type it meant.
+    assert_eq!(
+        resolve_cancel_target(None, Some("  E2ELockReleased "), false).unwrap(),
+        CancelTarget::On("E2ELockReleased".into())
+    );
+}
+
+// ── which subscriptions an `on` stop addresses ──────────────────────
+
+/// The name only, ignoring any `condition`. "I no longer need to be told about
+/// X" means every watch that could fire on an X, whatever slice of it each one
+/// asked for: a thread holding a filtered and an unfiltered watch on the same
+/// event would otherwise be left with the filtered one still armed.
+#[test]
+fn an_on_stop_addresses_every_watch_for_that_event_whatever_it_filters() {
+    let now = Utc::now();
+    let unfiltered = wait_at(now, 10, 600, vec![sub("E2ELockReleased", None)]);
+    let filtered = wait_at(
+        now,
+        10,
+        600,
+        vec![sub("E2ELockReleased", Some(json!({"outcome": "released"})))],
+    );
+    let among_several = wait_at(
+        now,
+        10,
+        600,
+        vec![sub("ReleasePublished", None), sub("E2ELockReleased", None)],
+    );
+    let unrelated = wait_at(now, 10, 600, vec![sub("ChangeProposed", None)]);
+
+    assert!(unfiltered.watches("E2ELockReleased"));
+    assert!(filtered.watches("E2ELockReleased"));
+    assert!(!unrelated.watches("E2ELockReleased"));
+
+    // A wait watching SEVERAL event types answers yes to each, so a stand-down
+    // by one of its names ends the whole thing. Intended, and the sharpest
+    // edge on this verb: a wait is one rendezvous with several triggers, spent
+    // by the first match, not several watches sharing a row, so there is no
+    // `ReleasePublished` leg left to be woken by once the other is gone. The
+    // alternative is replacing it with a subscription the caller never armed,
+    // and nothing in this family mutates a wait (ADR 0059).
+    assert!(among_several.watches("E2ELockReleased"));
+    assert!(among_several.watches("ReleasePublished"));
+    // What makes that honest rather than silent: the report names every type it
+    // ended, so the caller reads that the other leg went with it.
+    assert_eq!(
+        describe_subscriptions(&among_several.on),
+        "ReleasePublished or E2ELockReleased"
+    );
+    // Exact, not a prefix or a case-fold: event types are exact names
+    // everywhere else, and a loose match here would end a watch nobody named.
+    assert!(!unfiltered.watches("E2ELock"));
+    assert!(!unfiltered.watches("e2elockreleased"));
+    assert!(!unfiltered.watches("E2ELockAcquired"));
+}
+
+/// The success sentence says what is now true AND what it deliberately left
+/// alone, because an agent that reads only the first clause tells the user it
+/// stood everything down.
+#[test]
+fn an_on_stop_counts_the_watches_it_left_standing() {
+    let none_left = on_stop_settled("E2ELockReleased", 0);
+    assert!(none_left.contains("Nothing on this thread watches E2ELockReleased"));
+    assert!(
+        !none_left.contains("other subscription"),
+        "a thread with nothing else live says so by their absence: {none_left}"
+    );
+    assert!(on_stop_settled("E2ELockReleased", 1)
+        .contains("1 other subscription(s) on this thread is still live"));
+    assert!(on_stop_settled("E2ELockReleased", 3)
+        .contains("3 other subscription(s) on this thread are still live"));
 }
 
 // ── thread scoping ──────────────────────────────────────────────────
@@ -240,7 +337,7 @@ async fn the_list_is_per_thread_and_newest_first() {
     assert_eq!(names, vec!["Newer", "Older"]);
 }
 
-// ── stopping all of them ────────────────────────────────────────────
+// ── stopping several of them ────────────────────────────────────────
 
 fn outcome_text(o: CancelEventWaitOutcome) -> (bool, String) {
     match o {
@@ -249,16 +346,42 @@ fn outcome_text(o: CancelEventWaitOutcome) -> (bool, String) {
     }
 }
 
+/// The `all` scope's own settled sentence, as `cancel_all_for_agent` passes it.
+const ALL_SETTLED: &str = "Nothing is subscribed on this thread any more.";
+
 #[test]
 fn stopping_all_of_them_reports_success_only_when_nothing_is_left() {
-    let (ok, text) = outcome_text(all_stop_outcome(
+    let (ok, text) = outcome_text(stop_outcome(
         &["ChangeProposed".into(), "ReleasePublished".into()],
         &[],
+        ALL_SETTLED,
     ));
     assert!(ok);
     assert!(text.contains("ChangeProposed"), "{text}");
     assert!(text.contains("ReleasePublished"), "{text}");
     assert!(text.contains("Nothing is subscribed"), "{text}");
+}
+
+/// The success case is the only thing the two scopes say differently, so an
+/// `on` stop reports what it stopped and then its own closing sentence, never
+/// `all`'s claim that the thread is now watching nothing.
+#[test]
+fn stopping_by_event_type_never_claims_the_thread_is_watching_nothing() {
+    let (ok, text) = outcome_text(stop_outcome(
+        &["E2ELockReleased".into()],
+        &[],
+        &on_stop_settled("E2ELockReleased", 2),
+    ));
+    assert!(ok);
+    assert!(
+        text.contains("Stopped watching for E2ELockReleased"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Nothing is subscribed"),
+        "two other watches are still live: {text}"
+    );
+    assert!(text.contains("2 other subscription(s)"), "{text}");
 }
 
 /// **A partial stop is a failure.** An `all` stop is one emit per subscription,
@@ -267,9 +390,10 @@ fn stopping_all_of_them_reports_success_only_when_nothing_is_left() {
 /// the exact lie this whole surface exists to stop the agent telling.
 #[test]
 fn a_partial_stop_is_refused_and_names_what_is_still_running() {
-    let (ok, text) = outcome_text(all_stop_outcome(
+    let (ok, text) = outcome_text(stop_outcome(
         &["A".into(), "B".into(), "C".into()],
         &["B".into()],
+        ALL_SETTLED,
     ));
     assert!(!ok, "a subscription that is still live is not a success");
     assert!(text.starts_with("Error:"), "{text}");
@@ -282,9 +406,10 @@ fn a_partial_stop_is_refused_and_names_what_is_still_running() {
 
 #[test]
 fn a_total_failure_says_every_subscription_is_still_running() {
-    let (ok, text) = outcome_text(all_stop_outcome(
+    let (ok, text) = outcome_text(stop_outcome(
         &["A".into(), "B".into()],
         &["A".into(), "B".into()],
+        ALL_SETTLED,
     ));
     assert!(!ok);
     assert!(text.contains("still live"), "{text}");
@@ -298,14 +423,19 @@ fn a_total_failure_says_every_subscription_is_still_running() {
 /// it to a person.
 #[test]
 fn a_partial_stop_agrees_with_how_many_survived() {
-    let (_, one) = outcome_text(all_stop_outcome(&["A".into(), "B".into()], &["B".into()]));
+    let (_, one) = outcome_text(stop_outcome(
+        &["A".into(), "B".into()],
+        &["B".into()],
+        ALL_SETTLED,
+    ));
     assert!(
         one.contains("1 could not be recorded and is still live"),
         "{one}"
     );
-    let (_, many) = outcome_text(all_stop_outcome(
+    let (_, many) = outcome_text(stop_outcome(
         &["A".into(), "B".into(), "C".into()],
         &["B".into(), "C".into()],
+        ALL_SETTLED,
     ));
     assert!(
         many.contains("2 could not be recorded and are still live"),

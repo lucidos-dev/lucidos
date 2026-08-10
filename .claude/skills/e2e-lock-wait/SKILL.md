@@ -46,6 +46,11 @@ thread sits plain idle while it watches.
 with the whole conversation behind it, so re-read what you were doing first. If
 the retry is refused again, another waiter won the race: go back to step 1.
 
+**5. Nothing to clean up once you win.** Taking the lock stands your own watch
+for its release down, whether the wake or something else got you there. What
+still needs you is the case where you never take it at all: see "A watch you no
+longer need is yours to end".
+
 ## The sharp edges
 
 Get these wrong and you are worse off than with the sleep loop.
@@ -66,19 +71,33 @@ forgotten. A subscription is spent by a MATCH, and by nothing else: not by the
 turn ending, not by the user sending you something else, and not by you going on
 to run the suite some other way. It outlives all three on purpose (ADR 0052).
 
-So the moment the answer arrives from anywhere other than the wake, stand it
-down:
+**Winning the lock is handled for you.** The one case this used to cost the most
+is now mechanical: `acquire_e2e_lock` stands your watch for `E2ELockReleased`
+down the moment it takes the lock, because you cannot hold the lock and still
+need to be told it is free. You do not have to remember it, and you do not have
+to check afterwards. Only that watch is ended, never anything else you are
+waiting on.
+
+So what is left for you is every OTHER way the answer can arrive: the user tells
+you to skip the suite, the work is abandoned, the run happened somewhere else,
+you decide a targeted spec is enough and never take the lock at all. Stand it
+down yourself there:
 
 ```bash
-lucidos event-waits list            # the ids, reasons and deadlines
-lucidos event-waits cancel <id>     # or --all
+lucidos event-waits list                             # the ids, reasons and deadlines
+lucidos event-waits cancel --on E2ELockReleased      # or --wait-id <id>, or --all
 ```
 
-The case that actually happens: you subscribe, the user comes back and resumes
-you, you retry and win the lock, and the suite runs green. Nothing resolved the
-subscription, so the thread reads **Waiting** for the rest of your timeout after
-its work is finished and applied. Six hours, in the incident that produced this
-section. Cancel it in the turn you stop caring, and say you did.
+Prefer `--on`: it needs no id, and unlike `--all` it cannot end a watch you
+armed for something unrelated.
+
+What this cost before the acquire did it for you: you subscribe, the user comes
+back and resumes you, you retry and win the lock, and the suite runs green.
+Nothing resolved the subscription, so the thread reads **Waiting** for the rest
+of your timeout after its work is finished and applied. Six hours in the
+incident that produced this section, and two hours plus a spurious wake in the
+one that produced the automatic stand-down. Cancel it in the turn you stop
+caring, and say you did.
 
 ### It watches forward only, and the command tells you what you missed
 

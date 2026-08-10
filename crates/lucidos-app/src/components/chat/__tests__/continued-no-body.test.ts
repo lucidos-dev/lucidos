@@ -53,7 +53,15 @@ describe('Empty Continued-below panel is hidden entirely', () => {
     expect(fnMatch![0]).toMatch(/hasBody\s*&&\s*!collapsed[\s\S]*?class="response-body"/);
   });
 
-  it('ChatExchange passes hasBody=hasResponse||hasEvents to ResponsePanel', () => {
-    expect(source).toMatch(/<ResponsePanel[\s\S]*?hasBody=\{hasResponse \|\| hasEvents\}/);
+  it('ChatExchange passes a real content test to ResponsePanel, not a constant', () => {
+    // It was a `hasResponse || hasEvents` spelled here and a second time as the
+    // collapse gate. `hasEvents` is `events.length > 0`, which counts a
+    // whitespace-only text chunk and a step hidden by the steps control, so
+    // both read "body" on a turn drawing nothing; and two copies of one
+    // question is how the panel kept rendering the `⋯` stub off the old test
+    // after the gate was fixed. One name now, asserted in full over in
+    // collapse-needs-a-drawn-body.test.ts.
+    expect(source).toMatch(/<ResponsePanel[\s\S]*?hasBody=\{canCollapse\}/);
+    expect(source).toMatch(/const canCollapse = hasResponse \|\| events\.some\(/);
   });
 });

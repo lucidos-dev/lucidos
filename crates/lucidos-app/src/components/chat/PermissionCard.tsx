@@ -6,6 +6,7 @@ import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermi
 import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { followResolvedPermission } from './scrollState';
 
 interface PermissionEvent {
   request_id: string;
@@ -435,11 +436,10 @@ function PermissionBodyShell({
   );
 }
 
-/** Optimistic decide helper shared by both cards: stamp the pending choice,
+/** Optimistic decide helper shared by all three cards: stamp the pending choice,
  *  fire the resolve action, roll back + toast on failure. `resolve` is the
- *  permission action (`resolveCodingAgentPermission` / `resolveCommandPermission`),
- *  which force-scrolls to the bottom before POSTing consent so the agent's
- *  resumed stream tails. */
+ *  permission action (`resolveCodingAgentPermission` / `resolveCommandPermission`
+ *  / `resolveMcpPermission`), which posts the consent and nothing else. */
 function usePermissionDecide(
   requestId: string,
   resolve: (id: string, allowed: boolean, persist?: PersistScope) => Promise<void>,
@@ -447,6 +447,12 @@ function usePermissionDecide(
   const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
   const decide = async (allowed: boolean, persist?: PersistScope) => {
     pending.value = { allowed, persist_scope: persist };
+    // Deciding a card is a SUBMIT: the agent is expected to respond to it, so it
+    // gets the same one reaction every other submit gets, anchored on this card's
+    // own turn. All three permission-shaped cards decide through this hook, so
+    // one call site serves them all. Before the awaited POST, because this is the
+    // button's own tap and must not wait on the round trip. See `followSubmit`.
+    followResolvedPermission(requestId);
     if (allowed && persist === 'broad') {
       // Coarse trust granted — let the user feel the weight of it.
       showToast('You only live once', 'info');

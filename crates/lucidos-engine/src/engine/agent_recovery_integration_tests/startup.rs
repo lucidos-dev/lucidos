@@ -12,9 +12,14 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 ///
 /// Two assertions:
 ///   1. The constant itself stays non-empty (and non-whitespace).
-///   2. The consumer in `engine/mod.rs` actually references the constant —
-///      catches a regression where a future edit reverts to a literal `""`
-///      while the constant stays defined elsewhere.
+///   2. The consumer in `engine/mod.rs` actually routes through
+///      `continue_input_for_reason`, the one function that guarantees a
+///      non-empty input on every branch. This catches a regression where a
+///      future edit reverts to a literal `""` while the constant stays defined
+///      elsewhere. (The consumer stopped passing the constant directly on
+///      2026-08-10, when an `answered_after_idle` continuation started carrying
+///      the user's answer instead; every other reason still resolves to the
+///      constant, inside that function.)
 #[test]
 fn spawn_consumer_continue_must_send_non_empty_user_message() {
     use super::CONTINUE_RESUME_USER_MESSAGE;
@@ -26,9 +31,9 @@ fn spawn_consumer_continue_must_send_non_empty_user_message() {
 
     let consumer_src = include_str!("../engine_impl/construction.rs");
     assert!(
-        consumer_src.contains("CONTINUE_RESUME_USER_MESSAGE"),
-        "engine/engine_impl/construction.rs no longer references CONTINUE_RESUME_USER_MESSAGE — \
-             the SpawnConsumer's Continue path may have reverted to passing a \
+        consumer_src.contains("continue_input_for_reason"),
+        "engine/engine_impl/construction.rs no longer routes its Continue input through \
+             continue_input_for_reason, so the SpawnConsumer may have reverted to passing a \
              literal user_message and risks the empty-stdin zombie regression"
     );
 }

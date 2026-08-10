@@ -53,10 +53,12 @@ export function forgetLastWorkspace(): void {
 const MAX_SKELETON_ROWS = 20;
 
 /** Device-global key holding the count of workspaces from the last successful
- *  picker load. Read by the picker to size its loading skeleton to the list the
- *  user will actually see, so the skeleton→list handoff doesn't bounce. Like
- *  `LAST_WORKSPACE_KEY` it must stay raw (it's only ever touched in the picker
- *  context, where storage namespacing no-ops) — see `workspaceStorage.ts`. */
+ *  listing. Read to size a loading skeleton to the list the user will actually
+ *  see, so the skeleton→list handoff doesn't bounce. Two surfaces write it and
+ *  read it, the picker and the in-app workspace switcher, which is exactly why
+ *  it must stay raw like `LAST_WORKSPACE_KEY`: inside a workspace storage is
+ *  namespaced `ws:<slug>:…`, so a namespaced key would never match the one the
+ *  picker wrote (see `workspaceStorage.ts`). */
 export const LAST_WORKSPACE_COUNT_KEY = 'lucidos-last-workspace-count';
 
 /** Record how many workspaces the last load returned (best-effort). */

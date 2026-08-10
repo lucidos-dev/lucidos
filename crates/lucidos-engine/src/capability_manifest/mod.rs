@@ -1025,6 +1025,7 @@ const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
 }"#;
 const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
   "event_type": {"type":"string","description":"Omitting it queries all, worth avoiding on a busy workspace."},
+  "thread_id": {"type":"string","description":"One thread only: how you read a past conversation, with event_type 'MessageReceived'."},
   "since": {"type":"string","description":"After this RFC 3339 timestamp."},
   "until": {"type":"string","description":"Before this RFC 3339 timestamp."},
   "limit": {"type":"integer","description":"1-200, default 50. Raise only to fully enumerate a small type."},
@@ -1582,6 +1583,27 @@ const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children; resolved from the calling thread, so no id."}
 }"#;
 
+const THREADS_SEARCH_Q_ARG: Arg = Arg {
+    name: "q",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "What was discussed.",
+};
+const THREADS_SEARCH_LIMIT_ARG: Arg = Arg {
+    name: "limit",
+    ty: ArgType::Int,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Max threads (1-50, default 20).",
+};
+const THREADS_SEARCH_LLM_SCHEMA: &str = r#"{
+  "q": {"type":"string","description":"What was discussed, in the words it would have been said in. Matches titles and content."},
+  "limit": {"type":"integer","description":"1-50, default 20."}
+}"#;
+
 const THREADS_OPS: &[Operation] = &[
     Operation {
         action: "list",
@@ -1613,6 +1635,23 @@ const THREADS_OPS: &[Operation] = &[
         cli: None,
         sdk: None,
     },
+    Operation {
+        action: "search",
+        summary: "Find past threads by what was SAID in them (text plus semantic), which \
+                  'list' cannot: it filters by status and channel, never by topic. Read one \
+                  via `events` 'query' with its thread_id. (requires: q)",
+        method: Method::Get,
+        path: "/threads/search",
+        args: &[THREADS_SEARCH_Q_ARG, THREADS_SEARCH_LIMIT_ARG],
+        cli_name: "search",
+        sdk_name: "search",
+        mutating: false,
+        llm_alias: Some("search_threads"),
+        llm_schema: Some(THREADS_SEARCH_LLM_SCHEMA),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
 ];
 
 const THREADS_DOMAIN: Domain = Domain {
@@ -1629,13 +1668,27 @@ const THREADS_DOMAIN: Domain = Domain {
 };
 
 // ---------------------------------------------------------------------------
-// memory — long-term memory. Mixed surfaces (declared parity per op): the LLM
-// gets a grouped `memory` tool for CORRECTION (correct / correct_by_id, both
-// in-process — no HTTP route, so cli/sdk = false on those ops), while the CLI
-// gets the READ endpoints (stats / entries / source, GET-only — no LLM tool
-// exists for reading memory, which is injected into context instead). Correction
-// delegates to the existing execute_memory_tool / execute_correct_memory_by_id
-// via the flat alias. See engine/tools/memory.rs + api/memory.rs.
+// memory: long-term memory. Mixed surfaces (declared parity per op). The LLM
+// gets CORRECTION (correct / correct_by_id, both in-process, so no HTTP route
+// and cli/sdk = false on those ops) plus two READS, `search` and `source`. The
+// CLI gets every read.
+//
+// Those two reads reverse a decision this comment used to state as settled:
+// that no LLM tool reads memory, because memory is injected into context
+// instead. Injection is still the primary path and is untouched. What it cannot
+// do is recover from a bad guess, and on 2026-08-09 it made one: an evaluative
+// question decomposed to a bare subject name against a corpus overwhelmingly
+// about that subject, so the injected 25 came back arbitrary and the agent had
+// no way to ask again. That decomposition is fixed at the root in
+// `QUERY_CLASSIFICATION_PROMPT`; these are the backstop for the misses that
+// remain, because no pre-turn guess is ever complete.
+//
+// `stats` and `entries` stay CLI-only, deliberately. Paging the whole index and
+// reading index statistics are operator reads with no bearing on answering a
+// user, and they are exactly the browsing the summaries above warn off.
+// Correction delegates to the existing execute_memory_tool /
+// execute_correct_memory_by_id via the flat alias. See engine/tools/memory.rs +
+// api/memory.rs.
 // ---------------------------------------------------------------------------
 
 const MEM_LIMIT_ARG: Arg = Arg {
@@ -1678,13 +1731,38 @@ const MEM_IMPORTANCE_ARG: Arg = Arg {
     loc: ArgIn::Query,
     description: "Importance levels to include: low,medium,high,critical.",
 };
+const MEM_SEARCH_Q_ARG: Arg = Arg {
+    name: "q",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "What you are trying to find out.",
+};
+const MEM_SEARCH_LIMIT_ARG: Arg = Arg {
+    name: "limit",
+    ty: ArgType::Int,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Max entries (1-20, default 10).",
+};
+const MEMORY_SEARCH_LLM_SCHEMA: &str = r#"{
+  "q": {"type":"string","description":"What you want to know. A bare entity name discriminates nothing in a workspace mostly about it; ask about state or an outcome."},
+  "limit": {"type":"integer","description":"1-20, default 10."}
+}"#;
+const MEMORY_SOURCE_LLM_SCHEMA: &str = r#"{
+  "id": {"type":"string","description":"The `[id: <uuid>]` on the memory, or the source event's uuid."}
+}"#;
+
 const MEM_SOURCE_ID_ARG: Arg = Arg {
     name: "source_id",
     ty: ArgType::Str,
     enum_values: &[],
     required: false,
     loc: ArgIn::Query,
-    description: "Event UUID (required when source_type is 'event').",
+    description: "The memory's `[id: <uuid>]`, or the source event's UUID; either resolves. \
+                  Required when source_type is 'event'.",
 };
 const MEM_SOURCE_SOURCE_TYPE_ARG: Arg = Arg {
     name: "source_type",
@@ -1793,7 +1871,8 @@ const MEMORY_OPS: &[Operation] = &[
     },
     Operation {
         action: "source",
-        summary: "One memory's originating event or artifact, plus the entries derived from it.",
+        summary: "Where one memory came from: its event WITH thread_id, plus the other facts \
+                  from that moment. Takes the `[id: <uuid>]` you were shown. (requires: id)",
         method: Method::Get,
         path: "/memory/source",
         args: &[
@@ -1805,9 +1884,25 @@ const MEMORY_OPS: &[Operation] = &[
         cli_name: "source",
         sdk_name: "source",
         mutating: false,
-        llm_alias: None,
-        llm_schema: None,
-        llm: Some(false),
+        llm_alias: Some("memory_source"),
+        llm_schema: Some(MEMORY_SOURCE_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: Some(false),
+    },
+    Operation {
+        action: "search",
+        summary: "Search long-term memory: what web_search is to the outside world, this is to \
+                  what has happened HERE. (requires: q)",
+        method: Method::Get,
+        path: "/memory/search",
+        args: &[MEM_SEARCH_Q_ARG, MEM_SEARCH_LIMIT_ARG],
+        cli_name: "search",
+        sdk_name: "search",
+        mutating: false,
+        llm_alias: Some("search_memory"),
+        llm_schema: Some(MEMORY_SEARCH_LLM_SCHEMA),
+        llm: None,
         cli: None,
         sdk: Some(false),
     },
@@ -1816,7 +1911,7 @@ const MEMORY_OPS: &[Operation] = &[
 const MEMORY_DOMAIN: Domain = Domain {
     name: "memory",
     tool_name: "memory",
-    tool_summary: "Correct long-term memory. Prefer 'correct_by_id' when the [id: <uuid>] is visible. There is no read action: memory is injected into your context.",
+    tool_summary: "Read and correct long-term memory. Memories are injected before every turn, so 'search' is for when that missed something. Prefer 'correct_by_id' when the [id: <uuid>] is visible.",
     llm: true,
     cli: true,
     sdk: false,
@@ -2675,16 +2770,24 @@ mod tests {
     fn phase5d_memory_declared() {
         let mem = domains().iter().find(|d| d.name == "memory").unwrap();
         assert!(mem.llm && mem.cli && !mem.sdk);
-        // LLM exposes the correction actions only (reads are CLI-only).
-        assert_eq!(mem.actions(), vec!["correct", "correct_by_id"]);
-        // CLI exposes the read endpoints only (correction is in-process/LLM-only).
+        // The LLM gets correction plus the two reads that help it ANSWER: an
+        // on-demand `search` for when the pre-turn injection missed, and
+        // `source` to walk one memory back to its conversation. `stats` and
+        // `entries` stay off it deliberately, being operator reads with no
+        // bearing on a user's question and exactly the browsing the tool
+        // summaries warn against.
+        assert_eq!(
+            mem.actions(),
+            vec!["correct", "correct_by_id", "source", "search"]
+        );
+        // The CLI keeps every read, including the two the LLM now shares.
         let cli_ops: Vec<&str> = mem
             .operations
             .iter()
             .filter(|o| o.on_cli(mem))
             .map(|o| o.cli_name)
             .collect();
-        assert_eq!(cli_ops, vec!["stats", "entries", "source"]);
+        assert_eq!(cli_ops, vec!["stats", "entries", "source", "search"]);
         assert_eq!(domain_for_tool("correct_memory").unwrap().name, "memory");
         assert_eq!(
             mem.legacy_tool_for_action("correct_by_id"),
@@ -2695,7 +2798,9 @@ mod tests {
     #[test]
     fn phase5e_threads_declared() {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
-        assert_eq!(threads.actions(), vec!["list", "count"]);
+        // `search` answers "we talked about this", which `list` structurally
+        // cannot: it filters by status and channel and never by topic.
+        assert_eq!(threads.actions(), vec!["list", "count", "search"]);
         assert!(threads.llm && !threads.cli && !threads.sdk);
         assert_eq!(domain_for_tool("list_threads").unwrap().name, "threads");
         assert_eq!(

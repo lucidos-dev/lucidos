@@ -303,8 +303,8 @@ export function forceIOSRepaintBurst(el: HTMLElement | null | undefined): (() =>
  *  in the DOM, renders black). Forcing a repaint per token would thrash the
  *  compositor; one repaint every couple hundred ms keeps the layer healthy.
  *
- *  The trailing edge is load-bearing: a streamed mutation — or the large DOM
- *  shrink from a More/Less / steps toggle on the running thread — can blank the
+ *  The trailing edge is load-bearing. A streamed mutation (or the large DOM
+ *  shrink from a turn control on the running thread) can blank the
  *  layer a beat AFTER a leading repaint already fired. With a leading-only gate
  *  that re-blanking request is throttled away, and if the stream then pauses (a
  *  Claude Code tool call running for many seconds) no further request arrives to

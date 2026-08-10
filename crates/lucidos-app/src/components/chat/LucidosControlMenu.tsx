@@ -11,7 +11,7 @@ import { updateComposeSelection } from '../../store/actions/compose';
 import { chatModelOptions, loadChatModels } from '../../store/actions/models';
 import { availableReasoningLevels, clampReasoningEffort } from '../../store/models';
 import { LUCIDOS_AGENT_LABEL, displayModelName } from '../../store/thread-events';
-import { LucidosMark } from '../shared/LucidosMark';
+import { LucidosMarkIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 import { focusIfNeeded } from './promptFocus';
 
@@ -233,7 +233,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         // the `commands-btn` base style). Surfaces that need only the
         // coding-agent control — e.g. the `.commands-btn:not(.lucidos-commands-btn)`
         // e2e selector — rely on it, so keep it on this button.
-        class="icon-btn commands-btn lucidos-commands-btn"
+        class="icon-btn header-icon commands-btn lucidos-commands-btn"
         data-tooltip={`${LUCIDOS_AGENT_LABEL} model`}
         aria-label={`${LUCIDOS_AGENT_LABEL} model`}
         onClick={() => {
@@ -241,7 +241,10 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
           else openMenu();
         }}
       >
-        <span class="lucidos-agent-glyph"><LucidosMark size="var(--icon-size-md)" /></span>
+        {/* The flat mark, not `<LucidosMark/>`: this button is one of the
+            prompt bar's gray icons, so the glyph paints in `currentColor` and
+            carries no gradient tile. `.icon-btn.header-icon svg` sizes it. */}
+        <LucidosMarkIcon />
       </button>
       <Overlay
         open={open.value}

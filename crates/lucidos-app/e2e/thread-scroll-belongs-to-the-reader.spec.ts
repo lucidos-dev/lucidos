@@ -6,6 +6,12 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  Sending a message and pressing the down chevron each arm a follow that rides
  *  the live edge until the reader scrolls away.
  *
+ *  A send arms it only when there is somewhere to be taken, which is why this
+ *  spec opens on a BRAND-NEW thread and asserts the opposite there. The first
+ *  message is the whole of what is on screen, so the reader can see it without
+ *  moving and the send asks for nothing; riding would only drag them down
+ *  through a first reply they have not read, which is what it used to do.
+ *
  *  This file was `thread-open-lands-at-end-desktop.spec.ts` and asserted a
  *  time-boxed pin: a reply landed the reader on the newest turn, and a late grow
  *  KEPT them there for 500ms. The intermittent report behind it ("scrolling to
@@ -28,16 +34,13 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await assertHealthy(page);
   });
 
-  test('a send rides the live edge, a scroll up retires it, and the chevron arms it again', async ({ page }) => {
+  test('a new thread rides nothing, a later send rides the live edge, and a scroll up retires it', async ({ page }) => {
     test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
 
     // A short viewport so a modest transcript overflows: with no scroll capacity
     // the assertions are vacuous.
     await page.setViewportSize({ width: 1280, height: 400 });
     await navigateToApp(page);
-
-    await sendMessage(page, 'List the numbers from 1 to 40, one per line, and nothing else.');
-    await waitForResponse(page);
 
     const tc = page.locator('.thread-content.visible:visible').first();
     const atBottom = () => tc.evaluate(el => el.scrollTop + el.clientHeight >= el.scrollHeight - 2);
@@ -48,10 +51,27 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
       grown.style.height = '600px';
       last.appendChild(grown);
     });
-    await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(0);
 
-    // The send asked to ride the live edge, so the reply that streamed in below
-    // carried the reader with it and there is nothing for the chevron to offer.
+    // The first message in a brand-new thread. It IS the thread, so there is
+    // nothing to catch up to and nothing is armed: the 40-line reply grows past
+    // the fold BELOW the reader, who has not moved a pixel and is offered the
+    // chevron. This used to end on the answer's last line.
+    await sendMessage(page, 'List the numbers from 1 to 40, one per line, and nothing else.');
+    await waitForResponse(page);
+    await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(100);
+    await expect.poll(atBottom).toBe(false);
+    // Still where they started, not merely short of the bottom. The slack
+    // absorbs a repaint nudge's deliberate 1px, nothing near a drag.
+    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBeLessThan(50);
+    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
+
+    // A send into that same thread DOES ask: the reader is above the fold now,
+    // and what they write lands below it. So this one arms the follow, the
+    // landing glide takes them to their own message, and the reply that streams
+    // in below then carries them the rest of the way, leaving nothing for the
+    // chevron to offer.
+    await sendMessage(page, 'List the numbers from 1 to 20, one per line, and nothing else.');
+    await waitForResponse(page);
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
 

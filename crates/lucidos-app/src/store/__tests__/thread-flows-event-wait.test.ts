@@ -10,7 +10,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeResponseEvents, exchangeStatus, type ThreadEvent } from '../thread-events';
-import { getCollapsedVisibleEvents, getEventToggleState } from '../event-rendering';
+import { getCollapsedVisibleEvents, hidesEarlierProse, isStepMechanics } from '../event-rendering';
 import type { ResponseEvent } from '../types';
 
 beforeEach(resetSeqCounter);
@@ -37,9 +37,9 @@ const steps = (events: ResponseEvent[]) => events.filter((e) => e.type === 'step
 describe('a turn parked on an event wait', () => {
   /** The park used to render twice: the generic `Waiting: <reason>` tool step
    *  AND the event-wait row right under it, both naming the same reason. The
-   *  row is the richer of the two (it carries the subscription, the resolution
-   *  state and the jump to the matched event), so it takes the tool step's
-   *  place rather than queueing behind it. */
+   *  row is the richer of the two (it carries the subscription and the
+   *  resolution state), so it takes the tool step's place rather than queueing
+   *  behind it. */
   it('renders as ONE row, the event-wait line replacing the await_event tool step', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, park);
@@ -47,26 +47,32 @@ describe('a turn parked on an event wait', () => {
     const events = exchangeResponseEvents(getExchanges(map, id)[0]);
     expect(waits(events)).toHaveLength(1);
     expect(steps(events)).toHaveLength(0);
-    expect(waits(events)[0]).toMatchObject({ wait_id: 'w1', state: 'waiting', subscription: 'ChangeProposed' });
+    expect(waits(events)[0]).toMatchObject({ wait_id: 'w1', state: 'waiting', subscriptions: ['ChangeProposed'] });
   });
 
-  /** The row renders on its own, so a turn whose ONLY action was the park has
-   *  no step mechanics left to reveal and must not grow a button that reveals
-   *  nothing. The row used to be gated on "Show steps" and was counted here so
-   *  the toggle existed to open it; both halves went away together. */
-  it('offers no Show steps toggle when the park was the only action', () => {
+  /** The park is a transcript marker, not step mechanics, so a turn whose ONLY
+   *  action was the park contributes nothing to the step log. It used to be
+   *  classed as a step, which is how it ended up hidden behind a default-off
+   *  toggle; this pins that it is no longer counted as one.
+   *
+   *  (This asserted "and therefore no Show steps toggle appears" until the two
+   *  controls became fixed header icons. They are now always offered, since
+   *  what they flip spans the transcript rather than this turn, so a turn's own
+   *  contents no longer decide whether they render.) */
+  it('contributes no step mechanics when the park was the only action', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, park);
 
-    const { showStepsToggle } = getEventToggleState(exchangeResponseEvents(getExchanges(map, id)[0]));
-    expect(showStepsToggle).toBe(false);
+    const events = exchangeResponseEvents(getExchanges(map, id)[0]);
+    expect(events.filter(isStepMechanics)).toHaveLength(0);
+    expect(waits(events)).toHaveLength(1);
   });
 
   /** **The row survives the default view, which is the whole bug.**
    *
    *  `await_event`'s result tells the model to finish its turn and end the
    *  response normally, so an arming turn reliably writes prose AFTER the park.
-   *  Two prose chunks turn the More/Less collapse on, and it defaults to
+   *  Two prose chunks turn the full-response collapse on, and it defaults to
    *  collapsed, so the row sat before the last text block and was filtered out
    *  of the rendered set. The event was in the stream, the class was in the
    *  bundle, and no element ever painted.
@@ -90,7 +96,7 @@ describe('a turn parked on an event wait', () => {
     const events = exchangeResponseEvents(getExchanges(map, id)[0]);
     // The collapse is on by default for this turn: it has steps and two prose
     // chunks, and `detailsExpanded` starts false.
-    expect(getEventToggleState(events).showMoreToggle).toBe(true);
+    expect(hidesEarlierProse(events)).toBe(true);
     expect(waits(getCollapsedVisibleEvents(events).visibleEvents)).toMatchObject([
       { wait_id: 'w1', state: 'waiting', reason: REASON },
     ]);
@@ -354,7 +360,7 @@ describe('a turn parked on an event wait', () => {
         wait_id: 'w1',
         state: 'canceled',
         cause: 'agent_stand_down',
-        subscription: 'ChangeProposed',
+        subscriptions: ['ChangeProposed'],
         reason: REASON,
       },
     ]);
@@ -420,7 +426,7 @@ describe('a turn parked on an event wait', () => {
     ] as ThreadEvent[]);
 
     expect(waits(exchangeResponseEvents(getExchanges(map, id)[1]))).toMatchObject([
-      { state: 'canceled', subscription: '', reason: '' },
+      { state: 'canceled', subscriptions: [], reason: '' },
     ]);
   });
 });

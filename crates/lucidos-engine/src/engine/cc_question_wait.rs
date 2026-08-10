@@ -7,14 +7,23 @@
 //! in-process `ask_user_question` tool (waiting inside the agentic loop).
 //!
 //! In-memory only. On engine restart, both kinds of waiters die — CC
-//! hooks with their subprocesses; chat tools with their LLM call. On
-//! resume, CC re-emits the AskUserQuestion tool_use, the hook fires
-//! again, and the endpoint's crash-recovery path reads a previously-
-//! persisted UserQuestionAnswered event from the DB instead. A chat thread
-//! parked on a question is now PRESERVED across a restart (not aborted): the
-//! card stays answerable, and answering with no live waiter (`notify` returns
-//! `false`) re-enters the agentic loop via `resume_chat_after_answer` — the
-//! chat parity of CC's re-fire-the-hook resume.
+//! hooks with their subprocesses; chat tools with their LLM call. Neither
+//! waiter comes back, so **a question answered after its waiter died is
+//! delivered out of band, not by re-running the tool**: CC does NOT re-emit
+//! the `AskUserQuestion` tool_use on `--resume` (its transcript already closed
+//! that call at teardown), so the answer rides the `answered_after_idle`
+//! resume message instead (`agent_question::answered_question_recap`). A chat
+//! thread parked on a question is PRESERVED across a restart (not aborted):
+//! the card stays answerable, and answering with no live waiter (`notify`
+//! returns `false`) re-enters the agentic loop via `resume_chat_after_answer`,
+//! which reconstructs the `ToolResult` from the persisted answer. Both lanes
+//! hand the answer back themselves; neither relies on the agent asking again.
+//!
+//! The endpoint's crash-recovery lookup (a previously-persisted
+//! `UserQuestionAnswered` read back in `walk_question_batch`) still covers the
+//! narrower case where the waiter died but the SUBPROCESS did not, so the hook
+//! genuinely re-registers: a transient hook error, or an answer that landed in
+//! the gap between the two.
 
 use std::collections::HashMap;
 use std::sync::Arc;

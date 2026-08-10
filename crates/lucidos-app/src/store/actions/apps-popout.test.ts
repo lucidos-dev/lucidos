@@ -33,6 +33,7 @@ const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
   openExternal,
   setTitlebarColor: () => Promise.resolve(),
+  windowReadyToShow: () => {},
 }));
 
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));

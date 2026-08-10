@@ -208,23 +208,26 @@ describe('the chevron is the way back to the live edge', () => {
     expect(awayFromBottom.value).toBe(false);
   });
 
-  it('stays hidden as the thread grows, because the tap asked to ride the live edge', () => {
-    // The chevron is not a one-shot jump: it arms the standing follow, so the
-    // next chunk carries the reader with it and there is nothing to come back
-    // for. The chevron reappearing on growth is the UNARMED reader's case, one
-    // describe above.
+  it('comes BACK as the thread grows, because the tap asked for one jump', () => {
+    // The chevron is a one-shot jump and nothing more. It used to arm the
+    // standing follow on arrival, so the next chunk carried the reader with it;
+    // riding is the follow toggle's request now (see
+    // `scroll-follow-the-live-edge.test.ts`), and a reader who only tapped the
+    // chevron is left behind by the first token exactly like any other unarmed
+    // reader, with the chevron lighting again as their way back.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
 
     scrollToBottom();
     expect(awayFromBottom.value).toBe(false);
+    const landed = el.scrollTop;
 
     el.scrollHeight = 3400;
     onResize();
 
-    expect(awayFromBottom.value).toBe(false);
-    expect(el.scrollTop).toBe(2900); // carried to the new live edge
+    expect(awayFromBottom.value).toBe(true);
+    expect(el.scrollTop).toBe(landed); // and they were not carried anywhere
   });
 
   it('reconciles the chevron even when the container was already at the bottom', () => {

@@ -12,6 +12,7 @@ import { loadPluginCatalog } from '../../store/actions/plugin-marketplaces';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SearchIcon, CloseIcon } from '../shared/icons';
@@ -99,12 +100,7 @@ export function AppsView() {
                       />
                     );
                   })}
-                  {!query && (
-                    <div class="list-row-add-card" onClick={createNewApp}>
-                      <div class="list-row-add-icon">+</div>
-                      <div class="list-row-add-label">New App</div>
-                    </div>
-                  )}
+                  {!query && <ListRowAddCard label="New App" onClick={createNewApp} />}
                 </div>
               );
             })()

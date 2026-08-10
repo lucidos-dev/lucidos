@@ -86,23 +86,49 @@
 
 /* Indicator glanceable signal. All four states render the SAME TodoListIcon
    ticked checkbox, so the button keeps reading as "todo list" whatever the
-   agent is doing; the state rides on color alone. Shape-switching is what the
-   old two-glyph pair did, and its in-progress glyph (a filled dome inside a
-   checkbox, an SVG translation of the panel's ◐) read as nothing at all.
-   Counts stay in the tooltip + aria-label, which is where the detail belongs.
+   agent is doing; the state rides on color and, for waiting, motion.
+   Shape-switching is what the old two-glyph pair did, and its in-progress glyph
+   (a filled dome inside a checkbox, an SVG translation of the panel's ◐) read
+   as nothing at all. Counts stay in the tooltip + aria-label, which is where
+   the detail belongs.
 
-   Color has to carry it because the tooltip is desktop-only per the project
-   rule, so on mobile the glyph is the whole signal. Accent for in-progress
-   reads as "live, being worked"; accent-yellow for waiting reads as "live, but
-   stopped on something", the same colour language as the *subscription
-   indicator* beside it; desaturated + semi-transparent for abandoned
-   reads as "incomplete / walked away from" against the brighter three. */
+   The glyph has to carry it because the tooltip is desktop-only per the project
+   rule, so on mobile it is the whole signal. Accent for in-progress reads as
+   "live, being worked"; desaturated + semi-transparent for abandoned reads as
+   "incomplete / walked away from". */
 .icon-btn[data-role="todo-indicator"][data-state="in-progress"] {
     color: var(--accent);
 }
 
-.icon-btn[data-role="todo-indicator"][data-state="waiting"] {
-    color: var(--accent-yellow);
+/* Waiting speaks the app's OWN waiting language: the ordinary secondary gray,
+   pulsing. That is what `.progress-dot-waiting` does in a drawer row
+   (chat/input-messages.css), and the `progress-pulse` keyframes here are
+   literally that dot's, since keyframes are global. It used to be
+   --accent-yellow, justified as matching the *subscription indicator* beside
+   it, but that indicator lost its tinted state to ADR 0049 and is plain
+   --text-secondary now, so the yellow matched nothing: in this palette yellow
+   is the CAUTION tone, and a parked thread is not a caution (same call as
+   `.thread-info-dot-waiting`, which is --accent-notable rather than yellow).
+
+   No `color` of its own, so waiting and idle are the same gray and MOTION is
+   the whole difference: a moving glyph reads as "still going somewhere" in a
+   way no static hue does, and it separates waiting from abandoned's static dim
+   without asking the user to learn a second colour.
+
+   The animation sits on the SVG rather than the button so it moves the glyph
+   only: on the button it would fade the hover background and the focus ring
+   with it. Indefinite, so a literal duration and no --duration-* token (see
+   .claude/rules/frontend-css.md): it is an activity indicator, not a
+   transition.
+
+   It deliberately takes no `prefers-reduced-motion` opt-out, same as
+   `.progress-dot-waiting`. Every animation this app does silence there falls
+   back to a still-visible resting state (a solid shimmer, a stopped spinner),
+   and this one has none to fall back to: the pulse IS the state, so stopping it
+   would leave waiting and idle indistinguishable. A half-hertz opacity fade is
+   also not the motion class that rule protects against. */
+.icon-btn[data-role="todo-indicator"][data-state="waiting"] svg {
+    animation: progress-pulse 2s ease-in-out infinite;
 }
 
 .icon-btn[data-role="todo-indicator"][data-state="abandoned"] {

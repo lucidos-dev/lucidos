@@ -1178,3 +1178,185 @@ async fn ask_call_without_request_event_id_falls_back_to_boundary() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// ---------------------------------------------------------------------------
+// answered_question_recap: the answer the resumed agent would otherwise never
+// see. Regression suite for 2026-08-10 (thread 728de3cc), where a typed answer
+// given after the subprocess was torn down reached the model nowhere at all and
+// the model read the teardown's rejection stamp as approval.
+// ---------------------------------------------------------------------------
+
+/// The load-bearing distinction. A typed reply is NOT a selection, and the
+/// recap has to say so in words: an agent resumed next to a "the tool use was
+/// rejected" stamp will otherwise read "the user said something that was not
+/// Approve" as approval, which is exactly what happened.
+#[test]
+fn answer_kind_note_separates_a_typed_reply_from_a_picked_option() {
+    let typed = answer_kind_note(&serde_json::json!({"kind": "FreeText", "text": "hmm"}));
+    assert!(
+        typed.contains("typed that themselves") && typed.contains("picks none of them"),
+        "a typed reply must be marked as selecting no option: {typed}"
+    );
+
+    let picked = answer_kind_note(&serde_json::json!({"kind": "Selected", "option_id": "opt-0"}));
+    assert!(
+        picked.contains("picked that option"),
+        "a selection must read as a selection: {picked}"
+    );
+    assert_ne!(typed, picked, "the two must never render identically");
+
+    // MultiSelected splits on whether freetext rode along with the toggles.
+    let multi = answer_kind_note(&serde_json::json!({
+        "kind": "MultiSelected", "option_ids": ["opt-0"], "text": "and this"
+    }));
+    assert!(multi.contains("typed the rest"), "got {multi}");
+    let multi_bare =
+        answer_kind_note(&serde_json::json!({"kind": "MultiSelected", "option_ids": ["opt-0"]}));
+    assert!(!multi_bare.contains("typed the rest"), "got {multi_bare}");
+}
+
+#[tokio::test]
+async fn recap_carries_a_typed_answer_verbatim_and_marks_it_as_no_option() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    let typed = "think hard, do we really need this or is it overengineering?";
+    emit_answered_question(
+        &bus,
+        thread_id,
+        &synth_question_id("toolu_vrtx_01XT", 0),
+        "Approve this plan, or take the narrower deadline variant?",
+        &["Approve", "Derive the deadline instead"],
+        AnswerKind::FreeText { text: typed.into() },
+    )
+    .await;
+
+    let recap = answered_question_recap(&pool, thread_id)
+        .await
+        .expect("an answered question must produce a recap");
+    assert!(
+        recap.contains("Approve this plan, or take the narrower deadline variant?"),
+        "recap must quote the question: {recap}"
+    );
+    assert!(
+        recap.contains(typed),
+        "recap must carry the answer VERBATIM: {recap}"
+    );
+    assert!(
+        recap.contains("picks none of them"),
+        "recap must say the typed reply selected no option: {recap}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A clicked option is dropped by the same hole as a typed one, so it recaps
+/// too, resolved from the persisted `opt-N` back to the label the user saw.
+#[tokio::test]
+async fn recap_resolves_a_selected_option_back_to_its_label() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    emit_answered_question(
+        &bus,
+        thread_id,
+        &synth_question_id("toolu_a", 0),
+        "Which shape?",
+        &["Full rewrite", "Narrow flag"],
+        AnswerKind::Selected {
+            option_id: "opt-1".into(),
+        },
+    )
+    .await;
+
+    let recap = answered_question_recap(&pool, thread_id).await.unwrap();
+    assert!(
+        recap.contains("Narrow flag"),
+        "the opt-N id must resolve to its label: {recap}"
+    );
+    assert!(
+        !recap.contains("opt-1"),
+        "the raw option id must never reach the agent: {recap}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A batch asks one card at a time under one outer `tool_use_id`, so the recap
+/// must gather every `{outer}#q{i}` and keep ask order. Reporting only the
+/// newest sub-answer would silently drop the rest of the user's input.
+#[tokio::test]
+async fn recap_carries_every_sub_question_of_a_batch_in_ask_order() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    let outer = "toolu_vrtx_batch";
+    emit_answered_question(
+        &bus,
+        thread_id,
+        &synth_question_id(outer, 0),
+        "First question?",
+        &["Yes", "No"],
+        AnswerKind::Selected {
+            option_id: "opt-0".into(),
+        },
+    )
+    .await;
+    emit_answered_question(
+        &bus,
+        thread_id,
+        &synth_question_id(outer, 1),
+        "Second question?",
+        &["Left", "Right"],
+        AnswerKind::FreeText {
+            text: "neither, do it my way".into(),
+        },
+    )
+    .await;
+
+    let recap = answered_question_recap(&pool, thread_id).await.unwrap();
+    let first = recap
+        .find("First question?")
+        .expect("first sub-question must be recapped");
+    let second = recap
+        .find("Second question?")
+        .expect("second sub-question must be recapped");
+    assert!(first < second, "ask order must be preserved: {recap}");
+    assert!(recap.contains("Yes"), "got {recap}");
+    assert!(recap.contains("neither, do it my way"), "got {recap}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An unanswered (or absent) question recaps as `None`, so the caller falls
+/// back to the bare continue message instead of resuming with an empty prompt.
+#[tokio::test]
+async fn recap_is_none_when_nothing_has_been_answered() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    assert!(
+        answered_question_recap(&pool, thread_id).await.is_none(),
+        "a thread with no question at all has nothing to recap"
+    );
+
+    emit_user_question(&bus, thread_id, &synth_question_id("toolu_pending", 0)).await;
+    assert!(
+        answered_question_recap(&pool, thread_id).await.is_none(),
+        "an ASKED but unanswered question is not an answer"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

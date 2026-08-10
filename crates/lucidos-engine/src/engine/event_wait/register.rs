@@ -113,32 +113,17 @@ impl LucidosEngine {
             return AwaitEventOutcome::Refused(msg);
         }
 
-        // Read the watermark BEFORE emitting, so the catch-up scan
-        // (`sequence > watermark`) covers everything from this instant on,
-        // including anything that lands while the emit is still in flight. It
-        // re-reads `EventWaitStarted` itself, which is harmless: that name can
-        // never be one of the subscribed types (the gate above refuses it).
-        let watermark = match self.latest_event_sequence().await {
-            Ok(seq) => seq,
+        let wait = match self
+            .build_wait(thread_id, tool_use_id, on, reason, timeout_secs)
+            .await
+        {
+            Ok(w) => w,
             Err(e) => {
-                crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
                 return AwaitEventOutcome::Refused(format!(
                     "Error: could not register the wait ({e}). Try again, or fall back to \
                      checking the state yourself."
-                ));
+                ))
             }
-        };
-
-        let armed_at = Utc::now();
-        let wait = LiveWait {
-            wait_id: Uuid::new_v4(),
-            thread_id,
-            tool_use_id: tool_use_id.to_string(),
-            on,
-            reason: reason.to_string(),
-            armed_at,
-            expires_at: armed_at + Duration::seconds(timeout_secs),
-            watermark,
         };
 
         // The arming lookback. Bounded at `sequence <= watermark`, so it cannot
@@ -147,10 +132,105 @@ impl LucidosEngine {
         // refused call (the caps above) does no lookback work.
         let lookback = self.arming_lookback(&wait).await;
 
-        if let Err(e) = self
-            .event_bus
+        if let Err(e) = self.commit_wait(&wait).await {
+            return AwaitEventOutcome::Refused(format!(
+                "Error: could not register the wait ({e}). Try again, or fall back to \
+                 checking the state yourself."
+            ));
+        }
+
+        AwaitEventOutcome::Registered(registered_tool_result_text(&wait, lookback.as_ref()))
+    }
+
+    /// Read the watermark and build the [`LiveWait`]. Nothing is emitted or
+    /// cached yet, so a caller may still abandon it.
+    ///
+    /// The watermark is read BEFORE the emit in [`Self::commit_wait`], so the
+    /// catch-up scan (`sequence > watermark`) covers everything from this
+    /// instant on, including anything landing while the emit is in flight. It
+    /// re-reads `EventWaitStarted` itself, which is harmless: that name can
+    /// never be a subscribed type (the subscribability gate refuses it).
+    pub(super) async fn build_wait(
+        &self,
+        thread_id: Uuid,
+        tool_use_id: &str,
+        on: Vec<EventSubscription>,
+        reason: &str,
+        timeout_secs: i64,
+    ) -> Result<LiveWait, Box<dyn std::error::Error + Send + Sync>> {
+        let watermark = self.read_watermark(thread_id).await?;
+        Ok(self.build_wait_at(thread_id, tool_use_id, on, reason, timeout_secs, watermark))
+    }
+
+    /// The event store's high-water sequence, to be used as a wait's watermark.
+    ///
+    /// Separate from [`Self::build_wait`] for the ONE caller that must read it
+    /// earlier than the rest of its own inputs: see
+    /// [`Self::build_wait_at`].
+    pub(super) async fn read_watermark(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.latest_event_sequence().await.inspect_err(|e| {
+            crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
+        })
+    }
+
+    /// [`Self::build_wait`] with the watermark supplied rather than read here.
+    ///
+    /// **The watermark must be read before whatever state decided the `on`
+    /// list.** The catch-up scan is `sequence > watermark`, so any matching
+    /// event that landed at or below it is invisible to this wait: it will not
+    /// wake, and the thread sits until the timeout. Reading the watermark
+    /// afterwards leaves exactly that gap, sized by everything in between.
+    ///
+    /// `register_event_wait` has no gap to worry about, because the model's
+    /// `on` list arrives with the tool call and the watermark is the first
+    /// thing read after it (what covers the model's own observe-then-arm gap is
+    /// the separate arming lookback). The engine-armed background-task wait
+    /// does: it decides `on` from the task registry, and asks the database for
+    /// the subscription count in between, so a task completing across those
+    /// milliseconds would be armed for and then never delivered, which is the
+    /// exact stall the wait exists to prevent.
+    pub(super) fn build_wait_at(
+        &self,
+        thread_id: Uuid,
+        tool_use_id: &str,
+        on: Vec<EventSubscription>,
+        reason: &str,
+        timeout_secs: i64,
+        watermark: i64,
+    ) -> LiveWait {
+        let armed_at = Utc::now();
+        LiveWait {
+            wait_id: Uuid::new_v4(),
+            thread_id,
+            tool_use_id: tool_use_id.to_string(),
+            on,
+            reason: reason.to_string(),
+            armed_at,
+            expires_at: armed_at + Duration::seconds(timeout_secs),
+            watermark,
+        }
+    }
+
+    /// Persist a built wait and make it live: emit `EventWaitStarted`, insert
+    /// it into the cache, then run the catch-up scan.
+    ///
+    /// The scan is the same one the boot rebuild runs, and here it closes the
+    /// live race: an event emitted between the watermark read and the insert
+    /// was offered to a cache that did not yet hold this wait. It can therefore
+    /// resolve the wait before this call returns, which is fine, and is why the
+    /// caller's tool result is written in the future tense without promising
+    /// the thread is still subscribed by the time the model reads it. The wake
+    /// queues behind the current turn either way.
+    pub(super) async fn commit_wait(
+        &self,
+        wait: &LiveWait,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id,
+                thread_id: wait.thread_id,
                 event: ThreadEvent::EventWaitStarted {
                     wait_id: wait.wait_id,
                     tool_use_id: wait.tool_use_id.clone(),
@@ -163,33 +243,23 @@ impl LucidosEngine {
                 meta: EventMeta::NONE,
             })
             .await
-        {
-            crate::log!("[EventWait] EventWaitStarted emit failed for thread {thread_id}: {e}");
-            return AwaitEventOutcome::Refused(format!(
-                "Error: could not register the wait ({e}). Try again, or fall back to \
-                 checking the state yourself."
-            ));
-        }
+            .inspect_err(|e| {
+                crate::log!(
+                    "[EventWait] EventWaitStarted emit failed for thread {}: {e}",
+                    wait.thread_id
+                );
+            })?;
 
         crate::log!(
             "[EventWait] Thread {} subscribed to {:?} for {}s (wait {})",
-            thread_id,
+            wait.thread_id,
             wait.on.iter().map(|s| &s.event_type).collect::<Vec<_>>(),
-            timeout_secs,
+            (wait.expires_at - wait.armed_at).num_seconds(),
             wait.wait_id,
         );
-        let registered = registered_tool_result_text(&wait, lookback.as_ref());
         self.live_waits.insert(wait.clone()).await;
-        // Same scan the boot rebuild runs, and here it closes the live race:
-        // an event emitted between the watermark read and the insert above was
-        // offered to a cache that did not hold this wait yet.
-        //
-        // It can therefore resolve the wait before this call has even returned,
-        // which is fine and is why the text below is written in the future
-        // tense without promising the thread is still subscribed by the time
-        // the model reads it: the wake queues behind this turn either way.
-        self.catch_up_event_wait(&wait).await;
-        AwaitEventOutcome::Registered(registered)
+        self.catch_up_event_wait(wait).await;
+        Ok(())
     }
 
     /// The three caps, in the order that gives the model the most useful

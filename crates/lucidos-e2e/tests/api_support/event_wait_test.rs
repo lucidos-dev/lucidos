@@ -29,6 +29,8 @@
 //! * the agent's own two verbs over the routes `lucidos event-waits list` /
 //!   `cancel` call: the read, the refusals, and a stand-down that records its
 //!   own cause
+//! * a stand-down by EVENT TYPE (`--on`) ending exactly the watches for it and
+//!   leaving a second, unrelated one still able to wake the thread
 
 use crate::support::{
     base_url, db_url, http_client, poll_thread_summary_by_marker, unique_marker, user_client,
@@ -807,4 +809,145 @@ async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
         0,
         "a stopped subscription does not fire"
     );
+}
+
+/// Standing down by EVENT TYPE, and leaving everything else watching. The third
+/// target on the same route (`lucidos event-waits cancel --on`, the tool's
+/// `on`), and the one a script uses: `scripts/lib/e2e_lock.sh` runs it the
+/// moment a run takes the machine-wide lock, because holding the lock is the
+/// answer to any watch this thread had for its release.
+///
+/// The selectivity is the whole point and cannot be shown by a unit test: it
+/// needs a thread holding two real subscriptions, one of which must survive an
+/// end-to-end cancel. `all` in that position is the harm ADR 0052 exists to
+/// prevent, and it is what a caller with no id was previously reduced to.
+#[tokio::test]
+async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let answered = format!("E2eAnswered{}", Uuid::new_v4().simple());
+    let unrelated = format!("E2eUnrelated{}", Uuid::new_v4().simple());
+    let thread_id = subscribe_a_thread(&pool, &answered, "api-event-wait-on").await;
+
+    // The second watch, the one that must survive. Registered over HTTP because
+    // the mock subscribes once per turn, and this is the same route a coding
+    // agent's `lucidos await-event` calls.
+    let register_url = format!("{}/api/v1/threads/{}/event-waits", base_url(), thread_id);
+    let resp = http_client()
+        .post(&register_url)
+        .json(&serde_json::json!({
+            "on": [{ "event_type": unrelated }],
+            "timeout_secs": 300,
+            "reason": "e2e: the watch a by-type stand-down must leave alone",
+        }))
+        .send()
+        .await
+        .expect("register request failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(count_events(&pool, thread_id, "EventWaitStarted").await, 2);
+
+    let cancel_url = format!(
+        "{}/api/v1/threads/{}/event-waits/cancel",
+        base_url(),
+        thread_id
+    );
+
+    // `on` alongside either of the other two is ambiguous, exactly as they are
+    // with each other: the three address different sets.
+    for body in [
+        serde_json::json!({ "on": answered, "all": true }),
+        serde_json::json!({ "on": answered, "wait_id": Uuid::new_v4() }),
+    ] {
+        let resp = http_client()
+            .post(&cancel_url)
+            .json(&body)
+            .send()
+            .await
+            .expect("cancel request failed");
+        assert_eq!(resp.status(), 400, "over-specified cancel must be refused");
+    }
+
+    // An `on` nothing is watching is refused rather than reported as a quiet
+    // success. This is the e2e lock's ordinary path, where the refusal is
+    // discarded; for an agent it is the news that a watch it believed in is
+    // not there.
+    let resp = http_client()
+        .post(&cancel_url)
+        .json(&serde_json::json!({ "on": "E2eNobodyWatchesThis" }))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitCanceled").await,
+        0,
+        "a refused cancel stops nothing"
+    );
+
+    let resp = http_client()
+        .post(&cancel_url)
+        .json(&serde_json::json!({ "on": answered }))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(body["status"], "stopped");
+    let message = body["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        message.contains(&answered),
+        "names what it stopped: {message}"
+    );
+    // It must NOT claim the thread is watching nothing, the way an `all` stop
+    // does: one watch is deliberately still live and the agent will repeat this
+    // sentence to a person.
+    assert!(
+        !message.contains("Nothing is subscribed"),
+        "an on-stop that left a watch standing must not report a clean sweep: {message}"
+    );
+    assert!(
+        message.contains("1 other subscription(s)"),
+        "and it counts the survivor: {message}"
+    );
+
+    // One cancel, with the ordinary agent cause, naming the watch it ended.
+    let canceled = await_event_row(&pool, thread_id, "EventWaitCanceled", 10).await;
+    assert_eq!(canceled["cause"], "agent_stand_down");
+    assert_eq!(canceled["on"][0]["event_type"], answered.as_str());
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitCanceled").await,
+        1,
+        "only the watch for that event type was ended"
+    );
+
+    // The read agrees, and the survivor is the untouched one.
+    let list_url = format!("{}/api/v1/threads/{}/event-waits", base_url(), thread_id);
+    let body: serde_json::Value = http_client()
+        .get(&list_url)
+        .send()
+        .await
+        .expect("list request failed")
+        .json()
+        .await
+        .expect("JSON body");
+    assert_eq!(body["count"], 1);
+    assert_eq!(
+        body["event_waits"][0]["on"][0]["event_type"],
+        unrelated.as_str()
+    );
+
+    // The proof that matters: the stopped one is inert and the survivor still
+    // wakes the thread. A cache that merely reported correctly would pass every
+    // assertion above and fail here.
+    emit_domain_event(&answered, "arriving after the by-type stand-down").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitDelivered").await,
+        0,
+        "the stopped subscription does not fire"
+    );
+    emit_domain_event(&unrelated, "the watch that was left alone").await;
+    let delivered = await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
+    assert_eq!(delivered["event_type"], unrelated.as_str());
 }

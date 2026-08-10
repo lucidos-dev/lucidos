@@ -694,7 +694,7 @@ describe('createRepaintThrottle', () => {
   });
 
   it('a single request throttled right after a leading repaint still paints once activity stops', () => {
-    // The stuck-blank repro: a streamed mutation (or a More/Less toggle's shrink)
+    // The stuck-blank repro: a streamed mutation (or a turn control's shrink)
     // re-blanks the iOS layer a beat after a leading repaint, then the stream
     // pauses (a CC tool call runs for many seconds) so no further request comes.
     // Leading-only throttling dropped it and left the pane black; the trailing

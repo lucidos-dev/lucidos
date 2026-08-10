@@ -929,6 +929,21 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
     tool_label(name, args).unwrap_or_else(|| format!("Executing {}...", name))
 }
 
+/// Step label for a search action: the verb plus the query it was given.
+///
+/// The query is quoted back because this label is the user's only view of what
+/// the agent went looking for, and a bare "Searching memory" reads as the agent
+/// rummaging. Bounded like every sibling that renders a model-supplied string
+/// (`await_event`'s reason, `generate_image`'s prompt): these schemas invite a
+/// full sentence, and an unbounded one becomes a step row as wide as the
+/// transcript.
+fn search_label(verb: &str, args: &serde_json::Value) -> String {
+    match args["q"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => format!("{verb} for \"{}\"...", middle_truncate(q, 50)),
+        None => format!("{verb}..."),
+    }
+}
+
 /// The known-tool half of [`describe_tool`]: `Some(label)` for a name we ship,
 /// `None` for anything else. Split out from the fallback so the exhaustiveness
 /// guard test can ask "is this name labelled?" and get an honest answer, which
@@ -1284,9 +1299,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         },
         "list_threads" => "Listing threads...".to_string(),
         "count_threads" => "Counting threads...".to_string(),
+        "search_threads" => search_label("Searching past conversations", args),
         "list_changes" => "Listing changes...".to_string(),
         "apply_change" => "Applying change...".to_string(),
         "correct_memory" | "correct_memory_by_id" => "Updating memory...".to_string(),
+        "search_memory" => search_label("Searching memory", args),
+        "memory_source" => "Tracing a memory to its conversation...".to_string(),
         "dismiss_from_context" => "Dismissing from context...".to_string(),
         "query_events" => format!(
             "Querying {} events...",
@@ -1412,9 +1430,20 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         },
         // Grouped `memory` tool exposes only the correction actions to the LLM
         // (correct / correct_by_id); both render the same label.
-        "memory" => "Updating memory...".to_string(),
+        // The GROUPED names are what the model actually emits (the flat ones
+        // are back-compat aliases, and `consolidated_flat_tools_are_not_advertised`
+        // pins that they are never offered), so a grouped arm that ignores
+        // `action` mislabels every action but one. Both of these read now, and
+        // rendering a read as "Updating memory..." tells the user their memory
+        // was written to when nothing was.
+        "memory" => match args["action"].as_str() {
+            Some("search") => search_label("Searching memory", args),
+            Some("source") => "Tracing a memory to its conversation...".to_string(),
+            _ => "Updating memory...".to_string(),
+        },
         "threads" => match args["action"].as_str() {
             Some("count") => "Counting threads...".to_string(),
+            Some("search") => search_label("Searching past conversations", args),
             _ => "Listing threads...".to_string(),
         },
         "mcp" => match args["action"].as_str() {

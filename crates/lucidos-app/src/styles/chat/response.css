@@ -2,16 +2,37 @@
    (executor chip + status + timestamp) over a flush body. Inter-turn feed
    padding comes from the shared `.initiator-panel, .response-panel` rule in
    input-messages.css (no divider line). Body collapses on header click. */
+
+/* `flex-start`, paired with the row-unit sizing every field below carries: the
+   fields are all exactly --turn-header-line tall and centre their own content,
+   so on a one-row header this lands pixel for pixel where `center` did, and on a
+   wrapped one the executor's name stays level with the status instead of
+   dropping half a line to centre against the stacked pair. `center` alone is
+   what produced that drop, and `flex-start` alone would trade it for icons no
+   longer centred against the label on every ordinary row: neither works without
+   the other, which is why the pair is pinned together in
+   styles/__tests__/turn-meta-stacking.test.ts. */
 .response-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.5rem;
     padding-left: var(--turn-body-inset);
     margin-bottom: 0.7rem;
-    min-height: 1.2rem;
+    min-height: var(--turn-header-line);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-wrap: wrap;
+    /* Room to leave under this row when a send or an answer lands on it
+       (`landOnOwnTurn` in scrollState.ts rests the agent status line on the
+       transcript's bottom edge). That edge is UNDER the prompt dissolve,
+       .prompt-area::before in panels/content.css, a bg-coloured band that would
+       swallow the row the landing exists to show, so the clearance is the same
+       --prompt-fade + --nav-focus-reach the transcript's own bottom padding
+       reserves for it. Declared here, as the mirror of .chat-exchange's
+       scroll-margin-top below: the landing reads the RESOLVED px off this
+       property, so the number stays beside the fade that makes it necessary
+       instead of drifting as a literal in TypeScript. */
+    scroll-margin-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach));
 }
 
 .response-executor-icon {
@@ -34,14 +55,206 @@
     flex-shrink: 0;
 }
 
+/* The turn's three controls (`turnControls`), sitting immediately right of the
+   executor label: the full response, the step log, and the turn's fold.
+
+   One gap for all three, the collapse control included. It used to carry an
+   extra 0.3125rem so its narrower scope read as a group break. The break is
+   gone: its label and its turning glyph carry that scope on their own, and two
+   different gaps inside a run of three icons are a claim the eye reads before
+   it reads any tooltip, which landed as "two things and a stray" rather than
+   as a scope split. The class stays, since the brightness rule below still
+   singles the control out by it. */
+.response-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.125rem;
+    flex-shrink: 0;
+    /* One row unit tall, so the header can align its fields at flex-start
+       without the icons riding up off the label's line. The buttons are the
+       tallest thing on the row at 0.875rem plus their 0.25rem of padding, which
+       is under the unit, so this reserves the difference rather than adding
+       any: the run keeps the height it already had inside the header's
+       min-height. */
+    min-height: var(--turn-header-line);
+    /* Pulled back out of the header's 0.5rem gap, because that gap is measured
+       between BOXES and the eye measures ink. The button adds its 0.125rem
+       padding and the glyph its own inset (the chevron starts 5/24 of the way
+       in), so the flex gap alone left ~10px of white between the label's last
+       letter and the first stroke: the controls read as adrift rather than as
+       the label's. At 0.25rem it is ~8px.
+
+       Bounded on both sides, and the floor is now the binding one. With the
+       group break gone this is the ONE gap in the run that differs, so it is
+       the only thing keeping the label out of the run: a 0.375rem pull leaves
+       0.125rem between the boxes, exactly the gap the icons hold between
+       themselves, and the label reads as a fourth item in the row. 0.25rem is
+       double the intra-run gap, which is enough to group.
+
+       The ceiling: the executor button carries 0.375rem of trailing padding
+       cancelled by an equal negative margin (input-messages.css), so its hit
+       area and its hover chip both run that much past the text with only the
+       header's 0.125rem of real gap after them. This pull laps 2px of that
+       padding, where 0.375rem lapped 4px; the label's own text is still
+       exclusively the executor's, but going further starts eating a target
+       the user can feel and only sees on hover. */
+    margin-left: -0.25rem;
+}
+
+/* Tighter than the base .icon-btn's 0.25rem, deliberately: at 0.125rem the
+   button is the 0.875rem glyph plus 0.25rem, which fits inside the header's
+   existing 1.2rem min-height, so adding the controls grows no row anywhere in
+   the transcript. The base padding would push a control-bearing header ~3px
+   past a control-less one, and a row height that varies by turn TYPE reads
+   worse than a uniformly compact one. Everything here is rem, so the button is
+   ~20px on the 18px mobile root and ~27px at 150% ui-scale; the 18px is the
+   plain-desktop floor, not the common case.
+
+   What it costs, at a 16px root with the widest state ("Lucidos Agent" plus
+   "Requesting" plus the timestamp): the header's one-line width goes from
+   251px bare to 293px with two controls and 313px with three, and a thread
+   pane dragged to its 300px floor gives the header less than that. So at the
+   floor an in-flight turn's header runs to two rows, settling back to one when
+   the status shrinks to "Done" (269px with all three). Accepted rather than
+   fixed: wrapping is what that degradation is for, it keeps every field
+   readable where truncating the executor name would not, and a finished turn,
+   which is the whole transcript bar one row, still fits at the floor. Where
+   the break lands is `.response-meta`'s job, not this row's: the meta gives up
+   its width first and stacks the timestamp under the status, so the second row
+   costs the pair its own line rather than costing the whole header one.
+
+   Those two figures are arithmetic off the measured bare one, not fresh
+   measurements: the run costs 22px for its first control (an 18px box after
+   the 8px header gap less the 4px pull) and 20px for each one after it (the
+   box plus the run's 2px gap), which is 42px and 62px. They therefore move
+   whenever either gap above does, so keep them in step rather than reading
+   them as fixed. */
+.response-controls .icon-btn {
+    padding: 0.125rem;
+    color: var(--text-muted);
+}
+
+/* Hover lifts an OFF control one step, to secondary rather than all the way to
+   the primary the ON state uses. Going the whole way made the two states
+   identical under the cursor (both a bright glyph on a hover chip), so the one
+   control the pointer is on was the one you could not read. The chip is the
+   hover cue; the colour stays the state cue.
+
+   Out-specifies the muted default above (2 classes + a pseudo-class), so this
+   holds whichever file the cascade sees last, and the ON rule below both
+   out-specifies this one (its `:not()` argument counts, making it 2 classes +
+   an attribute + a class) and comes later, so a pressed control keeps its
+   brightness while hovered. The collapse control has no ON rule to lose, so
+   hover is the only thing that moves it, which is the whole point. */
+@media (hover: hover) {
+    .response-controls .icon-btn:hover {
+        color: var(--text-secondary);
+    }
+}
+
+/* On: the glyph brightens to full-contrast text and that is the whole state,
+   deliberately NOT the accent-on-a-chip the header's active icons wear
+   (.icon-btn.filter-active in host-components.css). Those sit alone on the app
+   bar; these repeat on every turn, and a column of filled accent chips down a
+   long thread reads as a column of alerts. Muted to bright is enough contrast
+   to answer "is it on" at a glance, and it leaves the hover background as the
+   one thing that fills, in both states, so hover still reads as hover.
+
+   The collapse control is excluded, and the scope split is why. For the pair
+   it belongs to, bright means "on, and you are seeing MORE": their off state
+   looks like nothing at all, so a turn with no steps drawn is indistinguishable
+   from a turn whose steps are hidden unless the control says which. Bright on
+   the collapse control would mean the turn is FOLDED, which is the same cue
+   inverted, sitting 0.125rem from the two it contradicts, with nothing in the
+   spacing left to hint that it answers a different question. And it reports a
+   state nothing else is hiding: the turn underneath it has become a `⋯` stub,
+   which is unmissable and is the affordance for unfolding. So it stays muted
+   in both states, hover is its only change, and `aria-pressed` carries the
+   state for a screen reader. Pinned by
+   styles/__tests__/turn-control-brightness.test.ts. */
+.response-controls .icon-btn[aria-pressed="true"]:not(.response-control-turn) {
+    color: var(--text-primary);
+}
+
 /* Status + timestamp pair: visually grouped on the right since they describe
-   the same thing — the current state of the response and when it last updated. */
+   the same thing, the current state of the response and when it last updated.
+   Same shape as `.initiator-meta` (input-messages.css); the two headers sit one
+   above the other in a turn, so they wrap the same way or they read as two
+   different widgets.
+
+   It is the row's ELASTIC field, and that is what decides how the header
+   degrades once it stops fitting. As a rigid content-width item it was bumped
+   whole onto a second row, leaving the executor and the controls alone on a
+   row with a hand of empty space to their right and "Working Today 12:00:52"
+   floated under them. Growing from a zero basis instead keeps it in the right
+   column, where `flex-wrap` breaks it between its own two fields and
+   `justify-content` holds both of them against the right edge: the status
+   over the timestamp, both flush right, still one cluster. Two rows either
+   way, so the fix is not about height, it is that the pair stays a right-hand
+   column and the wasted row goes away.
+
+   The executor and the controls stay level with the STATUS when that happens,
+   rather than centring against both of the cluster's lines: the header aligns
+   at flex-start and every field on the row is one --turn-header-line tall (see
+   the header rule above and the first-field rule below). Centring was the
+   original answer here and it is what put "Claude Code" half a line below the
+   "Working" beside it. Flex-start on its own is not the fix either, since the
+   fields are not naturally the same height and the icons would stop being
+   centred against the label on every ordinary one-row header, which is all but
+   one row in the transcript. The row unit is what makes the two agree, and all
+   three are pinned together in the test.
+
+   `flex: 1 1 0` is a basis, not a minimum: `min-width` is still `auto`, so the
+   item cannot be laid out narrower than its widest field, and where even THAT
+   will not fit beside the controls the whole pair still wraps to its own row.
+   That is the right last resort, since the alternative is a timestamp
+   overhanging the icons to its left.
+
+   `white-space: nowrap` picks WHERE the break lands. Without it the elastic
+   box shrinks by breaking the timestamp's own space first ("Today" over
+   "12:00:52", with the status still beside it), which is a break inside a
+   field rather than between the two.
+
+   The two gaps are longhands because they are two different answers, and
+   `row-gap: 0` is load-bearing despite matching the flex default: this was
+   `gap: 0.5rem`, which sets BOTH, and that row gap was invisible only because
+   the cluster could not wrap. Collapse the pair back into the shorthand now
+   and 8px opens between the status and the timestamp, which is the stacked
+   pair no longer reading as one cluster. Pinned by
+   styles/__tests__/turn-meta-stacking.test.ts. */
 .response-meta {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.5rem;
-    margin-left: auto;
-    flex-shrink: 0;
+    justify-content: flex-end;
+    column-gap: 0.5rem;
+    row-gap: 0;
+    flex: 1 1 0;
+    white-space: nowrap;
+}
+
+/* The cluster's FIRST field is the one that shares the executor's line, so it
+   is the one that carries the row unit: the status when there is one, the
+   timestamp on a turn with none. Its own `align-items: center` then centres the
+   text inside that box, which is what puts it on the label's line rather than
+   at the top of it.
+
+   Only the first field, deliberately. Sizing every field would make the
+   timestamp a full unit tall in the stacked state and open a gap between the
+   two lines that `row-gap: 0` above exists to close. The second field needs
+   nothing: it shares line one with the first field whenever the cluster fits
+   (the cluster centres it there), and on its own line it has nothing to align
+   with. A field is blockified by the flex container, so `min-height` applies to
+   the timestamp span even though it is written as inline.
+
+   Copied onto `.initiator-meta` (input-messages.css) rather than shared, like
+   the cluster rule above and for the same reason: each header's rules live with
+   its own component, and the test holds the two copies together. The two sit
+   one above the other in a turn, so they have to align the same way. */
+.response-meta > :first-child {
+    display: flex;
+    align-items: center;
+    min-height: var(--turn-header-line);
 }
 
 .response-timestamp {
@@ -734,8 +947,8 @@
 /* Setup-interview entry point, on the configured-workspace welcome. Same shape
    as .welcome-provider-setup above (prominent button plus a quiet hint line)
    because it is the same class of thing: the one action worth taking on this
-   surface, not a suggestion. A step tighter than the provider block, which owns
-   a whole surface of its own, while this one sits above the carousel. */
+   surface. A step tighter than the provider block, which owns a whole surface of
+   its own, while this one sits between the greeting and the disclaimer. */
 .welcome-setup-interview {
     margin: 0 0 1.25rem 0;
     display: flex;
@@ -756,12 +969,12 @@
 }
 
 /* ── Compact welcome (configured workspace) ──
-   A small first-run surface: a short greeting, a label, and a single-item
-   carousel of suggestions. The box is centered at `--content-max-width` (so it
-   lines up with the prompt textarea on both sides) with left-aligned text. Kept
-   compact so it reads well on every viewport and the prompt stays centered. The
-   compose-empty layout that gives the welcome its natural height (instead of a
-   filled scroll area) is owned by shell.css. */
+   A small first-run surface: a short greeting and the single setup-interview
+   action. The box is centered at `--content-max-width` (so it lines up with the
+   prompt textarea on both sides) with left-aligned text. Kept compact so it
+   reads well on every viewport and the prompt stays centered. The compose-empty
+   layout that gives the welcome its natural height (instead of a filled scroll
+   area) is owned by shell.css. */
 .welcome-hero {
     /* Width + centering match the transcript children and the prompt below: both
        are capped at `--content-max-width` and centered (`.thread-content > *`,
@@ -788,141 +1001,6 @@
     margin: 0 0 0.5rem 0;
     font-size: var(--font-size-xl);
     font-weight: 600;
-}
-
-/* Lead-in label framing the carousel below as suggestions. Higher specificity
-   than `.welcome-message p` (0,2,0 > 0,1,1) so its margin wins. */
-.welcome-hero .welcome-suggestions-label {
-    margin: 0 0 0.625rem 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-}
-
-/* Suggestions as a single-item carousel: ‹ suggestion › — one suggestion at a
-   time flanked by chevron buttons (no scrolling, no cards). */
-.welcome-carousel {
-    position: relative;
-    display: flex;
-    align-items: center;
-    margin: 0 0 1.25rem 0;
-}
-
-/* Circular bordered chevrons — same treatment as the notification detail nav
-   (.notification-detail-nav in panels/content.css) and the thread-view scroll
-   chevrons. Absolutely positioned so they FLOAT over the left/right ends of the
-   full-width suggestion box (below) at fixed spots — out of flow, so the
-   disabled-at-end state can't shift the box or the centered suggestion. Both
-   chevrons stay on screen on every step; the inapplicable one is `:disabled`
-   (greyed) rather than hidden. */
-.welcome-carousel-nav {
-    position: absolute;
-    top: 50%;
-    transform: translateY(-50%);
-    z-index: 1;
-    width: 2rem;
-    height: 2rem;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
-    backdrop-filter: blur(0.5rem);
-    -webkit-backdrop-filter: blur(0.5rem);
-    border: 0.125rem solid var(--border-color);
-    color: var(--text-secondary);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0.85;
-    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
-}
-
-/* Float each chevron near the edge it belongs to, inset 0.5rem so it clears the
-   box's rounded corner and leaves breathing room out to the box border — source
-   order is prev, viewport, next, so :first-child is the ‹ (left) and :last-child
-   the › (right). */
-.welcome-carousel-nav:first-child { left: 0.5rem; }
-.welcome-carousel-nav:last-child { right: 0.5rem; }
-
-/* Disabled "when applicable" — kept on screen, greyed and non-interactive at the
-   first / last suggestion. Deliberately does NOT set `pointer-events: none`
-   (unlike .icon-btn:disabled): the chevron now floats OVER the full-width
-   suggestion box, so making it transparent to pointers would let a tap on the
-   greyed chevron fall through to the box and prefill the suggestion. As a
-   disabled <button> it already swallows the tap — no action fires, and it blocks
-   the box beneath from receiving the click. `:hover` is `:not(:disabled)`-gated,
-   so keeping pointer events doesn't reintroduce a hover state. */
-.welcome-carousel-nav:disabled {
-    opacity: 0.3;
-    cursor: default;
-}
-
-@media (hover: hover) {
-    .welcome-carousel-nav:not(:disabled):hover {
-        opacity: 1;
-        background: var(--bg-hover);
-        color: var(--text-primary);
-        border-color: var(--text-muted);
-    }
-}
-
-/* Carousel viewport: the sole in-flow child, so it spans the full carousel width
-   (the chevrons float over its ends). Stacks every suggestion in a SINGLE grid
-   cell, so the row track sizes to the tallest suggestion (hidden cards stay laid
-   out and still contribute their height) — the viewport height is stable across
-   slides and the vertically-centered chevrons no longer bounce as the visible
-   card's length changes. */
-.welcome-carousel-viewport {
-    flex: 1 1 auto;
-    min-width: 0;
-    display: grid;
-}
-
-/* The suggestions — tappable cards spanning the full carousel width, with the
-   chevrons floating over their left/right ends. Resets the native <button> chrome
-   (font-family doesn't inherit on buttons) and adopts the same translucent-bordered
-   treatment as the chevron nav so it reads as interactive without a hover (mobile
-   has none). Clicking the current one prefills the prompt. The wide 3.25rem
-   horizontal padding holds the text in exactly the position it had when the box
-   sat *between* the chevrons (2rem chevron + 0.5rem gap + 0.75rem old padding) —
-   so widening the box under the chevrons didn't push the text out to the edges.
-   All cards share the grid cell (`grid-area: 1 / 1`) and the default grid
-   `stretch` so every card renders at the uniform tallest-card height; the flex
-   centering keeps shorter text vertically centered within that height. */
-.welcome-hero .welcome-carousel-item {
-    grid-area: 1 / 1;
-    min-width: 0;
-    margin: 0;
-    padding: 0.5rem 3.25rem;
-    display: flex;
-    align-items: center;
-    font-family: inherit;
-    /* Primary (near-black) so the suggestion stands out by contrast rather than
-       size — the small italic copy still reads as the focal line. */
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    font-style: italic;
-    line-height: 1.45;
-    text-align: left;
-    cursor: pointer;
-    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
-    border: 0.0625rem solid var(--border-color);
-    border-radius: 0.625rem;
-    -webkit-tap-highlight-color: transparent;
-    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
-}
-
-/* Non-current cards stay laid out (so they keep driving the track height) but are
-   removed from sight and hit-testing — the markup also drops them from the tab
-   order and the a11y tree (aria-hidden / tabindex in WelcomeMessage.tsx). */
-.welcome-hero .welcome-carousel-item[aria-hidden="true"] {
-    visibility: hidden;
-    pointer-events: none;
-}
-
-@media (hover: hover) {
-    .welcome-hero .welcome-carousel-item:hover {
-        background: var(--bg-hover);
-        border-color: var(--text-muted);
-    }
 }
 
 /* Dismiss: a sleek, chrome-less ghost control pinned to the top-right of the
@@ -1636,66 +1714,6 @@ body:not(.is-touch) .code-block-copy-btn {
 body:not(.is-touch) .code-block-wrapper:hover .code-block-copy-btn,
 body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     opacity: 1;
-}
-
-/* Flat — no border/background; the surrounding InitiatorPanel owns the chrome. */
-.child-completion-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-}
-.child-completion-header-row {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.375rem;
-}
-.child-completion-prefix {
-    color: var(--text-secondary);
-}
-.child-completion-status {
-    display: inline-flex;
-    align-items: center;
-    font-size: var(--font-size-sm);
-    padding: 0.125rem 0.5rem;
-    border-radius: 0.25rem;
-    font-weight: 600;
-}
-.child-completion-status-success {
-    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
-    color: var(--accent-green);
-}
-.child-completion-status-failure {
-    background: color-mix(in srgb, var(--accent-red) 18%, transparent);
-    color: var(--accent-red);
-}
-.child-completion-status-no-changes {
-    background: var(--bg-tertiary);
-    color: var(--text-muted);
-}
-/* The four completion pills appear together in one stream, so each needs to be
-   distinguishable from the other three. Canceled is warm (--accent-orange) and
-   deliberately NOT the cool --accent-notable used for neutral markers elsewhere:
-   grey-blue would be a near-twin of the grey .child-completion-status-no-changes
-   pill right beside it — same weight, same temperature, only the glyph differing. */
-.child-completion-status-canceled {
-    background: color-mix(in srgb, var(--accent-orange) 18%, transparent);
-    color: var(--accent-orange);
-}
-.child-completion-disclosure {
-    font-size: var(--font-size-md);
-    color: var(--text-muted);
-}
-.child-completion-disclosure > summary {
-    cursor: pointer;
-    user-select: none;
-}
-.child-completion-disclosure > summary:hover {
-    color: var(--text-secondary);
-}
-.child-completion-summary {
-    margin-top: 0.375rem;
-    color: var(--text-secondary);
 }
 
 /* Benign empty completion: the model ended its turn cleanly with no text.

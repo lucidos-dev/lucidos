@@ -75,6 +75,20 @@ impl LucidosEngine {
                     .await
                     .map_err(|e| format!("Git commit failed: {}", e))?;
 
+                // A script that rewrote the profile has to reach the engine's
+                // hot copy of it too, or the next chat turn renders the one
+                // loaded at startup. The content only exists on disk here: the
+                // staged file was copied into `data/` above. Ahead of the emits
+                // below, which can fail with the files already committed and
+                // would then take this refresh with them.
+                for path in created.iter().chain(updated.iter()) {
+                    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+                        self.user_profile
+                            .artifact_written_on_disk(self.workspace_path(), artifact_path)
+                            .await;
+                    }
+                }
+
                 for path in &created {
                     self.event_bus
                         .emit(BusEvent::System(SystemEvent::ArtifactCreated {

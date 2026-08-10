@@ -528,10 +528,13 @@
     <div class="section-desc">Used by credentials, scheduled tasks, MCP servers, memory entries, and all other list views.</div>
     <div style="border: 1px solid var(--border-color); border-radius: 0.375rem; overflow:hidden;">
       <div class="list-rows">
-        <div class="list-row-add-card">
+        <!-- A button, not a div: the class carries the UA button reset and a
+             :focus-visible ring, so the card is in the tab order and answers
+             Enter and Space. -->
+        <button type="button" class="list-row-add-card">
           <span class="list-row-add-icon">+</span>
           <span class="list-row-add-label">Add new credential</span>
-        </div>
+        </button>
         <div class="list-section-title">Active</div>
         <div class="list-row">
           <div class="list-row-info">

@@ -36,7 +36,17 @@ use super::LucidosEngine;
 /// Process a single broadcast event: if it's a response-termination for a
 /// thread, run the open-todo settle. Exposed so tests can drive the
 /// dispatch without spawning the background task.
-pub async fn handle_event(bus: &EventBus, pool: &sqlx::PgPool, emitted: &EmittedEvent) {
+///
+/// `holds_background_work` is read by the caller rather than here, which is
+/// what keeps this function free of the engine handle and lets a test drive
+/// both sides of the branch. See the settle for why an unfinished background
+/// task counts as parked.
+pub async fn handle_event(
+    bus: &EventBus,
+    pool: &sqlx::PgPool,
+    emitted: &EmittedEvent,
+    holds_background_work: bool,
+) {
     // Only react to persisted thread events; in-memory broadcasts (seq == None)
     // include transient streaming chunks we ignore.
     let Some(seq) = emitted.seq else {
@@ -61,7 +71,7 @@ pub async fn handle_event(bus: &EventBus, pool: &sqlx::PgPool, emitted: &Emitted
     ) {
         return;
     }
-    settle_open_todos(bus, pool, *thread_id, seq).await;
+    settle_open_todos(bus, pool, *thread_id, seq, holds_background_work).await;
 }
 
 /// Spawn the todo settle consumer as a background task.
@@ -78,7 +88,26 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(emitted) => {
-                    handle_event(&engine.event_bus, engine.pool(), &emitted).await;
+                    // Read at TERMINATOR time, which is the instant the
+                    // question is about, and from the in-memory registry, so
+                    // it cannot race the turn tail's arming the way an events
+                    // query does.
+                    let holds_background_work = match &emitted.typed {
+                        BusEvent::Thread { thread_id, .. } => {
+                            engine
+                                .bash_background
+                                .has_running_for_thread(*thread_id)
+                                .await
+                        }
+                        _ => false,
+                    };
+                    handle_event(
+                        &engine.event_bus,
+                        engine.pool(),
+                        &emitted,
+                        holds_background_work,
+                    )
+                    .await;
                 }
                 Err(BroadcastStreamRecvError::Lagged(n)) => {
                     crate::log!(
@@ -126,6 +155,16 @@ mod tests {
         rx: &mut Receiver<EmittedEvent>,
         thread_id: Uuid,
     ) {
+        dispatch_next_terminator_with_background(bus, pool, rx, thread_id, false).await
+    }
+
+    async fn dispatch_next_terminator_with_background(
+        bus: &EventBus,
+        pool: &sqlx::PgPool,
+        rx: &mut Receiver<EmittedEvent>,
+        thread_id: Uuid,
+        holds_background_work: bool,
+    ) {
         loop {
             let ev = rx.recv().await.expect("broadcast channel should not close");
             let dispatch = if let BusEvent::Thread {
@@ -146,7 +185,7 @@ mod tests {
                 false
             };
             if dispatch {
-                handle_event(bus, pool, &ev).await;
+                handle_event(bus, pool, &ev, holds_background_work).await;
                 return;
             }
         }
@@ -338,6 +377,49 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    /// The engine-armed background-task wait is INVISIBLE to the anti-join:
+    /// the chat turn tail arms it after the loop has already emitted this
+    /// terminator, so its `EventWaitStarted` always sequences above the
+    /// terminator, and this consumer can run before the arming happens at all.
+    /// Without the registry read the list would settle `Abandoned` while the
+    /// subscription indicator says the thread is watching a build, and
+    /// `Abandoned` is terminal. That is the reported bug arriving through the
+    /// fix for it.
+    #[tokio::test]
+    async fn handle_event_settles_to_waiting_when_the_thread_holds_background_work() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, thread_id).await;
+        // No EventWaitStarted at all: the wait does not exist yet at terminator
+        // time, which is precisely the window this covers.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseGenerated {
+                text: "Phase A is building, I will report when it lands".into(),
+                model: None,
+                reasoning_effort: None,
+                images: vec![],
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit failed");
+        dispatch_next_terminator_with_background(&bus, &pool, &mut rx, thread_id, true).await;
+
+        let flipped = next_todo_items(&mut rx, thread_id).await;
+        assert_eq!(flipped.len(), 1, "list kept, got {:?}", flipped);
+        assert_eq!(
+            flipped[0].status,
+            super::super::thread_events::TodoStatus::Waiting,
+            "a thread owning a running background task is parked, not abandoned; got {:?}",
+            flipped[0].status,
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
     #[tokio::test]
     async fn handle_event_settles_to_waiting_when_the_thread_holds_a_live_event_wait() {
         // The end-to-end shape of the reported bug, driven through the consumer
@@ -427,7 +509,7 @@ mod tests {
             match timeout(remaining, rx.recv()).await {
                 Ok(Ok(ev)) => {
                     // Feed every event through handle_event — none should trigger cleanup.
-                    handle_event(&bus, &pool, &ev).await;
+                    handle_event(&bus, &pool, &ev, false).await;
                     if let BusEvent::Thread {
                         event: ThreadEvent::TodoListWritten { items },
                         thread_id: tid,

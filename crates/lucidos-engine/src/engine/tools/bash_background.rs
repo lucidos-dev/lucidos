@@ -178,6 +178,13 @@ struct BackgroundTask {
     /// change auto-proposed as "done", which caused premature Apply + harden-
     /// from-scratch on click.
     thread_id: Option<Uuid>,
+    /// The watchdog budget this task was spawned with, in seconds. Retained so
+    /// [`BackgroundBashRegistry::running_for_thread`] can report the deadline
+    /// past which the child is killed: an engine-armed *event wait* over this
+    /// task must not expire before the task itself can, or a long build would
+    /// outlive its own subscription and the completion would land with nobody
+    /// watching, which is the stall this whole mechanism exists to prevent.
+    timeout_secs: u64,
     kill_signal: Option<tokio::sync::oneshot::Sender<()>>,
     /// Signals the final `finished_at` write, and ONLY that — a buffered
     /// chunk deliberately does not wake the waiter. `bash_output(wait_secs=N)`
@@ -204,6 +211,20 @@ impl BackgroundTask {
         self.finished_at
             .is_some_and(|at| (now - at).num_seconds() > FINISHED_RETENTION_SECS)
     }
+}
+
+/// One unfinished background task, as [`BackgroundBashRegistry::running_for_thread`]
+/// reports it: what to watch for, and how long the watching has to last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningTaskHandle {
+    /// Matches the `task_id` on the eventual `BackgroundBashCompleted`, which
+    /// is what makes a subscription specific to THIS task rather than to any
+    /// background task finishing anywhere in the workspace.
+    pub task_id: String,
+    /// When the watchdog kills the child if it has not exited. The task cannot
+    /// outlive this, so a wait armed to at least this instant cannot be
+    /// outlived by the task either.
+    pub watchdog_deadline: DateTime<Utc>,
 }
 
 /// The final state of a completed task, read for the
@@ -345,6 +366,7 @@ impl BackgroundBashRegistry {
                     finished_at: None,
                     completion_recorded: false,
                     thread_id,
+                    timeout_secs,
                     kill_signal: Some(kill_tx),
                     finish_notify: Arc::new(Notify::new()),
                 },
@@ -544,6 +566,32 @@ impl BackgroundBashRegistry {
         tasks
             .values()
             .any(|t| t.thread_id == Some(thread_id) && !t.is_finished())
+    }
+
+    /// Every unfinished task this thread spawned, with the deadline past which
+    /// its watchdog kills the child. The plural, itemised form of
+    /// [`Self::has_running_for_thread`], and it shares that method's filter
+    /// exactly (`!is_finished()`, never mere presence in the map) so a retained
+    /// completion cannot appear here either.
+    ///
+    /// Exists for the chat turn tail, which arms an *event wait* per unfinished
+    /// task so a chat thread is re-opened when its background work completes.
+    /// A coding-agent thread gets that wake pushed at it directly by
+    /// `spawn_bash_completion_watcher`; a chat thread has no parked session to
+    /// push to, so the subscription is how it hears. Both halves are needed:
+    /// the `task_id` because an unconditioned `BackgroundBashCompleted` would
+    /// wake on any thread's task, and the deadline because a wait that expires
+    /// before its task can is a subscription that guarantees nothing.
+    pub async fn running_for_thread(&self, thread_id: Uuid) -> Vec<RunningTaskHandle> {
+        let tasks = self.locked().await;
+        tasks
+            .iter()
+            .filter(|(_, t)| t.thread_id == Some(thread_id) && !t.is_finished())
+            .map(|(task_id, t)| RunningTaskHandle {
+                task_id: task_id.clone(),
+                watchdog_deadline: t.started_at + chrono::Duration::seconds(t.timeout_secs as i64),
+            })
+            .collect()
     }
 
     /// Read a finished task's final state, for the `BackgroundBashCompleted`
@@ -1331,6 +1379,71 @@ mod tests {
         assert!(
             !reg.has_running_for_thread(my_thread).await,
             "a finished task must NOT keep registering as running"
+        );
+    }
+
+    /// `running_for_thread` is the same question `has_running_for_thread`
+    /// answers, itemised, and the chat turn tail arms one *event wait* per
+    /// task it returns. Two things have to hold or that wait is useless: the
+    /// `task_id` must be the one the eventual `BackgroundBashCompleted`
+    /// carries (an unconditioned subscription would wake on any thread's
+    /// task), and the deadline must be the point past which the watchdog kills
+    /// the child (a wait expiring sooner is outlived by the work it watches).
+    #[tokio::test]
+    async fn running_for_thread_reports_each_task_with_its_watchdog_deadline() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let other_thread = Uuid::new_v4();
+
+        assert!(
+            reg.running_for_thread(my_thread).await.is_empty(),
+            "empty registry must report nothing for any thread"
+        );
+
+        let timeout_secs = 900;
+        let before = Utc::now();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "sleep 30",
+                timeout_secs,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(my_thread),
+            )
+            .await
+            .expect("spawn");
+
+        let running = reg.running_for_thread(my_thread).await;
+        assert_eq!(running.len(), 1, "one running task for my_thread");
+        assert_eq!(
+            running[0].task_id, task_id,
+            "the reported id must be the one BackgroundBashCompleted will carry"
+        );
+        // The deadline is `started_at + timeout_secs`, and `started_at` was
+        // stamped between `before` and now, so the window is what can be
+        // asserted without reaching into the task.
+        assert!(
+            running[0].watchdog_deadline >= before + chrono::Duration::seconds(timeout_secs as i64)
+                && running[0].watchdog_deadline
+                    <= Utc::now() + chrono::Duration::seconds(timeout_secs as i64),
+            "deadline {} is not started_at + {timeout_secs}s",
+            running[0].watchdog_deadline
+        );
+
+        assert!(
+            reg.running_for_thread(other_thread).await.is_empty(),
+            "my_thread's task must not leak to another thread"
+        );
+
+        // A retained completion is not running, exactly as its sibling has it:
+        // the filter is `!is_finished()`, never presence in the map. Otherwise
+        // the tail would arm a wait for work that already finished, and that
+        // wait can never fire.
+        assert!(reg.kill(&task_id).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+        assert!(
+            reg.running_for_thread(my_thread).await.is_empty(),
+            "a finished task must not still be reported as running"
         );
     }
 

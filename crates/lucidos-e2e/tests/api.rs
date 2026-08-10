@@ -11,6 +11,9 @@ mod support;
 #[path = "api_support/health_test.rs"]
 mod health_test;
 
+#[path = "api_support/workspace_label_test.rs"]
+mod workspace_label_test;
+
 #[path = "api_support/chat_test.rs"]
 mod chat_test;
 

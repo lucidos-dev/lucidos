@@ -16,8 +16,14 @@ vi.mock('../../utils/platform', () => ({
 // web-path tests don't need a Tauri IPC bridge and the Tauri-path test can
 // assert the per-theme color.
 const setTitlebarColorMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+// The same block signals that the page is about to paint, which is what lets the
+// shell show the window it kept hidden at launch. The real one is one-shot per
+// document (utils/tauri.test.ts pins that); this mock counts every call, which is
+// how the tests below can see it fire on the Tauri path only.
+const windowReadyToShowMock = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/tauri', () => ({
   setTitlebarColor: setTitlebarColorMock,
+  windowReadyToShow: windowReadyToShowMock,
 }));
 
 describe('currentTheme — localStorage fallback', () => {
@@ -362,6 +368,7 @@ describe("applyTheme('system') — matchMedia change listener gating", () => {
 describe('applyTheme — native title-bar tint (Tauri)', () => {
   beforeEach(() => {
     setTitlebarColorMock.mockClear();
+    windowReadyToShowMock.mockClear();
     platformMocks.isTauri = false;
   });
 
@@ -381,6 +388,19 @@ describe('applyTheme — native title-bar tint (Tauri)', () => {
     expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#1a6fd0');
     applyTheme('dark');
     expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#15549e');
+  });
+
+  it('tells the shell the page is ready to show, Tauri only', () => {
+    // Nothing is waiting on a hidden window in a browser, and there is no IPC
+    // bridge to carry the signal.
+    applyTheme('light');
+    expect(windowReadyToShowMock).not.toHaveBeenCalled();
+
+    // Under Tauri the theme is now resolved and on the document, which is the
+    // moment a window can come on screen showing a page instead of bare tint.
+    platformMocks.isTauri = true;
+    applyTheme('light');
+    expect(windowReadyToShowMock).toHaveBeenCalled();
   });
 });
 

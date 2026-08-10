@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, newThread, sendMessage, waitForResponse } from './helpers';
+import { assertHealthy, navigateToApp, newThread, revealSteps, sendMessage, waitForResponse } from './helpers';
 
 /** The step row's context counter collapses to the bare percentage when the ROW
  *  is narrow, not when the DEVICE is a phone (`@container step-row` in
@@ -47,11 +47,7 @@ async function counterOfFirstStep(page: Page): Promise<Locator> {
   await waitForResponse(page);
 
   // Inline steps are hidden by default (`stepsExpanded` in localStorage).
-  const showStepsBtn = page
-    .locator('button.details-toggle:visible', { hasText: 'Show steps' })
-    .first();
-  await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
-  await showStepsBtn.click();
+  await revealSteps(page);
 
   const counter = page
     .locator('[data-role="inline-step"]:visible [data-role="step-context"]')

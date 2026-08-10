@@ -161,7 +161,7 @@ describe('scrollToBottomAnimated', () => {
     expect(awayFromBottom.value).toBe(false);
   });
 
-  it('keeps following once it lands, because the tap asked to ride the live edge', () => {
+  it('arms nothing once it lands: the tap asked for one jump', () => {
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
     const { onResize } = makeScrollObservers(el as any);
     setActiveScrollElement(el);
@@ -170,17 +170,17 @@ describe('scrollToBottomAnimated', () => {
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(4500);
 
-    // A beat later the reply streams on. The landing ARMS the standing follow,
-    // so growth carries the reader with it instead of stranding them one tap
-    // above the live edge. It is not the old pin: the condition is the flag the
-    // tap set, not a proximity window, and a reader who never tapped is left
-    // alone by the identical growth (scroll-follow-the-live-edge.test.ts).
+    // A beat later the reply streams on, and the reader stays exactly where the
+    // tween put them. The landing used to ARM the standing follow, which left
+    // the mode with no visible state and no way off; riding is the follow
+    // toggle's own request now, and the chevron is a navigation like the up
+    // chevron beside it (scroll-follow-the-live-edge.test.ts).
     el.scrollHeight = 6000;
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(5500);
-    expect(awayFromBottom.value).toBe(false);
+    expect(el.scrollTop).toBe(4500);
+    expect(awayFromBottom.value).toBe(true);
   });
 
   it('reduced motion snaps straight to the bottom (scrollToBottom) with no ease', () => {

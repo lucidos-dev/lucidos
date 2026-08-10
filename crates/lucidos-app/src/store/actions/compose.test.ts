@@ -165,7 +165,7 @@ describe('sendFollowup clears the active-thread draft', () => {
   });
 });
 
-describe('prefillCompose — starter suggestion drop-in', () => {
+describe('prefillCompose: seeded-prompt drop-in', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -214,7 +214,7 @@ describe('prefillCompose — starter suggestion drop-in', () => {
   });
 });
 
-describe('applySuggestion — welcome starter drop-in', () => {
+describe('applySuggestion: seeding the compose input on the user\'s behalf', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {

@@ -473,8 +473,9 @@ enum EventWaitsCmd {
     /// Call it before telling the user whether you are still watching for
     /// something, and to get the id `cancel` takes.
     List,
-    /// Stop watching. Pass `--wait-id <id>` for one subscription or `--all` for
-    /// every one on this thread; exactly one of the two.
+    /// Stop watching. Pass `--wait-id <id>` for one subscription, `--on
+    /// <EventType>` for the ones watching an event type, or `--all` for every
+    /// one on this thread; exactly one of the three.
     ///
     /// There is no wake, so nothing interrupts you: the subscription simply
     /// stops, the user sees it leave the subscription indicator, and the
@@ -483,6 +484,12 @@ enum EventWaitsCmd {
         /// The subscription to stop, from `event-waits list`.
         #[arg(long = "wait-id")]
         wait_id: Option<String>,
+        /// Stop every subscription on this thread watching this event type,
+        /// whatever condition each one carries. Needs no id, and leaves every
+        /// other watch alone: the form to use when the answer about one thing
+        /// arrived some other way.
+        #[arg(long = "on")]
+        on: Option<String>,
         /// Stop every live subscription on this thread.
         #[arg(long)]
         all: bool,
@@ -839,6 +846,11 @@ enum EventsCmd {
         /// Mutually exclusive with --before-event-id.
         #[arg(long, value_name = "UUID")]
         after_event_id: Option<String>,
+        /// Restrict to one thread. This is how you read a past conversation:
+        /// pair it with `--type MessageReceived`, or the query returns that
+        /// thread's entire transcript including every streamed token.
+        #[arg(long, value_name = "UUID")]
+        thread_id: Option<String>,
         /// Max events to return (server clamps to 1..=1000).
         #[arg(long)]
         limit: Option<u32>,
@@ -907,6 +919,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     until,
                     before_event_id,
                     after_event_id,
+                    thread_id,
                     limit,
                 } => events::cmd_query(
                     &ws,
@@ -916,6 +929,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                         until: until.as_deref(),
                         before_event_id: before_event_id.as_deref(),
                         after_event_id: after_event_id.as_deref(),
+                        thread_id: thread_id.as_deref(),
                         limit,
                     },
                 )?,
@@ -1045,9 +1059,12 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             let ws = resolve_from_env()?;
             match action {
                 EventWaitsCmd::List => event_waits::cmd_event_waits_list(&ws)?,
-                EventWaitsCmd::Cancel { wait_id, all } => {
-                    event_waits::cmd_event_waits_cancel(&ws, wait_id.as_deref(), all)?
-                }
+                EventWaitsCmd::Cancel { wait_id, on, all } => event_waits::cmd_event_waits_cancel(
+                    &ws,
+                    wait_id.as_deref(),
+                    on.as_deref(),
+                    all,
+                )?,
             }
             Ok(0)
         }

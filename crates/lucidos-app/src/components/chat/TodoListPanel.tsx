@@ -22,12 +22,14 @@ export function todoListIndicatorBody({
   const waiting = items.filter((i) => i.status === 'waiting').length;
   const abandoned = items.filter((i) => i.status === 'abandoned').length;
   const inProgress = items.find((i) => i.status === 'in_progress');
-  // Four honest indicator states, stamped as `data-state` and distinguished
-  // by COLOR alone (todo-list.css) over one shared ticked-checkbox glyph:
+  // Four honest indicator states, stamped as `data-state` and distinguished by
+  // COLOR (and, for waiting, MOTION) in todo-list.css, over one shared
+  // ticked-checkbox glyph:
   //   - in-progress: the agent is actively working an item (accent)
   //   - waiting: no in-progress item AND at least one item is parked on a live
   //     event wait, i.e. the agent stopped on purpose and something will wake
-  //     it (accent-yellow, live but not working)
+  //     it (the idle gray, pulsing: the app's own waiting language, as on a
+  //     drawer row's dot)
   //   - abandoned: no in-progress item AND at least one item was abandoned (dimmed)
   //   - idle: every non-completed item is gone (all done, or nothing pending)
   // Waiting outranks abandoned because it is the live fact: a list carrying
@@ -46,12 +48,13 @@ export function todoListIndicatorBody({
       : abandoned > 0
         ? `${completed} of ${total} done, ${abandoned} abandoned`
         : `${completed} of ${total} done`;
-  // The aria-label names the state, it does not just count. Color is the ONLY
-  // visual channel carrying it now that all four states share one glyph, and
-  // color is exactly the channel a screen reader cannot read and forced-colors
-  // mode overwrites (there --accent, --accent-yellow and --text-secondary all
-  // collapse to the system foreground, so the states would be identical).
-  // The tooltip can't stand in for it: it is desktop-hover only.
+  // The aria-label names the state, it does not just count. Color and a pulse
+  // are the ONLY visual channels carrying it now that all four states share one
+  // glyph, and neither is a channel a screen reader can report. Color is also
+  // the one forced-colors mode overwrites: there --accent and --text-secondary
+  // both collapse to the system foreground, leaving in-progress, idle and
+  // abandoned identical. The tooltip can't stand in for it either: it is
+  // desktop-hover only.
   const ariaLabel = inProgress
     ? `Todo list: ${inProgress.active_form}. ${completed} of ${total} done. Click to expand.`
     : waiting > 0

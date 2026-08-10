@@ -912,12 +912,13 @@ export function ensureFocusedComposeThread(): string {
   return id;
 }
 
-/** Prefill the compose input with a starter prompt (the welcome suggestions).
+/** Prefill the compose input with a seeded prompt (today, the setup interview's
+ *  sentence).
  *  Lazily focuses/creates a composing thread, then writes the text through the
  *  normal debounced compose path so it syncs to the textarea and persists like
  *  any typed draft. Replaces the WHOLE input — text AND any attached images —
- *  so the starter lands cleanly; a lingering attachment would otherwise ride
- *  along with the unrelated suggestion (`image_hashes: []` is a no-op on a
+ *  so the seeded prompt lands cleanly; a lingering attachment would otherwise
+ *  ride along with an unrelated sentence (`image_hashes: []` is a no-op on a
  *  brand-new draft). Does NOT send — the user reviews/edits, picks a
  *  destination, and hits Send themselves. Returns the thread id the text
  *  landed on.
@@ -961,10 +962,15 @@ function dropNonComposingFocus(): void {
   unfocusThread();
 }
 
-/** Apply a welcome-message starter suggestion to the compose input.
+/** Apply a suggested sentence to the compose input on the user's behalf.
  *
- *  Starter suggestions are conversational, so the destination is forced to the
- *  Lucidos Agent (a coding-agent draft flips back to chat). The suggestion
+ *  Its one caller today is {@link startSetupInterview}; the welcome's starter
+ *  suggestions, which is where the name comes from, were removed in favour of
+ *  that single entry point. It stays a separate step because the interview
+ *  reuses every part of it and only adds the send.
+ *
+ *  A suggested sentence is conversational, so the destination is forced to the
+ *  Lucidos Agent (a coding-agent draft flips back to chat). It
  *  REPLACES the focused draft's whole input — text AND any attached images (via
  *  `prefillCompose`) — so if a non-empty draft is already in progress, confirm the
  *  override first (a click must never silently blow away typed text or attachments;
@@ -974,8 +980,8 @@ function dropNonComposingFocus(): void {
  *  typing — without the force the draft signal (and the drawer row) would update
  *  but the visible prompt would stay stale.
  *
- *  Returns true when the suggestion was applied, false when the user declined the
- *  override. Does NOT send — the user reviews/edits and hits Send themselves. */
+ *  Returns true when the sentence was applied, false when the user declined the
+ *  override. Does NOT send: that is `startSetupInterview`'s extra step. */
 export async function applySuggestion(text: string): Promise<boolean> {
   dropNonComposingFocus();
   const existingId = focusedThreadId.value;

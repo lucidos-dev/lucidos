@@ -223,7 +223,8 @@ indicator's job: the indicator is where the live countdown and Stop already
 were, and the ADR's own reasoning for the split says the indicator is primary.
 Nothing moved to a surface that did not already own it. The one affordance kept
 in the transcript is the jump to a matched event, because a resolved wait has
-left the indicator and the link is its only route there.
+left the indicator and the link is its only route there. (It sat on the arming
+row until 2026-08-10 and now sits on the wake; see the correction below.)
 
 **The detached wake shows the event, not the prompt.** The design leaves the
 wake's `UserPromptInjected.text` as the model's prompt, which necessarily spells
@@ -240,3 +241,61 @@ delivery, and the client never parses engine-authored prose back apart.
 Neither half changes the wake mechanics: the anchor is still a
 `UserPromptInjected`, still an exchange-start event, and still what the lost-wake
 sweep recognises.
+
+## Amendment, 2026-08-10: the transcript surface is a row of its own, shared with three others
+
+The amendment above dropped the box and made the record "one line in the step
+list". That was the right weight and the wrong clothes, and this corrects the
+clothes without touching the weight.
+
+**A marker must not wear a step's outcome.** Rendered through `.inline-step`, the
+row took a `StepOutcome`, and the only honest mapping put `waiting` on `success`,
+because the *action* of arming finished even though the *wait* had not. On screen
+that is the identical green check a completed tool call gets, sitting on a
+subscription that may sleep for hours. The same costume ellipsized both
+`.step-description` and `.step-detail` to one line each, which is correct for a
+terse tool description and wrong here: the reason is a sentence the model wrote
+and the subscription is a list of type names, and those two are the entire
+content of the row.
+
+**The fix is one row shared by four kinds, not a fifth bespoke one.** An event
+wait, a detached *wake anchor*'s delivery, a `ChildThreadCompleted` callback and
+a `TriggerStarted` fire all answer "what happened outside this thread", and they
+had four glyph vocabularies, three disclosure labels, and the event type as an
+accent chip in two of them and prose in the other two. They now share the *event
+row* (`docs/glossary.md`): one muted mark column, a wrapping subject, a state
+word whose tint only groups it, the one `.event-name` chip for every event type,
+and one fold labelled by its content. Nothing about grouping, delivery,
+attachment or the anchor moves; this is the view layer only.
+
+**Two constraints this amendment adds, both about not inventing.** A row states
+no fact its own event carries: a scheduled trigger names no cron, because
+`TriggerStarted` records `invocation: { kind: 'Schedule' }` and no schedule
+string; a wake names no arming reason, because that lives on the
+`EventWaitStarted`, which is routinely outside the loaded window by the time the
+wake lands. And the deadline is **stated, not counted down**: the amendment above
+already assigned the live countdown to the indicator, and a ticking span in the
+transcript would also re-render inside `ChatExchange` once a second for as long
+as the thread sleeps.
+
+**Correction, same day: the box comes back, one weight down.** The 2026-08-06
+amendment above dropped the box, and the first cut of this one kept it dropped.
+Seen in a real transcript that was wrong: with no container, the subject, the
+facts and the fold read as three loose lines of debris between the step list
+above and the prose below, and a wake printed its event name twice (once as the
+panel's summary line, once in the row). So an event row is a card, and the rule
+that survives is the RANKING rather than the prohibition: `.step-note-card` is
+what an inline affordance earns, so this sits one weight below it on
+`--bg-secondary` with a hairline. A panel embedding an event row now carries no
+summary line, since the row's subject already says it.
+
+**And the jump moved to the wake.** The 2026-08-06 amendment kept one affordance
+in the transcript, the link to a matched event, and put it on the arming row
+because that is where the resolution lands. On screen that reads wrong: the
+arming card records the moment the agent SET THE WAIT UP, and a link out of it
+points at something that happened hours later. The wake card is that event's
+arrival, so the jump lives there now (`EventDeliveryBody`, off the
+`EventWaitDelivered`'s own `event_id`). The arming card still NAMES the matched
+type, which is a fact about how the wait ended rather than a route out of it.
+
+See `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.

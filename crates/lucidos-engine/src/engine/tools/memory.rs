@@ -296,6 +296,100 @@ If NONE should be deleted, reply with "none"."#,
         };
         correct_memory_by_id_impl(index, self.embedder.as_ref(), args).await
     }
+
+    /// `memory` action `search`: the agent's own query against long-term
+    /// memory, for when the pre-turn injection missed something it needs.
+    ///
+    /// Ranked by the SAME formula as that injection
+    /// (`engine::memory::relevance_score`), so a search cannot come back in a
+    /// different order from the facts already in context. Two orderings over
+    /// one corpus is a contradiction the agent would have to resolve with
+    /// nothing to resolve it by.
+    pub(crate) async fn execute_search_memory(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if q.is_empty() {
+            return Ok("Error: q is required. Ask what you want to know.".to_string());
+        }
+        let limit = args.get("limit").and_then(|v| v.as_i64());
+        let found = self.search_memory_ranked(q, limit).await?;
+        Ok(serde_json::to_string(&found)?)
+    }
+
+    /// `memory` action `source`: walk one memory back to the event it came
+    /// from, which carries the thread that produced it.
+    pub(crate) async fn execute_memory_source(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if id.is_empty() {
+            return Ok(
+                "Error: id is required. Copy the `[id: <uuid>]` from the memory.".to_string(),
+            );
+        }
+        let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+            return Ok(format!("Error: '{id}' is not a uuid."));
+        };
+        match self.memory_source(uuid).await {
+            Ok(found) => Ok(serde_json::to_string(&found)?),
+            // Surfaced rather than returned as an Err so the agent reads the
+            // instruction and re-asks, instead of the loop reporting a failure
+            // it cannot act on. The artifact case is the one that matters: it
+            // is not a missing memory, it is a memory with no conversation.
+            Err(e) => Ok(format!("Error: {e}")),
+        }
+    }
+
+    /// `threads` action `search`: find past threads by what was said in them.
+    ///
+    /// The capability the UI's search box already had and the agent did not,
+    /// which is why "we talked about this" was unanswerable: `list` filters by
+    /// status and channel and can never find a topic.
+    pub(crate) async fn execute_search_threads(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let q = args.get("q").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if q.is_empty() {
+            return Ok("Error: q is required. Say what was discussed.".to_string());
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(20)
+            .clamp(1, 50);
+        let found = crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
+        // PROJECTED, never the raw `ThreadSearchResult`. That flattens the whole
+        // `ThreadSummary`, which carries the user's in-progress `compose_text`
+        // and `compose_images`: a half-typed private draft in a matching thread
+        // would be shipped to the model provider and quotable back, from a
+        // search the user only asked to find a topic with. It also carries ~30
+        // bookkeeping fields the model has no use for, and raw uuids the
+        // prompt's own NAMES-NOT-IDS rule tells it never to show. Returning the
+        // full row to the user's own browser was fine; the model is a new
+        // consumer with a different boundary.
+        let projected: Vec<serde_json::Value> = found
+            .iter()
+            // The schema states 1-50, and the merge bounds each ARM rather than
+            // the total, so the promise is kept here.
+            .take(limit.max(0) as usize)
+            .map(|r| {
+                serde_json::json!({
+                    // The one id the model needs, and only to pass to the
+                    // `events` tool's 'query' to read the thread.
+                    "thread_id": r.info.thread_id,
+                    "title": r.info.title,
+                    "last_activity": r.info.last_activity,
+                    "message_count": r.info.message_count,
+                    "channel": r.info.channel,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&projected)?)
+    }
 }
 
 /// Parse the `id` arg for `correct_memory_by_id`. Accepts a bare UUID

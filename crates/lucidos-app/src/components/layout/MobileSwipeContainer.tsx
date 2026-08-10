@@ -73,6 +73,49 @@ export function shouldStartPaneSwipe(args: {
   return !textInputFocused && !targetScrollable && !appFullscreen;
 }
 
+/** Pure decision: does focus on `el` mean the mobile keyboard is up over the
+ *  app, i.e. should `data-keyboard-active` be set?
+ *
+ *  Scoped to `<textarea>` (not every text input) so the header search bar stays
+ *  interactive while its `<input>` is focused. The thread-title editor is
+ *  excluded because its own container (`.mobile-thread-title-row`) is one of the
+ *  things the flag inerts, which would lock the user out of the editor they just
+ *  opened and defeat tap-outside-to-blur.
+ *
+ *  Takes the element rather than reading `document.activeElement` itself, so the
+ *  same predicate answers for a focus EVENT's target and for the live focus (see
+ *  `reconcileKeyboardActive`). Duck-typed on `tagName` + `closest` rather than
+ *  `instanceof`, matching `shouldSuppressDragStart`: testable without a DOM, and
+ *  realm-agnostic. */
+export function isKeyboardActiveTarget(el: EventTarget | null): boolean {
+  const node = el as { tagName?: string; closest?: (sel: string) => unknown } | null;
+  if (!node || node.tagName !== 'TEXTAREA' || typeof node.closest !== 'function') return false;
+  return node.closest('.mobile-thread-title-row') == null;
+}
+
+/** Attribute sink: `<html>` in the app, a recording stub in tests. */
+interface AttrTarget {
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+}
+
+/** Re-derive `data-keyboard-active` from the LIVE focus, rather than from the
+ *  last focus event seen.
+ *
+ *  The focusin/focusout pair below describes focus by its TRANSITIONS, and one
+ *  transition is never reported: removing the focused element from the DOM moves
+ *  focus to `<body>` WITHOUT firing focusout, in WebKit and Chromium alike
+ *  (verified on mobile WebKit). The flag then outlives the keyboard that
+ *  justified it, and everything it gates stays inert with nothing focused and no
+ *  event left to clear it. An iOS PWA resume is the same hazard from the other
+ *  side: the page can come back with the attribute intact and focus dropped.
+ *
+ *  Idempotent, so it is safe to run on every touch. */
+export function reconcileKeyboardActive(root: AttrTarget, active: EventTarget | null): void {
+  if (isKeyboardActiveTarget(active)) root.setAttribute('data-keyboard-active', '');
+  else root.removeAttribute('data-keyboard-active');
+}
+
 /** Pure decision: what value should `--app-height` be written to, given the
  *  current visual viewport, layout viewport, and focus state? Extracted so
  *  the wake/resize bug can be unit-tested without jsdom + fake visualViewport.
@@ -337,28 +380,32 @@ export function MobileSwipeContainer() {
 
   // When a textarea is focused on mobile, set data-keyboard-active on
   // <html> so CSS can disable pointer-events on non-textarea elements.
-  // Scoped to <textarea> (not all text inputs) so the header search bar
-  // remains interactive when its <input> is focused. Excludes the title
-  // editor — its container (.mobile-thread-title-row) is one of the
-  // pointer-events targets, which would lock the user out of their own
-  // editor and prevent tap-outside-to-blur.
   useEffect(() => {
     const root = document.documentElement;
-    const triggers = (el: EventTarget | null) =>
-      el instanceof HTMLTextAreaElement && !el.closest('.mobile-thread-title-row');
     const onFocusIn = (e: FocusEvent) => {
-      if (triggers(e.target)) root.setAttribute('data-keyboard-active', '');
+      if (isKeyboardActiveTarget(e.target)) root.setAttribute('data-keyboard-active', '');
     };
     const onFocusOut = (e: FocusEvent) => {
       // relatedTarget is the next focused element — if it's also a triggering
       // textarea, keep the attribute (user tapped between prompt fields).
-      if (!triggers(e.relatedTarget)) root.removeAttribute('data-keyboard-active');
+      if (!isKeyboardActiveTarget(e.relatedTarget)) root.removeAttribute('data-keyboard-active');
     };
+    // Sweep the flag back into agreement with the live focus at the moments a
+    // stale one would first be FELT: the user's next touch (capture phase, so an
+    // inert target still reports it) and a return to the foreground. See
+    // `reconcileKeyboardActive` for the transition that fires no event at all.
+    const reconcile = () => reconcileKeyboardActive(root, document.activeElement);
     document.addEventListener('focusin', onFocusIn, { passive: true });
     document.addEventListener('focusout', onFocusOut, { passive: true });
+    document.addEventListener('touchstart', reconcile, { passive: true, capture: true });
+    document.addEventListener('visibilitychange', reconcile, { passive: true });
+    window.addEventListener('pageshow', reconcile, { passive: true });
     return () => {
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
+      document.removeEventListener('touchstart', reconcile, { capture: true });
+      document.removeEventListener('visibilitychange', reconcile);
+      window.removeEventListener('pageshow', reconcile);
       root.removeAttribute('data-keyboard-active');
     };
   }, []);

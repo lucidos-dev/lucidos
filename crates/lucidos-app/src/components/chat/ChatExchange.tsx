@@ -1,28 +1,30 @@
 import type { ComponentChildren } from 'preact';
+import type { Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
-import { useMemo, useRef } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
 import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
-import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
+import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
 import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
-import { ChildCompletionCard } from './ChildCompletionCard';
-import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections, hasVisibleLiveStep } from '../../store/event-rendering';
-import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
+import { ChildCompletionRow } from './ChildCompletionRow';
+import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, hasVisibleLiveStep, drawsResponseRow } from '../../store/event-rendering';
+import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitStep, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon } from '../shared/icons';
+import { setThreadLive } from './scrollState';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
 // without these, every dependent useMemo invalidates on every render whenever
@@ -108,10 +110,50 @@ interface Props {
    *  29-exchange thread from re-parsing every markdown body per SSE event.
    *  Both undefined unless this exchange is such a wake. */
   wakeEventType?: string;
+  wakeEventId?: string;
   wakePayloadJson?: string;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson }: Props) {
+/** Does this exchange mean the AGENT IS RUNNING on the thread being shown? The
+ *  follow's live term (see `setThreadLive` in `scrollState`), and nothing else,
+ *  which is why it can afford to be strict: it decides whether the reader's
+ *  scroll means "stop dragging me" or merely "I am browsing".
+ *
+ *  TWO sources have to agree, and the second is the load-bearing one. The
+ *  exchange status alone was wrong, because it is a RENDERING verdict about one
+ *  turn and its final fallthrough is `'pending'`, i.e. "a coding-agent turn that
+ *  has not produced a step yet". A stepless SYSTEM boundary reaches that line
+ *  too: `ChangeApplied` opens an exchange of its own, so a coding-agent thread
+ *  whose change the user applied ends in an exchange with no steps and no
+ *  terminal, and `'pending'` is in `ACTIVE_STATUSES`. That is invisible in the
+ *  panel (a bare boundary draws no response row, so nothing painted the phantom
+ *  "Requesting"), and it made the follow believe every such thread was live
+ *  forever. Since most coding-agent threads here end in an applied change, that
+ *  was nearly all of them, and one scroll retired a follow the reader had turned
+ *  on deliberately.
+ *
+ *  So ask the THREAD PROJECTION as well. `threadIdle` is the aggregate's own
+ *  "this thread is quiescent", which is the exact question the live term wants
+ *  and the only authority on it: a per-turn render status can be generous about
+ *  a turn that might be starting, where the projection says whether anything is
+ *  actually running. Parked on a question counts as idle, correctly, since
+ *  nothing is being appended and nothing can drag the reader anywhere.
+ *
+ *  Deliberately NOT fixed in `exchangeStatus` instead. Its `'pending'`
+ *  fallthrough is load-bearing for the real case (a coding-agent send takes
+ *  seconds to produce its first step, and reading that gap as "Done ✓" is the
+ *  regression the `!isCC` guard on the empty-exchange arm exists to avoid), and
+ *  every status label in the app hangs off that function. The mistake was asking
+ *  a per-turn question and treating the answer as a thread-level fact. */
+export function exchangeMarksThreadLive(
+  isLast: boolean,
+  status: ExchangeStatus,
+  threadIdle: boolean,
+): boolean {
+  return isLast && isStatusActive(status) && !threadIdle;
+}
+
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakeEventId, wakePayloadJson }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -126,6 +168,24 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
+
+  // Tell `scrollState` whether the agent is LIVE on this thread, which is the
+  // one thing that decides whether the reader's scroll retires their standing
+  // follow: fleeing a reply in flight does, browsing an idle thread does not.
+  // Here because this is the component that already derives the status, and
+  // `scrollState` deliberately cannot import `store` to derive it itself.
+  //
+  // Only the LAST exchange answers, since only it can be running, and the
+  // cleanup clears the answer rather than leaving it: a thread switch unmounts
+  // this exchange and the incoming thread's own last exchange sets its own
+  // value, but between the two nobody must be able to read the thread they
+  // just left. See `setThreadLive`.
+  const threadLive = exchangeMarksThreadLive(isLast, status, threadIdle);
+  useEffect(() => {
+    if (!isLast) return;
+    setThreadLive(threadLive);
+    return () => setThreadLive(false);
+  }, [isLast, threadLive]);
 
   // Cap detection reads ResponseGenerated.text directly via exchangeEngineLimitDetail —
   // the cap is emitted without a preceding TextStreamed, so it never lands in
@@ -147,10 +207,23 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
   const hasEvents = events.length > 0;
   const hasSections = events.some(e => e.type === 'section_break');
-  const { showMoreToggle, showStepsToggle } = getEventToggleState(events);
+  const dropsEarlierProse = hidesEarlierProse(events);
   const hasSteps = steps.length > 0 || events.some(e => e.type === 'step');
 
-  const canCollapse = hasResponse || hasEvents;
+  // Is there a body to fold, and therefore a body to draw at all? One
+  // definition, because `hasBody` on the panel below asks the same thing.
+  //
+  // Deliberately NOT `hasEvents`. A fold swaps the body for a `⋯` stub, so on a
+  // turn whose body draws nothing it swaps nothing for a mark. In flight that
+  // is the common case rather than a corner: a coding-agent turn emits a
+  // whitespace-only text event before every tool call and its steps are hidden
+  // by default (`stepsExpanded` seeds from localStorage, absent means off), so
+  // `events.length` runs ahead of anything on screen for as long as the turn
+  // has produced only mechanics. Asking `drawsResponseRow` instead means the
+  // control is dead exactly while the turn is blank, and lights up with its
+  // first drawn row. Turning steps OFF can therefore unfold a step-only turn,
+  // which is right: folded or not, it is showing nothing either way.
+  const canCollapse = hasResponse || events.some((e) => drawsResponseRow(e, showSteps));
   const isCollapsed = canCollapse && collapsedExchanges.value.has(`${threadId}:${exchange.userSeq}`);
 
   function handleLinkClick(e: MouseEvent) {
@@ -290,28 +363,45 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     }
   }
 
-  // More/Less and Show steps/Hide steps grow the turn the reader is looking at,
-  // so `withScrollAnchor` holds the `.chat-exchange` ROOT still across the
-  // growth. Everything the two reveal grows BELOW that root's top, so the
-  // reader keeps looking at the same thing and the transcript simply gets
-  // taller underneath them.
+  // The two turn controls (full response, steps) grow the turn the reader is
+  // looking at, so `withScrollAnchor` holds the `.chat-exchange` ROOT still
+  // across the growth. Everything the two reveal grows BELOW that root's top,
+  // so the reader keeps looking at the same thing and the transcript simply
+  // gets taller underneath them.
   //
   // Each toggle used to call `preserveOnToggle()` first, which marked the reader
   // parked so the transcript's ResizeObserver would not read the growth as "the
   // reader is riding the bottom" and re-pin them, scrolling the thing they just
   // opened off the top. No resize re-pins anyone now, so the mark has nothing
   // left to prevent.
-  function toggleDetails() {
+  //
+  // Turning either ON also lifts THIS turn's fold, and only this turn's. A
+  // folded turn draws no body, so a reveal clicked from its header would land
+  // on every other turn in the transcript and do nothing where the click was
+  // made. The setting stays transcript-wide; what the unfold clears is the
+  // local override that would hide it here. One-way, via `expandExchange`
+  // rather than a toggle: turning a reveal off must never fold anything, since
+  // a fold is the reader's own explicit act.
+  //
+  // Unconditional on the ON edge, deliberately, and NOT gated on `canCollapse`
+  // however much it looks like it wants to be. The turn this fires on is very
+  // often one where `canCollapse` is false precisely BECAUSE the thing being
+  // revealed is hidden: a folded step-only turn with the steps control off
+  // draws nothing, so it reads as uncollapsible right up until the click that
+  // turns steps on. Gate on `canCollapse` and that click leaves the key in the
+  // store, so the turn folds back to `⋯` the instant its steps become
+  // drawable, which is the dead-click this whole path exists to remove.
+  // `expandExchange` no-ops when the key is absent, so the unconditional call
+  // costs nothing on a turn that was never folded.
+  function reveal(setting: Signal<boolean>) {
     withScrollAnchor(rootRef.current, () => {
-      detailsExpanded.value = !detailsExpanded.value;
+      setting.value = !setting.value;
+      if (setting.value) expandExchange(threadId, exchange.userSeq);
     });
   }
 
-  function toggleSteps() {
-    withScrollAnchor(rootRef.current, () => {
-      stepsExpanded.value = !stepsExpanded.value;
-    });
-  }
+  const toggleDetails = () => reveal(detailsExpanded);
+  const toggleSteps = () => reveal(stepsExpanded);
 
   const exchangeActive = isStatusActive(status);
   const isEmptyContinued = isEmptyContinuedExchange(status, hasResponse, events, isLast);
@@ -337,29 +427,28 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     });
   }
 
-  function renderToggles() {
-    if (!showMoreToggle && !showStepsToggle) return null;
-    return (
-      <div class="response-toggles">
-        {showMoreToggle && (
-          <button class="details-toggle" onClick={toggleDetails}>
-            {showDetails ? 'Less' : 'More'}
-          </button>
-        )}
-        {showStepsToggle && (
-          <button class="details-toggle" onClick={toggleSteps}>
-            {showSteps ? 'Hide steps' : 'Show steps'}
-          </button>
-        )}
-      </div>
-    );
-  }
+  // Folding this turn. One definition, because the header's collapse control
+  // and the `⋯` stub the fold leaves behind are two ways into the same action.
+  const toggleCollapsed = () => toggleExchangeCollapsed(threadId, exchange.userSeq);
+
+  // The header's three controls, rendered in every state (see `turnControls`):
+  // the collapse control is one of them, so a collapsed turn needs the group
+  // more than any other, not less.
+  const turnControlsSlot = turnControls({
+    detailsOn: showDetails,
+    stepsOn: showSteps,
+    collapsed: isCollapsed,
+    collapsible: canCollapse,
+    onToggleDetails: toggleDetails,
+    onToggleSteps: toggleSteps,
+    onToggleCollapsed: toggleCollapsed,
+  });
 
   const { visibleEvents, collapsedFallbackText } = useMemo(() => {
     let visible: ResponseEvent[] = [];
     let fallback = '';
     if (hasEvents) {
-      if (showDetails || !showMoreToggle) {
+      if (showDetails || !dropsEarlierProse) {
         visible = events;
       } else {
         const collapsed = getCollapsedVisibleEvents(events);
@@ -370,7 +459,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       }
     }
     return { visibleEvents: visible, collapsedFallbackText: fallback };
-  }, [hasEvents, showDetails, showMoreToggle, events, responseHtmlCombined]);
+  }, [hasEvents, showDetails, dropsEarlierProse, events, responseHtmlCombined]);
 
   // Sections (split on section_break) tagged with each section's base index in
   // visibleEvents, so `renderResponseEvents` can key rows by a stable index even
@@ -427,8 +516,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, { eventType: wakeEventType, eventId: wakeEventId, payloadJson: wakePayloadJson }),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakeEventId, wakePayloadJson],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
@@ -550,7 +639,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // record that the thread subscribed to something: the clock indicator
       // holds the LIVE half and drops the wait the moment it resolves, so a
       // toggle that defaults to off left a resolved wait recorded nowhere.
-      if (evt.type === 'event_wait') return <EventWaitStep key={`ew${k}`} event={evt} />;
+      if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
@@ -588,7 +677,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         <ResponsePanel
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
-          hasBody={hasResponse || hasEvents}
+          controls={turnControlsSlot}
+          hasBody={canCollapse}
           status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent, statusClass) ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>
               {/* The active status label — Working / Requesting / Canceling —
@@ -607,22 +697,17 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
             </span>
           ) : null}
           timestamp={formatMessageTimestamp(responseTimestamp || timestamp)}
-          collapsible={canCollapse}
           collapsed={isCollapsed}
-          onToggle={canCollapse
-            ? () => toggleExchangeCollapsed(threadId, exchange.userSeq)
-            : undefined}
+          onToggle={canCollapse ? toggleCollapsed : undefined}
         >
           {hasEvents && hasSections ? (
-            renderedSections.map(({ events: section, base }, sIdx) => (
+            renderedSections.map(({ events: section, base }) => (
               <div class="response-content markdown-content" key={`sec-${base}`} onClick={handleLinkClick}>
-                {sIdx === 0 && renderToggles()}
                 {renderResponseEvents(section, base)}
               </div>
             ))
           ) : (
             <div class="response-content markdown-content" onClick={handleLinkClick}>
-              {renderToggles()}
               {hasEvents ? (
                 collapsedFallbackText ? (
                   <div dangerouslySetInnerHTML={{ __html: collapsedFallbackHtml }} />
@@ -708,6 +793,7 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
   if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
   if (prev.wakeEventType !== next.wakeEventType) return false;
+  if (prev.wakeEventId !== next.wakeEventId) return false;
   if (prev.wakePayloadJson !== next.wakePayloadJson) return false;
   const a = prev.exchange;
   const b = next.exchange;
@@ -789,7 +875,12 @@ export interface InitiatorDescriptor {
 /** Action label shared by the panel header and the route popover's Origin row. */
 function initiatorSummary(ev: Exchange['userEvent']): string {
   switch (ev.type) {
-    case 'TriggerStarted':           return 'Trigger fired';
+    // No summary line: the event row in the body says "Trigger fired: <name>",
+    // so a header saying "Trigger fired" above it states the same thing twice.
+    // Same as `ChildThreadCompleted` below, whose row has owned its own prefix
+    // all along. The route popover is unaffected either way: it builds its own
+    // Trigger row in `renderTriggerOrigin` and never reads this.
+    case 'TriggerStarted':           return '';
     case 'ContinuationStarted':         return continuationStartedSummary(ev.reason, ev.actor);
     case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
     // ResponseCanceled carries its text as the header label (RESPONSE_CANCELED_SUMMARY),
@@ -927,22 +1018,28 @@ export function describeInitiator(
   proposedChangeFileCount?: number,
   /** The event a detached wake delivered, already resolved through this
    *  exchange's `UserPromptInjected.delivered_event_id` (see
-   *  `buildDeliveredEventInfo`). Two primitives rather than the payload object,
-   *  so `chatExchangePropsEqual` can compare them without a deep walk. Both
-   *  undefined for every exchange that is not such a wake. */
-  wakeEventType?: string,
-  wakePayloadJson?: string,
+   *  `buildDeliveredEventInfo`). Undefined for every exchange that is not such
+   *  a wake.
+   *
+   *  ONE object rather than three trailing `string | undefined` params, which is
+   *  what the third one made unsafe: at the end of a twelve-argument positional
+   *  list, same-typed neighbours mis-order without a type error, and adding
+   *  `eventId` in the middle silently re-bound an existing test's payload
+   *  argument to it. The fields are still flat primitives (never the payload
+   *  object) so `chatExchangePropsEqual` compares them without a deep walk. */
+  wake?: { eventType?: string; eventId?: string; payloadJson?: string },
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
   switch (ev.type) {
     case 'TriggerStarted':
+      // The row carries the subject now ("Trigger fired: <name>"), so the panel
+      // header drops its own summary line rather than saying it twice.
       return {
         variant: 'trigger',
         icon: '⏰',
         label: ENGINE_LABEL,
-        summary,
-        details: ev.prompt ? <MarkdownBlock html={renderMarkdown(ev.prompt)} /> : undefined,
+        details: <TriggerFiredBody event={ev} />,
       };
     case 'ContinuationStarted':
       // ContinuationStarted carries an actor (device when triggered by Continue,
@@ -1032,9 +1129,15 @@ export function describeInitiator(
         // and fold the payload away. Falls back to the prose whenever the link
         // is absent (every other injection, legacy rows) or unresolved (the
         // delivery scrolled out of the loaded window).
-        summary: wakeEventType ? `Woke on ${wakeEventType}` : summary,
-        details: wakeEventType
-          ? <EventDeliveryBody eventType={wakeEventType} payloadJson={wakePayloadJson} />
+        //
+        // No summary line on the wake: its event row already reads "Woke on
+        // <event>", so a header saying the same words printed it twice, once as
+        // plain prose and once in the card underneath (reported 2026-08-10).
+        // Same as the trigger and the child callback, whose rows own their
+        // prefixes too.
+        summary: wake?.eventType ? undefined : summary,
+        details: wake?.eventType
+          ? <EventDeliveryBody eventType={wake.eventType} eventId={wake.eventId} payloadJson={wake.payloadJson} />
           : <MarkdownBlock html={userMessageHtml} />,
       };
     case 'MessageReceived': {
@@ -1060,11 +1163,12 @@ export function describeInitiator(
         label: ENGINE_LABEL,
         actorClickable: false,
         details: (
-          <ChildCompletionCard
+          <ChildCompletionRow
             childThreadId={ev.child_thread_id}
             childThreadTitle={ev.child_thread_title}
             status={ev.status}
             summary={ev.summary}
+            pendingChangeIds={ev.pending_change_ids}
           />
         ),
       };

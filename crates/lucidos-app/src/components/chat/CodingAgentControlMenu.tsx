@@ -553,7 +553,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       {/* Never disabled — openMenu() guards against empty commands instead.
           disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
       <button
-        class={`icon-btn commands-btn${hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? ' commands-btn-active' : ''}`}
+        class={`icon-btn header-icon commands-btn${hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? ' commands-btn-active' : ''}`}
         data-tooltip={`${menuLabel} controls`}
         aria-label={`${menuLabel} controls`}
         onClick={() => {

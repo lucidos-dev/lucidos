@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const isTauri = vi.fn(() => true);
 vi.mock('../../utils/platform', () => ({
@@ -10,12 +10,27 @@ vi.mock('../../utils/pageActive', () => ({
   isPageActive: () => isPageActive(),
 }));
 
+// The gateway slug this page is served under. A getter (not a plain value) so a
+// test can move the page between workspaces: `native-push.ts` reads
+// `WORKSPACE_ID` inside its handlers, so each access re-runs this.
+let workspaceId: string | null = 'myws';
+vi.mock('../../utils/basePath', () => ({
+  get WORKSPACE_ID() {
+    return workspaceId;
+  },
+}));
+
 const showNativeNotification = vi.fn(
   (_opts: { title: string; body: string; deepLink: Record<string, unknown> }) => Promise.resolve(),
 );
-const dismissNativeNotification = vi.fn((_opts: { notificationId: string | null }) => Promise.resolve());
+const dismissNativeNotification = vi.fn(
+  (_opts: { workspace: string | null; notificationId: string | null }) => Promise.resolve(),
+);
 // Drain stub: defaults to empty; per-test override with mockResolvedValueOnce.
-const takePendingNativeTaps = vi.fn((): Promise<Record<string, unknown>[]> => Promise.resolve([]));
+// Takes the workspace the page passes, which is what scopes the drain in Rust.
+const takePendingNativeTaps = vi.fn(
+  (_workspace: string | null): Promise<Record<string, unknown>[]> => Promise.resolve([]),
+);
 let listenHandler: ((e: { payload: Record<string, unknown> }) => void) | null = null;
 const listenUnlisten = vi.fn();
 const listen = vi.fn((_event: string, handler: (e: { payload: Record<string, unknown> }) => void) => {
@@ -25,9 +40,9 @@ const listen = vi.fn((_event: string, handler: (e: { payload: Record<string, unk
 vi.mock('../../utils/tauri', () => ({
   showNativeNotification: (opts: { title: string; body: string; deepLink: Record<string, unknown> }) =>
     showNativeNotification(opts),
-  dismissNativeNotification: (opts: { notificationId: string | null }) =>
+  dismissNativeNotification: (opts: { workspace: string | null; notificationId: string | null }) =>
     dismissNativeNotification(opts),
-  takePendingNativeTaps: () => takePendingNativeTaps(),
+  takePendingNativeTaps: (workspace: string | null) => takePendingNativeTaps(workspace),
   listen: (event: string, handler: (e: { payload: Record<string, unknown> }) => void) =>
     listen(event, handler),
 }));
@@ -90,7 +105,15 @@ describe('NativePushRequested → native desktop banner', () => {
     expect(showNativeNotification).toHaveBeenCalledWith({
       title: 'Claude is asking',
       body: 'Pick one',
-      deepLink: { notification_id: 'n-7', thread_id: 't-1', event_id: 'e-1', tap: { kind: 'modal' } },
+      deepLink: {
+        notification_id: 'n-7',
+        thread_id: 't-1',
+        event_id: 'e-1',
+        tap: { kind: 'modal' },
+        // Names the workspace that RAISED the banner, so the tap can be routed
+        // back here however the client has moved by the time it is drained.
+        workspace: 'myws',
+      },
     });
   });
 
@@ -271,16 +294,26 @@ describe('NativePushDismissRequested → remove native desktop banner', () => {
     dismissNativeNotification.mockClear();
   });
 
-  it('removes one banner by id', async () => {
+  it('removes one banner by id, naming the workspace that raised it', async () => {
     emitDismiss({ notification_id: 'n-7' });
     await flush();
-    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: 'n-7' });
+    // The workspace is what rebuilds the composite request identifier `show`
+    // posted; a bare id would match no delivered banner at all.
+    expect(dismissNativeNotification).toHaveBeenCalledWith({
+      workspace: 'myws',
+      notificationId: 'n-7',
+    });
   });
 
-  it('removes all banners when notification_id is null (mark-all-read)', async () => {
+  it('scopes a mark-all-read dismiss to this workspace', async () => {
     emitDismiss({ notification_id: null });
     await flush();
-    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: null });
+    // A null id is "all of MINE", not all of everyone's: reading everything in
+    // one workspace used to wipe the other workspaces' banners too.
+    expect(dismissNativeNotification).toHaveBeenCalledWith({
+      workspace: 'myws',
+      notificationId: null,
+    });
   });
 
   it('no-ops when not running in Tauri (web can\'t silently remove a push banner)', async () => {
@@ -300,6 +333,113 @@ describe('NativePushDismissRequested → remove native desktop banner', () => {
     isPageActive.mockReturnValue(true);
     emitDismiss({ notification_id: 'n-9' });
     await flush();
-    expect(dismissNativeNotification).toHaveBeenCalledWith({ notificationId: 'n-9' });
+    expect(dismissNativeNotification).toHaveBeenCalledWith({
+      workspace: 'myws',
+      notificationId: 'n-9',
+    });
+  });
+});
+
+/** The cross-workspace mis-route. One packaged process fronts the gateway and
+ *  the pending-tap stash is process-global, so a banner raised by one workspace
+ *  used to be dispatched into whichever workspace the client had open by drain
+ *  time (which reported that notification's own app as missing and marked it
+ *  read on the wrong engine), and a page that noticed the mismatch navigated
+ *  ITSELF to the other workspace, taking the window off what the user had open.
+ *
+ *  Both halves now live in Rust: `take_pending_native_taps` hands a page only
+ *  the taps its own workspace raised, and `route_native_tap` picks (or opens)
+ *  the window a tap belongs in. What the page owes is exactly two things, and
+ *  these are what this suite pins. */
+describe('drain → workspace scoping', () => {
+  const assign = vi.fn();
+  let originalLocation: Location;
+
+  beforeEach(() => {
+    isTauri.mockReturnValue(true);
+    listenHandler = null;
+    dispatchDeepLink.mockClear();
+    assign.mockClear();
+    takePendingNativeTaps.mockClear();
+    takePendingNativeTaps.mockResolvedValue([]);
+    workspaceId = 'myws';
+    originalLocation = window.location;
+    Object.defineProperty(window, 'location', {
+      value: { origin: 'https://localhost:5251', assign },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', {
+      value: originalLocation,
+      configurable: true,
+    });
+  });
+
+  it('drains with THIS page\'s workspace, which is what scopes it', async () => {
+    // Pass the wrong slug (or none) and the Rust side would hand back another
+    // workspace's tap, which is the race this replaced.
+    await setupNativePushTapRouting();
+    await flush();
+    expect(takePendingNativeTaps).toHaveBeenCalledWith('myws');
+  });
+
+  it('re-reads the workspace on every drain, not once at module load', async () => {
+    // The reason the WORKSPACE_ID mock is a getter: a window can be navigated
+    // between workspaces, and the next drain must be scoped to where it is NOW.
+    await setupNativePushTapRouting();
+    await flush();
+    workspaceId = 'otherws';
+    window.dispatchEvent(new Event('focus'));
+    await flush();
+    expect(takePendingNativeTaps).toHaveBeenLastCalledWith('otherws');
+  });
+
+  it('passes null on a legacy engine with no gateway', async () => {
+    workspaceId = null;
+    await setupNativePushTapRouting();
+    await flush();
+    expect(takePendingNativeTaps).toHaveBeenCalledWith(null);
+  });
+
+  it('dispatches what it is handed and never navigates the window', async () => {
+    // Everything the drain returns is this page's by construction, so there is
+    // no second guess to make here. The absent `assign` is the point: the page
+    // no longer decides where a tap goes, so it can no longer take its own
+    // window off the workspace the user had open.
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'n-mine', workspace: 'myws', tap: { kind: 'modal' } },
+      {
+        notification_id: 'n-also-mine',
+        workspace: 'myws',
+        tap: { kind: 'navigate', to: { target: 'app', app_id: 'habit-tracker' } },
+      },
+    ]);
+    await setupNativePushTapRouting();
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledTimes(2);
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-mine' }),
+    );
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-also-mine' }),
+    );
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it('skips a stashed entry that is not an object at all', async () => {
+    // Defensive: the stash only ever holds the delegate's own JSON objects, but
+    // a non-object would parse to no target and must not reach the dispatcher.
+    takePendingNativeTaps.mockResolvedValueOnce([
+      'nope' as unknown as Record<string, unknown>,
+      { notification_id: 'n-ok', workspace: 'myws', tap: { kind: 'modal' } },
+    ]);
+    await setupNativePushTapRouting();
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-ok' }),
+    );
   });
 });

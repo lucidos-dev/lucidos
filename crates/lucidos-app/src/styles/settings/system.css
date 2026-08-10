@@ -56,18 +56,21 @@
     overflow-wrap: anywhere;
 }
 
-.system-info-path {
+/* A long technical value (the workspace path, the API URL) is the only thing in
+   this list that can't fit beside its label on a phone, so it drops a step below
+   the rest of the values and goes mono: smaller keeps the wrapped block from
+   dominating the row it belongs to. This also supplies the font-family that
+   overrides the UA button font on .system-api-url. Never a `font` shorthand
+   there, which would reset font-size to the page base and blow it up. */
+.system-info-long {
     font-family: var(--font-mono, monospace);
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
 }
 
 .system-api-url {
     background: none;
     border: none;
     padding: 0;
-    /* Drop only the UA button font-family; keep .system-info-value's font-size
-       (the `font` shorthand reset font-size to the page base, blowing it up). */
-    font-family: inherit;
 }
 
 /* Update markers ("*", "(latest: …)", "(update available)") stand out from the

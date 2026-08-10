@@ -1,6 +1,6 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
-import { AWAIT_EVENT_TOOL, describeWaitSubscription } from './event-waits';
+import { AWAIT_EVENT_TOOL, waitSubscriptionLabels } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
@@ -445,7 +445,17 @@ function resolveLastPendingResponseStep(
  *  Matched per chunk, before `mergeAdjacentTextEvents`: an agent emits the error
  *  as its own chunk, and merging would glue it onto whatever prose preceded it,
  *  leaving nothing that compares equal. Exact (trimmed) equality only, so prose
- *  that merely mentions the failure is the agent talking about it and stays. */
+ *  that merely mentions the failure is the agent talking about it and stays.
+ *
+ *  This is the BACKSTOP, not the primary defense, and it deliberately stays even
+ *  though Claude Code's copy no longer arrives: since 2026-08-10 the engine drops
+ *  an *agent error banner* at the parser (`claude_code_parse.rs`), so the echo is
+ *  never recorded for CC in the first place. What still reaches here is every
+ *  other route to the same duplicate: events already persisted by older engines,
+ *  the chat channel, Codex, and a CC that stops flagging its banner. Widening it
+ *  past exact equality is the wrong move if the duplicate reappears glued to real
+ *  prose, because that shape means a NEW ingestion path is treating a harness
+ *  message as model output, and the fix belongs there. */
 function failureEchoPredicate(exchange: Exchange): (text: string | undefined) => boolean {
   const failure = exchangeError(exchange)?.message.trim();
   if (!failure) return () => false;
@@ -719,8 +729,8 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         // description is `Waiting: <reason>` and this row names the same
         // reason, so rendering both put two near-identical lines in the
         // transcript for one action; this is the richer of the two (it carries
-        // the subscription, the resolution state, and the jump to the matched
-        // event), so it is the one that survives. A rejected subscription
+        // the subscription and the resolution state), so it is the one that
+        // survives. A rejected subscription
         // emits no `EventWaitStarted` at all, so a failed `await_event` keeps
         // its ordinary tool step and its error.
         const e = event as {
@@ -732,7 +742,7 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         const row: ResponseEvent = {
           type: 'event_wait',
           wait_id: e.wait_id,
-          subscription: describeWaitSubscription(e.on),
+          subscriptions: waitSubscriptionLabels(e.on),
           reason: e.reason,
           expires_at: e.expires_at,
           state: 'waiting',
@@ -801,7 +811,7 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
           // Self-contained on the event since 2026-08-07. An older row carries
           // neither, and the row then names no subscription rather than
           // inventing one.
-          subscription: e.on ? describeWaitSubscription(e.on) : '',
+          subscriptions: e.on ? waitSubscriptionLabels(e.on) : [],
           reason: e.reason ?? '',
           // The deadline died with the subscription, so there is nothing to
           // count down to. The row renders its note, not a countdown.
@@ -924,9 +934,8 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
  *
  *  An `event_wait` counts as drawn because it IS drawn: it is a marker, not step
  *  mechanics (`isStepMechanics`), so no toggle can hide it. A `step` counts even
- *  though `renderResponseEvents` gates it on the `showSteps` toggle, because one
- *  present means the body renders the "Show steps" button that reveals it
- *  (`getEventToggleState`'s `showStepsToggle` is that same predicate), so the
+ *  though `renderResponseEvents` gates it on the `showSteps` toggle, because the
+ *  response header always carries the steps control that reveals it, so the
  *  panel is neither empty nor a dead end. */
 export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
   return events.some(e => e.type !== 'text' || isMeaningfulText(e));
@@ -1729,7 +1738,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // injection routes new events back to the parent's request_event_id, so a
   // non-last exchange the loop is still actively processing has steps).
   if (!hasSteps && !isCC && (!isLast || threadIdle)) return 'done';
-  // A child-completion card is itself terminal — it renders the spawned
+  // A child-completion row is itself terminal: it renders the spawned
   // sub-thread's result (success/failure/canceled). When the parent is
   // QUIESCENT (idle, or parked on a question — both `threadIdle`) and never
   // resumed to react (its in-memory wake was lost to a restart, or — real

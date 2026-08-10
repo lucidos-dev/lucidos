@@ -704,6 +704,10 @@ pub(super) struct EventsQueryParams {
     before_event_id: Option<uuid::Uuid>,
     #[serde(default)]
     after_event_id: Option<uuid::Uuid>,
+    /// Restrict to one thread. Absent is every thread, which is what every
+    /// pre-existing caller sends, so the filter can only ever narrow.
+    #[serde(default)]
+    thread_id: Option<uuid::Uuid>,
     #[serde(default = "default_events_limit")]
     limit: i64,
 }
@@ -808,11 +812,14 @@ pub(super) async fn query_events(
     let result = state
         .event_store
         .query_events_paged(
-            q.event_type.as_deref(),
-            since,
-            until,
-            q.before_event_id,
-            q.after_event_id,
+            crate::core::store::EventQueryFilters {
+                event_type: q.event_type.as_deref(),
+                since,
+                until,
+                before_event_id: q.before_event_id,
+                after_event_id: q.after_event_id,
+                thread_id: q.thread_id,
+            },
             limit,
         )
         .await

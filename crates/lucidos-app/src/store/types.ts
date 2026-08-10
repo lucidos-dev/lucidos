@@ -240,8 +240,10 @@ export type ResponseEvent =
       removes: number;
     }
   | {
-      /** The thread subscribed to an *event wait* (`await_event`, ADR 0047). A
-       *  step-level row, deliberately NOT an exchange divider: an attached
+      /** The thread subscribed to an *event wait* (`await_event`, ADR 0047).
+       *  Rendered as an **event row** (`components/chat/EventRow.tsx`), the
+       *  marker shared with an event wake, a child-thread callback and a
+       *  trigger fire. Deliberately NOT an exchange divider: an attached
        *  delivery resumes the SAME exchange, which is the whole point of the
        *  design, so `EventWaitStarted` stays out of `EXCHANGE_START_TYPES` and
        *  the wake's steps continue below this row.
@@ -250,7 +252,9 @@ export type ResponseEvent =
        *  mechanics (see `isStepMechanics`). Hiding it behind the default-off
        *  "Show steps" toggle left a parked thread with no evidence anywhere that
        *  it had parked, since the clock indicator holds only the LIVE half and
-       *  drops a wait the moment it resolves.
+       *  drops a wait the moment it resolves. It was drawn with the step row's
+       *  own classes until 2026-08-10, which is a different bug with the same
+       *  root: a marker must not wear a step's green check.
        *
        *  `state` is flipped in place by a delivery or an expiry landing in the
        *  SAME exchange, matched by `wait_id`. Those keep the subject line and
@@ -265,8 +269,12 @@ export type ResponseEvent =
        *  watch started. */
       type: 'event_wait';
       wait_id: string;
-      /** Rendered subscription line, already collapsed to prose. */
-      subscription: string;
+      /** One label per watched event type (`waitSubscriptionLabels`), NOT a
+       *  joined line: the row chips each type through `.event-name`, and a
+       *  sentence would have to be parsed back apart to do that. Empty on a stop
+       *  row built from a pre-2026-08-07 `EventWaitCanceled`, which carries no
+       *  copy of what it stopped. */
+      subscriptions: string[];
       reason: string;
       /** Empty on a stop row built from a pre-2026-08-07 `EventWaitCanceled`,
        *  which carries no deadline of its own. */

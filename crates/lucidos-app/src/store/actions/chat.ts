@@ -364,8 +364,11 @@ function addPendingMessage(
       // and keep them there while the answer streams in. Called BEFORE the
       // threadMap write below, so the optimistic row has not rendered yet and
       // the landing correctly waits for it rather than resolving the previous
-      // message. This is one of exactly two things that arm the follow; the
-      // other is the down chevron. See `followSentMessage`.
+      // message. That ordering is also what makes a BRAND-NEW thread read as
+      // the empty transcript it still is, which is how `followSentMessage`
+      // knows this send has nowhere to take anybody and arms nothing. This is
+      // one of exactly three things that arm the follow; the others are the
+      // down chevron and answering a question card. See `followSentMessage`.
       followSentMessage();
       // Perf: stamp the open→paint re-render span for the `thread-rerender` mark
       // (a follow-up send on the focused thread re-renders the whole exchange

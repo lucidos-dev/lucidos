@@ -42,7 +42,17 @@ serde_json = "1"
 # (objc2 0.6 / framework crates 0.3).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray"] }
+# NSEnumerator is what gates `NSArray::iter()` (used by the scoped dismiss-all in
+# notifications.rs). It compiles without it today only because a transitive Tauri
+# dep (tao / tray-icon / wry) enables it and cargo unifies features, so a Tauri
+# bump that dropped it would break this crate from an unrelated upgrade. Declare
+# what we use.
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSError",
+    "NSArray",
+    "NSEnumerator",
+] }
 objc2-user-notifications = { version = "0.3", features = [
     "UNUserNotificationCenter",
     "UNNotificationContent",
@@ -55,10 +65,21 @@ objc2-user-notifications = { version = "0.3", features = [
 # Dock-tile app-icon badge (set_dock_badge): NSApplication.sharedApplication()
 # (behind NSResponder) → dockTile() (behind NSDockTile) → setBadgeLabel. Carries
 # the aggregate unread total across running workspaces (see desktop.rs poll).
+#
+# NSWindow/NSView/NSButton/NSControl are the traffic-light placement
+# (src/traffic_lights.rs): NSWindow.standardWindowButton() is gated on all three
+# of NSButton, NSControl and NSView, and the placement then reads and writes
+# NSView frames on the buttons and on their NSTitlebarContainerView. Tauri
+# exposes no runtime setter for this, so we drive AppKit directly; the module
+# doc says why.
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
     "NSDockTile",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSButton",
 ] }
 block2 = "0.6"
 

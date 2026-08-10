@@ -20,7 +20,7 @@
  */
 
 import { useSignal } from '@preact/signals';
-import { useEffect, useRef } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
@@ -28,6 +28,8 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { useTooltip } from '../../hooks/useTooltip';
+import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
+import { isInteractiveTarget } from '../../utils/dom';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { applyAppBadge } from '../../store/actions/app-badge';
@@ -63,6 +65,9 @@ import {
   draftFromBind,
   type BindDraft,
 } from '../../utils/bindMode';
+// Shared with the in-app workspace switcher, so a dot means the same thing in
+// the menu as it does here.
+import { workspaceState, workspaceStateLabel, type WorkspaceState } from '../../utils/workspaceState';
 import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 import {
   applyRestoreFile,
@@ -79,23 +84,21 @@ import {
 import { pickerFooter, type FooterMode } from './PickerFooter';
 import { restoreBanner } from './RestoreBanner';
 
-/** Derived display state — collapses health + last_error into one status the row
- *  renders as a dot. A stopped workspace reports `unhealthy` + "not started"; we
- *  treat that as a calm "idle", distinct from a genuine failure. */
-type PickerState = 'healthy' | 'booting' | 'stopped' | 'unhealthy';
-
-function pickerState(w: WorkspaceStatus): PickerState {
-  if (w.health === 'healthy') return 'healthy';
-  if (w.health === 'booting') return 'booting';
-  return w.last_error === 'not started' ? 'stopped' : 'unhealthy';
-}
-
-const STATE_LABEL: Record<PickerState, string> = {
-  healthy: 'Ready',
-  booting: 'Starting…',
-  stopped: 'Stopped',
-  unhealthy: 'Unhealthy',
-};
+/** Window-drag gate (Tauri desktop): the picker's whole background drags the
+ *  window, except presses on its controls and inside an open popover.
+ *
+ *  The popover clause is not belt-and-braces. `<Overlay>` portals to `document.body`
+ *  only when asked, and the picker's overlays (network access, the confirms, the
+ *  row menu) all render in place, so their panels are DOM descendants of the
+ *  region: without this, dragging to select the tailnet address out of the
+ *  Network access popover would move the window instead.
+ *
+ *  Module-level so it is a stable reference for `useWindowDragRegion`'s effect
+ *  deps, matching `AppHeader`. Both clauses are pinned by
+ *  `hooks/__tests__/window-drag-roots-guard.test.ts`, on the source rather than
+ *  on behavior: this suite has no jsdom, so `closest` has nothing to answer. */
+const pickerCanDragStart = (target: HTMLElement): boolean =>
+  !isInteractiveTarget(target) && !target.closest('[data-overlay-panel]');
 
 /** How long the "Restored X" confirmation stays up before the picker clears the
  *  gateway's terminal status and the banner leaves. Long enough to read, short
@@ -480,7 +483,7 @@ export function WorkspacePicker() {
         // Only auto-open a workspace that isn't already known-unhealthy — opening
         // into an unhealthy engine is the dead-end we're fixing. 'stopped' /
         // 'booting' still auto-open (a stopped workspace lazy-starts, intended).
-        if (w && pickerState(w) !== 'unhealthy') {
+        if (w && workspaceState(w) !== 'unhealthy') {
           openWorkspace(remembered); // navigates away; splash holds until unload
           return;
         }
@@ -668,7 +671,7 @@ export function WorkspacePicker() {
   // stopped workspace lazy-starts behind the gateway's own auto-refreshing boot
   // splash, which is the good path, not the dead-skeleton case. This mirrors the
   // auto-open guard above, which already skips an unhealthy remembered workspace.
-  function openOrRetry(w: WorkspaceStatus, state: PickerState) {
+  function openOrRetry(w: WorkspaceStatus, state: WorkspaceState) {
     if (state === 'unhealthy') {
       void withBusy(() => restartWorkspace(w.id).then(refresh));
       return;
@@ -715,6 +718,26 @@ export function WorkspacePicker() {
   const restore = restoreStatus.value;
   const restoreRunning = restore?.status === 'running';
 
+  // Packaged macOS: the picker is a render root of its own, so it inherits none
+  // of the app shell's window chrome. Without this the window cannot be moved at
+  // all while the picker is up: `titleBarStyle: "Overlay"` gives the webview the
+  // full window height, and the app's drag regions (`.titlebar-strip`, the
+  // header) live in `<App/>`, which the picker never mounts. The whole
+  // background is the region here, since a picker that is nothing but chrome has
+  // no title bar to aim at, and `isInteractiveTarget` keeps presses on the rows,
+  // buttons and name field out of it.
+  //
+  // A state-backed element rather than a `useRef`, because the root below is
+  // conditionally rendered: the auto-open branch returns null first and only
+  // reveals the picker if the remembered workspace turns out to be gone or
+  // unhealthy. `useWindowDragRegion`'s effect has stable deps, so a plain ref
+  // would leave it holding the null it read on that first render and the picker
+  // it eventually showed would be undraggable, which is this bug again in its
+  // rarest form.
+  const [pickerEl, setPickerEl] = useState<HTMLElement | null>(null);
+  const pickerRef = useMemo(() => ({ current: pickerEl }), [pickerEl]);
+  useWindowDragRegion(pickerRef, { canStart: pickerCanDragStart });
+
   // Smart-root auto-open in progress: render nothing so the inline boot splash
   // (index.html, kept up by the effect above) stays the only thing on screen —
   // the picker grid never flashes before the redirect to the last-active
@@ -722,7 +745,7 @@ export function WorkspacePicker() {
   if (autoOpening.value) return null;
 
   return (
-    <div class="ws-picker">
+    <div class="ws-picker" ref={setPickerEl}>
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
           <button
@@ -825,7 +848,7 @@ export function WorkspacePicker() {
         {v.status === 'loaded' && (
           <ul class="ws-picker-list">
             {v.data.map((w) => {
-              const state = pickerState(w);
+              const state = workspaceState(w);
               const running = state === 'healthy' || state === 'booting';
               return (
                 <li class="ws-picker-row" key={w.id}>
@@ -895,8 +918,8 @@ export function WorkspacePicker() {
                           unreachable by assistive tech. */}
                       <span
                         class={`ws-picker-dot ws-picker-dot-${state}`}
-                        data-tooltip={w.last_error || STATE_LABEL[state]}
-                        aria-label={w.last_error || STATE_LABEL[state]}
+                        data-tooltip={workspaceStateLabel(w)}
+                        aria-label={workspaceStateLabel(w)}
                       />
                       <span class="ws-picker-name">{w.name}</span>
                       {/* The address is normally invisible, and normally that's

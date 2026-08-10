@@ -70,10 +70,20 @@ pub const ENGINE_RESTART_INTERRUPT_REASON: &str = "engine_restart_interrupt";
 pub const USER_CLICKED_CONTINUE_REASON: &str = "user_clicked_continue";
 
 /// Tag stamped on `ContinuationRequested.reason` when the user answers an
-/// `AskUserQuestion` after the Claude Code subprocess has been torn down at idle.
-/// `notify()` is a no-op in that window, so this signal makes the spawn
-/// dispatcher boot a fresh `--resume` subprocess; the resumed CC re-runs
-/// the hook, which reads the persisted answer from the DB.
+/// `AskUserQuestion` after the coding-agent subprocess has been torn down at
+/// idle. `notify()` is a no-op in that window, so this signal makes the spawn
+/// dispatcher boot a fresh `--resume` subprocess.
+///
+/// **The resume carries the answer itself** ([`continue_input_for_reason`]).
+/// This constant used to promise that "the resumed agent re-runs the hook,
+/// which reads the persisted answer from the DB", and that is not true: on
+/// teardown Claude Code closes the pending `AskUserQuestion` in its OWN
+/// transcript with a `tool_result` reading "the tool use was rejected", so the
+/// resumed session has no dangling tool call to re-run, the hook never fires,
+/// and `walk_question_batch`'s crash-recovery lookup never gets a chance. The
+/// answer reached nobody, and the model was left with a rejection stamp next to
+/// a bare "continue" (2026-08-10, thread `728de3cc`: it read the pair as
+/// approval and started implementing).
 pub const ANSWERED_AFTER_IDLE_REASON: &str = "answered_after_idle";
 
 /// Tag stamped on `ContinuationRequested.reason` when the hung-subprocess watchdog
@@ -224,6 +234,71 @@ pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery
 /// stdin precondition.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
 
+/// Opens the [`ANSWERED_AFTER_IDLE_REASON`] resume message. Its whole job is to
+/// disarm what the agent is about to read in its own transcript.
+///
+/// On teardown Claude Code stamps a pending question tool call as
+/// `"The user doesn't want to proceed with this tool use. The tool use was
+/// rejected... STOP what you are doing"` with `toolDenialKind: "user-rejected"`.
+/// That text is inside the CC binary and inside CC's private session JSONL, so
+/// the engine can neither suppress it nor rewrite it. It can only refuse to
+/// leave it as the sole account of what happened: an engine restart is not the
+/// user declining anything.
+const ANSWER_OUT_OF_BAND_NOTE: &str =
+    "[Note from engine: the user answered your question, but your session was no longer \
+     running when they did, so their answer could not come back to you as the tool result. \
+     Your transcript may show that question tool call as rejected, denied or interrupted, \
+     possibly with a line claiming the user did not want to proceed. That line is an engine \
+     teardown artifact and it is false: the user declined nothing. They did not approve \
+     anything either. Their actual answer follows.]";
+
+/// Closes the [`ANSWERED_AFTER_IDLE_REASON`] resume message. Names the one
+/// inference that has to be blocked: "the card is closed and I was told to
+/// continue, so I may proceed with what I was about to do".
+const ANSWER_OUT_OF_BAND_TRAILER: &str =
+    "Continue the turn from that answer, and from nothing else. Do not re-ask the same \
+     question. Do not read the interrupted tool call as approval, as a refusal, or as \
+     permission to carry on with what you were doing before you asked.";
+
+/// The user message the spawn consumer hands a `SpawnRequest::Continue`,
+/// chosen by the `ContinuationRequested.reason` that produced it.
+///
+/// Only [`ANSWERED_AFTER_IDLE_REASON`] differs: that continuation exists
+/// *because* the user answered a question, so the message carries the answer
+/// (see [`crate::engine::agent_question::answered_question_recap`] for why the
+/// normal in-band delivery cannot reach this agent). Every other reason, and a
+/// thread with no answered question to recap, gets today's
+/// [`CONTINUE_RESUME_USER_MESSAGE`] unchanged.
+///
+/// **Never returns an empty string**, whichever branch runs: an empty stdin
+/// parks `claude --print --resume` forever and zombies the thread.
+pub(crate) async fn continue_input_for_reason(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    reason: Option<&str>,
+) -> String {
+    if reason != Some(ANSWERED_AFTER_IDLE_REASON) {
+        return CONTINUE_RESUME_USER_MESSAGE.to_string();
+    }
+    match crate::engine::agent_question::answered_question_recap(pool, thread_id).await {
+        Some(recap) => {
+            format!("{ANSWER_OUT_OF_BAND_NOTE}\n\n{recap}\n{ANSWER_OUT_OF_BAND_TRAILER}")
+        }
+        None => {
+            // Nothing to recap on an answered-after-idle continuation means the
+            // answer we were spawned for is not readable back. Say so: the
+            // agent still resumes, but the silence lands in the log rather than
+            // only in the model's guesswork.
+            crate::log!(
+                "[CCQuestion] answered_after_idle continuation for thread {} has no \
+                 recoverable answer, resuming with the bare continue message",
+                thread_id
+            );
+            CONTINUE_RESUME_USER_MESSAGE.to_string()
+        }
+    }
+}
+
 /// Input for the spawn consumer's **one-shot stale-resume retry** of a
 /// `SpawnRequest::Continue`: the thread's conversation reconstructed from events,
 /// followed by [`CONTINUE_RESUME_USER_MESSAGE`].
@@ -233,13 +308,23 @@ pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off
 /// the recap it would "continue from where you left off" with no idea where that
 /// was. Same shape as the chat handler's stale-resume retry
 /// (`chat::process_cc`), which is the path this one was missing.
-pub(crate) async fn continue_retry_input(pool: &sqlx::PgPool, thread_id: Uuid) -> String {
-    crate::engine::agent_session::prepend_reconstruction(
-        pool,
-        thread_id,
-        CONTINUE_RESUME_USER_MESSAGE,
-    )
-    .await
+///
+/// The tail is [`continue_input_for_reason`], not the bare constant, so an
+/// `answered_after_idle` retry still carries the user's answer. This path needs
+/// it MORE than the ordinary resume does, not less: `reconstruct_summary` does
+/// not project `UserQuestionAsked` / `UserQuestionAnswered` at all (see
+/// `fetch_relevant_events`), and the retry has no session to resume, so without
+/// the tail nothing anywhere in the fresh subprocess's context mentions that a
+/// question was asked, let alone what the user replied. A question-parked thread
+/// is also the likeliest one to hit a stale sid in the first place, having sat
+/// idle long enough for the transcript to age out.
+pub(crate) async fn continue_retry_input(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    reason: Option<&str>,
+) -> String {
+    let tail = continue_input_for_reason(pool, thread_id, reason).await;
+    crate::engine::agent_session::prepend_reconstruction(pool, thread_id, &tail).await
 }
 
 /// Remove a stale (duplicate-recovery) worktree, deleting its branch ONLY when

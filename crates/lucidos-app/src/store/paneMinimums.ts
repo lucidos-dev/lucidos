@@ -44,7 +44,13 @@ const DRAWER_ROW_TITLE_REM = 4.5;
 const DRAWER_ROW_PAD_REM = 0.5;
 /** Fallback for the traffic-lights reserve if the property cannot be read (it
  *  is declared inside the desktop media query, so a sub-769px viewport reports
- *  nothing). Kept in step with `--titlebar-lights-reserve` in shell.css. */
+ *  nothing). Kept in step with `--titlebar-lights-reserve` in shell.css, which
+ *  no longer states it directly: it is `--titlebar-lights-x` (10px, stamped by
+ *  the shell from the constant it places the cluster with) plus the cluster's
+ *  measured 60px plus an equal 10px gap, the two halves of the slack that
+ *  centre the lights in the room the row keeps clear. The SUM is what this
+ *  restates, and it has never changed, so the floor this feeds is the same one
+ *  it always was. */
 const TITLEBAR_LIGHTS_RESERVE_PX = 80;
 
 /** The Conversation pane's floor. 300px at a 16px root, which is the constant

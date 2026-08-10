@@ -331,8 +331,14 @@ pub async fn seed_preference_for_device(
 /// the connection failure rather than panicking, which is the wrong shape for
 /// an assertion: a test that cares about the event wants a real
 /// `setup_test_db`.
+///
+/// The short acquire timeout is what keeps "reaches an emit" cheap. sqlx retries
+/// a refused connection until the timeout expires, so on the 30s default a
+/// single unwanted emit stalls the test for half a minute (three writes in one
+/// test, and it is a 90s test).
 pub fn offline_event_bus() -> EventBus {
     let pool = PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(50))
         .connect_lazy("postgres://lucidos:lucidos@127.0.0.1:1/offline")
         .expect("lazy pool");
     let (bus, _callback_rx) = EventBus::new(pool);

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, isFollowScroll, makeScrollObservers, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
@@ -319,6 +319,90 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
 
     expect(hasPendingEventScroll()).toBe(false);
+  });
+});
+
+describe('a deep-link landing retires a standing follow', () => {
+  /** Going to a link is the reader asking to be at ONE place, so the ride ends
+   *  there. The scroll disarm cannot do this on its own: it needs the reader to
+   *  be off the live edge AND away from where the follow last wrote, and the
+   *  ordinary link into a thread the reader is riding points at its newest turn,
+   *  which lands them precisely ON the live edge. So the follow survived the
+   *  landing and the next token carried them off the event they had just asked
+   *  to see. The counterpart lives in `scroll-follow-the-live-edge.test.ts`,
+   *  which pins what does and does not ARM the same follow. */
+  let restore: (() => void) | null = null;
+  let container: any;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    stopFollowingBottom();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  /** As in the block above: a rect top of `absTop − container.scrollTop` gives
+   *  the tween a stable target of `absTop`. */
+  function makeVisibleEl(absTop: number) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({
+        width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200,
+      }),
+      classList: { add: () => {}, remove: () => {} },
+    } as any;
+  }
+
+  it('leaves the reader on the event even when the link lands ON the live edge', () => {
+    // The blind spot, reproduced: the target is the thread's newest turn, so
+    // the landing writes the same offset the follow was already holding and no
+    // scroll event can read as the reader leaving.
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
+    const { onResize } = makeScrollObservers(container);
+
+    setFollowLiveEdge(true);          // the reader arms the follow
+    vi.advanceTimersByTime(1500);     // its glide settles on the live edge
+    // 9200, the MAX offset, and the same place the link below resolves to,
+    // which is the whole point of this test. (It read 10000 while the arming
+    // was the chevron's, because `scrollToBottom` writes the raw `scrollHeight`
+    // and leans on the browser's clamp, which this fake container has not got.)
+    expect(container.scrollTop).toBe(9200);
+
+    scrollToEventAndPulse('e-7');     // and then taps a notification
+    vi.advanceTimersByTime(1500);     // the landing settles
+    expect(container.scrollTop).toBe(9200);
+
+    container.scrollHeight = 20000;   // the agent keeps working
+    onResize();
+
+    expect(container.scrollTop).toBe(9200);
+    expect(isFollowScroll(container)).toBe(false);
+  });
+
+  it('leaves a ride alone when the link never lands', () => {
+    // Retiring belongs to the LANDING, not to the tap. A dead link moves the
+    // reader nowhere, so there is nothing for the ride to be inconsistent with,
+    // and taking it away would be the app dropping a request over a navigation
+    // that never happened.
+    restore = installFakeDom({}); // the target never renders
+    const { onResize } = makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
+
+    container.scrollHeight = 20000;
+    onResize();
+
+    expect(container.scrollTop).toBe(19200);
   });
 });
 

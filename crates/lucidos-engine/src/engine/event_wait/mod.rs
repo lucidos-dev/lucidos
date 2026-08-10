@@ -84,6 +84,7 @@
 //! `docs/plans/2026-08-06-every-event-wait-is-detached.md`.
 
 mod agent_surface;
+mod background_task;
 mod dispatcher;
 mod register;
 
@@ -135,6 +136,30 @@ impl LiveWait {
         self.on
             .iter()
             .position(|sub| sub.matches(event_type, payload))
+    }
+
+    /// Does this subscription watch `event_type` at all?
+    ///
+    /// The name only, deliberately ignoring any `condition`, because this
+    /// answers "could this wake me on that event?" rather than "would this
+    /// particular payload wake me?" ([`Self::matched_index`] is that question).
+    /// It is what a stand-down by event type resolves against: a caller saying
+    /// "I no longer need to be told about X" means every watch that could fire
+    /// on an X, whatever slice of it each one asked for.
+    ///
+    /// **`any`, so a subscription watching several event types answers yes to
+    /// each of them, and a stand-down by one of its names ends the whole
+    /// thing.** That is the intended reading and not an oversight: a wait is
+    /// ONE rendezvous with several triggers, spent by the first match, not
+    /// several independent watches sharing a row. There is no way to be woken
+    /// by its `B` leg after its `A` leg is gone, so the alternatives are ending
+    /// it or replacing it with a narrower subscription the caller never armed,
+    /// and nothing in this family mutates a wait: the persisted
+    /// `EventWaitStarted` IS the wait. The report names every event type it
+    /// ended (`describe_subscriptions` joins them with " or "), so the caller
+    /// reads exactly what went. ADR 0059 records the rejected re-arm.
+    pub fn watches(&self, event_type: &str) -> bool {
+        self.on.iter().any(|sub| sub.event_type == event_type)
     }
 }
 

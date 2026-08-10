@@ -564,7 +564,7 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
     }
 }
 
-/// Correct long-term memory. Prefer 'correct_by_id' when the [id: <uuid>] is visible. There is no read action: memory is injected into your context.
+/// Read and correct long-term memory. Memories are injected before every turn, so 'search' is for when that missed something. Prefer 'correct_by_id' when the [id: <uuid>] is visible.
 #[derive(clap::Subcommand)]
 pub enum MemoryCmd {
     /// Index stats: entry counts and sources.
@@ -587,9 +587,9 @@ pub enum MemoryCmd {
         #[arg(long)]
         importance: Option<String>,
     },
-    /// One memory's originating event or artifact, plus the entries derived from it.
+    /// Where one memory came from: its event WITH thread_id, plus the other facts from that moment. Takes the `[id: <uuid>]` you were shown. (requires: id)
     Source {
-        /// Event UUID (required when source_type is 'event').
+        /// The memory's `[id: <uuid>]`, or the source event's UUID; either resolves. Required when source_type is 'event'.
         #[arg(long)]
         source_id: Option<String>,
         /// Which source to inspect: 'event' (default) or 'artifact'.
@@ -601,6 +601,15 @@ pub enum MemoryCmd {
         /// Artifact commit SHA (required when source_type is 'artifact').
         #[arg(long)]
         commit: Option<String>,
+    },
+    /// Search long-term memory: what web_search is to the outside world, this is to what has happened HERE. (requires: q)
+    Search {
+        /// What you are trying to find out.
+        #[arg(long)]
+        q: String,
+        /// Max entries (1-20, default 10).
+        #[arg(long)]
+        limit: Option<i64>,
     },
 }
 
@@ -658,6 +667,16 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
             }
             if let Some(v) = commit {
                 query.push(("commit", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&query);
+            send_and_print("GET", &url, req)
+        }
+        MemoryCmd::Search { q, limit } => {
+            let url = format!("{}/api/v1/memory/search", ws.base_url());
+            let mut query: Vec<(&str, String)> = Vec::new();
+            query.push(("q", q.to_string()));
+            if let Some(v) = limit {
+                query.push(("limit", v.to_string()));
             }
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)

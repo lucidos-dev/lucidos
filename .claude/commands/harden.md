@@ -330,6 +330,21 @@ looks exactly like a hook that was never added.
 
 ### Then the test suites
 
+**Join the Codex review before you start them.** The engine suite includes
+`runtime::codex::driver_tests`, which drives a real `codex app-server`, and a
+Codex review is another client of the same CLI. Run them together and those
+tests fail: on 2026-08-10 a merge-hardening run overlapped the two and got
+twelve failures in that module out of 5,325, on a run that took 539s against
+the usual 82s, and all seven passed in isolation immediately after. The
+failures look like real breakage in the diff and are not, so the cost is a
+wasted debugging pass on a red suite that was never red.
+
+Phase 1's review is already joined in Phase 3, so the ordinary flow is safe.
+The way in is launching a SECOND review (a later `/harden` iteration, or a
+re-review after fixes) and then starting the suite while it runs. If one is in
+flight, wait for it. Never treat a `runtime::codex::driver_tests` failure as a
+finding until you have re-run that module alone with no Codex process active.
+
 Run the test suites for the layers touched on this branch.
 
 Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:

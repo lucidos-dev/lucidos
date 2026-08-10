@@ -72,6 +72,34 @@ few-minute window a repeat call returns an empty window (you already drained
 the output), and after it, calls fall back to the event store and re-return the
 full final stdout/stderr each time, which is wasted context either way.
 
+### You do not have to sit through it: ending the turn is a valid wait
+
+A background task **outlives your turn**, and so does the engine's interest in
+it. When you end a turn with one still running, the engine subscribes the
+thread to that task's `BackgroundBashCompleted` and re-opens the thread with a
+new turn the moment it lands, so you drain the result then. You will see the
+subscription in the thread's own indicator, and the user sees it too, which is
+how they tell a sleeping thread from a stalled one.
+
+So for anything genuinely long, a release build, a full test suite, a
+notarization, the shape is: spawn it, drain once or twice to confirm it started
+cleanly, **report where things stand and end the turn**. Twenty consecutive
+120-second drains spend twenty turns of context to learn what one wake tells
+you for free.
+
+Two things this replaces outright:
+
+- **A shell polling loop** (`for i in $(seq 1 200); do …; sleep 60; done`) spawned
+  to watch something. It cannot re-open a thread, it burns a process for an
+  hour, and it dies unread.
+- **Promising to "check back later".** You do not run between turns. Either a
+  subscription re-opens the thread or nothing does, so a promise with no
+  subscription behind it is a promise the engine cannot keep.
+
+You can also subscribe explicitly with `await_event` when you want to watch
+something *other* than the task's completion. For the completion itself you do
+not need to: it is armed for you.
+
 ### Never estimate elapsed time — read it
 
 Every drain reports two clocks, and they are the only ones you have:
@@ -192,6 +220,8 @@ These all look reasonable in isolation; they fail the same way every time and wa
 3. **`subprocess.run(["python", "-c", code])`** from inside `run_python` to get a "fresh interpreter". You already are one. The subprocess won't see the venv's site-packages.
 4. **Re-spawning a background task to read its result** instead of calling `bash_output(task_id)`. The task is still running with a known id; drain it.
 5. **Polling `bash_output` after `finished: true`**. Nothing new can arrive. For the next few minutes each call returns an empty window, and after that each one replays the full final stdout/stderr from the event store, which is exactly the context bloat the drain semantics exist to avoid.
+6. **Draining a long task to the end of the turn rather than ending the turn.** A build with forty minutes left costs twenty 120-second drains and twenty turns of context, and the last one still might not reach the end. End the turn instead: the engine subscribes you to the completion and re-opens the thread when it lands. See "You do not have to sit through it" above.
+7. **Spawning a shell loop to watch something** (`for i in $(seq 1 200); do … sleep 60; done`). It cannot re-open a thread when it finds what it was looking for, so nobody ever reads it, and it dies with your turn anyway.
 
 ## Errors
 

@@ -14,9 +14,11 @@
 
 mod embedder_retry;
 mod extract;
+mod read;
 mod rebuild;
 mod scoring;
 
 pub(crate) use scoring::{
-    age_in_days, jaccard_similarity, relevance_score, MEMORY_CORRECTION_THRESHOLD,
+    age_in_days, jaccard_similarity, keywords_for, relevance_score, KEYWORD_BOOST,
+    KEYWORD_SIMILARITY_PROXY, MEMORY_CORRECTION_THRESHOLD,
 };

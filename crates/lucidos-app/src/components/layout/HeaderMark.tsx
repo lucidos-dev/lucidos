@@ -7,11 +7,11 @@ import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosV
 import { composeHandlers } from '../chat/promptFocus';
 import { focusSearchInput } from '../search/searchEverywhereActions';
 import { Overlay } from '../shared/Overlay';
-import { CheckIcon, ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
+import { ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
-import { gatewayPickerHref } from '../../utils/basePath';
 import { BrandBadge } from './BrandBadge';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
+import { WorkspacesMenuRow } from './WorkspaceSwitcher';
 
 /** Readable spelling of the connection light, naming what it is connected TO.
  *
@@ -70,7 +70,6 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
    *  this menu desktop can reach nowhere else. */
   actionsInRow: boolean;
 }) {
-  const workspace = visibleWorkspaceName.value;
   // The version of LUCIDOS the user is running: the umbrella release, plus a
   // `*` when the code has moved past it. One number, the same one on every
   // platform. The engine's CalVer, this client's build id and the service
@@ -81,34 +80,6 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
   const releaseDirty = lucidosReleaseDirty.value;
   const version = lucidosVersionLabel(release, releaseDirty);
   const versionTooltip = lucidosVersionTooltip(release, releaseDirty);
-  // Where switching workspaces lives: the gateway picker at `/~/`, which already
-  // lists every workspace and can rename and create them. `?pick` suppresses its
-  // auto-open-last-workspace so the link always lands on the list.
-  //
-  // Null means there is no picker to send anyone to, and the row STAYS: it is
-  // the only place either mobile header names the workspace you are in, so
-  // dropping it drops that too. It renders as a plain static row instead, which
-  // is honest about having nowhere to go.
-  //
-  // Null is not the rare legacy case it reads as. The href is derived from what
-  // the ENGINE stamps into the shell (`<base href>`, the gateway-port meta), so
-  // any bundle served by something else resolves it to null: a direct
-  // engine-port page, the Vite dev server every browser e2e runs against, and
-  // the frontend preview a coding agent serves from its worktree.
-  const workspacesHref = gatewayPickerHref();
-  const workspacesRow = (
-    <>
-      <WorkspacesIcon />
-      Workspaces
-      {workspace && (
-        <span class="brand-menu-value">
-          <CheckIcon className="brand-menu-value-check" />
-          <span class="brand-menu-value-name">{workspace}</span>
-        </span>
-      )}
-    </>
-  );
-
   // Every menu action closes the menu first. `composeHandlers` focuses the
   // prompt from inside the touch gesture, which is the only way iOS raises the
   // keyboard, and it runs the action AFTER the focus for the same reason: a
@@ -241,15 +212,11 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             )}
           </>
         )}
-        {workspacesHref ? (
-          <a class="brand-menu-item" role="menuitem" href={workspacesHref} onClick={onClose}>
-            {workspacesRow}
-          </a>
-        ) : (
-          <div class="brand-menu-item brand-menu-item-static" role="none">
-            {workspacesRow}
-          </div>
-        )}
+        {/* Names the workspace you are in, and unfolds the list of the ones you
+            could be in. It renders from inside the panel on purpose: the state
+            it holds (unfolded or not, and the listing) belongs to one opening of
+            the menu, and the Overlay unmounting on close is what resets it. */}
+        <WorkspacesMenuRow onClose={onClose} />
         <WorkspaceRefreshRow onClose={onClose} />
         <WorkspaceRestartRow onClose={onClose} />
       </Overlay>
@@ -352,18 +319,5 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
         actionsInRow={onDesktop}
       />
     </>
-  );
-}
-
-/** Stacked plates: several of the same thing, one of them on top. Deliberately
- *  not the four-square grid it replaces, which reads as "all apps" and collided
- *  with the sparkle-grid already in the header row. */
-function WorkspacesIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M12 2 2 7l10 5 10-5-10-5Z" />
-      <path d="m2 12 10 5 10-5" />
-      <path d="m2 17 10 5 10-5" />
-    </svg>
   );
 }

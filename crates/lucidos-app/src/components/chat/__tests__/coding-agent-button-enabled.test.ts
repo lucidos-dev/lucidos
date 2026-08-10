@@ -2,18 +2,20 @@
  * Tests for the coding-agent command availability logic in CodingAgentControlMenu.
  *
  * The button is NEVER disabled — it's always clickable. The openMenu()
- * guard prevents the dropdown from opening when no commands exist yet.
- * The orange "active" class additionally requires builtin or skill commands
- * (indicating CC binary has reported its commands via Init).
+ * guard prevents the dropdown from opening when no commands exist yet, and the
+ * "active" class rides that SAME predicate (hasAnyCommands): the button is
+ * undimmed exactly when clicking it opens something, and dimmed while it would
+ * be a silent no-op. Landing the list also pulses the mark once.
  */
 import { describe, it, expect } from 'vitest';
 
 /**
- * Mirrors codingAgentCommandsReady() in CodingAgentControlMenu.tsx.
- * Returns true when CC has reported builtin or skill commands (CC connected).
- * Used for the orange "active" visual indicator.
+ * Mirrors codingAgentSlashCommandsReady() in CodingAgentControlMenu.tsx.
+ * Returns true when CC has reported builtin or skill commands (CC binary
+ * connected). It gates the slash-command CACHE update and the empty-response
+ * retry, NOT the button's visual state, which is hasAnyCommands below.
  */
-function codingAgentCommandsReady(
+function codingAgentSlashCommandsReady(
   builtinCommands: unknown[],
   skillCommands: unknown[],
 ): boolean {
@@ -21,16 +23,18 @@ function codingAgentCommandsReady(
 }
 
 /**
- * Mirrors the openMenu guard in CodingAgentControlMenu.tsx.
- * The menu opens when ANY commands exist (control, builtin, or skill).
- * Control commands are always present from the backend for CC threads.
+ * Mirrors hasAnyCommands() in CodingAgentControlMenu.tsx, which is BOTH the
+ * openMenu guard and the `commands-btn-active` condition. One predicate, so the
+ * button cannot look ready while the menu refuses to open. Any commands
+ * (control, builtin, or skill) count; control commands are always present from
+ * the backend for CC threads.
  */
 function menuOpens(
   controlCommands: unknown[],
   builtinCommands: unknown[],
   skillCommands: unknown[],
 ): boolean {
-  return controlCommands.length > 0 || codingAgentCommandsReady(builtinCommands, skillCommands);
+  return controlCommands.length > 0 || codingAgentSlashCommandsReady(builtinCommands, skillCommands);
 }
 
 describe('Control menu opens (openMenu guard)', () => {
@@ -57,37 +61,59 @@ describe('Control menu opens (openMenu guard)', () => {
   });
 });
 
-describe('codingAgentCommandsReady (CC connected indicator)', () => {
+describe('codingAgentSlashCommandsReady (CC binary connected)', () => {
   it('is false when no builtin or skill commands', () => {
-    expect(codingAgentCommandsReady([], [])).toBe(false);
+    expect(codingAgentSlashCommandsReady([], [])).toBe(false);
   });
 
   it('is true when builtinCommands are present', () => {
-    expect(codingAgentCommandsReady(['help', 'status'], [])).toBe(true);
+    expect(codingAgentSlashCommandsReady(['help', 'status'], [])).toBe(true);
   });
 
   it('is true when skillCommands are present', () => {
-    expect(codingAgentCommandsReady([], ['commit'])).toBe(true);
+    expect(codingAgentSlashCommandsReady([], ['commit'])).toBe(true);
   });
 
   it('is true when both are present', () => {
-    expect(codingAgentCommandsReady(['help'], ['commit'])).toBe(true);
+    expect(codingAgentSlashCommandsReady(['help'], ['commit'])).toBe(true);
   });
 });
 
 describe('button visual state', () => {
-  it('button is clickable but NOT orange when only control commands exist', () => {
-    const ccReady = codingAgentCommandsReady([], []);
-    expect(ccReady).toBe(false);  // not orange
-    const className = `icon-btn commands-btn${ccReady ? ' commands-btn-active' : ''}`;
-    expect(className).not.toContain('commands-btn-active');
+  const controlCmds = [{ subtype: 'set_model' }, { subtype: 'set_permission_mode' }];
+
+  /** Mirrors the button's class expression in CodingAgentControlMenu.tsx.
+   *  Built from `menuOpens` (the hasAnyCommands mirror) on purpose: deriving it
+   *  from the slash-commands predicate instead is how this block drifted from
+   *  production and came to claim a control-only session stays dimmed. */
+  function buttonClass(control: unknown[], builtin: unknown[], skill: unknown[]): string {
+    const ready = menuOpens(control, builtin, skill);
+    return `icon-btn header-icon commands-btn${ready ? ' commands-btn-active' : ''}`;
+  }
+
+  it('is dimmed while nothing has loaded, because clicking it opens nothing', () => {
+    expect(menuOpens([], [], [])).toBe(false);
+    expect(buttonClass([], [], [])).not.toContain('commands-btn-active');
   });
 
-  it('button is clickable AND orange when coding-agent commands are cached', () => {
-    const ccReady = codingAgentCommandsReady(['help', 'status'], ['commit']);
-    expect(ccReady).toBe(true);  // orange
-    const className = `icon-btn commands-btn${ccReady ? ' commands-btn-active' : ''}`;
-    expect(className).toContain('commands-btn-active');
+  it('is undimmed as soon as control commands exist, even with no slash commands', () => {
+    // The dim means "clicking me is a no-op", so it has to lift the moment the
+    // menu will open, which control commands alone are enough for.
+    expect(codingAgentSlashCommandsReady([], [])).toBe(false);
+    expect(menuOpens(controlCmds, [], [])).toBe(true);
+    expect(buttonClass(controlCmds, [], [])).toContain('commands-btn-active');
+  });
+
+  it('is undimmed when coding-agent slash commands are cached', () => {
+    expect(buttonClass([], ['help', 'status'], ['commit'])).toContain('commands-btn-active');
+  });
+
+  it('carries header-icon, so it wears the prompt row\'s shared icon box', () => {
+    // The glyph is sized and grayed by `.icon-btn.header-icon`, the same class
+    // the todo / subscription / attach buttons beside it use. Dropping it puts
+    // the agent mark back at 1rem in a 1.5rem box, a size out of step with
+    // every other icon in the cluster.
+    expect(buttonClass(controlCmds, [], [])).toContain('header-icon');
   });
 
   it('button is always clickable even when nothing loaded yet', () => {
@@ -272,7 +298,7 @@ describe('loadCommands retry on empty response', () => {
   it('should retry when commands are empty (CC Init may not have arrived)', () => {
     let retryCalled = false;
     const scheduleRetry = (commands: string[], skills: string[]) => {
-      if (!codingAgentCommandsReady(commands, skills)) {
+      if (!codingAgentSlashCommandsReady(commands, skills)) {
         retryCalled = true;
       }
     };
@@ -283,7 +309,7 @@ describe('loadCommands retry on empty response', () => {
   it('should NOT retry when commands are present', () => {
     let retryCalled = false;
     const scheduleRetry = (commands: string[], skills: string[]) => {
-      if (!codingAgentCommandsReady(commands, skills)) {
+      if (!codingAgentSlashCommandsReady(commands, skills)) {
         retryCalled = true;
       }
     };

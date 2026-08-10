@@ -305,7 +305,33 @@ html:not([data-theme="light"]) .action-btn-confirm {
     flex-direction: column;
 }
 
+/* The "+ Add <thing>" row closing a list. It is a real <button> (see
+   components/shared/ListRowAddCard.tsx), so the first block below is the UA
+   button reset: without it the card renders on a grey button face, inside a
+   hairline border, in the UA's centered sans-serif.
+   `font-feature-settings` is re-inherited straight after `font: inherit`,
+   which resets it to initial and would hand ligatures back to a Fira Code
+   user (the same trap documented at .accent-link above). `width: 100%` is belt
+   and braces: `display: flex` below already makes the box block-level, so it
+   fills on its own, but a UA button is `inline-block` and that is what it
+   would fall back to.
+
+   `color` IS reset here, unlike .settings-nav-row (which is already coloured by
+   a higher-specificity rule of its own): nothing else states a colour for this
+   card, so without it a bare text node dropped into one lands on the UA's
+   `buttontext` in the host and on the iframe sheet's `button` colour in an app.
+
+   Every declaration here is inert on a non-button, which matters because this
+   file is include_str!'d into /api/v1/sdk-iframe.css and ships to every app
+   iframe: an app author who put the class on a div sees no change. */
 .list-row-add-card {
+    background: none;
+    border: none;
+    width: 100%;
+    font: inherit;
+    font-feature-settings: inherit;
+    text-align: left;
+    color: inherit;
     display: flex;
     align-items: center;
     gap: 0.75rem;
@@ -318,6 +344,21 @@ html:not([data-theme="light"]) .action-btn-confirm {
     .list-row-add-card:hover {
         background: var(--bg-hover);
     }
+}
+
+.list-row-add-card:focus-visible {
+    /* The shared --focus-ring band (see .icon-btn:focus-visible), drawn INSET
+       rather than around the box. In Apps, Triggers and Accounts the card runs
+       edge to edge (those lists re-establish the 1rem gutter as the row's own
+       padding, so the hover wash reaches the pane edges) and its clip ancestor
+       is .content-pane-body { overflow-x: hidden }, so an outward ring would
+       lose its left and right sides there and render as two stray bars. The
+       card's own 1rem padding keeps the inset band well clear of the label.
+       The transparent outline is the forced-colors fallback, where box-shadow
+       is stripped, and takes a matching negative offset for the same reason. */
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
 }
 
 .list-row-add-icon {

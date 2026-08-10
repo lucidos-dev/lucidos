@@ -199,6 +199,26 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
   return response;
 }
 
+/** Turn the step log on, which is the door to everything a step row carries
+ *  (the context counter, the detail modal). Inline steps are hidden by default
+ *  (`stepsExpanded`, persisted in localStorage), so a spec that wants a step
+ *  row must open them first.
+ *
+ *  Targets the toggle in its OFF state, so the click can only ever turn steps
+ *  on. The control is an icon in the response header (`turnControls`) with no
+ *  text to match on, and `aria-pressed` is the state the icon draws.
+ *
+ *  It does NOT wait for a step to exist: every response turn carries the
+ *  control now, whatever it holds. Keep asserting on the step row itself
+ *  afterwards, which is what actually waits for the work to land. */
+export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
+  const toggle = page
+    .locator('.response-controls [data-role="toggle-steps"][aria-pressed="false"]:visible')
+    .first();
+  await expect(toggle).toBeVisible({ timeout });
+  await toggle.click();
+}
+
 /** Wait for at least one physically visible element matching a selector (dual-layout safe). */
 export async function waitForVisibleElement(page: Page, selector: string, timeout = 5_000): Promise<void> {
   await page.waitForFunction((sel) => {

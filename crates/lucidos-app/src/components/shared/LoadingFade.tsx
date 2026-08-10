@@ -32,15 +32,22 @@ const SKELETON_FADE_MS = 250;
 export function LoadingFade({
   showSkeleton,
   skeleton,
+  class: cls,
   children,
 }: {
   showSkeleton: boolean;
   skeleton: VNode;
+  /** Extra class on the wrapper. The wrapper takes the place of whatever it
+   *  wraps in the PARENT's layout, so any rule that used to reach the content
+   *  as a flex/grid child now has to reach this instead (a control with
+   *  `flex-shrink: 0` stops holding its width otherwise, since the wrapper
+   *  shrinks in its place). */
+  class?: string;
   children: ComponentChildren;
 }) {
   const skeletonMounted = useLingeringFlag(showSkeleton, SKELETON_FADE_MS);
   return (
-    <div class="loading-fade">
+    <div class={cls ? `loading-fade ${cls}` : 'loading-fade'}>
       <div class="loading-fade-content">{children}</div>
       {skeletonMounted && (
         <div class={`loading-fade-skeleton${showSkeleton ? '' : ' loading-fade-out'}`} aria-hidden="true">

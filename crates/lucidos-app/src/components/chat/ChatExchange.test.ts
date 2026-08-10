@@ -6,9 +6,13 @@ import { LucidosGlyph } from '../shared/LucidosMark';
 import { LUCIDOS_AGENT_LABEL, type ThreadEvent } from '../../store/thread-events';
 
 describe('describeExecutor', () => {
-  it('shows Claude Code label and icon for CC threads', () => {
+  it('shows the SHORT Claude label and the icon for CC threads', () => {
+    // "Claude", not "Claude Code": this row is the tightest in the app on a
+    // phone and the coding agent's own name was the longest thing in it. Every
+    // other "Claude Code" in the app names the backend the user is choosing
+    // between and keeps the full product name. See `describeExecutor`.
     const { icon, label } = describeExecutor(true);
-    expect(label).toBe('Claude Code');
+    expect(label).toBe('Claude');
     expect((icon as VNode).type).toBe(ClaudeIcon);
   });
 
