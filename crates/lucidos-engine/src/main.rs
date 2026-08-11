@@ -411,6 +411,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
 
+    // Point the embedding-model cache at the shared per-user directory unless
+    // something already chose one (the packaged app and the headless service
+    // both do). One ~465 MB copy serves every workspace on the machine, and the
+    // workspace is only the last resort when there is no per-user cache root.
+    // Runs BEFORE `apply_to_process_env` below, so a value the user stored in
+    // Settings still wins.
+    lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
+
     // The legacy per-workspace `data/.env` is retired in favour of the DB-backed
     // environment_variables store. Its contents are migrated into the DB and the
     // file removed below, AFTER the engine (and thus the DB + migrations) is up —

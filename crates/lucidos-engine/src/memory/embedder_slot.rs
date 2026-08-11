@@ -50,7 +50,10 @@ pub enum EmbeddingModelLoadState {
     },
     /// Every file is local; the ONNX session is being built. Seconds, not
     /// minutes. Also the state a fresh boot starts in, before the loader has
-    /// found out whether anything needs downloading.
+    /// found out whether anything needs downloading, and the state it holds
+    /// while ANOTHER engine on this machine downloads into the shared model
+    /// cache (nothing is failing and no backoff is in effect, so `Waiting` would
+    /// be the wrong reading; see `embedder_retry::delay_before_pass`).
     Loading,
     /// Installed. Memory search, extraction and semantic thread search are live.
     Ready,

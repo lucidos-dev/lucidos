@@ -196,6 +196,156 @@ pub(crate) fn now_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
+/// The message a refused apply carries back to its caller (the HTTP handler,
+/// the Apply-All driver, the `apply_change` LLM tool). Deliberately says the
+/// change still lands on its own, because it does: the resolution session's
+/// completion is what applies it.
+pub(crate) const MERGE_OWNED_BY_RESOLVER_MESSAGE: &str =
+    "A merge resolution is already in flight for this change. The coding-agent \
+     session owns the merge until it finishes; the change applies automatically \
+     when it does.";
+
+/// Who is allowed to move `main` for a change right now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeOwnership {
+    /// A conflict-resolution session holds the merge. Every other apply path
+    /// must refuse: no fast-forward, no worktree reset, no `ChangeApplied`.
+    ResolverOwnsIt,
+    /// Nobody is resolving. The caller may run the normal apply tiers.
+    CallerMayMerge,
+}
+
+/// Decide whether an in-flight merge-conflict resolution owns a change's merge.
+///
+/// The durable half is the `MergeConflictDetected` pairing: every tier opens it
+/// through `start_merge_and_get_prompt`, and it closes on `ChangeApplied` /
+/// `ChangeApplyFailed` / `MergeResolutionCleared`. That is what was missing on
+/// 2026-08-11, when a second `apply_change` for the same change found the
+/// resolver's own live session, fast-forwarded `main` at step 2 of the
+/// resolver's 5-step prompt, and then reset the resolver's worktree under it.
+/// The only re-entrancy guard at the time was the in-memory
+/// `apply_now_in_progress` flag, which the detached Tier-2 and Tier-3 merge
+/// spawns never set.
+///
+/// `resolver_present` is the second half, and it is deliberately about THE
+/// resolver, not about any live session. A live session that happens to share
+/// the thread is not evidence that anyone is resolving: a pairing stranded by a
+/// crash plus a later, unrelated turn on the same thread would otherwise refuse
+/// every Apply for the length of that turn, over and over. So the term is
+/// `AgentSession::conflict_change_id == Some(change_id)`, set where each tier
+/// binds its resolution to a session.
+///
+/// It is also what keeps this from wedging Apply outright. An engine restart
+/// empties `agent_sessions`, so a stranded pairing names no resolver and does
+/// NOT refuse: the apply falls through to the ordinary tiers, which is exactly
+/// the recovery that exists today.
+///
+/// `pairing_open` is `None` when the projection query itself failed. That is an
+/// UNKNOWN, and per `.claude/rules/rust.md` an unknown must not authorize the
+/// destructive direction: merging under a working resolver is what destroys
+/// something, refusing costs a retry. So an unknown refuses, but only while a
+/// resolver is actually present, since with nobody resolving there is nobody to
+/// own the merge whatever the query would have said.
+pub(crate) fn decide_merge_ownership(
+    pairing_open: Option<bool>,
+    resolver_present: bool,
+) -> MergeOwnership {
+    if resolver_present && pairing_open != Some(false) {
+        MergeOwnership::ResolverOwnsIt
+    } else {
+        MergeOwnership::CallerMayMerge
+    }
+}
+
+impl super::LucidosEngine {
+    /// Change-scoped [`decide_merge_ownership`]: is THIS change's resolution
+    /// still in flight? Used by `apply_change_inner` before it touches git.
+    pub(crate) async fn merge_ownership_for_change(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+    ) -> MergeOwnership {
+        let resolver_present = self.live_resolver_change(thread_id).await == Some(change_id);
+        if !resolver_present {
+            // Skip the query when nobody is resolving: the answer cannot change
+            // the verdict, and Apply is on the user's click path.
+            return MergeOwnership::CallerMayMerge;
+        }
+        decide_merge_ownership(
+            self.conflict_pairing_open_or_unknown(thread_id, change_id)
+                .await,
+            true,
+        )
+    }
+
+    /// Thread-scoped twin of [`Self::merge_ownership_for_change`], for callers
+    /// that act on a thread rather than a known change (`apply_now`). Asks the
+    /// live session which change it is resolving, then checks that pairing, so
+    /// an unrelated open pairing on the same thread cannot mislabel it.
+    pub(crate) async fn merge_ownership_for_thread(&self, thread_id: Uuid) -> MergeOwnership {
+        let Some(change_id) = self.live_resolver_change(thread_id).await else {
+            return MergeOwnership::CallerMayMerge;
+        };
+        decide_merge_ownership(
+            self.conflict_pairing_open_or_unknown(thread_id, change_id)
+                .await,
+            true,
+        )
+    }
+
+    /// The durable half: `Some(open)`, or `None` when the query could not run.
+    async fn conflict_pairing_open_or_unknown(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+    ) -> Option<bool> {
+        match self
+            .changes()
+            .conflict_pairing_open(thread_id, change_id)
+            .await
+        {
+            Ok(open) => Some(open),
+            Err(e) => {
+                log!(
+                    "[Changes] conflict_pairing_open({}, {}) failed: {}. Treating the resolution as in flight",
+                    thread_id,
+                    change_id,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// The change a live session on this thread is currently resolving, if any.
+    /// `is_live` matters as much as the binding: a phantom or exited session is
+    /// nobody working (see `AgentSession::is_live`).
+    async fn live_resolver_change(&self, thread_id: Uuid) -> Option<Uuid> {
+        let guard = self.agent_sessions.lock().await;
+        guard
+            .get(&thread_id)
+            .filter(|s| s.is_live())
+            .and_then(|s| s.conflict_change_id)
+    }
+
+    /// Record that this thread's live session is carrying `change_id`'s
+    /// conflict resolution. Used by the Tier-1 in-place merge, whose session
+    /// predates the resolution; Tier 2 and Tier 3 set the same field at session
+    /// registration instead. A missing session is a no-op: the merge prompt is
+    /// about to fail to send anyway, and the guard falls back to "nobody is
+    /// resolving", which is true.
+    pub(crate) async fn bind_session_to_conflict_resolution(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+    ) {
+        let mut guard = self.agent_sessions.lock().await;
+        if let Some(s) = guard.get_mut(&thread_id) {
+            s.conflict_change_id = Some(change_id);
+        }
+    }
+}
+
 /// True iff the branch counts as hardened for Apply purposes. Marker existence
 /// (Fresh or Stale) means CC ran `/harden` at least once and is trusted; if
 /// the marker was consumed by a prior apply (Missing), fall back to the DB

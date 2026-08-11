@@ -61,9 +61,8 @@ describe('drawsResponseRow', () => {
   });
 
   it('draws step mechanics only while the steps control is on', () => {
-    // `stepsExpanded` seeds from localStorage, so absent means OFF. A turn that
-    // has emitted only steps therefore shows an EMPTY body by default, which is
-    // exactly the in-flight case: nothing to fold until the first row lands.
+    // A turn that has emitted only steps shows an EMPTY body to a reader who
+    // turned `stepsExpanded` off: nothing to fold until the first row lands.
     for (const outcome of ['pending', 'success', 'error', 'unfinished'] as StepOutcome[]) {
       expect(drawsResponseRow(step(outcome), true), outcome).toBe(true);
       expect(drawsResponseRow(step(outcome), false), outcome).toBe(false);

@@ -29,10 +29,12 @@ const SOURCE_BEHIND_TTL: Duration = Duration::from_secs(3);
 /// merged commit shows up in the toast within a few seconds.
 const PENDING_COMMITS_TTL: Duration = Duration::from_secs(3);
 
-/// How many commit subjects the version-status response carries. The toast is a
-/// glance, not a changelog: past a handful the list stops being readable, so the
-/// rest are counted rather than named ([`PendingCommits::total`]).
-const PENDING_COMMIT_SUBJECT_CAP: usize = 5;
+/// How many commit descriptions each [`CommitGroup`] carries. PER GROUP, not
+/// across the range: a flat cap let forty doc commits crowd out the one `feat`
+/// the user actually wanted to read about. The rest are counted
+/// ([`CommitGroup::total`]) rather than named, because the toast is a glance,
+/// not a changelog.
+const PENDING_COMMIT_DESCRIPTION_CAP: usize = 5;
 
 /// Max background rebuilds the self-heal driver auto-triggers for a single HEAD
 /// before giving up (until HEAD moves). Bounds a genuinely broken `main` so it
@@ -111,22 +113,103 @@ pub struct SourceBehindCache {
     behind: bool,
 }
 
-/// The commits a *Switch to new version* would bring: everything between the
-/// running engine's commit and HEAD. Surfaced on `version_status` so the status
-/// toast behind the spinning brand badge can say what is being built instead of
-/// repeating its own tooltip.
+/// What a commit in the range IS, so the toast can describe the build rather
+/// than reciting its log. Derived from the conventional-commit type; the
+/// frontend owns the wording each kind renders as.
+///
+/// [`CommitGroupKind::Other`] is the honest home of a subject with no type we
+/// recognize (a hand commit, a revert): guessing would be worse than saying so,
+/// and dropping it would lose a commit that might be the interesting one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitGroupKind {
+    /// `feat`.
+    New,
+    /// `fix`.
+    Fixed,
+    /// `perf`, `refactor`, `style`. In this repo `style` is UI design work, not
+    /// whitespace, so it belongs with the user-visible improvements.
+    Improved,
+    /// No recognized conventional-commit type.
+    Other,
+    /// `docs`, `chore`, `test`, `ci`, `build`, `harden`. Counted, never listed:
+    /// it is the bulk of this repo's log and none of it answers "what am I
+    /// getting". [`CommitGroup::descriptions`] is always empty for this kind.
+    Housekeeping,
+}
+
+impl CommitGroupKind {
+    /// How many kinds there are, and the width of the tallies
+    /// [`parse_pending_commits`] counts into.
+    const COUNT: usize = 5;
+
+    /// This kind's index in those tallies, and in [`COMMIT_GROUP_ORDER`].
+    ///
+    /// An exhaustive `match` rather than a lookup in the order array: adding a
+    /// variant then has to answer this, at compile time, instead of panicking
+    /// on a `position(...).unwrap()` inside a version-status poll.
+    fn slot(self) -> usize {
+        match self {
+            CommitGroupKind::New => 0,
+            CommitGroupKind::Fixed => 1,
+            CommitGroupKind::Improved => 2,
+            CommitGroupKind::Other => 3,
+            CommitGroupKind::Housekeeping => 4,
+        }
+    }
+}
+
+/// One bucket of the pending range, with its own count so a capped list can say
+/// how much it is not showing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommitGroup {
+    pub kind: CommitGroupKind,
+    /// Every commit in this group, capped or not.
+    pub total: usize,
+    /// Newest-first, at most [`PENDING_COMMIT_DESCRIPTION_CAP`], and empty for
+    /// [`CommitGroupKind::Housekeeping`]. Each line is the commit subject with
+    /// its conventional-commit TYPE stripped and its scope kept as a lead-in
+    /// (`fix(ui): the trash is sized by its ink` becomes `ui: the trash is
+    /// sized by its ink`): the type is already carried by the group, and the
+    /// scope names the area. Nothing is re-capitalized, since these subjects
+    /// are authored lowercase and a mechanical uppercase turns `ui` into `Ui`.
+    pub descriptions: Vec<String>,
+}
+
+/// The commits a *Switch to new version* would bring: every non-merge commit
+/// between the running engine's commit and HEAD, grouped by what it is.
+/// Surfaced on `version_status` so the status toast behind the spinning brand
+/// badge can say what is being built instead of repeating its own tooltip.
+///
+/// **Merges are excluded** ([`LucidosEngine::read_pending_commits`] passes
+/// `--no-merges`). An Apply lands as a merge whose subject is the branch name,
+/// which describes no work, and everything it merged is already in this range
+/// under its own subject. Listing them is pure duplication, and on a range
+/// spanning several Applies they crowded out every real commit.
 ///
 /// "commits", not "changes": a *change* is the coding-agent change the user
 /// Applies (see `system-knowhow/glossary.md`), and not every commit in this
-/// range is one (a merge, a hand commit), so naming them changes would be wrong
-/// in both directions.
+/// range is one (a hand commit, a revert), so naming them changes would be
+/// wrong in both directions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PendingCommits {
-    /// How many commits are in the range. Can exceed `subjects.len()`, which is
-    /// capped, so the UI can say "+N more" honestly.
+    /// Every non-merge commit in the range. Computed from `groups` by
+    /// [`Self::from_groups`], the only constructor, so the count the toast
+    /// headlines can never drift from the list under it.
     pub total: usize,
-    /// Newest-first subject lines, at most [`PENDING_COMMIT_SUBJECT_CAP`].
-    pub subjects: Vec<String>,
+    /// Non-empty groups, in the order the toast lists them.
+    pub groups: Vec<CommitGroup>,
+}
+
+impl PendingCommits {
+    /// The one constructor: derives `total` so it cannot disagree with the
+    /// groups it summarizes.
+    fn from_groups(groups: Vec<CommitGroup>) -> Self {
+        PendingCommits {
+            total: groups.iter().map(|g| g.total).sum(),
+            groups,
+        }
+    }
 }
 
 /// Throttled cache of [`LucidosEngine::pending_commits`], mirroring
@@ -654,8 +737,8 @@ impl LucidosEngine {
         }
     }
 
-    /// The commits between the running engine's commit and HEAD, newest first
-    /// and capped, or `None` when git could not answer. TTL-cached
+    /// The non-merge commits between the running engine's commit and HEAD,
+    /// grouped by what they are, or `None` when git could not answer. TTL-cached
     /// ([`PENDING_COMMITS_TTL`]) so the `git log` runs at most once per interval
     /// across every polling client.
     async fn pending_commits(&self) -> Option<PendingCommits> {
@@ -699,8 +782,12 @@ impl LucidosEngine {
         let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
         let root = crate::paths::repo_root().ok()?;
         let range = format!("{running}..HEAD");
+        // `--no-merges`: an Apply lands as a merge whose subject is the branch
+        // name, and everything it merged is in this same range under its own
+        // subject. See [`PendingCommits`].
         classify_pending_commits(
-            crate::engine::git_ops::git_cmd(&["log", "--format=%s", &range], &root).await,
+            crate::engine::git_ops::git_cmd(&["log", "--no-merges", "--format=%s", &range], &root)
+                .await,
         )
     }
 
@@ -1103,15 +1190,17 @@ fn build_id_commit(id: &str) -> Option<&str> {
     (!commit.is_empty()).then_some(commit)
 }
 
-/// Classify a `git log --format=%s <range>` run into the commit list the status
-/// toast shows, keeping "git could not answer" apart from "git answered none".
+/// Classify a `git log --no-merges --format=%s <range>` run into the grouped
+/// commit list the status toast shows, keeping "git could not answer" apart
+/// from "git answered none".
 ///
 /// `Err` is a spawn failure or the [`GIT_TIMEOUT`](crate::engine::git_ops) ceiling,
 /// and a non-zero exit means git refused the range (an unknown commit, no
 /// repository); neither says anything about what is pending, so both are `None`.
 /// Only a successful run yields a verdict, and an empty one is a real
-/// `total: 0`. Reading an unanswerable probe as "nothing is coming" is the
-/// failure this split exists to prevent (`.claude/rules/rust.md`).
+/// `total: 0` with no groups. Reading an unanswerable probe as "nothing is
+/// coming" is the failure this split exists to prevent
+/// (`.claude/rules/rust.md`).
 fn classify_pending_commits(
     result: Result<std::process::Output, String>,
 ) -> Option<PendingCommits> {
@@ -1123,25 +1212,95 @@ fn classify_pending_commits(
     }
 }
 
-/// Parse `git log --format=%s` stdout (newest first, one subject per line) into
-/// a total plus the first [`PENDING_COMMIT_SUBJECT_CAP`] subjects. Pure so the
-/// cap, the total and the ordering are testable without a repository. Blank
-/// lines are dropped: an empty subject would render as an empty bullet, and it
-/// would inflate the count of what the user is waiting for.
-fn parse_pending_commits(stdout: &str) -> PendingCommits {
-    let subjects: Vec<&str> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    PendingCommits {
-        total: subjects.len(),
-        subjects: subjects
-            .into_iter()
-            .take(PENDING_COMMIT_SUBJECT_CAP)
-            .map(str::to_string)
-            .collect(),
+/// The order the toast lists the groups in. What the user is being GIVEN leads;
+/// what was merely tidied trails.
+const COMMIT_GROUP_ORDER: [CommitGroupKind; CommitGroupKind::COUNT] = [
+    CommitGroupKind::New,
+    CommitGroupKind::Fixed,
+    CommitGroupKind::Improved,
+    CommitGroupKind::Other,
+    CommitGroupKind::Housekeeping,
+];
+
+/// Split a conventional-commit subject into its type, scope and description, or
+/// `None` when it isn't one. Pure and deliberately strict: the type is `[a-z]+`
+/// optionally followed by a `(scope)` and/or a breaking-change `!`, then `": "`.
+/// A looser rule would read the colon in an ordinary English subject as a type
+/// tag and eat the words before it, so "Note to self: don't" keeps its lead-in
+/// and lands in [`CommitGroupKind::Other`] whole.
+fn split_conventional(subject: &str) -> Option<(&str, &str, &str)> {
+    let (head, rest) = subject.split_once(": ")?;
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let (kind, scope) = match head.split_once('(') {
+        Some((kind, scope)) => (kind, scope.strip_suffix(')')?),
+        None => (head, ""),
+    };
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
     }
+    Some((kind, scope, rest))
+}
+
+/// Classify one commit subject into its group and the line the toast shows for
+/// it. Pure, so the whole taxonomy is testable without a repository.
+///
+/// An unrecognized type keeps its WHOLE subject: we only strip a tag we
+/// understood, since deleting a token we could not classify loses information
+/// for nothing.
+fn classify_commit_subject(subject: &str) -> (CommitGroupKind, String) {
+    let Some((kind, scope, description)) = split_conventional(subject) else {
+        return (CommitGroupKind::Other, subject.to_string());
+    };
+    let group = match kind {
+        "feat" => CommitGroupKind::New,
+        "fix" => CommitGroupKind::Fixed,
+        "perf" | "refactor" | "style" => CommitGroupKind::Improved,
+        "docs" | "chore" | "test" | "ci" | "build" | "harden" => CommitGroupKind::Housekeeping,
+        _ => return (CommitGroupKind::Other, subject.to_string()),
+    };
+    let line = if scope.is_empty() {
+        description.to_string()
+    } else {
+        format!("{scope}: {description}")
+    };
+    (group, line)
+}
+
+/// Parse `git log --no-merges --format=%s` stdout (newest first, one subject
+/// per line) into the grouped list the status toast shows. Pure so the
+/// taxonomy, the per-group cap, the counts and the ordering are testable
+/// without a repository.
+///
+/// Blank lines are dropped: an empty subject would render as an empty bullet,
+/// and it would inflate the count of what the user is waiting for. Empty groups
+/// are omitted, so no heading is ever rendered over nothing.
+fn parse_pending_commits(stdout: &str) -> PendingCommits {
+    let mut totals = [0usize; CommitGroupKind::COUNT];
+    let mut descriptions: [Vec<String>; CommitGroupKind::COUNT] = Default::default();
+    for subject in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (kind, line) = classify_commit_subject(subject);
+        let slot = kind.slot();
+        totals[slot] += 1;
+        // Housekeeping is counted only, so it collects no lines to send.
+        if kind != CommitGroupKind::Housekeeping
+            && descriptions[slot].len() < PENDING_COMMIT_DESCRIPTION_CAP
+        {
+            descriptions[slot].push(line);
+        }
+    }
+    PendingCommits::from_groups(
+        COMMIT_GROUP_ORDER
+            .into_iter()
+            .zip(totals)
+            .zip(descriptions)
+            .filter(|((_, total), _)| *total > 0)
+            .map(|((kind, total), descriptions)| CommitGroup {
+                kind,
+                total,
+                descriptions,
+            })
+            .collect(),
+    )
 }
 
 /// Is the on-disk binary a genuine upgrade, given its id, the running id, and the
@@ -1319,10 +1478,11 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_engine_build_lock_waiting, build_id_commit, classify_pending_commits,
-        commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at, open_teardown,
-        parse_pending_commits, self_heal_is_wedged, stash_first_restart_actor, try_lock_file,
-        BuildProcessGroupGuard, BuildState, PENDING_COMMIT_SUBJECT_CAP,
+        acquire_engine_build_lock_waiting, build_id_commit, classify_commit_subject,
+        classify_pending_commits, commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at,
+        open_teardown, parse_pending_commits, self_heal_is_wedged, stash_first_restart_actor,
+        try_lock_file, BuildProcessGroupGuard, BuildState, CommitGroupKind, COMMIT_GROUP_ORDER,
+        PENDING_COMMIT_DESCRIPTION_CAP,
     };
     use crate::engine::thread_events::MessageOrigin;
     use std::time::Duration;
@@ -1800,30 +1960,159 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The list is capped so the toast stays glanceable, but the COUNT is not:
-    /// "+N more" is only honest if the total saw every commit. Blank lines are
-    /// dropped rather than counted, since an empty subject would both render as
-    /// an empty bullet and inflate what the user is waiting for.
+    /// The two halves of the group indexing have to agree: `slot()` is what
+    /// tallies are counted into and `COMMIT_GROUP_ORDER` is what they are read
+    /// back out as, so a kind counted at one index and emitted at another would
+    /// silently attribute every `feat` to the wrong heading. The compiler
+    /// already forces a new variant to answer `slot()`; this forces it into the
+    /// order array at the matching position.
     #[test]
-    fn parse_pending_commits_caps_the_list_but_not_the_count() {
-        let many: String = (1..=8).map(|i| format!("commit {i}\n")).collect();
-        let parsed = parse_pending_commits(&many);
-        assert_eq!(parsed.total, 8, "every commit counts toward the total");
-        assert_eq!(parsed.subjects.len(), PENDING_COMMIT_SUBJECT_CAP);
+    fn every_group_reads_back_out_at_the_index_it_was_counted_into() {
+        for (index, kind) in COMMIT_GROUP_ORDER.into_iter().enumerate() {
+            assert_eq!(kind.slot(), index, "{kind:?} is misplaced in the order");
+        }
+    }
+
+    /// The taxonomy: each conventional-commit type lands in the group the toast
+    /// describes it under, the type tag is stripped, and the scope is kept as a
+    /// lead-in so the line names its area.
+    #[test]
+    fn classify_commit_subject_maps_the_type_and_keeps_the_scope() {
+        let cases = [
+            (
+                "feat(memory): one cache per user",
+                CommitGroupKind::New,
+                "memory: one cache per user",
+            ),
+            ("feat: no scope here", CommitGroupKind::New, "no scope here"),
+            (
+                "feat(api)!: a breaking one",
+                CommitGroupKind::New,
+                "api: a breaking one",
+            ),
+            (
+                "fix(ui): the trash is sized by its ink",
+                CommitGroupKind::Fixed,
+                "ui: the trash is sized by its ink",
+            ),
+            (
+                "style(triggers): the actions stack",
+                CommitGroupKind::Improved,
+                "triggers: the actions stack",
+            ),
+            (
+                "perf: fewer probes",
+                CommitGroupKind::Improved,
+                "fewer probes",
+            ),
+            (
+                "refactor: one writer",
+                CommitGroupKind::Improved,
+                "one writer",
+            ),
+            (
+                "docs(plans): a plan",
+                CommitGroupKind::Housekeeping,
+                "plans: a plan",
+            ),
+            (
+                "harden(ui): pinned",
+                CommitGroupKind::Housekeeping,
+                "ui: pinned",
+            ),
+        ];
+        for (subject, kind, line) in cases {
+            assert_eq!(
+                classify_commit_subject(subject),
+                (kind, line.to_string()),
+                "{subject}"
+            );
+        }
+    }
+
+    /// A subject we could not classify keeps every word of itself. Stripping a
+    /// tag we did not understand would lose information for nothing, and the
+    /// commit that is hardest to categorize is often the interesting one.
+    #[test]
+    fn classify_commit_subject_leaves_an_unrecognized_subject_whole() {
+        for subject in [
+            "Merge branch 'main' into some-branch",
+            "wip: an unknown type",
+            "Revert \"feat(ui): a thing\"",
+            "no colon at all",
+            "Note to self: not a conventional type",
+        ] {
+            assert_eq!(
+                classify_commit_subject(subject),
+                (CommitGroupKind::Other, subject.to_string()),
+                "{subject}"
+            );
+        }
+    }
+
+    /// Each group's list is capped so the toast stays glanceable, but the COUNTS
+    /// are not: "and N more" is only honest if every commit was seen. The cap is
+    /// PER GROUP, which is what stops a pile of doc commits from crowding out
+    /// the one feature. Blank lines are dropped rather than counted, since an
+    /// empty subject would both render as an empty bullet and inflate what the
+    /// user is waiting for.
+    #[test]
+    fn parse_pending_commits_groups_and_caps_each_list_but_not_the_counts() {
+        let mut log = String::new();
+        for i in 1..=8 {
+            log.push_str(&format!("fix: bug {i}\n"));
+        }
+        log.push_str("feat: the one feature\n");
+        for i in 1..=4 {
+            log.push_str(&format!("docs: page {i}\n"));
+        }
+        let parsed = parse_pending_commits(&log);
+
+        assert_eq!(parsed.total, 13, "every commit counts toward the total");
         assert_eq!(
-            parsed.subjects[0], "commit 1",
+            parsed.total,
+            parsed.groups.iter().map(|g| g.total).sum::<usize>(),
+            "the headline count reconciles with the groups under it"
+        );
+        assert_eq!(
+            parsed.groups.iter().map(|g| g.kind).collect::<Vec<_>>(),
+            vec![
+                CommitGroupKind::New,
+                CommitGroupKind::Fixed,
+                CommitGroupKind::Housekeeping,
+            ],
+            "listed in display order, and a group with nothing in it is omitted"
+        );
+
+        let fixed = &parsed.groups[1];
+        assert_eq!(fixed.total, 8);
+        assert_eq!(fixed.descriptions.len(), PENDING_COMMIT_DESCRIPTION_CAP);
+        assert_eq!(
+            fixed.descriptions[0], "bug 1",
             "git log order is preserved (newest first)"
+        );
+        assert_eq!(
+            parsed.groups[0].descriptions,
+            vec!["the one feature"],
+            "the lone feature survives eight fixes ahead of it"
+        );
+
+        let housekeeping = &parsed.groups[2];
+        assert_eq!(housekeeping.total, 4);
+        assert!(
+            housekeeping.descriptions.is_empty(),
+            "housekeeping is counted, never listed"
         );
 
         // Blank and whitespace-only lines are not commits.
         let ragged = parse_pending_commits("fix: one\n\n   \nfix: two\n");
         assert_eq!(ragged.total, 2);
-        assert_eq!(ragged.subjects, vec!["fix: one", "fix: two"]);
+        assert_eq!(ragged.groups[0].descriptions, vec!["one", "two"]);
 
         // A genuinely empty range is a real answer: zero, with nothing to list.
         let none = parse_pending_commits("");
         assert_eq!(none.total, 0);
-        assert!(none.subjects.is_empty());
+        assert!(none.groups.is_empty());
     }
 
     /// The distinction the whole field rests on: git saying "no commits" is
@@ -1852,8 +2141,9 @@ mod tests {
 
     /// The real range against a throwaway repo: `<running>..HEAD` lists what a
     /// switch would bring, newest first, with the running commit itself
-    /// excluded. And a range git cannot resolve classifies as UNKNOWN rather
-    /// than as empty.
+    /// excluded and every MERGE dropped (its subject is a branch name, and what
+    /// it merged is already in the range). And a range git cannot resolve
+    /// classifies as UNKNOWN rather than as empty.
     #[tokio::test]
     async fn pending_commits_reads_the_range_between_the_running_commit_and_head() {
         let dir = std::env::temp_dir().join(format!(
@@ -1885,18 +2175,65 @@ mod tests {
             git(&["add", "."]);
             git(&["commit", "-qm", subject]);
         }
+        // A side branch merged back in, exactly as an Apply lands: the merge
+        // subject names the branch and must not reach the toast, while the work
+        // it brought must.
+        git(&["checkout", "-q", "-b", "side", &running]);
+        std::fs::write(dir.join("b.txt"), "side work").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "fix(side): work done on a branch"]);
+        // `-` rather than a branch NAME: `init.defaultBranch` is the user's
+        // config, so this repo's trunk is `master` on one machine and `main` on
+        // the next.
+        git(&["checkout", "-q", "-"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'side'",
+            "side",
+        ]);
 
         let range = format!("{running}..HEAD");
         let commits = classify_pending_commits(
-            crate::engine::git_ops::git_cmd(&["log", "--format=%s", &range], &dir).await,
+            crate::engine::git_ops::git_cmd(&["log", "--no-merges", "--format=%s", &range], &dir)
+                .await,
         )
         .expect("a resolvable range is a real answer");
         assert_eq!(
-            commits.subjects,
-            vec!["feat: the newer one", "fix: the older one"],
-            "newest first, and the running commit is not part of what is coming"
+            commits.total, 3,
+            "the merge is not a commit the user is waiting for; its content is"
         );
-        assert_eq!(commits.total, 2);
+        let group = |kind| {
+            commits
+                .groups
+                .iter()
+                .find(|g| g.kind == kind)
+                .unwrap_or_else(|| panic!("{kind:?} group is present"))
+        };
+        assert_eq!(
+            group(CommitGroupKind::New).descriptions,
+            vec!["the newer one"],
+            "the running commit is not part of what is coming"
+        );
+        // Not order-asserted across the two: `git log` sorts by commit date, and
+        // the branch commit is younger than the trunk commits it merges beside.
+        let mut fixed = group(CommitGroupKind::Fixed).descriptions.clone();
+        fixed.sort();
+        assert_eq!(
+            fixed,
+            vec!["side: work done on a branch", "the older one"],
+            "the branch's own work is listed, under its own subject"
+        );
+        assert!(
+            !commits
+                .groups
+                .iter()
+                .flat_map(|g| g.descriptions.iter())
+                .any(|d| d.contains("Merge branch")),
+            "no merge subject reaches the toast"
+        );
 
         // A range git refuses (unknown object) exits non-zero: unknown, not empty.
         assert_eq!(
@@ -1904,6 +2241,7 @@ mod tests {
                 crate::engine::git_ops::git_cmd(
                     &[
                         "log",
+                        "--no-merges",
                         "--format=%s",
                         "0000000000000000000000000000000000000000..HEAD",
                     ],

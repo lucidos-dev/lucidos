@@ -951,6 +951,158 @@ describe('scrolling an IDLE thread keeps the follow', () => {
   });
 });
 
+describe('an IDLE thread moves an armed reader nowhere', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** The other half of the block above, and the half that was missing until
+   *  2026-08-11. The disarm asked whether the agent was live; the WRITE did not.
+   *  So the reader kept the ride when they scrolled an idle thread, exactly as
+   *  promised, and was then written back to the live edge by the next thing that
+   *  changed the transcript's height. On an idle thread that is the transcript
+   *  finishing its own rendering: markdown settling, an image decoding, a card
+   *  mounting. Reported from a session parked on a question card, which is idle
+   *  by every measure this module has (`awaiting-answer` is not an active
+   *  status), while reading a reply that had already finished.
+   *
+   *  ARMED and CARRYING are the two states this pins apart. Nothing here retires
+   *  anything: the toggle stays lit and the ride resumes on its own. */
+
+  function armedThenScrolledUpOnAnIdleThread() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);   // the toggle's glide settles on the live edge
+    setThreadLive(false);           // the reply finishes
+    readerScrollsTo(el, 800, observers.onScroll); // and the reader goes back to re-read it
+    expect(followingLiveEdge.value).toBe(true);   // the ride survives, per the block above
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  it('leaves the reader where they scrolled when the transcript grows', () => {
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(800);
+  });
+
+  it('leaves them alone across round after round of it', () => {
+    // One round could pass on a stale stamp or a coincidence. A finished reply
+    // settles over several frames, and every one of them used to move the
+    // reader.
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    for (const height of [3400, 4000, 9000]) {
+      el.scrollHeight = height;
+      onResize();
+      expect(el.scrollTop).toBe(800);
+    }
+    expect(el.writes).toBe(0);
+  });
+
+  it('still shows them the chevron, so they can go back themselves', () => {
+    // Standing down from the WRITE is not standing down from the signals: the
+    // reader is off the live edge and has to be told, or the one way back is
+    // gone along with the ride that used to carry them.
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(awayFromBottom.value).toBe(true);
+  });
+
+  it('carries them again the moment the agent starts', () => {
+    // Armed is armed. The idle spell suspends the writing, it does not end the
+    // request, and no second press is needed.
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    el.scrollHeight = 4000;
+    onResize();
+    expect(el.scrollTop).toBe(800);
+
+    setThreadLive(true);
+    el.scrollHeight = 5000;
+    onResize();
+    expect(el.scrollTop).toBe(4500);
+  });
+
+  it('carries them on the WAKE itself, without waiting for a second resize', () => {
+    // The ordering the two signals actually arrive in. The mutation that wakes a
+    // thread (the new turn's row mounting) fires the ResizeObserver inside its
+    // own frame, while `ChatExchange` publishes the new status from a Preact
+    // effect, which is deferred to a task AFTER that frame. So `honourGrowth`
+    // sees the waking resize while this module still reads idle, and stands
+    // down for the one round that mattered.
+    //
+    // Modelled exactly that way: the growth and its resize land FIRST, the
+    // liveness arrives after. A streaming reply hides this by resizing again a
+    // moment later; a coding-agent turn resuming its subprocess does not, and
+    // sits on its mounted row for fifteen to twenty seconds. Reported by the
+    // Codex reviewer, 2026-08-11.
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    el.scrollHeight = 4000;  // the waking turn's row mounts
+    onResize();              // and its resize is delivered while we still read idle
+    expect(el.scrollTop).toBe(800);
+
+    setThreadLive(true);     // the effect lands a task later, with no resize behind it
+
+    expect(el.scrollTop).toBe(3500);
+  });
+
+  it('acts on the EDGE only, so a repeated live signal writes nothing', () => {
+    // Only a WAKE describes new content. `ChatExchange` re-runs its effect
+    // whenever its derived liveness changes, and a `true` that says what the
+    // module already knew is not a second turn arriving. The distinction has to
+    // be pinned from the armed side, where both answers are visible: the first
+    // `true` carries the reader, and a second must move them zero pixels, or
+    // every later render would re-assert the live edge over wherever the reader
+    // had got to.
+    const { el, onScroll } = armedThenScrolledUpOnAnIdleThread();
+
+    setThreadLive(true);        // the wake: the round the observer missed
+    expect(el.scrollTop).toBe(2500);
+
+    // Now put the container somewhere the follow did not: with NO gesture
+    // behind it, which is the iOS keyboard / app-resume case the follow
+    // deliberately survives (the setup's own scroll is retired first, or its
+    // coast would still be counting as the reader's and this live move would
+    // disarm). Armed, live, and off the stamp is exactly the state a
+    // re-asserting signal would trample.
+    readerGestureForTest(null, false);
+    el.scrollTop = 1200;
+    onScroll();
+    expect(followingLiveEdge.value).toBe(true);
+    el.writes = 0;
+
+    setThreadLive(true);        // the same answer again, from a later render
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(1200);
+  });
+
+  it('carries them for a SUBMIT before any status says the thread is live', () => {
+    // The gap the submit's own claim covers, checked from this side too: the
+    // write has to run through the seconds between the submit and the
+    // projection catching up, or the reader would submit and watch the reply
+    // grow in below them.
+    const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
+
+    followContinuedThread();  // marks the thread live by itself
+    vi.advanceTimersByTime(1500);
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(el.scrollTop).toBe(3500);
+  });
+});
+
 describe('the toggle remembers the last press as a seed', () => {
   /** The seed is what a thread with NO reading position starts as, and the only
    *  state the toggle can show in the compose view, which has no transcript.

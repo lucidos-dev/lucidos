@@ -94,8 +94,9 @@ describe('a turn parked on an event wait', () => {
     ] as ThreadEvent[]);
 
     const events = exchangeResponseEvents(getExchanges(map, id)[0]);
-    // The collapse is on by default for this turn: it has steps and two prose
-    // chunks, and `detailsExpanded` starts false.
+    // This turn is one the full-response collapse acts on: it has steps and two
+    // prose chunks, so `hidesEarlierProse` is true and a reader who turned the
+    // control off sees only what follows the last of them.
     expect(hidesEarlierProse(events)).toBe(true);
     expect(waits(getCollapsedVisibleEvents(events).visibleEvents)).toMatchObject([
       { wait_id: 'w1', state: 'waiting', reason: REASON },

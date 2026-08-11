@@ -54,37 +54,80 @@ describe('backgroundActivities', () => {
     expect(activity.detail).toBeUndefined();
   });
 
-  it('lists the commits the build will bring, newest first', () => {
+  /** The point of grouping: the reader learns WHAT they are getting before they
+   *  read a single sentence. A flat list of subjects was what shipped first, and
+   *  over several Applies it read as five `Merge branch 'main' into …` lines. */
+  it('describes the build by group, newest first inside each', () => {
     const detail = {
       elapsedMs: 0,
       anchoredAt: 0,
-      pendingCommits: { total: 2, subjects: ['feat: newer', 'fix: older'] },
+      pendingCommits: {
+        total: 3,
+        groups: [
+          { kind: 'new' as const, total: 1, descriptions: ['memory: one cache per user'] },
+          {
+            kind: 'fixed' as const,
+            total: 2,
+            descriptions: ['splash: the brand leaves first', 'todo: a canceled subscription settles'],
+          },
+        ],
+      },
     };
     const [activity] = backgroundActivities(true, null, null, detail, 0);
     expect(activity.note).toBe(
-      '2 commits since your running version\n• feat: newer\n• fix: older',
+      '3 commits since your running version\n\n' +
+        'New\n• memory: one cache per user\n\n' +
+        'Fixed\n• splash: the brand leaves first\n• todo: a canceled subscription settles',
     );
   });
 
-  it('counts the commits it does not name', () => {
+  it('counts the commits each group does not name', () => {
     const detail = {
       elapsedMs: 0,
       anchoredAt: 0,
-      pendingCommits: { total: 9, subjects: ['a', 'b', 'c', 'd', 'e'] },
+      pendingCommits: {
+        total: 9,
+        groups: [{ kind: 'fixed' as const, total: 9, descriptions: ['a', 'b', 'c', 'd', 'e'] }],
+      },
     };
     const [activity] = backgroundActivities(true, null, null, detail, 0);
     expect(activity.note).toContain('9 commits since your running version');
     expect(activity.note).toContain('• and 4 more');
   });
 
+  /** Counted, never listed, and named for what it is: the number still
+   *  reconciles with the heading without forty doc commits crowding out the
+   *  work the user is waiting for. */
+  it('counts housekeeping on one line instead of listing it', () => {
+    const detail = {
+      elapsedMs: 0,
+      anchoredAt: 0,
+      pendingCommits: {
+        total: 43,
+        groups: [
+          { kind: 'new' as const, total: 1, descriptions: ['memory: one cache per user'] },
+          { kind: 'housekeeping' as const, total: 42, descriptions: [] },
+        ],
+      },
+    };
+    expect(backgroundActivities(true, null, null, detail, 0)[0].note).toBe(
+      '43 commits since your running version\n\n' +
+        'New\n• memory: one cache per user\n\n' +
+        '• 42 housekeeping commits (docs, tests, chores)',
+    );
+  });
+
   it('says "1 commit", not "1 commits"', () => {
     const detail = {
       elapsedMs: 0,
       anchoredAt: 0,
-      pendingCommits: { total: 1, subjects: ['fix: the only one'] },
+      pendingCommits: {
+        total: 1,
+        groups: [{ kind: 'fixed' as const, total: 1, descriptions: ['the only one'] }],
+      },
     };
     expect(backgroundActivities(true, null, null, detail, 0)[0].note).toBe(
-      '1 commit since your running version\n• fix: the only one',
+      '1 commit since your running version\n\nFixed\n• the only one',
     );
   });
 
@@ -95,7 +138,7 @@ describe('backgroundActivities', () => {
   it('says nothing about commits it does not know, and nothing about none', () => {
     const unknown = { elapsedMs: 1000, anchoredAt: 0, pendingCommits: null };
     expect(backgroundActivities(true, null, null, unknown, 0)[0].note).toBeUndefined();
-    const zero = { elapsedMs: 1000, anchoredAt: 0, pendingCommits: { total: 0, subjects: [] } };
+    const zero = { elapsedMs: 1000, anchoredAt: 0, pendingCommits: { total: 0, groups: [] } };
     expect(backgroundActivities(true, null, null, zero, 0)[0].note).toBeUndefined();
   });
 
@@ -175,14 +218,26 @@ describe('activityToastContent', () => {
     const content = activityToastContent(true, null, null, false, {
       elapsedMs: 134_000,
       anchoredAt: 500,
-      pendingCommits: { total: 2, subjects: ['fix: one', 'docs: two'] },
+      pendingCommits: {
+        total: 3,
+        groups: [
+          { kind: 'fixed', total: 1, descriptions: ['one'] },
+          { kind: 'housekeeping', total: 2, descriptions: [] },
+        ],
+      },
     }, 500);
     expect(content?.message).not.toBe('Building new version');
     const parsed = parseToastMessage(content?.message ?? '');
     expect(parsed.heading).toBe('Building new version, 2m 14s');
-    expect(parsed.sections).toHaveLength(1);
-    expect(parsed.sections[0].title).toBe('2 commits since your running version');
-    expect(parsed.sections[0].bullets).toEqual(['fix: one', 'docs: two']);
+    // The count, the one described group, and the counted-only footnote: each
+    // its own section, so a group heading can never render as a bullet of the
+    // group above it.
+    expect(parsed.sections).toHaveLength(3);
+    expect(parsed.sections[0].title).toBe('3 commits since your running version');
+    expect(parsed.sections[1].title).toBe('Fixed');
+    expect(parsed.sections[1].bullets).toEqual(['one']);
+    expect(parsed.sections[2].title).toBeUndefined();
+    expect(parsed.sections[2].bullets).toEqual(['2 housekeeping commits (docs, tests, chores)']);
   });
 
   /** Two activities that both have something to add: each note has to land in
@@ -193,18 +248,23 @@ describe('activityToastContent', () => {
     const content = activityToastContent(true, downloading, null, false, {
       elapsedMs: 5_000,
       anchoredAt: 0,
-      pendingCommits: { total: 2, subjects: ['fix: one', 'docs: two'] },
+      pendingCommits: {
+        total: 2,
+        groups: [{ kind: 'fixed', total: 2, descriptions: ['one', 'two'] }],
+      },
     }, 0);
     const parsed = parseToastMessage(content?.message ?? '');
-    // Three sections: the two activities listed under the heading, then one per
-    // note. Before the fix there were two, because the caveat was absorbed as a
-    // third bullet of the commit list.
-    expect(parsed.sections).toHaveLength(3);
+    // Four sections: the two activities listed under the heading, the build's
+    // count line, its one group, then the download's caveat. Before the fix
+    // there were fewer, because the caveat was absorbed as one more bullet of
+    // the commit list.
+    expect(parsed.sections).toHaveLength(4);
     expect(parsed.sections[1].title).toBe('2 commits since your running version');
-    expect(parsed.sections[1].bullets).toEqual(['fix: one', 'docs: two']);
-    expect(parsed.sections[2].title).toBe(MEMORY_NOT_INDEXED_NOTE);
+    expect(parsed.sections[2].title).toBe('Fixed');
+    expect(parsed.sections[2].bullets).toEqual(['one', 'two']);
+    expect(parsed.sections[3].title).toBe(MEMORY_NOT_INDEXED_NOTE);
     // The caveat is emphatically NOT a commit.
-    expect(parsed.sections[1].bullets).not.toContain(MEMORY_NOT_INDEXED_NOTE);
+    expect(parsed.sections[2].bullets).not.toContain(MEMORY_NOT_INDEXED_NOTE);
   });
 
   it('lists concurrent activities and shows no bar for either', () => {

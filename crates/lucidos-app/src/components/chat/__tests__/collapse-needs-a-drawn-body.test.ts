@@ -11,8 +11,7 @@
  * different question. Two shapes make it run ahead of anything on screen, and
  * a coding-agent turn produces both from its first second: a whitespace-only
  * text event is pushed for every `CodingAgentTextStreamed`, and step mechanics
- * are hidden unless the steps control is on, which it is not by default
- * (`stepsExpanded` seeds from localStorage, absent means off). So a turn that
+ * are hidden from a reader who turned the steps control off. So a turn that
  * had only worked, and drawn nothing, offered a live collapse control.
  *
  * This is the same trap `abort-boundary-renders-its-turn.test.ts` guards one

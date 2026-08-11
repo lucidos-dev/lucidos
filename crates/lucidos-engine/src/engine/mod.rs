@@ -58,6 +58,10 @@ pub(crate) use agentic_loop::{
     emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
 pub(crate) use change_ops::now_epoch_millis;
+// Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
+// into an HTTP status by identity against this const (a 404 there means "no
+// live session" to the frontend, so misclassifying it runs the wrong fallback).
+pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 // The child-follow-up vocabulary, re-exported for the HTTP route in
 // `api::threads::follow_up`, which is outside `engine`. Only the ack and the
 // refusal taxonomy: the delivery half stays reachable solely as

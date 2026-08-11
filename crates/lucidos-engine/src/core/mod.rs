@@ -34,6 +34,8 @@ pub mod system_knowhow;
 pub mod user_dir;
 pub mod user_path;
 
+use std::borrow::Cow;
+
 /// Get the database URL from the environment, with a default for local dev.
 pub fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -862,6 +864,154 @@ fn first_command_line(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
+/// Shell basenames that mark a `<shell> -c <script>` wrapper, for the step-row
+/// label ([`shell_script_body`]).
+///
+/// A SUPERSET of `command_guard::GUARD_SHELLS`, which unwraps the same shapes to
+/// decide what the permission guard classifies. The containment is asserted, and
+/// it holds in one direction on purpose:
+///
+/// * A shell the GUARD knows must be one the label knows, or a payload would be
+///   scanned and then displayed still wrapped.
+/// * The reverse is allowed, and `fish` is currently the whole difference.
+///   Over-recognizing costs a label nothing, but the guard discards the operands
+///   after the script as `$0` and positional parameters, and that is a POSIX rule
+///   fish does not follow: it collects EVERY `-c` and evaluates each in turn, so
+///   `fish -c 'ls' -c 'rm -rf /'` would hand the classifier `ls` alone. Teaching
+///   the guard fish means handling its whole script-carrying flag surface (`-c`
+///   and `-C`/`--init-command` at least), which is a security change on its own
+///   terms rather than a side effect of a labelling one.
+pub(crate) const WRAPPER_SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
+
+/// The script inside a login-shell wrapper, or `cmd` unchanged when there is no
+/// wrapper to see through.
+///
+/// Codex reports a shell step as the whole invocation its harness built,
+/// `/bin/zsh -lc "<script>"`, where Claude Code's `Bash` reports the script on
+/// its own. Left alone the two backends read as different tools on every row of
+/// a transcript, and the wrapper is worse than noise: `describe_cc_tool`
+/// middle-truncates to 60 bytes and the prefix spends a quarter of that before
+/// the command starts, so the informative part is exactly what gets elided.
+///
+/// Only Codex's `command_execution` goes through here. A Claude Code session
+/// that literally invokes `bash -lc "..."` chose to, and its row must show it.
+///
+/// Conservative by construction: anything not recognizably
+/// `<shell> -<letters including c> <one quoted-or-bare script>` comes back
+/// untouched, and the result is always a suffix of `cmd` apart from unescaping,
+/// never a re-composition of it.
+///
+/// # Why this is not `command_guard::unwrap_shell_command`
+///
+/// That function unwraps the same shapes, and the two share [`WRAPPER_SHELLS`]
+/// so they cannot disagree about what a shell is. They are separate because
+/// their errors have opposite costs, and the difference is concrete rather than
+/// stylistic: on an UNQUOTED operand (`zsh -lc git status`) the guard returns
+/// `git status`, because a guard that reads too much only ever scans more, while
+/// POSIX `sh -c` actually runs `git` with `$0=status`. Showing that in a step row
+/// would name a command that never ran, so this declines and shows the
+/// invocation verbatim. The guard is deliberately generous; a label must be
+/// exact. Do not collapse them into one.
+fn shell_script_body(cmd: &str) -> Cow<'_, str> {
+    let Some((shell, rest)) = cmd.trim_start().split_once(char::is_whitespace) else {
+        return Cow::Borrowed(cmd);
+    };
+    if !WRAPPER_SHELLS.contains(&shell.rsplit('/').next().unwrap_or(shell)) {
+        return Cow::Borrowed(cmd);
+    }
+    let Some((flags, script)) = rest.trim_start().split_once(char::is_whitespace) else {
+        return Cow::Borrowed(cmd);
+    };
+    // `-c`, `-lc`, `-ic`: one cluster of letters including the flag that says
+    // "the next argument is the script". Anything else (`--norc`, a bare `-`, a
+    // flag that takes its own value) means this is not the shape we can read.
+    let Some(letters) = flags.strip_prefix('-') else {
+        return Cow::Borrowed(cmd);
+    };
+    if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Cow::Borrowed(cmd);
+    }
+    if !letters.contains('c') {
+        return Cow::Borrowed(cmd);
+    }
+    let script = script.trim();
+    match script.as_bytes().first() {
+        // A quoted script has to be exactly ONE quoted word. `zsh -lc "a" && "b"`
+        // is two words and a pipeline, so no part of it is "the command" and the
+        // label shows the invocation verbatim rather than a confident half of it.
+        Some(b'\'' | b'"') => unquote_shell_word(script).unwrap_or(Cow::Borrowed(cmd)),
+        // An UNQUOTED suffix is the script only when it is a single word. POSIX
+        // `sh -c` reads ONE operand as the script and assigns the rest to `$0`,
+        // `$1`, ..., so `zsh -lc git status` runs `git` with `$0=status` and does
+        // NOT run `git status`. Reading it as the latter would put a command in
+        // the row that never ran, which is the one thing this must never do.
+        Some(_) if !script.contains(char::is_whitespace) => Cow::Borrowed(script),
+        _ => Cow::Borrowed(cmd),
+    }
+}
+
+/// The contents of `s` when it is exactly ONE quoted shell word, unescaped for
+/// that quoting style. `None` when `s` is unquoted, unterminated, or carries
+/// anything after its closing quote, because `"a" && "b"` is two words and a
+/// pipeline rather than one script, and stripping its outer quotes would claim
+/// otherwise.
+fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    // Lazily allocated: a script with no escapes borrows straight out of `s`.
+    let mut unescaped: Option<String> = None;
+    let mut chunk_start = 1;
+    let mut i = 1;
+    // Byte scanning is UTF-8-safe here because every byte compared against is
+    // ASCII, and a continuation byte is always >= 0x80, so a cut only ever lands
+    // on a char boundary.
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            // A single-quoted script cannot contain a quote, so the wrapper
+            // spells one as close, escape, reopen. That is not the terminator.
+            if quote == b'\'' && s[i..].starts_with("'\\''") {
+                let buf = unescaped.get_or_insert_with(String::new);
+                buf.push_str(&s[chunk_start..i]);
+                buf.push('\'');
+                i += 4;
+                chunk_start = i;
+                continue;
+            }
+            if i + 1 != bytes.len() {
+                return None;
+            }
+            return Some(match unescaped {
+                Some(mut buf) => {
+                    buf.push_str(&s[chunk_start..i]);
+                    Cow::Owned(buf)
+                }
+                None => Cow::Borrowed(&s[1..i]),
+            });
+        }
+        // Inside double quotes a backslash escapes exactly four characters plus
+        // a line continuation; before anything else it is a literal backslash
+        // and the character after it is read normally.
+        if quote == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if matches!(next, b'"' | b'\\' | b'$' | b'`' | b'\n') {
+                let buf = unescaped.get_or_insert_with(String::new);
+                buf.push_str(&s[chunk_start..i]);
+                if next != b'\n' {
+                    buf.push(next as char);
+                }
+                i += 2;
+                chunk_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None // unterminated
+}
+
 /// The bare tool name inside an `mcp__<server>__<tool>` identifier, or `None`
 /// when `name` is not shaped like one. Every surface uses that naming: the
 /// engine's own MCP client, Claude Code natively, and Codex, whose
@@ -1517,6 +1667,30 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
     })
 }
 
+/// The step-row verb a Codex `file_change` kind implies.
+///
+/// The kind arrives as `{"type": "add"}` over the app-server protocol and as a
+/// bare `"add"` from older exec frames, so both shapes resolve; an unrecognized
+/// one reads "Change", which is true of every kind and claims nothing extra.
+///
+/// The vocabulary is deliberately Claude Code's (`Write` / `Edit` / `Delete`)
+/// rather than the sentence verbs `PermissionCard` uses ("wants to create
+/// /path"). That card builds a sentence; this is a step label, and it has to
+/// read like the label a Claude Code row carrying the same edit would.
+fn change_kind_verb(kind: Option<&serde_json::Value>) -> &'static str {
+    let name = match kind {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(v) => v.get("type").and_then(|t| t.as_str()).unwrap_or(""),
+        None => "",
+    };
+    match name {
+        "add" => "Write",
+        "update" => "Edit",
+        "delete" => "Delete",
+        _ => "Change",
+    }
+}
+
 /// Human-friendly description of a Claude Code tool call.
 pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
     fn basename(p: &str) -> &str {
@@ -1620,27 +1794,49 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
         "TodoWrite" => "Update plan".into(),
         "ExitPlanMode" => "Present plan for approval".into(),
         // Codex item types (see runtime/codex_parse.rs) — Codex reports
-        // coarse-grained items, not named tools like CC.
+        // coarse-grained items, not named tools like CC. Each arm lands on the
+        // SAME sentence its Claude Code counterpart produces, because the two
+        // backends share every transcript component and a row that reads
+        // differently is the only thing left that can tell them apart.
         "command_execution" => {
-            let cmd = str_arg("command");
-            if cmd.is_empty() {
+            let script = shell_script_body(str_arg("command"));
+            let line = first_command_line(&script);
+            if line.is_empty() {
                 "Run command".into()
             } else {
-                format!("Run {}", middle_truncate(first_command_line(cmd), 60))
+                format!("Run {}", middle_truncate(line, 60))
             }
         }
-        "file_change" => {
-            let n = args
-                .get("changes")
-                .and_then(|c| c.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            match n {
-                0 => "Apply file changes".into(),
-                1 => "Apply 1 file change".into(),
-                n => format!("Apply {} file changes", n),
+        "file_change" => match args.get("changes").and_then(|c| c.as_array()) {
+            Some(changes) if !changes.is_empty() => {
+                let verbs: Vec<&str> = changes
+                    .iter()
+                    .map(|c| change_kind_verb(c.get("kind")))
+                    .collect();
+                // One verb for the whole set only when they agree: a patch that
+                // both creates and deletes is a "change", same honesty rule
+                // `renderFileChangeQuestion` applies on the permission card.
+                let verb = if verbs.windows(2).all(|w| w[0] == w[1]) {
+                    verbs[0]
+                } else {
+                    "Change"
+                };
+                if changes.len() > 1 {
+                    format!("{} {} files", verb, changes.len())
+                } else {
+                    // Indexing is safe: this arm is guarded on a non-empty array.
+                    match changes[0]
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                    {
+                        Some(p) => format!("{} {}", verb, basename(p)),
+                        None => format!("{} 1 file", verb),
+                    }
+                }
             }
-        }
+            _ => "Apply file changes".into(),
+        },
         "web_search" => {
             let q = str_arg("query");
             if q.is_empty() {

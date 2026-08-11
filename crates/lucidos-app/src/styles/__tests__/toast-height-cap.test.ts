@@ -16,6 +16,10 @@
  * message and a short screen. `rulesTargeting` (not `block`) is the reader on
  * purpose, so a `@media` copy or a compound selector quietly raising the cap
  * back is caught rather than passed over by a first textual match.
+ *
+ * The cap is only half the contract: capping a toast that CANNOT scroll just
+ * clips it, which is the second bug in this file (see the spinner test at the
+ * bottom). The two are tested together because they are one promise.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -83,17 +87,51 @@ describe('a long toast body cannot swallow the viewport', () => {
     ).toEqual([]);
   });
 
-  it('scrolls the overflow inside the body, leaving [Open] and the X reachable', () => {
-    const body = block(componentsCss, '.toast-body {');
-    expect(decl(body, 'overflow-y')).toBe('auto');
-    // Without this the flex item refuses to shrink below its content and the
-    // cap would clip the message instead of scrolling it.
-    expect(decl(body, 'min-height')).toBe('0');
+  it('scrolls the overflow inside the message, leaving [Open] and the X reachable', () => {
+    const message = block(componentsCss, '.toast-message {');
+    expect(decl(message, 'overflow-y')).toBe('auto');
+    // Without these the flex item takes its content height and overflows the
+    // capped body, so the cap would clip the message instead of scrolling it:
+    // `min-height: 0` lets the box shrink, `align-self: stretch` overrides
+    // .toast-body's `align-items: flex-start` so it takes the shrunk height.
+    expect(decl(message, 'min-height')).toBe('0');
+    expect(decl(message, 'align-self')).toBe('stretch');
+    // The body must be able to shrink below its content in .toast's column, or
+    // there is no capped height for the message to stretch into.
+    expect(decl(block(componentsCss, '.toast-body {'), 'min-height')).toBe('0');
     // The actions row and the absolutely-positioned close X are siblings of the
-    // scrolling body, not inside it, so a clamped toast still offers its action
-    // without the user scrolling to find it.
+    // scrolling message, not inside it, so a clamped toast still offers its
+    // action without the user scrolling to find it.
     const toast = block(componentsCss, '.toast {');
     expect(decl(toast, 'display')).toBe('flex');
     expect(decl(toast, 'flex-direction')).toBe('column');
+  });
+
+  /**
+   * The scroll container may not be an ancestor of the mini-spinner.
+   *
+   * A scroll container clips its own painted overflow on both axes, and the
+   * spinner rotates via `transform`, so at 45° it paints ~√2 outside its square
+   * layout box and gets sheared. When `.toast-body` was the scroller that was
+   * patched with `.toast-body:has(.mini-spinner) { overflow: visible }`, written
+   * when a spinning toast was always one line. It then switched the scroll off
+   * for EVERY spinning toast, so the build toast's commit list was clipped at
+   * the cap with no way to reach the rest (reported 2026-08-11).
+   *
+   * Scanned rather than measured, for the same reason as the cap above: the
+   * failure is a property of the rule, and reproducing it needs a spinning
+   * toast whose body happens to be long.
+   */
+  it('does not let a spinner switch the toast scroll off', () => {
+    for (const sheet of [componentsCss, mobileCss]) {
+      const offenders = [...rulesTargeting(sheet, 'toast-body'), ...rulesTargeting(sheet, 'toast')]
+        .filter((rule) => ['overflow', 'overflow-y'].some((p) => rule.props.has(p)))
+        .filter((rule) => rule.props.get('overflow') !== 'hidden');
+
+      expect(
+        offenders.map((r) => `${r.atRules} ${r.selector} { ${r.body} }`),
+        'an ancestor of .toast-message owns a scroll the spinner would then have to switch off',
+      ).toEqual([]);
+    }
   });
 });

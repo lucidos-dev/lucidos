@@ -1,4 +1,4 @@
-import { useState, useRef } from 'preact/hooks';
+import { useState, useRef, useEffect } from 'preact/hooks';
 import { triggers, triggerGroups, collapsedTriggerGroupIds, showToast } from '../../store/store';
 import { openAddTrigger } from '../../store/actions/triggers';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
@@ -112,6 +112,16 @@ function TriggersLoaded({
   const collapsed = collapsedTriggerGroupIds.value;
   const ungroupedTriggers = byGroup.get(UNGROUPED_KEY) ?? [];
 
+  const creatingGroup = newGroupName !== null;
+  const createInputRef = useRef<HTMLInputElement>(null);
+  // Closing the field leaves it focused (Escape and a committed Enter both do),
+  // and it stays mounted now, so the mobile keyboard would hang over a panel
+  // with nothing to type into. onBlur is only wired while open, so this cannot
+  // re-submit the name.
+  useEffect(() => {
+    if (!creatingGroup) createInputRef.current?.blur();
+  }, [creatingGroup]);
+
   return (
     <>
       {groups.map(group => {
@@ -139,28 +149,44 @@ function TriggersLoaded({
           ))}
         </div>
       )}
-      {newGroupName !== null && (
-        <div class="trigger-group-create-row">
-          <input
-            class="trigger-group-name-input"
-            type="text"
-            autoFocus
-            value={newGroupName}
-            placeholder="Group name"
-            onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
-            onBlur={commitNewGroup}
-            onKeyDown={e => {
-              if (e.key === 'Enter') void commitNewGroup();
-              else if (e.key === 'Escape') setNewGroupName(null);
-            }}
-          />
-        </div>
-      )}
+      {/* Mounted whether or not the field is open, clipped to nothing until it
+          is, for the same reason as the group header's rename field: iOS raises
+          the keyboard only for a focus() made inside the user's own gesture, so
+          the field the New Group card focuses has to already exist when the card
+          is tapped. The row collapses rather than unmounting, and the input
+          inside keeps its own box, so the element iOS scrolls into view is a
+          real one. */}
+      <div class={`trigger-group-create-row${creatingGroup ? '' : ' trigger-group-create-idle'}`}>
+        <input
+          ref={createInputRef}
+          class="trigger-group-name-input"
+          type="text"
+          value={newGroupName ?? ''}
+          placeholder="Group name"
+          tabIndex={creatingGroup ? 0 : -1}
+          // Clipped is not hidden: without this a screen reader would find a
+          // "Group name" field sitting in the panel at all times, doing
+          // nothing. Flips with the open state, and the New Group button
+          // unhides it in the same tap that focuses it.
+          aria-hidden={!creatingGroup}
+          onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
+          onBlur={creatingGroup ? commitNewGroup : undefined}
+          onKeyDown={e => {
+            if (e.key === 'Enter') void commitNewGroup();
+            else if (e.key === 'Escape') setNewGroupName(null);
+          }}
+        />
+      </div>
       <div class="trigger-add-row">
         <ListRowAddCard label="Add Trigger" onClick={openAddTrigger} />
         <ListRowAddCard
           label="New Group"
-          onClick={() => { creatingGroupRef.current = false; setNewGroupName(''); }}
+          onClick={() => {
+            creatingGroupRef.current = false;
+            // Synchronous, and before the state flip: see the note above.
+            createInputRef.current?.focus();
+            setNewGroupName('');
+          }}
         />
       </div>
     </>

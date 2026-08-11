@@ -575,6 +575,75 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
     teardown_test_db(&db).await;
 }
 
+/// Regression, 2026-08-11: the pairing must stay open for the WHOLE
+/// resolution, not just until the resolver's first sign of life. `apply_change`
+/// now refuses to move `main` while `conflict_pairing_open` is true, so
+/// anything that closed the pairing early would re-arm the exact incident: a
+/// second apply landing the merge at step 2 of the resolver's 5-step prompt and
+/// then resetting its worktree mid-turn.
+///
+/// The mid-turn traffic replayed here is what the buggy path actually produced:
+/// a `CodingAgentIdled` (emitted by `apply_now_success`'s worktree reset) and a
+/// fresh `ChangeProposed` for the same change (the resolver's auto-commit
+/// hook). Neither is a merge-lifecycle event, so neither may close the pairing.
+#[tokio::test]
+async fn conflict_pairing_stays_open_through_the_resolver_mid_turn_traffic() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    start_cc_thread(&bus, thread).await;
+    let change = Uuid::new_v4();
+    let proj = ChangesProjection::new(pool);
+
+    emit(&bus, thread, aggregate_proposed(change, "jitter", "/r")).await;
+    emit(
+        &bus,
+        thread,
+        ThreadEvent::MergeConflictDetected {
+            change_id: change.to_string(),
+            files: vec!["CreateThreadView.tsx".to_string()],
+            origin: None,
+        },
+    )
+    .await;
+    assert!(
+        proj.conflict_pairing_open(thread, change).await.unwrap(),
+        "handing the merge prompt to the agent opens the pairing"
+    );
+
+    for mid_turn in [
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some("cc-resolver".to_string()),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+        aggregate_proposed(change, "jitter", "/r"),
+    ] {
+        emit(&bus, thread, mid_turn).await;
+        assert!(
+            proj.conflict_pairing_open(thread, change).await.unwrap(),
+            "only a merge-lifecycle event may close the pairing, so the guard \
+             stays armed for the whole resolution"
+        );
+    }
+
+    // The resolver's own completion is what closes it, and only then may
+    // another caller merge.
+    emit(&bus, thread, applied_event(change, &["fix: jitter"], false)).await;
+    assert!(
+        !proj.conflict_pairing_open(thread, change).await.unwrap(),
+        "the resolution's terminal hands the merge back"
+    );
+
+    teardown_test_db(&db).await;
+}
+
 /// With two open pairings on one thread (an older one stranded by a crash),
 /// the NEWEST wins — the continuation that just fired belongs to the most
 /// recently started merge; binding the stranded older change would ff-merge

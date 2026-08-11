@@ -588,8 +588,8 @@ interface TurnControlsProps {
 /** The response header's `controls` slot: three icon buttons right of the
  *  executor label, evenly spaced as one run.
  *
- *  The first two are the detail toggles, the full response (the prose the
- *  default view drops) and the step log. They were text links at the top of the
+ *  The first two are the detail toggles, the full response and the step log,
+ *  both ON until the reader turns one off. They were text links at the top of the
  *  response BODY ("More" / "Less" and "Show steps" / "Hide steps"), which
  *  pushed the answer down by a row and reflowed that row on every click, since
  *  both labels change width as they toggle. As icons in the header they cost

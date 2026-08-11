@@ -125,6 +125,33 @@ impl StackRuntime {
     }
 }
 
+/// The workspace-specific variables every spawned engine gets, whatever the
+/// runtime posture. Split out of [`spawn_engine`] (which adds the conditional
+/// bind/TLS handling on top) so the set is inspectable, and pinned by a test.
+///
+/// Note what is deliberately NOT here: a model-cache directory. The embedding
+/// model is hundreds of MB and byte-identical for every workspace, so the engine
+/// resolves ONE shared per-user cache itself
+/// (`memory::model_download::apply_default_cache_dir`) and otherwise inherits
+/// whatever the packaged app or the headless service already chose. Pinning it
+/// per workspace here is what used to give every workspace its own copy.
+fn engine_env_overrides(
+    ws: &Workspace,
+    resolved_dir: &Path,
+    database_url: &str,
+    gateway_port: u16,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        ("LUCIDOS_WORKSPACE", resolved_dir.as_os_str().to_os_string()),
+        ("DATABASE_URL", database_url.into()),
+        ("LUCIDOS_API_PORT", ws.port.to_string().into()),
+        // Identity + callback so the engine's /api/v1/restart can ask the
+        // gateway to restart this one stack in place (dev Apply path).
+        ("LUCIDOS_WORKSPACE_ID", ws.id.clone().into()),
+        ("LUCIDOS_GATEWAY_PORT", gateway_port.to_string().into()),
+    ]
+}
+
 /// Spawn a workspace engine: detached, pointed at its workspace dir + database,
 /// told how to call the gateway back for an in-place restart. Inherits the
 /// gateway's environment (so `LUCIDOS_STATIC_DIR` — the engine serves the built
@@ -147,22 +174,16 @@ pub fn spawn_engine(
     gateway_port: u16,
     loopback: bool,
 ) -> std::io::Result<Child> {
-    // fastembed caches its model relative to CWD by default; pin it under the
-    // workspace's ephemeral .lucidos/ and give the engine a writable CWD.
-    let fastembed_cache = resolved_dir.join(".lucidos/fastembed");
-    std::fs::create_dir_all(&fastembed_cache)?;
+    // The engine writes its pidfile in here, and wants a writable CWD.
     std::fs::create_dir_all(resolved_dir.join(".lucidos"))?;
 
     let mut cmd = Command::new(engine_bin);
-    cmd.current_dir(resolved_dir)
-        .env("LUCIDOS_WORKSPACE", resolved_dir)
-        .env("DATABASE_URL", database_url)
-        .env("LUCIDOS_API_PORT", ws.port.to_string())
-        // Identity + callback so the engine's /api/v1/restart can ask the
-        // gateway to restart this one stack in place (dev Apply path).
-        .env("LUCIDOS_WORKSPACE_ID", &ws.id)
-        .env("LUCIDOS_GATEWAY_PORT", gateway_port.to_string())
-        .env("FASTEMBED_CACHE_DIR", &fastembed_cache);
+    cmd.current_dir(resolved_dir).envs(engine_env_overrides(
+        ws,
+        resolved_dir,
+        database_url,
+        gateway_port,
+    ));
 
     // Never hand a spawned engine a frontend pinned to a coding-agent worktree.
     // This inherit is precisely what made the 2026-07-26 pin self-perpetuating:
@@ -932,5 +953,44 @@ mod tests {
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["unread_count"], serde_json::json!(4));
+    }
+
+    /// The embedding model is hundreds of MB and identical for every workspace,
+    /// so a spawned engine must INHERIT its cache location rather than be given
+    /// a per-workspace one. Pinning `FASTEMBED_CACHE_DIR` (or `HF_HOME`) here is
+    /// what used to leave a private ~465 MB copy under every workspace's
+    /// `.lucidos/`, and it also overrode the shared directory the packaged app
+    /// and the headless service already set for the gateway.
+    #[test]
+    fn a_spawned_engine_inherits_the_model_cache_instead_of_getting_its_own() {
+        let ws = Workspace {
+            id: "dev".into(),
+            name: "Dev".into(),
+            dir: "/ws/dev".into(),
+            port: 5173,
+            database_url: None,
+            autostart: false,
+        };
+        let overrides =
+            engine_env_overrides(&ws, Path::new("/ws/dev"), "postgres://local/dev", 5251);
+
+        let keys: Vec<&str> = overrides.iter().map(|(k, _)| *k).collect();
+        for cache_var in ["FASTEMBED_CACHE_DIR", "HF_HOME"] {
+            assert!(
+                !keys.contains(&cache_var),
+                "{cache_var} must be inherited, not set per workspace: {keys:?}"
+            );
+        }
+        assert_eq!(
+            keys,
+            [
+                "LUCIDOS_WORKSPACE",
+                "DATABASE_URL",
+                "LUCIDOS_API_PORT",
+                "LUCIDOS_WORKSPACE_ID",
+                "LUCIDOS_GATEWAY_PORT",
+            ],
+            "the workspace-specific set changed: add the new variable here deliberately"
+        );
     }
 }

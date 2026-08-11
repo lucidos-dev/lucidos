@@ -13,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isNavigationScroll, followingLiveEdge } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isNavigationScroll, followIsCarrying } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -414,7 +414,27 @@ function carriedAnchorDebt(container: HTMLElement): number {
   return Math.abs(container.scrollTop - anchorDebtAt) <= 1 ? anchorDebt : 0;
 }
 
+/** Retire the debt the moment the reader takes the container somewhere else.
+ *
+ *  Watched as an EVENT, and the comparison above cannot stand in for it: that
+ *  one is asked once, at the next reveal, and so sees only where the reader
+ *  ENDED UP. The clamped offset IS the live edge of the shrunk transcript, which
+ *  is exactly where a reader who scrolled up to read comes back to, and they
+ *  land on it to the pixel. Asked per scroll event, the trip away is seen even
+ *  though the return hides it, and a bottom the reader chose to return to stays
+ *  theirs instead of being paid a debt they had walked away from.
+ *
+ *  Our own correction's echo is not a trip away: a `scrollTop` write dispatches
+ *  its event a frame later, by which point the recorded offset IS where we put
+ *  the container, so the same 1px of slack ignores it. */
+function anchorDebtScrolled(): void {
+  if (anchorDebtEl && Math.abs(anchorDebtEl.scrollTop - anchorDebtAt) > 1) clearAnchorDebt();
+}
+
 function clearAnchorDebt(): void {
+  if (anchorDebtEl && typeof anchorDebtEl.removeEventListener === 'function') {
+    anchorDebtEl.removeEventListener('scroll', anchorDebtScrolled);
+  }
   anchorDebtEl = null;
   anchorDebt = 0;
   anchorDebtAt = -1;
@@ -422,16 +442,23 @@ function clearAnchorDebt(): void {
 }
 
 /** Record what the clamp ate, and the state it left the container in. A debt
- *  inside the same 1px of slack is no debt at all. */
+ *  inside the same 1px of slack is no debt at all.
+ *
+ *  Clears first unconditionally, so re-recording on the same container cannot
+ *  leave two watchers on it, and a debt that moves to another container takes
+ *  its watcher off the old one. */
 function rememberAnchorDebt(container: HTMLElement, debt: number): void {
-  if (Math.abs(debt) <= 1) {
-    clearAnchorDebt();
-    return;
-  }
+  clearAnchorDebt();
+  if (Math.abs(debt) <= 1) return;
   anchorDebtEl = container;
   anchorDebt = debt;
   anchorDebtAt = container.scrollTop;
   anchorDebtHeight = container.scrollHeight;
+  // A container with no `addEventListener` is a test double, as elsewhere in the
+  // scroll code; the offset comparison above still covers it.
+  if (typeof container.addEventListener === 'function') {
+    container.addEventListener('scroll', anchorDebtScrolled, { passive: true });
+  }
 }
 
 /** Keep `anchor` visually pinned while `fn` mutates the DOM. */
@@ -462,15 +489,22 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     restored = true;
     observer.disconnect();
 
-    // A reader RIDING the live edge has asked for the opposite of an anchor
-    // correction: hold me on the newest content, not on the content I was
+    // A reader being CARRIED to the live edge has asked for the opposite of an
+    // anchor correction: hold me on the newest content, not on the content I was
     // looking at. Correcting them anyway and then letting
     // `honourAnchoredMutation` bring them back down is why toggling full
     // response / steps on a live thread moved the transcript UP and then DOWN
     // again for one tap. The freeze has kept the container at `scrollBefore`
     // through the mutation, so skipping the correction leaves the live-edge
     // write below as the tap's ONE motion.
-    const riding = followingLiveEdge.value;
+    //
+    // `followIsCarrying` and not the bare armed flag, because this and
+    // `honourAnchoredMutation` are ONE decision split across the DOM/layout
+    // line: the follow stands down on an idle thread, so an armed reader
+    // clicking around a finished thread would get neither the correction nor the
+    // snap and would drift on whatever grew above them. Asking the same question
+    // makes that state unreachable rather than merely unlikely.
+    const riding = followIsCarrying();
     // A mutation that took the anchor OUT of the DOM leaves nothing to hold the
     // reader on, and a detached element does not say so: it measures as a zero
     // rect, so the correction would come out as "the turn moved to the top of

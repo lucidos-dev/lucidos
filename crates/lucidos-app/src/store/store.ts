@@ -1509,12 +1509,50 @@ export interface RestartGroup {
 
 /** Applied changes requiring engine restart, grouped by originating thread. */
 export const restartGroups = signal<RestartGroup[]>([]);
-export const stepsExpanded = signal(
-  localStorage.getItem('lucidos-steps-expanded') === 'true'
-);
-export const detailsExpanded = signal(
-  localStorage.getItem('lucidos-details-expanded') === 'true'
-);
+/** The two transcript-wide *turn controls*, both ON unless the reader turned
+ *  them off: a turn shows its full response and its step log by default.
+ *
+ *  Storage holds only the DEVIATION, which is what makes that a real default
+ *  rather than one only a fresh browser profile ever sees. The pre-2026-08-11
+ *  keys were written on every load, clicked or not, by a persisting effect that
+ *  did not distinguish the default from a choice, so every browser that had
+ *  opened the app held a `false` recording the old default and nobody's intent.
+ *  Reading those would pin every existing reader to the default this replaces,
+ *  and there is no intent in them to migrate, so the pair is dropped and the
+ *  seeds read `-v2` keys. A reader who really had turned steps off pays for
+ *  that once, by turning them off again.
+ *
+ *  `persistTurnControl` is the other half and keeps the rename from ever being
+ *  needed again: an ON control stores nothing at all, so a stored value always
+ *  means the reader turned something off. */
+export const STEPS_EXPANDED_KEY = 'lucidos-steps-expanded-v2';
+export const DETAILS_EXPANDED_KEY = 'lucidos-details-expanded-v2';
+
+/** Absent means ON, and so does any value `persistTurnControl` never wrote:
+ *  `'false'` is the only thing that hides anything, so a corrupted key shows
+ *  more rather than less. */
+export function seedTurnControl(stored: string | null): boolean {
+  return stored !== 'false';
+}
+
+/** The write half of `seedTurnControl`: an OFF control is recorded, an ON one
+ *  clears the key. Called from an effect that runs on load as well as on a
+ *  click, which is exactly why the ON branch must not write. */
+export function persistTurnControl(key: string, on: boolean): void {
+  if (on) localStorage.removeItem(key);
+  else localStorage.setItem(key, 'false');
+}
+
+export const stepsExpanded = signal(seedTurnControl(localStorage.getItem(STEPS_EXPANDED_KEY)));
+export const detailsExpanded = signal(seedTurnControl(localStorage.getItem(DETAILS_EXPANDED_KEY)));
+// Clear the superseded pair rather than leaving a `false` sitting under a name
+// so close to the live one: nothing reads it, and the next person looking at
+// this app's storage would read it as the state of a control that is on.
+// A one-shot purge, so it is removable: docs/temporary-measures.md
+// § "Superseded turn-control localStorage keys cleared at load" holds the
+// condition, and says the `-v2` names and the deviation-only write stay.
+localStorage.removeItem('lucidos-steps-expanded');
+localStorage.removeItem('lucidos-details-expanded');
 
 /** Signal + toggle + expand triple, backed by a localStorage-persisted Set of
  *  "threadId:userSeq" keys.

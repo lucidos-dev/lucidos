@@ -510,6 +510,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   rather than prose the user reads.
   (`engine/tool_arg_entity_repair.rs`, `docs/temporary-measures.md` §2.)
 
+- **The merge-ownership guard letting an apply through during the Tier-2 /
+  Tier-3 startup window cannot move `main`** (2026-08-11, Codex). Those tiers
+  open the `MergeConflictDetected` pairing inside their spawned task, before
+  `run_direct_agent` registers the session, so for a moment
+  `decide_merge_ownership` sees an open pairing with no resolver named and
+  returns `CallerMayMerge`. That reads as the guard's whole premise leaking. It
+  does not merge anything: arriving at a resolution at all means
+  `catchup_and_ff_to_main` ALREADY failed on this branch, and in that window
+  nothing has merged yet, so a concurrent apply's ff fails identically and it
+  spawns another merge attempt rather than advancing `main`. The alternative,
+  an in-memory claim held across the spawn, is the wedging shape ADR 0060
+  rejects by name. Tier 1 has no window at all: it binds the session before it
+  opens the pairing. Re-flag only with a path where the ff can SUCCEED between
+  the pairing emit and session registration.
+  (`engine/change_ops/mod.rs`, `engine/change_ops/apply.rs`, ADR 0060.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -2199,3 +2215,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   if the reduced-motion path starts arming no follow, or if a landing can be
   consumed without a growth round following it.
   (`components/chat/scrollState.ts`.)
+
+- **The trash's optical correction reaching the queued-message trash too is the
+  point of it, not spillover** (2026-08-11, Codex). `.icon-btn.row-icon
+  .trash-icon` (`styles/global/host-components.css`) grows the glyph by the
+  ratio of two measured fills, and `.queued-message-remove` carries `row-icon`,
+  so the correction lands on the queued trash as well as the trigger group
+  heading's. That reads as a targeted fix leaking onto an unrelated control,
+  and the comment's "the pencil it sits beside" makes it read that way twice
+  over, since nothing sits beside the queued one. The pencil is the REFERENCE
+  for how much of its box a glyph in this icon set paints, not the reason: the
+  trash under-fills wherever it renders, so the correction is right at every
+  site taking this box, and the user asked for both places to grow in the same
+  breath ("Same trash as queue? I guess we can make it taller both places?").
+  Scoping it to `.trigger-group-delete` would put the two trashes back at
+  different sizes in one nominal box, which is the inconsistency the shared
+  class removed. Re-flag only with evidence that a `row-icon` site wants the
+  UNCORRECTED glyph, which would be an argument for a second box, not a
+  narrower selector. (`styles/global/host-components.css`,
+  `styles/__tests__/trash-icon-optical-size.test.ts`.)

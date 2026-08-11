@@ -2,8 +2,10 @@
 //! semantics: each call's `items` become the new truth and any prior list is
 //! implicitly dropped. The empty list clears the panel.
 //!
-//! Also hosts [`settle_open_todos`], the engine-side post-response hook that
-//! runs at response termination. The agent's contract is "either keep working
+//! Also hosts [`settle_open_todos`], the engine-side hook that runs whenever a
+//! thread stops working the list: at response termination, and at the one
+//! unpark no response follows (`todo_consumer` has both triggers and says which
+//! is which). The agent's contract is "either keep working
 //! the list until every item is `completed`, or call `todo_write` with `[]` to
 //! drop it explicitly." If the agent terminates a response with any OPEN item
 //! still on the list, the engine emits a new `TodoListWritten` with those items
@@ -19,9 +21,11 @@
 //! items settle to `Waiting`, which is the same reading the thread's own status
 //! dot already gives that fact. Everything else settles to `Abandoned`.
 //!
-//! See `docs/plans/2026-05-18-todo-list-design.md` for the original design and
+//! See `docs/plans/2026-05-18-todo-list-design.md` for the original design,
 //! `docs/plans/2026-08-09-a-subscribed-threads-todo-list-reads-as-waiting.md`
-//! for the waiting split.
+//! for the waiting split, and
+//! `docs/plans/2026-08-11-a-canceled-subscription-settles-the-todo-list.md` for
+//! the second trigger that keeps `Waiting` from stranding.
 
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -180,19 +184,23 @@ async fn thread_held_event_wait(
 /// abandoned within milliseconds of the agent saying it would keep watching is
 /// the bug this split fixes. `TodoStatus::is_open` owns which statuses are
 /// rewritable: `Waiting` is open, so a wait that resolves without the agent
-/// touching the list settles it to `Abandoned` at the next terminator rather
-/// than stranding; `Abandoned` is terminal, so a later subscription cannot
-/// un-abandon an item the agent already walked away from.
+/// touching the list settles it to `Abandoned` rather than stranding, at the
+/// next terminator or, when the resolution was a cancel and no turn follows,
+/// at the cancel itself; `Abandoned` is terminal, so a later subscription
+/// cannot un-abandon an item the agent already walked away from.
 ///
 /// Called from `todo_consumer` on every chat-thread terminator
 /// (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` /
-/// `ResponseFailed`). The agent's contract: either finish the list (every
+/// `ResponseFailed`), and on the one unpark no terminator follows, an
+/// `EventWaitCanceled`. The agent's contract: either finish the list (every
 /// item `completed`) or call `todo_write` with `[]` to drop it. Already-settled
-/// lists short-circuit, so a second terminator with the same answer re-emits
-/// nothing.
+/// lists short-circuit, so a second call with the same answer re-emits
+/// nothing. That short-circuit is also what keeps the archive cascade to one
+/// rewrite: cancelling N waits fires this N times, and the first N-1 still see
+/// a live wait at their own sequence and compute `Waiting` again.
 ///
-/// `terminator_seq` is the bigserial `sequence` of the terminator that
-/// triggered this call. We only consider TodoListWritten rows with
+/// `terminator_seq` is the bigserial `sequence` of the event that triggered
+/// this call. We only consider TodoListWritten rows with
 /// `sequence <= terminator_seq`, AND skip the settle if a NEWER
 /// TodoListWritten exists (a fresh turn started before our async consumer
 /// caught up, and that turn owns its list: the consumer will see its own

@@ -215,11 +215,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   //
   // Deliberately NOT `hasEvents`. A fold swaps the body for a `⋯` stub, so on a
   // turn whose body draws nothing it swaps nothing for a mark. In flight that
-  // is the common case rather than a corner: a coding-agent turn emits a
-  // whitespace-only text event before every tool call and its steps are hidden
-  // by default (`stepsExpanded` seeds from localStorage, absent means off), so
-  // `events.length` runs ahead of anything on screen for as long as the turn
-  // has produced only mechanics. Asking `drawsResponseRow` instead means the
+  // is a real case rather than a corner: a coding-agent turn emits a
+  // whitespace-only text event before every tool call, and a reader who turned
+  // the steps control off is shown nothing else either, so `events.length` runs
+  // ahead of anything on screen for as long as the turn has produced only
+  // mechanics. Asking `drawsResponseRow` instead means the
   // control is dead exactly while the turn is blank, and lights up with its
   // first drawn row. Turning steps OFF can therefore unfold a step-only turn,
   // which is right: folded or not, it is showing nothing either way.
@@ -548,7 +548,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       {queuedMessageId && (
         <button
           type="button"
-          class="icon-btn queued-message-remove"
+          class="icon-btn row-icon queued-message-remove"
           aria-label="Remove queued message"
           data-tooltip="Remove queued message"
           onClick={(e) => {

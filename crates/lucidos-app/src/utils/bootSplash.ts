@@ -32,10 +32,12 @@ const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
 // The cover itself is permanent either way: do NOT delete it with that measure.
 const QUIET_CLASS_SELECTOR = '.boot-splash-quiet';
 
-// Matches the longest `.boot-splash-leaving` fade in index.html (0.45s); the
-// extra margin covers the reduced-motion 0.15s case too. Used as the removal
-// fallback when `animationend` doesn't fire.
-const FADE_REMOVE_MS = 550;
+// Outlives the longest `.boot-splash-leaving` fade in index.html (the veil's
+// 0.65s; the mark and the status finish inside it), with margin. Used as the
+// removal fallback when `animationend` doesn't fire. It MUST stay ahead of that
+// duration: set below it, this stops being a fallback and becomes the thing that
+// removes the splash, cutting the veil off partway through its dissolve.
+const FADE_REMOVE_MS = 800;
 
 let dismissed = false;
 
@@ -129,7 +131,17 @@ export function dismissBootSplash(): void {
     el.remove();
     revertDocumentBackground();
   };
-  el.addEventListener('animationend', remove, { once: true });
+  // Only THIS element's own fade may remove it. `animationend` bubbles, and the
+  // exit choreography (index.html) runs shorter animations on the mark and the
+  // status inside the veil's: acting on one of those tore the splash out at 57%
+  // veil opacity, snapping the app in mid-fade. `once` is deliberately not used
+  // for the same reason, since a child's event would spend it.
+  const onAnimationEnd = (event: Event) => {
+    if (event.target !== el) return;
+    el.removeEventListener('animationend', onAnimationEnd);
+    remove();
+  };
+  el.addEventListener('animationend', onAnimationEnd);
   // Fallback: if the fade animation is suppressed (no animationend), still remove.
   window.setTimeout(remove, FADE_REMOVE_MS);
 }

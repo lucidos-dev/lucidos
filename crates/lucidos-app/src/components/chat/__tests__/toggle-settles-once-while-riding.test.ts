@@ -244,4 +244,65 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       expect(el.style.overflow, `riding=${riding}`).toBe('');
     }
   });
+
+  /** **Clicking around an IDLE thread.**
+   *
+   *  The block above is the LIVE case, which is where "riding" and "reading"
+   *  genuinely conflict: content is arriving, and an armed reader has asked to
+   *  be kept on the newest of it. On an idle thread nothing is arriving, so
+   *  there is no conflict to resolve and no reason to move anybody: the reader
+   *  expanding a turn on a finished thread wants to see what they expanded.
+   *
+   *  So an armed reader is treated exactly as an unarmed one here, and BOTH
+   *  halves have to agree about that or they get neither treatment. The snap
+   *  lives in `honourAnchoredMutation` and the decision to skip the correction
+   *  lives in `withScrollAnchor`; skip one without the other and the reader is
+   *  left frozen at their old offset with the content above them grown, which
+   *  is a drift rather than a hold. `followIsCarrying` is the one question both
+   *  ask, which is what makes that state unreachable. */
+  describe('and holds an armed reader still on an IDLE thread instead', () => {
+    /** Arm the follow, then let the thread go quiet. */
+    function armedOnAFinishedThread() {
+      const el = makeContainer({ scrollTop: 2500, scrollHeight: 3000, clientHeight: 500 });
+      setActiveScrollElement(el);
+      setFollowLiveEdge(true);
+      vi.advanceTimersByTime(1500);
+      expect(followingLiveEdge.value).toBe(true);
+      setThreadLive(false);
+      el.settled.length = 0;
+      return el;
+    }
+
+    it('gives them the anchor correction when the steps go on, not the live edge', () => {
+      const el = armedOnAFinishedThread();
+
+      showSteps(el);
+
+      // 3700, the same single correction the unarmed reader gets above, and NOT
+      // 4500: on a finished thread the 2000px that appeared is the transcript
+      // rendering itself, not the agent writing anything worth being carried to.
+      expect(el.settled).toEqual([3700]);
+      expect(el.settled).not.toContain(4500);
+    });
+
+    it('gives them the anchor correction when the steps go off', () => {
+      const el = armedOnAFinishedThread();
+
+      hideSteps(el);
+
+      // The shrink's clamp, then the correction that puts the toggled turn back
+      // under their eyes: the unarmed reader's pair, exactly.
+      expect(el.settled).toEqual([2300, 1300]);
+    });
+
+    it('keeps the ride armed through all of it', () => {
+      // Nothing here is a retirement. The toggle stays lit, and the next live
+      // turn carries them again.
+      const el = armedOnAFinishedThread();
+
+      showSteps(el);
+
+      expect(followingLiveEdge.value).toBe(true);
+    });
+  });
 });

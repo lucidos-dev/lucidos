@@ -216,8 +216,17 @@
     }
 }
 
-/* Header-level icon buttons — 2.25rem tap target, large icons, background fills full area */
-.icon-btn.header-icon {
+/* Icon-only buttons: one 2.25rem tap target, large glyph, background filling the
+   full area. `header-icon` is the one in a header band; `row-icon` is the same
+   control sitting inline in a list row or a status line. Two names for one box
+   because only the header one is narrowed by the mobile thread title bar, which
+   squeezes it onto the title's own line, and a row control must not follow it
+   there. Left to `.icon-btn`'s bare padding either would be its glyph plus
+   0.25rem, a ~24px target a thumb misses that reads squat beside the row's text.
+   That is what the queued message's trash (1.25rem) and the trigger group
+   heading's pair (1.375rem) each were before they came here. */
+.icon-btn.header-icon,
+.icon-btn.row-icon {
     position: relative;
     width: 2.25rem;
     height: 2.25rem;
@@ -226,9 +235,44 @@
     -webkit-tap-highlight-color: transparent;
 }
 
-.icon-btn.header-icon svg {
+.icon-btn.header-icon svg,
+.icon-btn.row-icon svg {
     width: var(--icon-size-lg);
     height: var(--icon-size-lg);
+}
+
+/* The trash is sized by its INK, not by the box, which is the same correction
+   the composer's agent marks take and for the same reason: a shared box is not
+   a shared size (styles/__tests__/prompt-mark-optical-size.test.ts). Measured
+   in both engines at this box, the trash paints 16 of its 24 viewBox units
+   vertically where the pencil paints 20.12, so at one box it rendered a fifth
+   shorter and was reported as small twice over. Growing it by that ratio lands
+   the two on one height.
+
+   The pencil is the REFERENCE for how much of its box a glyph in this set
+   paints, not the reason, so this deliberately reaches every `row-icon` trash
+   and not only the one that happens to sit beside a pencil: the queued
+   message's is the other, and two sizes of one glyph in one nominal box is the
+   inconsistency the shared class exists to remove.
+
+   The stroke has the ratio taken back out because `stroke-width` is in user
+   units and would otherwise thicken with the glyph, which would answer "too
+   small" with "too heavy". Both numbers are measurements of the artwork in
+   icons.tsx, so they are only right while it is unchanged: pinned against the
+   real rendering by e2e/trigger-group-icon-optics.spec.ts, which fails if
+   either glyph is redrawn without re-measuring here. */
+.icon-btn.header-icon .trash-icon,
+.icon-btn.row-icon .trash-icon {
+    /* The two measurements, in viewBox units of 24, and nothing derived from
+       them by hand: the size and the stroke both divide by the same pair, so
+       they cannot drift into a glyph that grew without its stroke thinning,
+       which is the mismatch this rule exists to avoid. */
+    --pencil-ink: 20.12;
+    --trash-ink: 16;
+    width: calc(var(--icon-size-lg) * var(--pencil-ink) / var(--trash-ink));
+    height: calc(var(--icon-size-lg) * var(--pencil-ink) / var(--trash-ink));
+    /* 2 is the stroke-width the artwork is drawn at (icons.tsx). */
+    stroke-width: calc(2 * var(--trash-ink) / var(--pencil-ink));
 }
 
 .icon-btn.filter-active,

@@ -3515,8 +3515,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     NotificationStore::init_schema(&pool).await?;
     log!("[Populate] Scheduler schemas initialized");
 
-    // Initialize embedder and memory index
-    log!("[Populate] Initializing embedder (first run downloads model ~30MB)...");
+    // Initialize embedder and memory index. Share the engine's per-user model
+    // cache rather than fetching a private copy next to the working directory.
+    log!("[Populate] Initializing embedder (first run downloads the model)...");
+    lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
     let embedder = FastEmbedProvider::new()?;
 
     log!("[Populate] Creating memory index...");

@@ -113,6 +113,27 @@ pub(super) struct ApplyNowQuery {
     thread_id: String,
 }
 
+/// Classify an `apply_now` error into its HTTP status.
+///
+/// `404` is not a generic failure here, it is a SIGNAL: the frontend
+/// (`endClaudeCodeAndApply`) reads it as "no live coding-agent session" and
+/// falls back to applying the thread's pending changes one at a time. `409` is
+/// its "already applying" branch, which keeps the spinner and arms the safety
+/// timeout. So every refusal that is not literally "there is no session" has to
+/// be `409`, or the UI runs the wrong fallback.
+///
+/// The merge-ownership refusal is matched by identity against the const rather
+/// than by another substring sniff, so rewording the message cannot silently
+/// reclassify it as "no session".
+fn apply_now_error_status(msg: &str) -> StatusCode {
+    if msg.contains("already in progress") || msg == crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 pub(super) async fn claude_code_apply_now(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -125,12 +146,45 @@ pub(super) async fn claude_code_apply_now(
         Err(e) => {
             let msg = e.to_string();
             crate::log!("[API] apply_now failed for {}: {}", thread_id, msg);
-            if msg.contains("already in progress") {
-                Err(StatusCode::CONFLICT)
-            } else {
-                Err(StatusCode::NOT_FOUND)
-            }
+            Err(apply_now_error_status(&msg))
         }
+    }
+}
+
+#[cfg(test)]
+mod apply_now_status_tests {
+    use super::*;
+
+    /// The refusal added with the merge-ownership guard must reach the
+    /// frontend's "already applying" branch. As a 404 it would instead hit the
+    /// "no live session" fallback, which loops over the thread's pending
+    /// changes calling `applyChange` on each: the wrong fallback for a thread
+    /// whose merge a resolver already owns.
+    #[test]
+    fn a_resolver_owned_merge_is_a_conflict_not_a_missing_session() {
+        assert_eq!(
+            apply_now_error_status(crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE),
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// The pre-existing concurrent-apply refusal keeps its 409.
+    #[test]
+    fn a_concurrent_apply_stays_a_conflict() {
+        assert_eq!(
+            apply_now_error_status("Apply is already in progress for this thread"),
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// Anything else still reads as "no live session" so the frontend can fall
+    /// back to applying the pending changes directly.
+    #[test]
+    fn an_unrecognised_failure_still_signals_no_live_session() {
+        assert_eq!(
+            apply_now_error_status("Session channel closed"),
+            StatusCode::NOT_FOUND
+        );
     }
 }
 

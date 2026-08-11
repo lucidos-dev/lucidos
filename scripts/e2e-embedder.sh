@@ -67,6 +67,10 @@ done
 # seeded runs are fully offline and deterministic. fastembed reads this var via
 # `get_cache_dir()`. (If the cache is cold AND huggingface.co is unreachable, the
 # tests skip rather than fail — see `shared_embedder()` in lucidos-engine.)
+#
+# This is the same path a dev engine now defaults to (ADR 0061), so an e2e run
+# and the dev workspaces warm one copy between them. Kept explicit here because
+# the tests run as a bare `cargo test`, which never reaches the engine's `main`.
 export FASTEMBED_CACHE_DIR="${FASTEMBED_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed}"
 mkdir -p "$FASTEMBED_CACHE_DIR"
 echo "Using fastembed model cache: $FASTEMBED_CACHE_DIR"

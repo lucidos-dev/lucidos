@@ -12,7 +12,7 @@
        gradient painted on <html>/<body>. That gradient is reverted to
        var(--bg-primary) only AFTER the splash node is removed at the end of its
        fade-out (bootSplash.ts / index.html), so without this the panels flash
-       blue for the ~0.45s the splash spends fading. */
+       blue for the ~0.65s the splash spends fading. */
     background: var(--bg-primary);
 }
 

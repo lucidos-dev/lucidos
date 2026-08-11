@@ -103,7 +103,7 @@ data/
 
 - **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `weather-forecast.md`, `comfort-cloud-api.md`).
 - **Everything under `data/` is git-tracked** — files persist and have version history — **except** the engine-managed gitignored paths `postgres/` (event store), `blobs/` (binary cache), and `.env` (per-workspace env overrides; secret-bearing, loaded on startup).
-- **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`.
+- **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`. It holds nothing large: the embedding model is cached once per user (or per install), never per workspace, so a workspace directory does not carry a multi-hundred-MB copy of it (ADR 0061).
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
 - **Scripts belong with their consumer** — if only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`. A script genuinely shared across multiple consumers (apps/triggers/intents) — or invoked by a proxy auth handshake — goes in the top-level `data/scripts/<name>/` (see `system-knowhow/best-practices.md` § "scripts/ — Shared Scripts"); don't duplicate it into each consumer.
 

@@ -39,8 +39,8 @@ test.describe('LLM Context Viewer two-layer grouping', () => {
     await sendMessage(page, 'Say "hello world" and nothing else.');
     await waitForResponse(page);
 
-    // Inline steps are collapsed by default: open them to surface the
-    // context counter on the latest step, which is the viewer's door.
+    // Leave the step log open, which surfaces the context counter on the latest
+    // step, the viewer's door. On by default, but a stored per-reader setting.
     await revealSteps(page);
 
     const counter = page

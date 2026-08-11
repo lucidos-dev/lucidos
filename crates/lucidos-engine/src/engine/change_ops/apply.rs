@@ -227,6 +227,57 @@ impl LucidosEngine {
             }
         }
 
+        // An in-flight conflict resolution owns this change's merge.
+        //
+        // Placement is load-bearing, and this is the FIRST thing after the
+        // stale-merge-worktree self-heal above (which closes a dead Tier-3
+        // pairing by emitting `MergeResolutionCleared`, so a pruned temp
+        // worktree cannot refuse forever). Everything below this point has a
+        // side effect a refused apply must not have: the plan gate and the
+        // harden gate emit events and can spawn a session, the dirty-tree check
+        // auto-commits the workspace repo, and the tiers move `main`.
+        //
+        // 2026-08-11: without this, a second `apply_change` for a change whose
+        // Tier-2 resolution was mid-turn took the Tier-1 path (the resolver's
+        // own session is a live session), fast-forwarded `main` at step 2 of
+        // the resolver's 5-step merge prompt, and then `apply_now_success` ran
+        // `reset --hard main` + `clean -fd` inside the resolver's worktree
+        // while it was still working. `apply_now_in_progress` did not catch it:
+        // only `apply_now` and the Tier-1 path set that flag, never the
+        // detached Tier-2 / Tier-3 merge spawns.
+        //
+        // `Conflict`, not `Err`: the frontend, the Apply-All driver and the
+        // `apply_change` LLM tool all already read `Conflict` as "an agent is
+        // resolving it", and the change really does apply on its own when the
+        // resolver's completion (`finalize_direct_agent`) lands its terminal.
+        //
+        // Deliberately NOT covered: the Tier-2 / Tier-3 startup window, where
+        // the spawned task has opened the pairing but its session is not
+        // registered yet, so no resolver is named. `main` cannot move there.
+        // Reaching a resolution at all means `catchup_and_ff_to_main` already
+        // failed on this branch, and in that window nothing has merged yet, so
+        // a second apply's ff fails identically. Closing the window would mean
+        // an in-memory claim spanning a spawn, which is the wedging shape
+        // ADR 0060 rejects. Tier 1 has no such window: it binds the session
+        // before it opens the pairing.
+        if let Some(tid) = change.thread_id {
+            if self.merge_ownership_for_change(tid, change_id).await
+                == MergeOwnership::ResolverOwnsIt
+            {
+                log!(
+                    "[Changes] Apply refused for {} (thread {}): a conflict resolution is in flight and owns the merge",
+                    change_id,
+                    tid
+                );
+                return Ok(ApplyResult::conflict(
+                    change_id,
+                    tid,
+                    change.files.len(),
+                    MERGE_OWNED_BY_RESOLVER_MESSAGE,
+                ));
+            }
+        }
+
         // Implementation-plan floor (Lucidos-source only). A gate-satisfying
         // marker — an APPROVED plan (`planned`), or an explicit
         // `lucidos planned mark --simple` acknowledgment — MUST exist before a

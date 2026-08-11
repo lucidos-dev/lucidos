@@ -19,7 +19,10 @@
     padding-left: var(--turn-body-inset);
     /* One measurement, shared with `.initiator-header` (chat/input-messages.css):
        the two rows sit one above the other in a turn, so the gap under each of
-       them moves in step or the transcript reads as two rhythms.
+       them moves in step or the transcript reads as two rhythms. Pinned equal by
+       components/chat/__tests__/turn-header-gutter.test.ts, which compares the
+       two declarations rather than the number, so a retune is still a two-line
+       edit and only drift fails.
 
        Down from the 0.7rem that 9dc95f66a set on 2026-06-09. That value was
        measured against a body opening on PROSE, which runs at 1.5 leading
@@ -603,9 +606,18 @@
    Both edge rules out-rank `.markdown-content p` (0,1,1) on the class count:
    `:last-child` is a pseudo-class, so `.response-chunk > :last-child` is
    (0,2,0). Without that the paragraph's own 0.75rem would simply collapse
-   through and the asymmetry would survive. */
+   through and the asymmetry would survive.
+
+   0.25rem, down from the 0.375rem it carried: this is the gap under the LAST
+   step of a run before the prose starts, and against the step list's own pitch
+   it read as too much. Those rows sit a couple of px apart at 1.4 leading
+   (`.inline-step` in styles/steps.css), and at 0.375rem the break after the run
+   was around three times that, which reads as a hole rather than as the end of
+   the run. Still symmetric: the asymmetry is the whole reason the chunk owns
+   its margin instead of the paragraph inside it, so the step down applies going
+   into a chunk and coming out of it alike. */
 .response-chunk {
-    margin: 0.375rem 0;
+    margin: 0.25rem 0;
 }
 
 .response-chunk > :first-child {
@@ -644,9 +656,16 @@
    tighten from 1.61x to 1.49x exactly when the user asked for more room. The
    1px hairline is the one thing that does NOT scale, for the reason below.
 
-   Both sides of the boundary are set, and both are load-bearing: adjacent-sibling
-   margins collapse to the LARGER of the two, so leaving the first chunk on the
-   base 0.375rem would hold the gap above the tick at 6px against 5px below it.
+   Both sides of the boundary are set, and the pair is what makes this gap
+   independent of the base rule above. Adjacent-sibling margins collapse to the
+   LARGER of the two, so which half does the work depends on which value is
+   bigger: at the 0.375rem the base used to carry, the first chunk alone would
+   have held the gap above the tick at 6px against 5px below it, and the
+   `:has()` rule is what stopped it. The base is 0.25rem now, under the
+   boundary, so that half is currently belt and braces. It stays: the base is a
+   tuned number that moves when the step run's rhythm is retuned, and this
+   boundary is not supposed to move with it.
+
    `:has()` takes the specificity of its argument, so both rules are (0,2,0)
    against the base rule's (0,1,0) and win on specificity rather than source
    order. Widening the base rule instead would space every chunk off its step

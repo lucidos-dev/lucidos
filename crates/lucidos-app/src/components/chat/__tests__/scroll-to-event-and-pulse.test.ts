@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, isFollowScroll, makeScrollObservers, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
@@ -322,15 +322,21 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   });
 });
 
-describe('a deep-link landing retires a standing follow', () => {
-  /** Going to a link is the reader asking to be at ONE place, so the ride ends
-   *  there. The scroll disarm cannot do this on its own: it needs the reader to
-   *  be off the live edge AND away from where the follow last wrote, and the
-   *  ordinary link into a thread the reader is riding points at its newest turn,
-   *  which lands them precisely ON the live edge. So the follow survived the
-   *  landing and the next token carried them off the event they had just asked
-   *  to see. The counterpart lives in `scroll-follow-the-live-edge.test.ts`,
-   *  which pins what does and does not ARM the same follow. */
+describe('a deep-link landing retires a standing follow while the agent is LIVE', () => {
+  /** Going to a link on a live thread is the reader asking to be at ONE place,
+   *  so the ride ends there. The scroll disarm cannot do this on its own: it
+   *  needs the reader to be off the live edge AND away from where the follow
+   *  last wrote, and the ordinary link into a thread the reader is riding points
+   *  at its newest turn, which lands them precisely ON the live edge. So the
+   *  follow survived the landing and the next token carried them off the event
+   *  they had just asked to see.
+   *
+   *  On an IDLE thread it retires nothing, in step with the scroll disarm, the
+   *  up chevron and turn stepping: the reader is browsing, there is no next
+   *  token, and their next submit should still take them to the live edge. That
+   *  half is the second block below. The counterpart to both lives in
+   *  `scroll-follow-the-live-edge.test.ts`, which pins what does and does not
+   *  ARM the same follow. */
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -338,11 +344,16 @@ describe('a deep-link landing retires a standing follow', () => {
     vi.useFakeTimers();
     container = makeContainer();
     setActiveScrollElement(container);
+    // The premise of every test in this block. `setThreadLive` is a module
+    // global, so the afterEach un-says it rather than leaving a live thread for
+    // the next block.
+    setThreadLive(true);
   });
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
     stopFollowingBottom();
+    setThreadLive(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -399,6 +410,92 @@ describe('a deep-link landing retires a standing follow', () => {
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
 
+    container.scrollHeight = 20000;
+    onResize();
+
+    expect(container.scrollTop).toBe(19200);
+  });
+});
+
+describe('a deep-link landing leaves the ride alone on an IDLE thread', () => {
+  /** The other half of the block above, and the same rule the scroll disarm,
+   *  the up chevron and turn stepping already followed: if nothing is running,
+   *  nothing touches the toggle. Following a link into a finished thread is
+   *  browsing, so the reader keeps the lit toggle and their next submit still
+   *  takes them to the live edge.
+   *
+   *  What makes that safe is the follow's OTHER live term: it does not write on
+   *  an idle thread either (`followIsCarrying`). Without it, the render-all a
+   *  deep-link triggers would resize the transcript and haul the reader straight
+   *  off the event they had just landed on, which is why these two live in one
+   *  block rather than one per rule. */
+  let restore: (() => void) | null = null;
+  let container: any;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+    // Deliberately never `setThreadLive(true)`: an idle thread is the premise.
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setFollowLiveEdge(false); // un-press, so the *follow seed* does not leak
+    setThreadLive(false);
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  function makeVisibleEl(absTop: number) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({
+        width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200,
+      }),
+      classList: { add: () => {}, remove: () => {} },
+    } as any;
+  }
+
+  /** Arm the follow, then land a link on an old turn, both settled. */
+  function armThenLandOnAnOldTurn() {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
+    const observers = makeScrollObservers(container);
+    setFollowLiveEdge(true);      // the reader arms the follow
+    vi.advanceTimersByTime(1500); // its glide settles on the live edge
+    expect(container.scrollTop).toBe(9200);
+    scrollToEventAndPulse('e-7'); // then follows a link to an older turn
+    vi.advanceTimersByTime(1500); // the landing settles, and the claim releases
+    expect(container.scrollTop).toBe(3000);
+    return observers;
+  }
+
+  it('keeps the follow armed, so the lit toggle still means something', () => {
+    armThenLandOnAnOldTurn();
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('is not undone by the growth the link itself causes', () => {
+    // The deep-link renders the FULL exchange list so a windowed-out target can
+    // be found, which is a large resize arriving right around the landing. An
+    // armed follow that wrote on an idle thread would spend it teleporting the
+    // reader to the bottom, one beat after they tapped the notification.
+    const { onResize } = armThenLandOnAnOldTurn();
+
+    container.scrollHeight = 20000; // render-all, a decoded image, markdown settling
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('carries the reader again the moment the thread wakes', () => {
+    // Armed is armed. The idle spell suspends the writing, it does not end the
+    // request, so a trigger firing or the reader submitting picks them back up
+    // with no second press.
+    const { onResize } = armThenLandOnAnOldTurn();
+
+    setThreadLive(true);
     container.scrollHeight = 20000;
     onResize();
 

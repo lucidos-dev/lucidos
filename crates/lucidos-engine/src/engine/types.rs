@@ -342,6 +342,24 @@ pub struct AgentSession {
     /// When true, an `apply_now` task is already running for this thread.
     /// Prevents concurrent apply_now calls from causing duplicate merges.
     pub apply_now_in_progress: bool,
+    /// The change whose merge-conflict resolution this session is carrying, set
+    /// where the resolution binds to the session: at registration for the
+    /// detached Tier-2 / Tier-3 spawns (they carry a `conflict_change_id`), and
+    /// in `cc_assisted_merge_then_ff` for the Tier-1 in-place merge, which
+    /// injects the merge prompt into a session that already existed.
+    ///
+    /// Read by the merge-ownership guard (ADR 0060) as the liveness half of
+    /// "is a resolver working on this change right now". Descriptive, NOT a
+    /// claim: nothing has to clear it, because the guard's other half is the
+    /// durable `MergeConflictDetected` pairing and the binding dies with the
+    /// session. A Tier-1 session deliberately outlives its own resolution, so a
+    /// lingering binding here is expected and harmless.
+    ///
+    /// Naming the resolver is what keeps the guard from misreading an ORDINARY
+    /// live session as one: a pairing stranded by a crash plus a later
+    /// unrelated turn on the same thread would otherwise refuse every Apply for
+    /// the length of that turn.
+    pub conflict_change_id: Option<uuid::Uuid>,
     /// Set to true when the CC process exits. Checked by `apply_now_inner`
     /// after waking from `idle_notify` to detect CC death vs normal idle.
     pub process_exited: bool,
@@ -562,6 +580,7 @@ impl AgentSession {
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
             apply_now_in_progress: false,
+            conflict_change_id: None,
             process_exited: false,
             worktree_path: None,
             branch_name: None,

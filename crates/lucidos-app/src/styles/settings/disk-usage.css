@@ -114,6 +114,50 @@
     overflow-wrap: anywhere;
 }
 
+/* A worktree row grows tall (a wrapping title over a line of fields) and
+   `.list-row` top-aligns its children, so pin the actions to the bottom edge,
+   the way `.app-row` / `.trigger-row` (skills.css) and the Accounts rows
+   (settings/accounts.css) already do. */
+.disk-usage-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* Gated on the ROW's own width, not the viewport's. The two differ constantly
+   on a desktop: the row is only as wide as the content pane the split divider
+   was dropped at, and that width is the whole question here. Named, so the
+   query cannot silently resolve to some outer container. Safe to contain: the
+   row's width comes from `.list-rows`, a stretching flex column, never from its
+   contents. */
+.disk-usage-row {
+    container-type: inline-size;
+    container-name: disk-usage-row;
+}
+
+/* The trigger row's treatment (skills.css), with its own measured threshold,
+   because this row is a different size in both directions: these two labels are
+   long, so the pair comes to 17.9rem abreast against the trigger row's 12.8rem,
+   and the four fields under the title want up to 15rem of their own before they
+   start wrapping. Side by side past that point the row squeezes the title into
+   a two-word ribbon and drops the fields onto a second line. Stacked, the pair
+   gives 8rem of that width back and the row comes out no taller, because the
+   two buttons are shorter than the wraps they save.
+
+   34rem of the row's CONTENT box (the 1rem gutters are already out of it) is
+   where it stops holding both, leaving the info column ~15.4rem at the flip. In
+   rem, so the gate tracks the user's UI scale (the root font-size IS that
+   scale) rather than pinning to a width measured at 100%.
+
+   Desktop only: below the mobile breakpoint `.list-row` is itself a column
+   (mobile.css) and the actions take the full width of their own line, which the
+   rule below relies on. */
+@media (min-width: 769px) {
+    @container disk-usage-row (max-width: 34rem) {
+        .disk-usage-row .list-row-actions {
+            flex-direction: column;
+        }
+    }
+}
+
 /* On mobile, the row stacks; constrain actions to full width so the
    "Remove worktree" button can wrap onto a second line instead of being
    clipped at the right edge. */

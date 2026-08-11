@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildCCThread, makeThreadState } from './thread-events-helpers';
-import { exchangeResponseEvents, exchangeSteps, fullCommandForCCTool, fullCommandForEngineTool, groupIntoExchanges, handleEvent, type StoredEvent, type ThreadEvent } from '../thread-events';
+import { describeCCTool, exchangeResponseEvents, exchangeSteps, fullCommandForCCTool, fullCommandForEngineTool, groupIntoExchanges, handleEvent, shellScriptBody, type StoredEvent, type ThreadEvent } from '../thread-events';
 import type { StepOutcome } from '../types';
 
 describe('UserPromptInjected in groupIntoExchanges', () => {
@@ -800,6 +800,160 @@ describe('tool description from event', () => {
     expect(fullCommandForCCTool('todo_list', { items: [] })).toBeUndefined();
     expect(fullCommandForCCTool('todo_list', { items: 'nope' })).toBeUndefined();
     expect(fullCommandForCCTool('todo_list', {})).toBeUndefined();
+  });
+
+  it('fullCommandForCCTool gives a Codex step the un-elided value a Claude Code step gets', () => {
+    // Codex had no arm for any of its own item types, so no Codex step ever
+    // carried a `full` and the step detail had nothing to show under a
+    // truncated label. The shell wrapper is stripped here too, so the detail
+    // and the row agree about what ran.
+    expect(fullCommandForCCTool('command_execution', { command: '/bin/zsh -lc "cd /tmp && ls -la | head"' }))
+      .toBe('cd /tmp && ls -la | head');
+    expect(fullCommandForCCTool('Bash', { command: 'cd /tmp && ls -la | head' }))
+      .toBe(fullCommandForCCTool('command_execution', { command: '/bin/zsh -lc "cd /tmp && ls -la | head"' }));
+    expect(fullCommandForCCTool('command_execution', {})).toBeUndefined();
+
+    expect(fullCommandForCCTool('file_change', {
+      changes: [
+        { kind: { type: 'update' }, path: '/w/src/lib.rs' },
+        { kind: { type: 'delete' }, path: '/w/e2e/probe.spec.ts' },
+      ],
+    })).toBe('Edit /w/src/lib.rs\nDelete /w/e2e/probe.spec.ts');
+    // One entry we cannot name discards the whole set, same rule the permission
+    // card applies: a complete-looking list whose unnamed half writes elsewhere
+    // is worse than no list.
+    expect(fullCommandForCCTool('file_change', {
+      changes: [{ kind: { type: 'update' }, path: '/w/a.ts' }, { kind: { type: 'add' } }],
+    })).toBeUndefined();
+    expect(fullCommandForCCTool('file_change', { changes: [] })).toBeUndefined();
+
+    expect(fullCommandForCCTool('web_search', { query: 'rust async' })).toBe('rust async');
+  });
+
+  // --- Codex and Claude Code step labels are one vocabulary ---
+  //
+  // Every expectation below is asserted verbatim in the Rust twin
+  // (`core::tests::describe_cc_tool_*` in `crates/lucidos-engine/src/core/mod_tests.rs`),
+  // so the two implementations can be diffed by eye. Rust produces the stored
+  // description; this fallback only runs for events stored before descriptions
+  // existed, and the two must not disagree.
+
+  it('describeCCTool reads a Codex shell step like a Claude Code one', () => {
+    const bare = describeCCTool('Bash', { command: 'git log --oneline -20' });
+    expect(bare).toBe('Run git log --oneline -20');
+    for (const wrapped of [
+      '/bin/zsh -lc "git log --oneline -20"',
+      "/bin/bash -lc 'git log --oneline -20'",
+      'sh -c "git log --oneline -20"',
+    ]) {
+      expect(describeCCTool('command_execution', { command: wrapped })).toBe(bare);
+    }
+    expect(describeCCTool('command_execution', {})).toBe('Run command');
+  });
+
+  it('describeCCTool never unwraps a Claude Code Bash call', () => {
+    // When that model asks for a login shell it chose to, and the row must not
+    // rewrite the request.
+    expect(describeCCTool('Bash', { command: 'bash -lc "make lint"' }))
+      .toBe('Run bash -lc "make lint"');
+  });
+
+  it('shellScriptBody declines anything it cannot read', () => {
+    for (const untouched of [
+      'cargo test --locked',
+      'shellcheck -x scripts/e2e.sh',       // first word merely contains a shell name
+      '/usr/local/bin/pushd -c \'x\'',
+      'zsh --version',                       // no script-carrying flag
+      'bash -x script.sh',
+      'zsh -lc "a" && "b"',                  // two quoted words and a pipeline
+      'zsh -lc "git status',                 // unterminated
+      'zsh -lc',
+      'zsh',
+      '',
+    ]) {
+      expect(shellScriptBody(untouched)).toBe(untouched);
+    }
+  });
+
+  it('shellScriptBody unescapes the quoting style it stripped', () => {
+    expect(shellScriptBody("/bin/zsh -lc 'echo '\\''hi'\\'' > out'")).toBe("echo 'hi' > out");
+    expect(shellScriptBody('/bin/zsh -lc "rg -n \\"pat\\" src"')).toBe('rg -n "pat" src');
+    expect(shellScriptBody('/bin/zsh -lc "printf \'%s\\\\n\' x"')).toBe("printf '%s\\n' x");
+    // A backslash before anything else inside double quotes is literal.
+    expect(shellScriptBody('zsh -lc "grep \'\\d+\' f"')).toBe("grep '\\d+' f");
+  });
+
+  it('shellScriptBody keeps the wrapper on a multiword unquoted script', () => {
+    // POSIX `sh -c` reads ONE operand as the script and assigns the rest to $0,
+    // $1, ..., so `zsh -lc git status` runs `git` with $0=status. Labelling it
+    // "Run git status" would put a command in the row that never ran.
+    expect(shellScriptBody('zsh -lc git status')).toBe('zsh -lc git status');
+    expect(describeCCTool('command_execution', { command: 'zsh -lc git status' }))
+      .toBe('Run zsh -lc git status');
+    // A single unquoted word IS the whole script.
+    expect(shellScriptBody('zsh -lc ls')).toBe('ls');
+    // Trailing whitespace around the script is the wrapper's, not the command's.
+    expect(shellScriptBody('zsh -lc "git status"  ')).toBe('git status');
+  });
+
+  it('shellScriptBody handles the two real Codex shapes, one by reading it and one by declining', () => {
+    // The double-quoted one is the common case: nested \" escapes resolve and
+    // the row finally shows the command.
+    expect(shellScriptBody('/bin/zsh -lc "rg -n \\"detailsExpanded|stepsExpanded\\" src -g \'*.ts\' | head -40; git status --short"'))
+      .toBe('rg -n "detailsExpanded|stepsExpanded" src -g \'*.ts\' | head -40; git status --short');
+
+    // The second uses shell quote CONCATENATION ('a'"b"'c' is one word), which
+    // this deliberately does not parse: a wrong guess would re-punctuate a
+    // command someone is reading to find out what ran.
+    const concatenated = `/bin/zsh -lc 'if [ -e "$LOCK" ]; then sed -n '"'1,20p' \\""'$LOCK"; else echo MISSING; fi'`;
+    expect(shellScriptBody(concatenated)).toBe(concatenated);
+  });
+
+  it('describeCCTool names the file a Codex change touches, in Claude Code vocabulary', () => {
+    const label = (changes: unknown) => describeCCTool('file_change', { changes });
+
+    expect(label([{ kind: { type: 'add' }, path: '/w/src/new.ts' }])).toBe('Write new.ts');
+    expect(label([{ kind: { type: 'update', move_path: null }, path: '/w/src/lib.rs' }])).toBe('Edit lib.rs');
+    expect(label([{ kind: { type: 'delete' }, path: '/w/e2e/probe.spec.ts' }])).toBe('Delete probe.spec.ts');
+    // Older exec frames send the kind as a bare string.
+    expect(label([{ kind: 'update', path: '/w/src/lib.rs' }])).toBe('Edit lib.rs');
+    // The Claude Code row for the same edit reads the same way.
+    expect(describeCCTool('Edit', { file_path: '/w/src/lib.rs' })).toBe('Edit lib.rs');
+  });
+
+  it('describeCCTool only claims one verb when the whole Codex patch agrees', () => {
+    const label = (changes: unknown) => describeCCTool('file_change', { changes });
+
+    expect(label([
+      { kind: { type: 'update' }, path: '/w/a.ts' },
+      { kind: { type: 'update' }, path: '/w/b.ts' },
+      { kind: { type: 'update' }, path: '/w/c.ts' },
+    ])).toBe('Edit 3 files');
+    expect(label([
+      { kind: { type: 'add' }, path: '/w/a.ts' },
+      { kind: { type: 'delete' }, path: '/w/b.ts' },
+    ])).toBe('Change 2 files');
+    // An unreadable kind claims nothing beyond "something changed"; a prototype
+    // key must not answer off Object.prototype either.
+    expect(label([{ path: '/w/a.ts' }])).toBe('Change a.ts');
+    expect(label([{ kind: 'constructor', path: '/w/a.ts' }])).toBe('Change a.ts');
+    // No path to name: state the verb and the count rather than inventing one.
+    expect(label([{ kind: { type: 'add' } }])).toBe('Write 1 file');
+    expect(label([])).toBe('Apply file changes');
+    expect(describeCCTool('file_change', {})).toBe('Apply file changes');
+  });
+
+  it('describeCCTool labels the remaining shared and Codex tools like Rust does', () => {
+    expect(describeCCTool('TodoWrite', {})).toBe('Update plan');
+    expect(describeCCTool('todo_list', {})).toBe('Update plan');
+    expect(describeCCTool('ExitPlanMode', {})).toBe('Present plan for approval');
+    expect(describeCCTool('web_search', { query: 'rust lifetimes' })).toBe("Search 'rust lifetimes'");
+    expect(describeCCTool('WebSearch', { query: 'rust lifetimes' })).toBe("Search 'rust lifetimes'");
+    // Both backends name an MCP tool `mcp__<server>__<tool>`; the server prefix
+    // is noise, and a malformed name keeps the whole identifier.
+    expect(describeCCTool('mcp__example_server__create_issue', {})).toBe('MCP: create_issue');
+    expect(describeCCTool('mcp__weird', {})).toBe('MCP: mcp__weird');
+    expect(describeCCTool('CustomTool', {})).toBe('CustomTool');
   });
 
   it('exchangeResponseEvents stamps full path on CodingAgentToolCalled steps for hover tooltip', () => {

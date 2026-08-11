@@ -11,9 +11,14 @@
  * deliberately not exercised: it holds no branch this cannot see, and its two
  * real properties (no request until the row is expanded, state resets when the
  * menu closes) are structural rather than renderable. See the plan.
+ *
+ * The placeholder itself is the one thing in it with a checkable property, and
+ * `skeletonShape` is why: the shimmer tree needs a `SkeletonProvider` and the
+ * `Sk*` leaves read it through a hook, so `vnodeToText` cannot flatten it, but
+ * the SHAPE it draws is pure and is exactly where the height parity lives.
  */
 import { describe, it, expect } from 'vitest';
-import { workspacesMenuRow, workspaceSwitcherList } from '../WorkspaceSwitcher';
+import { workspacesMenuRow, workspaceSwitcherList, skeletonShape } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
@@ -83,6 +88,22 @@ describe('the Workspaces row', () => {
     expect(text).toContain('dev');
     expect(text).toContain('brand-menu-value-check');
     expect(text).not.toContain('brand-menu-value-chevron');
+  });
+
+  it('holds the pill, marker included, before the workspace label lands', () => {
+    // The chevron rides INSIDE the pill, so dropping the pill dropped the only
+    // thing saying the row expands, and the row then grew both under the user's
+    // finger the moment /health answered.
+    const text = row({ workspaceName: null });
+    expect(text).toContain('brand-menu-value-name');
+    expect(text).toContain('sk-bar');
+    expect(text).toContain('brand-menu-value-chevron');
+  });
+
+  it('holds it on the link-out row too, where the marker is the check', () => {
+    const text = row({ canList: false, workspaceName: null });
+    expect(text).toContain('sk-bar');
+    expect(text).toContain('brand-menu-value-check');
   });
 
   it('stays a static label with no gateway at all', () => {
@@ -175,5 +196,39 @@ describe('the workspace list', () => {
     });
     expect(text.indexOf('work')).toBeLessThan(text.indexOf('dev'));
     expect(text.indexOf('dev')).toBeLessThan(text.indexOf('spike'));
+  });
+});
+
+describe('the loading placeholder', () => {
+  /** Every `.brand-menu-ws-row` in a flattened list. All three row elements
+   *  carry the class and share one `min-height`, so counting them counts the
+   *  list's height in rows. */
+  function rowCount(text: string): number {
+    return [...text.matchAll(/<(?:div|button|a) class="brand-menu-ws-row/g)].length;
+  }
+
+  it('stands exactly as tall as the list it replaces, footer included', () => {
+    // The bug this pins: the placeholder drew only workspace rows while the
+    // loaded list also carries Manage workspaces, so it came up one row short
+    // and the panel grew by that row at settle, pushing Refresh and Restart
+    // down under the user's finger.
+    const data = [ws({ id: 'dev' }), ws({ id: 'work' }), ws({ id: 'spike' })];
+    const shape = skeletonShape(data.length, MANAGE);
+    expect(shape.rows + (shape.manage ? 1 : 0)).toBe(rowCount(list({ status: 'loaded', data })));
+  });
+
+  it('drops the footer wherever the loaded list has none', () => {
+    const data = [ws({ id: 'dev' })];
+    const shape = skeletonShape(data.length, null);
+    expect(shape.manage).toBe(false);
+    expect(shape.rows).toBe(
+      rowCount(list({ status: 'loaded', data }, { currentId: 'dev', manageHref: null })),
+    );
+  });
+
+  it('guesses a short list when this device has never seen one', () => {
+    // An unfolded list pushes the rows below it down, so the cheaper guess is
+    // the one that moves less when it is wrong.
+    expect(skeletonShape(null, MANAGE)).toEqual({ rows: 2, manage: true });
   });
 });

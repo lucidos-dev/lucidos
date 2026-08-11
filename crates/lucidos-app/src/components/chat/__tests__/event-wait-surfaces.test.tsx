@@ -317,10 +317,11 @@ describe('EventWaitRow', () => {
 
   /** **Source-scan tripwire for the bug this file's transcript half exists for.**
    *
-   *  The row was gated on the "Show steps" toggle, which is off until a user
-   *  turns it on, so a parked thread rendered no `[data-role="event-wait-row"]`
+   *  The row was gated on the "Show steps" toggle, which was off until a user
+   *  turned it on, so a parked thread rendered no `[data-role="event-wait-row"]`
    *  at all: the event was in the stream and the class was in the bundle with
-   *  nothing on screen. There is no jsdom here, so the render gate cannot be
+   *  nothing on screen. The toggle defaults ON since 2026-08-11, which changes
+   *  nothing here: it is the reader's, so it can still be off. There is no jsdom here, so the render gate cannot be
    *  driven; the line itself is what gets pinned. `'step'` is read alongside it
    *  so a scan that stopped matching anything would fail rather than pass. */
   it('renders the row without consulting the Show steps toggle', () => {

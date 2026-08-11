@@ -12,10 +12,10 @@ import {
  *
  *  - Creation: the "New Group" card → inline name field → Enter lands an empty
  *    section header with a "(0)" badge.
- *  - Deletion: an EMPTY group's Delete button is enabled; clicking it +
+ *  - Deletion: an EMPTY group's delete button is enabled; clicking it +
  *    confirming removes the section.
  *  - The full lifecycle additionally pins the member-count guard: a group with
- *    a member trigger shows "(1)" and its Delete button is DISABLED, and only
+ *    a member trigger shows "(1)" and its delete button is DISABLED, and only
  *    becomes deletable once the trigger is removed. That guard is the server's
  *    409-on-non-empty rule surfaced in the UI, so it's the most important thing
  *    to keep regression-tested. */
@@ -104,8 +104,8 @@ test.describe('Trigger groups — create / delete', () => {
     const section = groupSection(page, groupName);
     await expect(section.locator('.trigger-group-count')).toHaveText('(0)');
 
-    // Delete — an empty group's Delete is enabled; confirm removes the section.
-    const deleteBtn = section.locator('.trigger-group-actions .action-btn-danger');
+    // Delete: an empty group's delete icon is enabled; confirm removes the section.
+    const deleteBtn = section.locator('.trigger-group-delete');
     await expect(deleteBtn).toBeEnabled();
     await deleteBtn.click();
     await confirmDialog(page);
@@ -123,13 +123,13 @@ test.describe('Trigger groups — create / delete', () => {
     // 1. Create group A.
     await createGroup(page, groupA);
 
-    // 2. Rename A → B. Clicking Rename swaps the name span for an edit input
-    //    (so the section can no longer be found by name A — target the single
-    //    header input globally).
-    await groupSection(page, groupA)
-      .locator('.trigger-group-actions .action-btn', { hasText: 'Rename' })
-      .click();
-    const renameInput = page.locator('.trigger-group-header .trigger-group-name-input');
+    // 2. Rename A → B. Clicking the rename icon reveals the edit field over the
+    //    name (so the section can no longer be found by name A). EVERY heading
+    //    carries that field mounted and hidden, which is what lets the tap focus
+    //    it and open the mobile keyboard, so target the one heading that is
+    //    actually renaming rather than the class alone.
+    await groupSection(page, groupA).locator('.trigger-group-rename').click();
+    const renameInput = page.locator('.trigger-group-renaming .trigger-group-name-input');
     await expect(renameInput).toBeVisible({ timeout: 5_000 });
     await renameInput.fill(groupB);
     await renameInput.press('Enter');
@@ -146,13 +146,13 @@ test.describe('Trigger groups — create / delete', () => {
     await pickDropdownOption(page, '.trigger-group-select', groupB);
     await form.locator('.btn-save').click();
 
-    // The trigger lands under group B, the badge flips to (1), and — the guard —
-    // Delete is now DISABLED (the panel mirrors the server's non-empty refusal).
+    // The trigger lands under group B, the badge flips to (1), and (the guard)
+    // delete is now DISABLED (the panel mirrors the server's non-empty refusal).
     const sectionB = groupSection(page, groupB);
     await expect(sectionB.locator('.trigger-row .list-row-name', { hasText: triggerName }))
       .toBeVisible({ timeout: 10_000 });
     await expect(sectionB.locator('.trigger-group-count')).toHaveText('(1)', { timeout: 10_000 });
-    await expect(sectionB.locator('.trigger-group-actions .action-btn-danger')).toBeDisabled();
+    await expect(sectionB.locator('.trigger-group-delete')).toBeDisabled();
 
     // 4. Empty the group by deleting its member trigger.
     await clearToasts(page);
@@ -163,9 +163,9 @@ test.describe('Trigger groups — create / delete', () => {
     await expect(sectionB.locator('.trigger-row', { hasText: triggerName }))
       .toHaveCount(0, { timeout: 10_000 });
 
-    // Badge back to (0); Delete re-enabled.
+    // Badge back to (0); delete re-enabled.
     await expect(sectionB.locator('.trigger-group-count')).toHaveText('(0)', { timeout: 10_000 });
-    const deleteB = sectionB.locator('.trigger-group-actions .action-btn-danger');
+    const deleteB = sectionB.locator('.trigger-group-delete');
     await expect(deleteB).toBeEnabled();
 
     // 5. Delete the now-empty group.

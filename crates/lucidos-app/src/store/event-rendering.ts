@@ -108,9 +108,9 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
   }
 }
 
-/** True when this exchange has prose the DEFAULT view drops: with the
- *  full-response control off, `getCollapsedVisibleEvents` keeps only what
- *  follows the last text block, so anything said earlier disappears.
+/** True when this exchange has prose that turning the full-response control OFF
+ *  drops: `getCollapsedVisibleEvents` then keeps only what follows the last
+ *  text block, so anything said earlier disappears.
  *
  *  Takes steps AND two or more meaningful text chunks. Steps because a chat
  *  turn that simply wrote two paragraphs has no superseded prose, only one

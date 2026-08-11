@@ -727,6 +727,77 @@ fn describe_tool_built_from_redacted_args_masks_postgres_password() {
     }
 }
 
+/// The coding-agent twin of the test above. Codex reports a shell step as the
+/// whole `/bin/zsh -lc "<script>"` invocation, and `shell_script_body` now puts
+/// the script itself inside the 60-byte label budget, so a hardcoded password
+/// that used to be pushed out by the wrapper is squarely inside it.
+#[test]
+fn describe_cc_tool_built_from_redacted_args_masks_postgres_password() {
+    let leaky = "psql postgres://lucidos:topsecret@localhost:5432/db -c 'select 1'";
+    for (tool, mut args) in [
+        ("Bash", serde_json::json!({ "command": leaky })),
+        (
+            "command_execution",
+            serde_json::json!({ "command": format!("/bin/zsh -lc \"{leaky}\"") }),
+        ),
+    ] {
+        redact_postgres_secrets_in_json(&mut args);
+        let desc = describe_cc_tool(tool, &args);
+        assert!(
+            !desc.contains("topsecret"),
+            "{tool} leaked password: {desc}"
+        );
+        assert!(
+            desc.contains("***"),
+            "{tool} description not redacted: {desc}"
+        );
+    }
+}
+
+/// Redaction has to happen BEFORE the description is built, at BOTH tool-call
+/// emit sites: a step row renders the description exactly as it renders the
+/// args, so describing first leaves a hardcoded password in cleartext on
+/// `description` while `args` is clean.
+///
+/// The two composition tests above prove the masking works on the way through.
+/// This proves the call sites use it in the right ORDER, which is the half that
+/// silently regressed: the coding-agent path described first and redacted after
+/// until 2026-08-11, so every `psql postgres://user:pass@…` a coding agent ran
+/// was persisted in cleartext on the event and broadcast over SSE.
+#[test]
+fn both_tool_call_emit_sites_redact_before_describing() {
+    for (label, src, redact_call, describe_call) in [
+        (
+            "agent_session/run_session/run.rs",
+            include_str!("../engine/agent_session/run_session/run.rs"),
+            "redact_postgres_secrets_in_json(&mut input)",
+            "describe_cc_tool(&name, &input)",
+        ),
+        (
+            "agentic_loop/run.rs",
+            include_str!("../engine/agentic_loop/run.rs"),
+            "redact_postgres_secrets_in_json(&mut redacted_args)",
+            "describe_tool(&tool_call.name, &redacted_args)",
+        ),
+        (
+            "agentic_loop_special_tool.rs",
+            include_str!("../engine/agentic_loop_special_tool.rs"),
+            "redact_postgres_secrets_in_json(&mut redacted_args)",
+            "describe_tool(&tc.name, &redacted_args)",
+        ),
+    ] {
+        let find = |needle: &str| {
+            src.find(needle).unwrap_or_else(|| {
+                panic!("{label}: `{needle}` not found. If the call was renamed or moved, update this guard rather than deleting it.")
+            })
+        };
+        assert!(
+            find(redact_call) < find(describe_call),
+            "{label}: the description is built from the UNREDACTED args, so a hardcoded postgres password lands in cleartext on the persisted `description`. Redact first."
+        );
+    }
+}
+
 #[test]
 fn test_describe_tool_result_read_file() {
     let content = "hello world"; // 11 chars
@@ -1067,6 +1138,302 @@ fn describe_cc_tool_labels_both_backends_plan_tools_alike() {
     assert_eq!(
         describe_cc_tool("ExitPlanMode", &args),
         "Present plan for approval"
+    );
+}
+
+/// The whole point of `shell_script_body`: the two backends running the same
+/// command produce the same row. Codex reports the invocation its harness built
+/// (`/bin/zsh -lc "<script>"`), Claude Code reports the script.
+#[test]
+fn describe_cc_tool_reads_a_codex_shell_step_like_a_claude_code_one() {
+    let bare = serde_json::json!({ "command": "git log --oneline -20" });
+    for wrapped in [
+        r#"/bin/zsh -lc "git log --oneline -20""#,
+        r#"/bin/bash -lc 'git log --oneline -20'"#,
+        "sh -c \"git log --oneline -20\"",
+    ] {
+        assert_eq!(
+            describe_cc_tool(
+                "command_execution",
+                &serde_json::json!({ "command": wrapped })
+            ),
+            describe_cc_tool("Bash", &bare),
+            "wrapper not seen through: {wrapped}"
+        );
+    }
+}
+
+/// The wrapper is stripped BEFORE truncation, which is the reason it matters at
+/// all: `/bin/zsh -lc "` is 14 of the 60-byte budget, so leaving it on spends a
+/// quarter of the row on the harness and elides the command.
+#[test]
+fn describe_cc_tool_spends_the_label_budget_on_the_command_not_the_wrapper() {
+    let script = "rg -n 'withScrollAnchor' crates/lucidos-app/src/components/chat/scrollState.ts";
+    let args = serde_json::json!({ "command": format!("/bin/zsh -lc \"{script}\"") });
+    let desc = describe_cc_tool("command_execution", &args);
+
+    assert!(desc.starts_with("Run rg -n "), "got: {desc}");
+    assert!(desc.ends_with("chat/scrollState.ts"), "got: {desc}");
+    assert!(!desc.contains("zsh"), "wrapper survived: {desc}");
+}
+
+/// Unwrapping runs before `first_command_line`, so a wrapped multi-line script
+/// condenses to the first line of the SCRIPT rather than of the invocation.
+#[test]
+fn describe_cc_tool_condenses_a_wrapped_multiline_script_to_its_own_first_line() {
+    let args = serde_json::json!({
+        "command": "/bin/zsh -lc \"\n  git status\ncat <<'EOF' > out.txt\nbody\nEOF\n\"",
+    });
+    assert_eq!(
+        describe_cc_tool("command_execution", &args),
+        "Run git status"
+    );
+}
+
+/// A Claude Code `Bash` call keeps whatever it was given. When that model asks
+/// for a login shell it chose to, and the row must not rewrite the request.
+#[test]
+fn describe_cc_tool_never_unwraps_a_claude_code_bash_call() {
+    let args = serde_json::json!({ "command": r#"bash -lc "make lint""# });
+    assert_eq!(
+        describe_cc_tool("Bash", &args),
+        r#"Run bash -lc "make lint""#
+    );
+}
+
+/// Everything the unwrap must decline, because the label has to stay a faithful
+/// rendering of what ran. Each case would silently lose or re-punctuate part of
+/// the command if the helper guessed.
+#[test]
+fn shell_script_body_declines_anything_it_cannot_read() {
+    for untouched in [
+        // Not a shell.
+        "cargo test --locked",
+        // First word merely CONTAINS a shell name.
+        "shellcheck -x scripts/e2e.sh",
+        "/usr/local/bin/pushd -c 'x'",
+        // No script-carrying flag.
+        "zsh --version",
+        "bash -x script.sh",
+        // Two quoted words and a pipeline, not one quoted script: stripping the
+        // outer quotes here would claim `a" && "b` was the command.
+        r#"zsh -lc "a" && "b""#,
+        // Unterminated.
+        r#"zsh -lc "git status"#,
+        // Nothing after the flag.
+        "zsh -lc",
+        "zsh",
+        "",
+    ] {
+        assert_eq!(
+            shell_script_body(untouched),
+            untouched,
+            "should have passed through untouched"
+        );
+    }
+}
+
+/// The escapes each quoting style actually uses. A single-quoted script cannot
+/// contain a quote, so the wrapper spells one as close-escape-reopen, and that
+/// sequence must not read as the terminator.
+#[test]
+fn shell_script_body_unescapes_the_quoting_style_it_stripped() {
+    assert_eq!(
+        shell_script_body(r#"/bin/zsh -lc 'echo '\''hi'\'' > out'"#),
+        "echo 'hi' > out"
+    );
+    assert_eq!(
+        shell_script_body(r#"/bin/zsh -lc "rg -n \"pat\" src""#),
+        r#"rg -n "pat" src"#
+    );
+    assert_eq!(
+        shell_script_body(r#"/bin/zsh -lc "printf '%s\\n' x""#),
+        r#"printf '%s\n' x"#
+    );
+    // A backslash before anything else inside double quotes is literal, and the
+    // character after it is read normally.
+    assert_eq!(
+        shell_script_body(r#"zsh -lc "grep '\d+' f""#),
+        r#"grep '\d+' f"#
+    );
+}
+
+/// POSIX `sh -c` reads ONE operand as the script and assigns the rest to `$0`,
+/// `$1`, ..., so an unquoted suffix is only the script when it is a single word.
+/// `zsh -lc git status` runs `git` with `$0=status`; labelling it `Run git
+/// status` would put a command in the row that never ran. Found by the Codex
+/// reviewer, 2026-08-11.
+#[test]
+fn shell_script_body_keeps_the_wrapper_on_a_multiword_unquoted_script() {
+    assert_eq!(
+        shell_script_body("zsh -lc git status"),
+        "zsh -lc git status"
+    );
+    assert_eq!(
+        describe_cc_tool(
+            "command_execution",
+            &serde_json::json!({ "command": "zsh -lc git status" })
+        ),
+        "Run zsh -lc git status"
+    );
+    // A single unquoted word IS the whole script, and reads as one.
+    assert_eq!(shell_script_body("zsh -lc ls"), "ls");
+    // Trailing whitespace around the script is the wrapper's, not the command's.
+    assert_eq!(shell_script_body(r#"zsh -lc "git status"  "#), "git status");
+}
+
+/// Every shell the permission guard unwraps is one the step-row label unwraps
+/// too. That direction is the load-bearing one: a payload the guard scanned and
+/// the label did not would be displayed still wrapped, so the row would not show
+/// the command the decision was made about.
+///
+/// The containment is deliberately one-way, and `WRAPPER_SHELLS`'s doc says what
+/// the extra entry costs and what taking it the other way would require.
+#[test]
+fn every_shell_the_guard_scans_is_one_the_label_can_name() {
+    for shell in crate::engine::command_guard::GUARD_SHELLS {
+        assert!(
+            WRAPPER_SHELLS.contains(&shell),
+            "the guard unwraps `{shell}` but the label does not, so its payload is classified and then shown still wrapped"
+        );
+        let wrapped = format!("/bin/{shell} -lc 'ls -la'");
+        assert_eq!(
+            shell_script_body(&wrapped),
+            "ls -la",
+            "{shell}: the label does not see through this wrapper"
+        );
+    }
+}
+
+/// Where the two unwrappers deliberately disagree, pinned so neither is later
+/// "fixed" into the other. POSIX `sh -c` runs `git` here and sets `$0=status`,
+/// so the guard reading it as `git status` scans strictly more (always safe)
+/// while the label doing so would name a command that never ran.
+#[test]
+fn the_label_declines_the_unquoted_operand_the_guard_over_reads() {
+    let unquoted = "zsh -lc git status";
+    assert_eq!(shell_script_body(unquoted), unquoted);
+    assert_eq!(
+        crate::engine::command_guard::unwrap_shell_command(unquoted),
+        "git status"
+    );
+}
+
+/// Two real Codex payload shapes, both kept because only one of them is a win
+/// and the other has to stay a deliberate decline.
+///
+/// The double-quoted one is the common case and the reason any of this exists:
+/// nested `\"` escapes resolve and the row finally shows the command.
+///
+/// The second uses shell quote CONCATENATION (`'a'"b"'c'` is one word), which
+/// this deliberately does not parse. Reading it would take a real tokenizer, and
+/// a wrong guess would silently re-punctuate a command someone is reading to
+/// find out what ran, so it declines and shows the invocation verbatim, exactly
+/// as it did before the unwrap existed.
+#[test]
+fn shell_script_body_on_the_two_real_codex_shapes() {
+    assert_eq!(
+        shell_script_body(
+            r#"/bin/zsh -lc "rg -n \"detailsExpanded|stepsExpanded\" src -g '*.ts' | head -40; git status --short""#
+        ),
+        r#"rg -n "detailsExpanded|stepsExpanded" src -g '*.ts' | head -40; git status --short"#
+    );
+
+    let concatenated = r#"/bin/zsh -lc 'if [ -e "$LOCK" ]; then sed -n '"'1,20p' \""'$LOCK"; else echo MISSING; fi'"#;
+    assert_eq!(shell_script_body(concatenated), concatenated);
+}
+
+/// Codex's `file_change` used to say only how many files it touched. Claude Code
+/// names the file, and so must this: the two land on the same verb set.
+#[test]
+fn describe_cc_tool_names_the_file_a_codex_change_touches() {
+    let change =
+        |kind: serde_json::Value, path: &str| serde_json::json!({ "kind": kind, "path": path });
+    let label = |changes: serde_json::Value| {
+        describe_cc_tool("file_change", &serde_json::json!({ "changes": changes }))
+    };
+
+    assert_eq!(
+        label(serde_json::json!([change(
+            serde_json::json!({"type": "add"}),
+            "/w/src/new.ts"
+        )])),
+        "Write new.ts"
+    );
+    assert_eq!(
+        label(serde_json::json!([change(
+            serde_json::json!({"type": "update", "move_path": null}),
+            "/w/src/lib.rs"
+        )])),
+        "Edit lib.rs"
+    );
+    assert_eq!(
+        label(serde_json::json!([change(
+            serde_json::json!({"type": "delete"}),
+            "/w/e2e/probe.spec.ts"
+        )])),
+        "Delete probe.spec.ts"
+    );
+    // Older exec frames send the kind as a bare string.
+    assert_eq!(
+        label(serde_json::json!([change(
+            serde_json::json!("update"),
+            "/w/src/lib.rs"
+        )])),
+        "Edit lib.rs"
+    );
+    // The Claude Code row for the same edit reads the same way.
+    assert_eq!(
+        describe_cc_tool("Edit", &serde_json::json!({"file_path": "/w/src/lib.rs"})),
+        "Edit lib.rs"
+    );
+}
+
+/// A set of changes states its count, and claims one verb only when every change
+/// agrees. A patch that both creates and deletes is a "change", the same honesty
+/// rule the permission card applies to the same payload.
+#[test]
+fn describe_cc_tool_only_claims_one_verb_when_the_whole_patch_agrees() {
+    let change =
+        |kind: &str, path: &str| serde_json::json!({ "kind": {"type": kind}, "path": path });
+    let label = |changes: serde_json::Value| {
+        describe_cc_tool("file_change", &serde_json::json!({ "changes": changes }))
+    };
+
+    assert_eq!(
+        label(serde_json::json!([
+            change("update", "/w/a.ts"),
+            change("update", "/w/b.ts"),
+            change("update", "/w/c.ts"),
+        ])),
+        "Edit 3 files"
+    );
+    assert_eq!(
+        label(serde_json::json!([
+            change("add", "/w/a.ts"),
+            change("delete", "/w/b.ts")
+        ])),
+        "Change 2 files"
+    );
+    // An unreadable kind claims nothing beyond "something changed".
+    assert_eq!(
+        label(serde_json::json!([
+            serde_json::json!({ "path": "/w/a.ts" })
+        ])),
+        "Change a.ts"
+    );
+    // No path to name: state the verb and the count rather than inventing one.
+    assert_eq!(
+        label(serde_json::json!([
+            serde_json::json!({ "kind": {"type": "add"} })
+        ])),
+        "Write 1 file"
+    );
+    // Nothing announced at all.
+    assert_eq!(label(serde_json::json!([])), "Apply file changes");
+    assert_eq!(
+        describe_cc_tool("file_change", &serde_json::json!({})),
+        "Apply file changes"
     );
 }
 

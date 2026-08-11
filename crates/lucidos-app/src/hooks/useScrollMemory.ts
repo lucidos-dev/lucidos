@@ -432,14 +432,23 @@ export function attachScrollMemory(
    *  landing below), because the two must not be able to disagree about which
    *  form a position takes.
    *
-   *  For the deep-link landing the answer is always the OFFSET, and by
-   *  construction rather than by a test here: going to a link retires the
-   *  standing follow before it records (see `stopFollowingBottom`), because the
-   *  reader asked to be at one specific place. So coming back returns them to
-   *  that place rather than to a live edge they stopped riding when they
-   *  followed the link. This used to be the opposite, and had to be: the follow
-   *  survived the landing, so recording the offset would have thrown away a
-   *  request that was still live.
+   *  For the deep-link landing the answer is the OFFSET whenever the landing
+   *  MOVED the reader, which is the ordinary case and the one worth stating:
+   *  they asked to be at one specific place, so coming back returns them there.
+   *  On a LIVE thread that is true twice over, because the landing retires the
+   *  standing follow before it records (see `stopFollowingBottom`).
+   *
+   *  On an IDLE thread the follow survives the landing (a link into a finished
+   *  thread is browsing, and nothing will carry the reader off the event
+   *  either), so the positional test below is what answers, and it answers
+   *  correctly without a second rule: the landing moved the container away from
+   *  the follow's stamp, so `isFollowScroll` is false and the offset is
+   *  recorded. The one case it answers `live-edge` is a link that lands the
+   *  reader exactly where the follow already had them, which IS the live edge
+   *  and IS still being ridden. Both were once wrong in the other direction: the
+   *  follow survived every landing, so recording the offset would have thrown
+   *  away a request that was still live, which is why this reads the position
+   *  rather than the flag.
    *
    *  A scroll the FOLLOW made is recorded as the live edge, not as the offset it
    *  happened to produce. Every growth round writes `scrollTop`, so recording the

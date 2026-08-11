@@ -46,7 +46,8 @@ async function counterOfFirstStep(page: Page): Promise<Locator> {
   await sendMessage(page, 'Say "hello world" and nothing else.');
   await waitForResponse(page);
 
-  // Inline steps are hidden by default (`stepsExpanded` in localStorage).
+  // Declare the step log as something this spec needs, rather than inheriting
+  // it: `stepsExpanded` is on by default but is a stored per-reader setting.
   await revealSteps(page);
 
   const counter = page

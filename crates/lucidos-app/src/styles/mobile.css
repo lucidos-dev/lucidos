@@ -575,6 +575,27 @@
         height: var(--icon-size-md);
     }
 
+    /* Above .edge-swipe-zone (z-index: 1), like .prompt-area above, and for the
+       same reason: an action cluster pinned to a row's right edge sits under
+       that transparent strip, which is 1.25rem of the screen and therefore a
+       third of a 2.25rem button. A tap landing on the strip reaches neither the
+       button nor `isInteractiveTarget`, so it is read as an edge gesture and
+       preventDefault()ed, and the control is close to unhittable. The strip
+       exists to beat an app IFRAME to the touch (see EdgeSwipeZones), never a
+       host control, and the swipe container sees an edge touch through a lifted
+       button anyway, because touch events bubble to it either way.
+
+       The third control column at this edge, the thread title bar's pin and
+       overflow, needs nothing here: `.mobile-thread-title-row` already carries
+       its own `z-index: 2` below, and its `transform` makes it a stacking
+       context, so its children are lifted with it and could not be lifted past
+       it. Pinned by e2e/trigger-group-actions-edge-mobile.spec.ts, which
+       hit-tests the button's outer edge rather than tapping its centre. */
+    .trigger-group-actions {
+        position: relative;
+        z-index: 2;
+    }
+
     /* Badge position reset for smaller mobile icons */
     .badge {
         top: -0.125rem;

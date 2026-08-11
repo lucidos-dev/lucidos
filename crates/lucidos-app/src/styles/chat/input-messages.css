@@ -990,17 +990,13 @@
     font-size: var(--font-size-md);
 }
 
+/* Box and glyph come from `.icon-btn.row-icon` (host-components.css), shared
+   with the trigger group heading's trash. It used to be hand-sized here, at
+   1.25rem around a 0.85rem glyph that was on no icon step: a target a thumb
+   misses, and the same trash a step smaller than the one two panes over. Only
+   the colour is local. */
 .queued-message-remove {
-    width: 1.25rem;
-    height: 1.25rem;
-    padding: 0.125rem;
     color: var(--text-muted);
-    justify-content: center;
-}
-
-.queued-message-remove svg {
-    width: 0.85rem;
-    height: 0.85rem;
 }
 
 @media (hover: hover) {
@@ -1225,7 +1221,8 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     gap: 0.5rem;
     padding-left: var(--turn-body-inset);
     /* Shared with `.response-header` (chat/response.css), where the reasoning
-       for the value lives: it is one measurement and must move with it. */
+       for the value lives: it is one measurement and must move with it. Pinned
+       equal by components/chat/__tests__/turn-header-gutter.test.ts. */
     margin-bottom: 0.5rem;
     min-height: var(--turn-header-line);
     font-size: var(--font-size-sm);

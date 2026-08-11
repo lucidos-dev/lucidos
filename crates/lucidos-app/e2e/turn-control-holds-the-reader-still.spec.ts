@@ -126,6 +126,26 @@ async function pressAndMeasure(page: Page): Promise<{ drift: number; heightChang
   });
 }
 
+/** Dismiss any toast before reaching into the drawer.
+ *
+ *  The toast container sits over the bottom of the pane, and at a phone width
+ *  the drawer's rows are under it, so a toast the workspace happens to be
+ *  showing (an engine-version notice, a change landing) intercepts the click
+ *  that opens the thread and the spec times out with nothing to say about the
+ *  anchor. Desktop is wide enough to miss it, which is exactly why this is worth
+ *  doing rather than leaving to luck. Dismissing rather than force-clicking: a
+ *  real finger cannot reach through a toast either, and `force` would hide a
+ *  genuine overlap regression. */
+async function clearToasts(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    document.querySelectorAll<HTMLButtonElement>('.toast .toast-close').forEach(b => b.click());
+  });
+  await page.locator('.toast-container .toast').first().waitFor({ state: 'detached', timeout: 5_000 }).catch(() => {
+    // Not every toast is dismissable. The click below retries for 15s anyway,
+    // and an auto-expiring toast clears well inside that.
+  });
+}
+
 async function park(page: Page, frac: number): Promise<void> {
   await page.locator('.thread-content.visible:visible').first().evaluate((el, f) => {
     el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) * (f as number));
@@ -140,6 +160,7 @@ test.describe('A turn control holds the reader still', () => {
     try {
       await navigateToApp(page);
       await openThreadDrawer(page);
+      await clearToasts(page);
       await page.locator('.thread-row:has-text("Turn control anchor")').first().click();
       await ensureOnThreadPane(page);
 

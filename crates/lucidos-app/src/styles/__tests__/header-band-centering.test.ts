@@ -277,8 +277,16 @@ describe('on the overlay build the leading control only steps sideways', () => {
     // value that lives in another stylesheet (CSS cannot read a rule's own
     // declaration back out), so this also catches it drifting from the button.
     const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
-    const iconBox = cssRules(readFileSync(resolve(stylesDir, 'global/host-components.css'), 'utf-8'))
-      .find(r => r.selector === '.icon-btn.header-icon');
+    // Matched as a member of the rule's selector LIST, not as the whole
+    // selector text: the box is shared with `.icon-btn.row-icon`, the same
+    // control sitting in a row rather than a header band, so an exact compare
+    // reads `undefined` the moment the two are declared together and the guard
+    // silently stops guarding.
+    const iconBox = rulesTargeting(
+      readFileSync(resolve(stylesDir, 'global/host-components.css'), 'utf-8'),
+      'header-icon',
+    ).find(r => r.props.has('height'));
+    expect(iconBox, 'no .icon-btn.header-icon rule declaring a height').toBeDefined();
     expect(root?.props.get('--header-icon-box'), '--header-icon-box drifted from the button')
       .toBe(iconBox?.props.get('height'));
   });

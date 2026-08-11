@@ -247,6 +247,67 @@ async fn revert_multiple_fast_forward_commits() {
     );
 }
 
+// ── Merge ownership during a conflict resolution ──
+
+/// The incident this guard exists for (2026-08-11): a conflict-resolution
+/// session was mid-turn on its 5-step merge prompt when a second
+/// `apply_change` for the same change found that very session live, took the
+/// Tier-1 path, and fast-forwarded `main` at step 2. Pairing open plus a live
+/// session means the resolver owns the merge, and every other caller refuses.
+#[test]
+fn a_live_resolver_owns_its_change_merge() {
+    assert_eq!(
+        decide_merge_ownership(Some(true), true),
+        MergeOwnership::ResolverOwnsIt
+    );
+}
+
+/// The liveness half is what keeps the guard from wedging Apply, and it names
+/// the RESOLVER rather than any live session. Both wedge shapes collapse to
+/// `resolver_present = false` here: an engine restart empties `agent_sessions`
+/// so a pairing stranded by a crash has nobody carrying it, and a later
+/// unrelated turn on that same thread is not a resolver either (its session
+/// carries no `conflict_change_id` for this change). Either way the apply falls
+/// through to the ordinary tiers instead of being refused forever.
+#[test]
+fn a_stranded_pairing_with_no_resolver_does_not_block_apply() {
+    assert_eq!(
+        decide_merge_ownership(Some(true), false),
+        MergeOwnership::CallerMayMerge
+    );
+}
+
+/// No resolution in flight is the ordinary case: a live session (the thread
+/// the user is working in) must not stop its own change from applying.
+#[test]
+fn a_closed_pairing_never_blocks_apply() {
+    assert_eq!(
+        decide_merge_ownership(Some(false), true),
+        MergeOwnership::CallerMayMerge
+    );
+    assert_eq!(
+        decide_merge_ownership(Some(false), false),
+        MergeOwnership::CallerMayMerge
+    );
+}
+
+/// A projection query that could not run is UNKNOWN, never a "no"
+/// (`.claude/rules/rust.md`). Merging under a working resolver is the direction
+/// that destroys something, so an unknown refuses while a resolver is present
+/// and costs the caller a retry. With nobody resolving there is nobody to own
+/// the merge whatever the query would have said, so it proceeds.
+#[test]
+fn an_unanswerable_pairing_probe_refuses_only_while_a_resolver_is_present() {
+    assert_eq!(
+        decide_merge_ownership(None, true),
+        MergeOwnership::ResolverOwnsIt
+    );
+    assert_eq!(
+        decide_merge_ownership(None, false),
+        MergeOwnership::CallerMayMerge
+    );
+}
+
 // ── Phase 0: Pre-refactor safety net ──
 
 #[test]

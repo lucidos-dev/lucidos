@@ -228,10 +228,9 @@ export interface EngineVersionStatus {
    *  the two disagree. The client anchors this to its own `Date.now()` at
    *  receipt and counts up locally, so skew never reaches the number. */
   build_elapsed_ms?: number;
-  /** The commits between the running engine's commit and HEAD: what a Switch
-   *  would bring, which is what the status toast lists while a rebuild runs.
-   *  `subjects` is capped engine-side; `total` counts them all, so the UI can
-   *  say "+N more" honestly.
+  /** The non-merge commits between the running engine's commit and HEAD,
+   *  grouped by what they are: what a Switch would bring, which is what the
+   *  status toast describes while a rebuild runs.
    *
    *  Absent means UNKNOWN (git couldn't answer, or nothing was asked because
    *  no build is in flight), never "none pending". A present object with
@@ -239,13 +238,38 @@ export interface EngineVersionStatus {
   pending_commits?: PendingCommits;
 }
 
-/** The commits a Switch would bring. See `EngineVersionStatus.pending_commits`
- *  for why an ABSENT value and a `total: 0` one mean different things. */
-export interface PendingCommits {
-  /** How many commits are in the range. Can exceed `subjects.length`. */
+/** Which bucket a pending commit falls in, from its conventional-commit type.
+ *  The engine classifies; the frontend words it (`GROUP_LABEL` in
+ *  `store/backgroundActivity.ts`).
+ *
+ *  `housekeeping` (docs/chore/test/ci/build/harden) is COUNTED, never listed:
+ *  its `descriptions` is always empty. */
+export type CommitGroupKind = 'new' | 'fixed' | 'improved' | 'other' | 'housekeeping';
+
+/** One bucket of the pending range, with its own count so a capped list can say
+ *  how much it is not showing. */
+export interface CommitGroup {
+  kind: CommitGroupKind;
+  /** Every commit in this group, capped or not. */
   total: number;
-  /** Newest-first subject lines, capped engine-side. */
-  subjects: string[];
+  /** Newest-first, capped engine-side, and empty for `housekeeping`. Each line
+   *  is the commit subject with its conventional-commit TYPE stripped and its
+   *  scope kept as a lead-in (`ui: the trash is sized by its ink`). */
+  descriptions: string[];
+}
+
+/** The commits a Switch would bring. Merges are excluded engine-side: an Apply
+ *  lands as a merge whose subject is a branch name, and what it merged is
+ *  already in the range under its own subject.
+ *
+ *  See `EngineVersionStatus.pending_commits` for why an ABSENT value and a
+ *  `total: 0` one mean different things. */
+export interface PendingCommits {
+  /** Every non-merge commit in the range, including the ones no group lists.
+   *  Equals the sum of the group totals (the engine derives it from them). */
+  total: number;
+  /** Non-empty groups, in the order the toast lists them. */
+  groups: CommitGroup[];
 }
 
 export async function engineVersionStatus(): Promise<EngineVersionStatus> {

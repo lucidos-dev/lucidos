@@ -131,7 +131,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
           <div class="list-row-date trigger-last-run">
             <SkText as="span" w="8rem">{lastRunStr && `Last run ${lastRunStr}`}</SkText>
             {trigger?.last_run_status && (
-              <span class={`trigger-run-status trigger-run-status-${trigger.last_run_status}`}>
+              <span class={`label trigger-run-status trigger-run-status-${trigger.last_run_status}`}>
                 {trigger.last_run_status === 'ok' ? 'OK' : 'Failed'}
               </span>
             )}

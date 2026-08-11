@@ -1936,8 +1936,9 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
     // The embedding model (fastembed) caches its ONNX model under
     // `FASTEMBED_CACHE_DIR` (default: `.fastembed_cache` relative to CWD). Under
     // launchd the CWD is read-only `/`, so pin it to a writable, update-surviving
-    // dir under app-data, and give the gateway a writable CWD. The gateway
-    // overrides this per-workspace when it spawns each engine.
+    // dir under app-data, and give the gateway a writable CWD. Every engine the
+    // gateway spawns INHERITS this, so one ~465 MB copy serves the whole install
+    // and uninstalling the app takes it with it.
     let fastembed_cache = app_data.join("fastembed");
     std::fs::create_dir_all(&fastembed_cache)?;
     std::fs::create_dir_all(app_data.join("config"))?;

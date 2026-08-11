@@ -157,7 +157,13 @@ describe('the badge tooltip never promises more than the toast delivers', () => 
   const richBuild: EngineBuildDetail = {
     elapsedMs: 134_000,
     anchoredAt: NOW,
-    pendingCommits: { total: 2, subjects: ['fix: one', 'docs: two'] },
+    pendingCommits: {
+      total: 2,
+      groups: [
+        { kind: 'fixed', total: 1, descriptions: ['one'] },
+        { kind: 'housekeeping', total: 1, descriptions: [] },
+      ],
+    },
   };
   /** A co-located peer's build: the badge spins, but this client has neither a
    *  clock for it nor an answer from git, so there is nothing more to show. */

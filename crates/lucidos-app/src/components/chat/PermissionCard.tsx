@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
-import type { PersistScope } from '../../store/thread-events';
+import { changeKindName, type PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { followResolvedPermission } from './scrollState';
@@ -24,10 +24,15 @@ interface PermissionBodyProps {
   terminated?: boolean;
 }
 
-/** What a Codex change `kind` means in a sentence. The app-server sends it as
- *  `{type: "add" | "update" | "delete"}`; older frames used a bare string, so
- *  both shapes resolve. Anything unrecognized reads "change", which is true of
- *  every kind and claims nothing extra.
+/** What a Codex change `kind` means in a SENTENCE. Anything unrecognized reads
+ *  "change", which is true of every kind and claims nothing extra.
+ *
+ *  The dual `{type: "add"}` / bare-`"add"` shape is read by `changeKindName`, so
+ *  the two surfaces keyed off a change kind share one reader. They deliberately
+ *  do NOT share the verbs: this card says "wants to create /path", where a
+ *  transcript step row says "Write foo.ts" because it has to read like the
+ *  Claude Code row carrying the same edit (`CODEX_CHANGE_VERBS` in
+ *  `store/thread-events/exchange.ts`).
  *
  *  A `Map`, not an object literal: the key is a string codex chose, and a plain
  *  object answers `constructor` / `toString` / `valueOf` / `__proto__` off its
@@ -43,12 +48,7 @@ const CHANGE_VERBS: ReadonlyMap<string, string> = new Map([
 const DEFAULT_CHANGE_VERB = 'change';
 
 function changeVerb(kind: unknown): string {
-  const name = typeof kind === 'string'
-    ? kind
-    : (kind && typeof kind === 'object' && typeof (kind as { type?: unknown }).type === 'string')
-      ? (kind as { type: string }).type
-      : '';
-  return CHANGE_VERBS.get(name) ?? DEFAULT_CHANGE_VERB;
+  return CHANGE_VERBS.get(changeKindName(kind)) ?? DEFAULT_CHANGE_VERB;
 }
 
 /** The files a Codex `file_change` approval is about, as `{verb, path}` pairs.

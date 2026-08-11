@@ -102,9 +102,9 @@ test.describe('Chat - send and receive messages', () => {
     expect(threadId, 'focused thread id not in localStorage').toBeTruthy();
 
     // Deterministic mid-tool-call signal: poll the events API until a
-    // CodingAgentToolCalled event lands for this thread. Steps are hidden
-    // by default in the UI, so we cannot rely on .inline-step rendering —
-    // the event store is the source of truth.
+    // CodingAgentToolCalled event lands for this thread. The step log is a
+    // stored per-reader setting, so `.inline-step` rendering is not a signal
+    // this spec can rely on. The event store is the source of truth.
     await expect.poll(
       async () => {
         const resp = await page.request.get(`/api/v1/threads/${threadId}/events`);

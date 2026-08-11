@@ -375,6 +375,157 @@ function describeRun(text: string): string {
   return 'Run command';
 }
 
+/** Last path segment, or the whole string when it has none. */
+function basename(p: string): string {
+  return p.split('/').pop() || p;
+}
+
+/** Shell basenames that mark a `<shell> -c <script>` wrapper. Mirrors
+ *  `WRAPPER_SHELLS` in `crates/lucidos-engine/src/core/mod.rs`, which is the
+ *  authoritative list; `store/__tests__/wrapper-shells-mirror.test.ts` reads that
+ *  source and fails if the two stop naming the same shells. */
+export const WRAPPER_SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish']);
+
+/** The script inside a login-shell wrapper, or `cmd` unchanged when there is no
+ *  wrapper to see through.
+ *
+ *  Codex reports a shell step as the whole invocation its harness built,
+ *  `/bin/zsh -lc "<script>"`, where Claude Code's `Bash` reports the script on
+ *  its own. Left alone the two backends read as different tools on every row of
+ *  a transcript, which is the thing this exists to stop.
+ *
+ *  TypeScript twin of Rust `shell_script_body` in
+ *  `crates/lucidos-engine/src/core/mod.rs`. Rust is authoritative and produces
+ *  the description stored on the event; this covers the step detail's un-elided
+ *  value (always derived client-side) and events stored before descriptions
+ *  existed. Both sides are asserted to agree in `thread-events-steps-status.test.ts`.
+ *
+ *  Only Codex's `command_execution` goes through here. A Claude Code session that
+ *  literally invokes `bash -lc "..."` chose to, and its row must show it. */
+export function shellScriptBody(cmd: string): string {
+  const wrapper = /^\s*(\S+)\s+-([A-Za-z]+)\s+([\s\S]*)$/.exec(cmd);
+  if (!wrapper) return cmd;
+  const [, shell, letters, rest] = wrapper;
+  // `-c`, `-lc`, `-ic`: one cluster of letters including the flag that says
+  // "the next argument is the script".
+  if (!WRAPPER_SHELLS.has(basename(shell)) || !letters.includes('c')) return cmd;
+  const script = rest.trim();
+  const quote = script[0];
+  // A quoted script has to be exactly ONE quoted word. `zsh -lc "a" && "b"` is
+  // two words and a pipeline, so no part of it is "the command" and the label
+  // shows the invocation verbatim rather than a confident half of it.
+  if (quote === "'" || quote === '"') return unquoteShellWord(script, quote) ?? cmd;
+  // An UNQUOTED suffix is the script only when it is a single word. POSIX
+  // `sh -c` reads ONE operand as the script and assigns the rest to `$0`, `$1`,
+  // ..., so `zsh -lc git status` runs `git` with `$0=status` and does NOT run
+  // `git status`. Reading it as the latter would put a command in the row that
+  // never ran, which is the one thing this must never do.
+  return script && !/\s/.test(script) ? script : cmd;
+}
+
+/** The contents of `s` when it is exactly one quoted shell word, unescaped for
+ *  that quoting style. `null` when it is unterminated or carries anything after
+ *  its closing quote. Twin of Rust `unquote_shell_word`. */
+function unquoteShellWord(s: string, quote: string): string | null {
+  let unescaped = '';
+  let chunkStart = 1;
+  let i = 1;
+  while (i < s.length) {
+    if (s[i] === quote) {
+      // A single-quoted script cannot contain a quote, so the wrapper spells one
+      // as close, escape, reopen. That sequence is not the terminator.
+      if (quote === "'" && s.startsWith("'\\''", i)) {
+        unescaped += `${s.slice(chunkStart, i)}'`;
+        i += 4;
+        chunkStart = i;
+        continue;
+      }
+      if (i + 1 !== s.length) return null;
+      return unescaped + s.slice(chunkStart, i);
+    }
+    // Inside double quotes a backslash escapes exactly four characters plus a
+    // line continuation; before anything else it is a literal backslash and the
+    // character after it is read normally.
+    if (quote === '"' && s[i] === '\\' && i + 1 < s.length && '"\\$`\n'.includes(s[i + 1])) {
+      unescaped += s.slice(chunkStart, i) + (s[i + 1] === '\n' ? '' : s[i + 1]);
+      i += 2;
+      chunkStart = i;
+      continue;
+    }
+    i += 1;
+  }
+  return null; // unterminated
+}
+
+/** The name inside a Codex change `kind`. The app-server sends it as
+ *  `{type: "add" | "update" | "delete"}`; older exec frames used a bare string,
+ *  so both shapes resolve and anything else is `''`. Read in one place because
+ *  two surfaces key off it: the step label below and `PermissionCard`'s approval
+ *  sentence. */
+export function changeKindName(kind: unknown): string {
+  if (typeof kind === 'string') return kind;
+  if (kind && typeof kind === 'object' && typeof (kind as { type?: unknown }).type === 'string') {
+    return (kind as { type: string }).type;
+  }
+  return '';
+}
+
+/** The step-row verb each Codex change kind implies. Deliberately Claude Code's
+ *  vocabulary rather than the sentence verbs `PermissionCard` uses ("wants to
+ *  create /path"): that card builds a sentence, this is a label, and it has to
+ *  read like the label a Claude Code row carrying the same edit would.
+ *
+ *  A `Map` for the same reason `CHANGE_VERBS` is one: the key is a string codex
+ *  chose, and a plain object answers `constructor` off its prototype. */
+const CODEX_CHANGE_VERBS: ReadonlyMap<string, string> = new Map([
+  ['add', 'Write'],
+  ['update', 'Edit'],
+  ['delete', 'Delete'],
+]);
+/** True of every kind, so it claims nothing extra about one we can't read. */
+const DEFAULT_CODEX_CHANGE_VERB = 'Change';
+
+/** The `{verb, path}` pairs a Codex `file_change` call is about. Empty when the
+ *  payload announces no changes. `path` is `''` for an entry that carries none. */
+function codexFileChanges(args: unknown): { verb: string; path: string }[] {
+  const raw = (args as { changes?: unknown } | null | undefined)?.changes;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry) => {
+    const e = (entry ?? {}) as { kind?: unknown; path?: unknown };
+    return {
+      verb: CODEX_CHANGE_VERBS.get(changeKindName(e.kind)) ?? DEFAULT_CODEX_CHANGE_VERB,
+      path: typeof e.path === 'string' ? e.path : '',
+    };
+  });
+}
+
+/** Step label for a Codex `file_change`. Mirrors Rust's `file_change` arm: name
+ *  the file when there is one, and claim a single verb only when every change in
+ *  the patch agrees, the same honesty rule `renderFileChangeQuestion` applies to
+ *  this payload on the permission card. */
+function codexFileChangeLabel(args: unknown): string {
+  const changes = codexFileChanges(args);
+  if (changes.length === 0) return 'Apply file changes';
+  const verb = changes.every(c => c.verb === changes[0].verb)
+    ? changes[0].verb
+    : DEFAULT_CODEX_CHANGE_VERB;
+  if (changes.length === 1) {
+    return changes[0].path ? `${verb} ${basename(changes[0].path)}` : `${verb} 1 file`;
+  }
+  return `${verb} ${changes.length} files`;
+}
+
+/** The bare tool name inside an `mcp__<server>__<tool>` identifier, or undefined
+ *  when `name` is not shaped like one. Both backends name MCP tools this way
+ *  (Codex rebuilds its `mcp_tool_call` item into the same shape), so the server
+ *  prefix is noise in a step row. Twin of Rust `mcp_tool_suffix`. */
+function mcpToolSuffix(name: string): string | undefined {
+  if (!name.startsWith('mcp__')) return undefined;
+  const rest = name.slice('mcp__'.length);
+  const sep = rest.indexOf('__');
+  return sep === -1 ? undefined : rest.slice(sep + 2);
+}
+
 /** Full primary-arg value for an engine tool call — used as a hover tooltip when
  *  the rendered description elides it (Rust `describe_tool()` truncates commands,
  *  paths, prompts, and URLs to ~60 chars). Returns whichever single arg the
@@ -408,13 +559,13 @@ export function fullCommandForEngineTool(name: string, args: unknown): string | 
   }
 }
 
-/** Full primary-arg value for a Claude Code tool call — used as a hover tooltip
- *  when the rendered description elides it (Rust `describe_cc_tool()` in
- *  `crates/lucidos-engine/src/core/mod.rs` shows basenames for paths,
- *  truncates Bash commands to 57 chars + first line, and shows only the URL
- *  origin for WebFetch). `Agent` returns `prompt` rather than the short
- *  `description` field Rust uses, since the prompt is the actual hidden detail.
- *  Undefined when no primary arg is defined for the tool. */
+/** Full primary-arg value for a Claude Code tool call, shown in the step detail
+ *  (`StepDetailModal`'s `.step-detail-full`) when the rendered description elides
+ *  it (Rust `describe_cc_tool()` in `crates/lucidos-engine/src/core/mod.rs` shows
+ *  basenames for paths, truncates Bash commands to 57 chars + first line, and
+ *  shows only the URL origin for WebFetch). `Agent` returns `prompt` rather than
+ *  the short `description` field Rust uses, since the prompt is the actual hidden
+ *  detail. Undefined when no primary arg is defined for the tool. */
 export function fullCommandForCCTool(name: string, args: unknown): string | undefined {
   const a = args as Record<string, unknown> | null | undefined;
   if (!a) return undefined;
@@ -455,6 +606,21 @@ export function fullCommandForCCTool(name: string, args: unknown): string | unde
         return `${completed ? '[x]' : '[ ]'} ${text ?? ''}`;
       }).join('\n');
     }
+    // Codex's other item types. Without these, no Codex step had an un-elided
+    // value in its detail at all, where every Claude Code step does.
+    case 'command_execution': {
+      const cmd = s('command');
+      return cmd ? shellScriptBody(cmd) : undefined;
+    }
+    case 'file_change': {
+      const changes = codexFileChanges(a);
+      // One entry we cannot name discards the whole set, mirroring
+      // `PermissionCard`'s `fileChanges`: a complete-looking list whose unnamed
+      // half writes elsewhere is worse than showing no list.
+      if (changes.length === 0 || changes.some(c => !c.path)) return undefined;
+      return changes.map(c => `${c.verb} ${c.path}`).join('\n');
+    }
+    case 'web_search': return s('query');
     default: return undefined;
   }
 }
@@ -463,7 +629,6 @@ export function fullCommandForCCTool(name: string, args: unknown): string | unde
 export function describeEngineTool(name: string, args: unknown): string {
   const a = args as Record<string, unknown> | null | undefined;
   const str = (key: string) => (a && typeof a[key] === 'string' ? a[key] as string : '');
-  const basename = (p: string) => p.split('/').pop() || p;
 
   switch (name) {
     case 'read_file': return str('path') ? `Read ${basename(str('path'))}` : 'Read file';
@@ -633,7 +798,6 @@ export function describeEngineTool(name: string, args: unknown): string {
 export function describeCCTool(name: string, args: unknown): string {
   const a = args as Record<string, unknown> | null | undefined;
   const str = (key: string) => (a && typeof a[key] === 'string' ? a[key] as string : '');
-  const basename = (p: string) => p.split('/').pop() || p;
 
   switch (name) {
     case 'Read': return str('file_path') ? `Read ${basename(str('file_path'))}` : 'Read file';
@@ -648,6 +812,21 @@ export function describeCCTool(name: string, args: unknown): string {
     case 'Agent': return str('description') || 'Run agent';
     case 'Skill': return str('skill') ? `Run skill: ${str('skill')}` : 'Run skill';
     case 'NotebookEdit': return str('file_path') ? `Edit ${basename(str('file_path'))}` : 'Edit notebook';
-    default: return name;
+    case 'TodoWrite': return 'Update plan';
+    case 'ExitPlanMode': return 'Present plan for approval';
+    // Codex item types (see `runtime/codex_parse.rs`): Codex reports
+    // coarse-grained items, not named tools like CC. Each arm lands on the SAME
+    // sentence its Claude Code counterpart above produces, because the two
+    // backends share every transcript component and a row that reads differently
+    // is the only thing left that can tell them apart.
+    case 'command_execution': return describeRun(shellScriptBody(str('command')));
+    case 'file_change': return codexFileChangeLabel(a);
+    case 'web_search': return str('query') ? `Search '${str('query')}'` : 'Web search';
+    case 'todo_list': return 'Update plan';
+    default:
+      // An MCP tool reaches both backends under the same name, and the server
+      // prefix is noise. Without this the raw identifier IS the label.
+      if (name.startsWith('mcp__')) return `MCP: ${mcpToolSuffix(name) ?? name}`;
+      return name;
   }
 }

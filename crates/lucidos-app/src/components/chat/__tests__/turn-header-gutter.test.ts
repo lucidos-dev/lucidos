@@ -21,6 +21,17 @@ function declarationValue(block: string, property: string): string | undefined {
   return block.match(new RegExp(`${escaped}\\s*:\\s*([^;]+)`))?.[1].trim();
 }
 
+/**
+ * The gap under a header, and NOT the `scroll-margin-bottom` that shares its
+ * tail. `declarationValue` matches anywhere in the block, so on
+ * `.response-header` (which declares both) it answers whichever comes first in
+ * source order: correct today, and quietly wrong the day the two swap places.
+ * The leading boundary is what tells the longhand apart from the shorthand.
+ */
+function gapBelow(block: string): string | undefined {
+  return block.match(/(?:^|[;{\s])margin-bottom\s*:\s*([^;]+)/)?.[1].trim();
+}
+
 describe('turn header gutter', () => {
   it('keeps actor and executor icons aligned with turn body content', () => {
     const initiatorHeader = getBlock(inputCss, '.initiator-header');
@@ -32,6 +43,28 @@ describe('turn header gutter', () => {
     expect(declarationValue(responseHeader, 'padding-left')).toBe('var(--turn-body-inset)');
     expect(declarationValue(initiatorBody, 'padding-left')).toBe('var(--turn-body-inset)');
     expect(declarationValue(responseContent, 'padding-left')).toBe('var(--turn-body-inset)');
+  });
+
+  // The gap UNDER a header is one measurement with two copies, the same shape
+  // as the inset above: the initiator's row and the response's row sit one
+  // above the other in a turn, so a value moved on one and not the other ships
+  // two rhythms in one transcript. A comment at each site says they move
+  // together, and this is what makes that hold. It is not hypothetical upkeep:
+  // the value has already moved twice (0.35rem to 0.7rem on 2026-06-09, then to
+  // 0.5rem) and nothing else in the gate can catch a mismatch, since
+  // `vite build` parses the CSS without comparing two rules in different files.
+  //
+  // Equality rather than a pinned literal, deliberately. The number is a
+  // judgment call that is expected to keep moving, so pinning it would fail
+  // every retune and teach the next person to edit the test; only DRIFT between
+  // the two copies is a defect, and only drift fails here.
+  it('keeps the gap under both turn headers on one value', () => {
+    const initiatorGap = gapBelow(getBlock(inputCss, '.initiator-header'));
+    expect(initiatorGap, '.initiator-header declares no gap under the header').toBeTruthy();
+    expect(
+      gapBelow(getBlock(responseCss, '.response-header')),
+      'the two turn headers must carry the same gap under them',
+    ).toBe(initiatorGap);
   });
 
   it('insets the collapsed marker to match the turn body content', () => {

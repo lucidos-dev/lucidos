@@ -889,6 +889,10 @@ impl LucidosEngine {
                 interrupt: interrupt.clone(),
                 idle_notify: idle_notify.clone(),
                 apply_now_in_progress: false,
+                // Names this session as the resolver for the merge-ownership
+                // guard (ADR 0060). Tier-2 / Tier-3 merge spawns reach here
+                // with `conflict_change_id` set; every other session is None.
+                conflict_change_id,
                 process_exited: false,
                 worktree_path: worktree_path.clone(),
                 branch_name: Some(branch_name.clone()),
@@ -1559,7 +1563,6 @@ impl LucidosEngine {
                                 // step would double-surface the question), no kill (the
                                 // subprocess keeps running), no session removal.
                             } else {
-                                let description = crate::core::describe_cc_tool(&name, &input);
                                 // Safety net: env-side fix (`pg_env_vars` injected
                                 // into the Claude Code subprocess env) keeps the password
                                 // out of `psql` argv in the common case, but a
@@ -1567,8 +1570,17 @@ impl LucidosEngine {
                                 // can still slip through. Walk every string in
                                 // `args` and mask `postgres(ql)://user:pass@…`
                                 // before the event reaches the store / SSE stream.
+                                //
+                                // BEFORE the description, not after: the step row
+                                // renders the description exactly as it renders the
+                                // args, so both have to be built from the redacted
+                                // copy. Describing first left the password in
+                                // cleartext on `description` while `args` was clean.
+                                // `agentic_loop::run` orders it the same way and
+                                // carries the same note.
                                 let mut input = input;
                                 crate::core::redact_postgres_secrets_in_json(&mut input);
+                                let description = crate::core::describe_cc_tool(&name, &input);
                                 self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::CodingAgentToolCalled {

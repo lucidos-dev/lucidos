@@ -1,4 +1,6 @@
-use crate::engine::change_ops::{branch_is_hardened, now_epoch_millis};
+use crate::engine::change_ops::{
+    branch_is_hardened, now_epoch_millis, MergeOwnership, MERGE_OWNED_BY_RESOLVER_MESSAGE,
+};
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
     branch_changed_files, catchup_and_ff_to_main, commits_in_range, consume_harden_marker,
@@ -108,6 +110,21 @@ impl LucidosEngine {
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Thread-scoped twin of the guard in `apply_change_inner`: while a
+        // conflict resolution is in flight on this thread, it owns the merge.
+        // Checked before the session is claimed, because the live-session
+        // branch below would otherwise send a SECOND merge prompt down the
+        // resolver's own `msg_tx` and then ff `main` under it. The no-live
+        // branch needs no separate cover: it delegates to `apply_change`, which
+        // carries the change-scoped guard.
+        if self.merge_ownership_for_thread(thread_id).await == MergeOwnership::ResolverOwnsIt {
+            log!(
+                "[ApplyNow] Refused for thread {}: a conflict resolution is in flight and owns the merge",
+                thread_id
+            );
+            return Err(MERGE_OWNED_BY_RESOLVER_MESSAGE.into());
+        }
+
         // Extract session metadata — if no live session, fall back to stale handling
         let (worktree_path, branch_name, repo_root, idle_notify, msg_tx, last_event_at) = {
             let mut guard = self.agent_sessions.lock().await;
@@ -719,6 +736,14 @@ impl LucidosEngine {
             branch_name,
             conflict_files.len()
         );
+        // Bind the session to this resolution at the same moment the pairing
+        // opens, so the merge-ownership guard (ADR 0060) can name the resolver.
+        // The detached Tier-2 / Tier-3 spawns get their binding at session
+        // registration instead, because their session does not exist yet when
+        // they open the pairing; Tier 1 injects the prompt into a session that
+        // is already running, so the binding belongs here.
+        self.bind_session_to_conflict_resolution(thread_id, change_id)
+            .await;
         let prompt = self
             .start_merge_and_get_prompt(thread_id, change_id, conflict_files, "main", None, None)
             .await;

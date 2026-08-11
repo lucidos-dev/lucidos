@@ -23,6 +23,39 @@ export function SkeletonProvider({ children }: { children: ComponentChildren }) 
   return <SkeletonContext.Provider value={true}>{children}</SkeletonContext.Provider>;
 }
 
+/** The shimmer bar itself: the one place `.sk-bar` and its two shape modifiers
+ *  are spelled. HOOK-FREE on purpose, which is the only reason it is exported
+ *  separately from the two wrappers below.
+ *
+ *  Reach for it only where a placeholder has to be drawn OUTSIDE a
+ *  {@link SkeletonProvider}, i.e. where the surrounding markup is real content
+ *  and a single value inside it is the thing still loading. The Workspaces row
+ *  in the Lucidos menu is the case it exists for: its builder is a pure function
+ *  with no hooks (so its every branch stays flattenable in a unit test), so it
+ *  cannot read the context, and only the name inside its value pill is missing.
+ *  Anywhere a whole row / list / tree is standing in for loaded content, use
+ *  {@link SkText} / {@link SkBlock} under a provider instead, so the placeholder
+ *  is the real markup and cannot drift from it. */
+export function SkBar({
+  w,
+  h,
+  circle,
+  round,
+}: {
+  w?: string;
+  h?: string;
+  circle?: boolean;
+  round?: boolean;
+}) {
+  return (
+    <span
+      class={`sk-bar${circle ? ' sk-circle' : ''}${round ? ' sk-round' : ''}`}
+      style={{ width: w, height: h }}
+      aria-hidden="true"
+    />
+  );
+}
+
 /** Text → shimmer bar. In skeleton mode renders the SAME outer element (so the
  *  surface class still drives its box / margins / flex placement) wrapping a clean
  *  `.sk-bar` child of width `w`; otherwise renders `children` unchanged. `as`
@@ -42,7 +75,7 @@ export function SkText({
   if (useSkeleton()) {
     return (
       <Tag class={cls} aria-hidden="true">
-        <span class="sk-bar" style={{ width: w ?? '60%' }} />
+        <SkBar w={w ?? '60%'} />
       </Tag>
     );
   }
@@ -66,15 +99,7 @@ export function SkBlock({
   round?: boolean;
   children?: ComponentChildren;
 }) {
-  if (useSkeleton()) {
-    return (
-      <span
-        class={`sk-bar${circle ? ' sk-circle' : ''}${round ? ' sk-round' : ''}`}
-        style={{ width: w, height: h }}
-        aria-hidden="true"
-      />
-    );
-  }
+  if (useSkeleton()) return <SkBar w={w} h={h} circle={circle} round={round} />;
   return <>{children}</>;
 }
 

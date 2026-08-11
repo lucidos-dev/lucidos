@@ -1,5 +1,5 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
+import { pageTitle, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
@@ -59,14 +59,17 @@ effect(() => {
   document.documentElement.style.setProperty('--duration-scale', String(durationScale.value));
 });
 
-// Persist steps expanded state
+// Persist the two transcript-wide turn controls. Both keys and the write itself
+// come from `store.ts`, beside the seeds that read them back: absent means ON,
+// so a bare `setItem(key, String(value))` here would record the default in
+// every browser that merely opened the app and make the default unchangeable
+// without renaming the keys, which is the trap the `-v2` names paid for once.
 effect(() => {
-  localStorage.setItem('lucidos-steps-expanded', String(stepsExpanded.value));
+  persistTurnControl(STEPS_EXPANDED_KEY, stepsExpanded.value);
 });
 
-// Persist details (more/less) expanded state
 effect(() => {
-  localStorage.setItem('lucidos-details-expanded', String(detailsExpanded.value));
+  persistTurnControl(DETAILS_EXPANDED_KEY, detailsExpanded.value);
 });
 
 // Persist expanded folders

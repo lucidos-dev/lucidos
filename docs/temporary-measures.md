@@ -121,6 +121,31 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   value, not just this one. The migration stays: it is applied history.
 - **Status:** open
 
+### Per-workspace model-cache seed and reclaim
+
+- **Added:** 2026-08-11
+- **Lives in:** `crates/lucidos-engine/src/memory/legacy_cache.rs`
+  (`seed_shared_cache_from_legacy`, `reclaim_legacy_cache`), called from the two
+  ends of the background load in
+  `engine/memory/embedder_retry.rs::spawn_embedder_load`.
+- **Impermanent because:** They exist only to migrate installs off the
+  per-workspace embedding-model cache the gateway used to pin
+  (`<workspace>/.lucidos/fastembed`, retired by ADR 0061). The seed moves one
+  such copy into the shared cache so the upgrade costs no download; the reclaim
+  deletes a copy once the model has demonstrably loaded from elsewhere. On a
+  fresh install both are no-ops on the first boot and every boot after it, and
+  no code writes that path any more, so the only thing they can ever find is a
+  directory an older engine left behind.
+- **Removal / resolution condition:** No supported upgrade path can still be
+  carrying a per-workspace copy, which in practice means every install has booted
+  at least once on a version at or after ADR 0061. The signal is the reclaim's
+  log line (`Reclaimed N bytes: removed this workspace's leftover model cache`)
+  having stopped appearing in the field. Then delete the module, its two call
+  sites, and its `pub mod` line. `dir_bytes` moves to wherever it is still
+  needed: the gated `test_downloaded_model_loads_without_a_second_fetch` uses it
+  to measure the cache tree, and that test is permanent.
+- **Status:** open
+
 ### Batch `data/` writes announce once for the caller, not per file
 
 - **Added:** 2026-08-01
@@ -1107,6 +1132,29 @@ event that retires it.
   placeholder prompts). Then drop both functions, their call sites in `start()`,
   and the `ScheduledTrigger*` event aliases in `triggers/replay.rs` (named by the
   first migration's comment).
+- **Status:** active
+
+### Superseded turn-control localStorage keys cleared at load
+
+- **Added:** 2026-08-11
+- **Lives in:** `crates/lucidos-app/src/store/store.ts`, the two
+  `localStorage.removeItem('lucidos-steps-expanded' / 'lucidos-details-expanded')`
+  calls immediately below the `stepsExpanded` / `detailsExpanded` seeds.
+- **Impermanent because:** A one-shot purge of two keys nothing writes any more.
+  The *turn controls* flipped to defaulting ON, and the old keys could not be
+  reused: the previous persisting effect wrote its value on every load, clicked
+  or not, so every browser that had opened the app held a `false` recording the
+  old default rather than a reader's choice. The seeds moved to `-v2` names and
+  these two calls clear the dead pair so nobody reads a stale `false` as the
+  state of a control that is on. Dead on arrival for any browser profile created
+  after 2026-08-11, and a no-op on every load after the first.
+- **Removal / resolution condition:** Drop the two calls once every device that
+  opened this workspace before 2026-08-11 has loaded the app at least once since
+  (in practice: a release boundary past which the pre-`-v2` keys cannot exist).
+  Nothing else goes with them. The `-v2` key names are permanent, and
+  `persistTurnControl`'s deviation-only write is the design that keeps a stored
+  value meaning "the reader turned this off", not a crutch: neither is part of
+  this measure.
 - **Status:** active
 
 ### `repo` → `folder` deprecated alias on `run_coding_agent`

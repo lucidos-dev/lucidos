@@ -38,7 +38,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
-import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
+import { SkeletonProvider, SkText, SkBlock, SkBar } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ChevronDownIcon } from '../shared/icons';
 import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
@@ -52,6 +52,24 @@ import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState'
  *  not the picker's three: an unfolded list pushes the rows below it down, so
  *  the cheaper guess is the one that moves less when it is wrong. */
 const DEFAULT_SKELETON_ROWS = 2;
+
+/** What the placeholder has to draw to stand exactly as tall as the list it
+ *  replaces: one row per workspace the last listing saw, PLUS the footer.
+ *
+ *  The footer is the half that was missing. `workspaceSwitcherList` renders
+ *  **Manage workspaces** under every listing that has a picker to reach, so a
+ *  placeholder made only of workspace rows was always one row short: the panel
+ *  grew by that row at settle and pushed Refresh and Restart down, which is the
+ *  bounce the remembered count exists to prevent in the first place.
+ *
+ *  Pure and exported so the parity is pinned by a test rather than by two call
+ *  sites happening to agree about the footer. */
+export function skeletonShape(
+  remembered: number | null,
+  manageHref: string | null,
+): { rows: number; manage: boolean } {
+  return { rows: remembered ?? DEFAULT_SKELETON_ROWS, manage: manageHref !== null };
+}
 
 /** Stacked plates: several of the same thing, one of them on top. Deliberately
  *  not the four-square grid it replaces, which reads as "all apps" and collided
@@ -114,10 +132,24 @@ export function workspacesMenuRow({
   const marker = canList
     ? <span class="brand-menu-value-chevron" aria-hidden="true"><ChevronDownIcon /></span>
     : <CheckIcon className="brand-menu-value-check" />;
-  const value = workspaceName && (
+  // Until the label resolves the pill used to be dropped whole, and that cost
+  // more than the name: the expander's chevron rides INSIDE the pill, so the
+  // row did not look like an expander at all, and then grew a pill and a marker
+  // under the user's finger the moment /health answered. A bar in the name's
+  // own slot holds the box and keeps the marker on screen.
+  //
+  // Drawn immediately, with no `useDelayedFlag` gate, and that is not an
+  // exception to the delay rule so much as the case it does not describe: the
+  // gate exists so a load STARTED BY THIS RENDER cannot flash a placeholder,
+  // and this one started at boot, long before the menu was opened. A gate keyed
+  // on the menu opening would just reinstate the blank pill for its first 300ms.
+  const name = workspaceName
+    ? <span class="brand-menu-value-name">{workspaceName}</span>
+    : <span class="brand-menu-value-name"><SkBar w="3.5rem" /></span>;
+  const value = (
     <span class="brand-menu-value">
       {!canList && marker}
-      <span class="brand-menu-value-name">{workspaceName}</span>
+      {name}
       {canList && marker}
     </span>
   );
@@ -319,8 +351,10 @@ export function workspaceSwitcherList({
 
 /** Placeholder rows while the list loads: the real row's markup (dot, name)
  *  inside a `SkeletonProvider`, so a row's height mirrors a loaded one by
- *  construction and the handoff does not reflow. Decorative, so aria-hidden. */
-function WorkspaceSwitcherSkeleton({ rows }: { rows: number }) {
+ *  construction and the handoff does not reflow. Decorative, so aria-hidden.
+ *  Both counts come from {@link skeletonShape}, which owns why the footer is
+ *  drawn at all. */
+function WorkspaceSwitcherSkeleton({ rows, manage }: { rows: number; manage: boolean }) {
   return (
     <SkeletonProvider>
       <div class="brand-menu-ws-list" aria-hidden="true">
@@ -332,6 +366,14 @@ function WorkspaceSwitcherSkeleton({ rows }: { rows: number }) {
             <SkText class="brand-menu-ws-name" w="7rem" />
           </div>
         ))}
+        {/* The Manage workspaces footer: both of its classes, so it takes the
+            smaller type and carries no dot, exactly as the loaded list draws
+            it. */}
+        {manage && (
+          <div class="brand-menu-ws-row brand-menu-ws-manage">
+            <SkText w="8rem" />
+          </div>
+        )}
       </div>
     </SkeletonProvider>
   );
@@ -361,10 +403,11 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   // Sized to the count the last successful listing saw, on this device, so the
   // skeleton does not bounce into the list. Captured once per mount so it holds
   // still while the skeleton fades out over the fresher count just recorded.
-  const skeletonRows = useRef<number | undefined>(undefined);
-  if (skeletonRows.current === undefined) {
-    skeletonRows.current = recallLastWorkspaceCount() ?? DEFAULT_SKELETON_ROWS;
-  }
+  // `null` is "nothing recorded", which is a real answer and must survive the
+  // `undefined` sentinel that means "not captured yet".
+  const remembered = useRef<number | null | undefined>(undefined);
+  if (remembered.current === undefined) remembered.current = recallLastWorkspaceCount();
+  const skeleton = skeletonShape(remembered.current, manageHref);
 
   useEffect(() => {
     // Never fires in the two non-switcher shapes: they cannot expand, so the
@@ -407,7 +450,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
       {expanded.value && (
         <LoadingFade
           showSkeleton={showSkeleton}
-          skeleton={<WorkspaceSwitcherSkeleton rows={skeletonRows.current ?? DEFAULT_SKELETON_ROWS} />}
+          skeleton={<WorkspaceSwitcherSkeleton rows={skeleton.rows} manage={skeleton.manage} />}
         >
           {workspaceSwitcherList({
             state: list.value,

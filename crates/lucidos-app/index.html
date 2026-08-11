@@ -505,7 +505,58 @@
         pointer-events: auto;
       }
       .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
-      .boot-splash-leaving { animation: boot-splash-out 0.45s ease forwards; }
+      /* THE EXIT IS TWO BEATS, and the split is what makes the hand-off read as
+         one. Fading the whole splash on one curve (what this did until
+         2026-08-11) dissolves the veil, the white mark and the status line
+         together, so for most of the fade a 240px mark and a line of text sit
+         ghosting ON TOP of the app's own content: in a captured frame the mark
+         read as grey blocks over the file tree and the status as a second line
+         across a row of it. `ease` has a long tail, so the ghost is thinnest
+         exactly where the UI underneath has become readable. Slowing that fade
+         down (the obvious answer to "the transition is a little fast") only
+         lengthens the ghost.
+         So the brand leaves the stage first: the status in 0.18s, the mark in
+         0.3s, and only then does the gradient veil finish dissolving on its own
+         over 0.65s. By the time the veil is thin enough to read the app
+         through, nothing white is left over it.
+         src/utils/bootSplash.ts removes the node when THIS element's animation
+         ends (a child's `animationend` bubbles, and acting on one would tear the
+         splash out mid-veil), and its fallback timer outlives this duration. */
+      .boot-splash-leaving { animation: boot-splash-out 0.65s ease forwards; }
+      /* A cover on its way out is not a target. `.boot-splash-escape` takes its
+         own pointer events back and `.boot-splash-stalled` takes the whole
+         container's, both for a splash that is still standing; once dismissal
+         has started, a click belongs to the app underneath. Two-class
+         specificity and declared after the stalled rule, so it wins. */
+      .boot-splash.boot-splash-leaving,
+      .boot-splash-leaving .boot-splash-escape { pointer-events: none; }
+      /* Beat one, the status. Same specificity as `.boot-splash-status-shown`
+         above and later in the file, which is what lets it win. */
+      .boot-splash-leaving .boot-splash-status {
+        opacity: 0;
+        transition: opacity 0.18s ease;
+      }
+      /* Beat one, the mark. The exit is APPENDED to the animation list rather
+         than replacing it, and the entries ahead of it are restated verbatim:
+         an animation keeps its start time as long as its name stays at the same
+         index, so the reveal does not re-run, and the exit's implicit `from`
+         composites over whatever the breathe is currently producing. Redeclaring
+         the shorthand with the exit alone would instead drop the breathe and
+         start from the base opacity 1, jumping the mark up to 16% brighter on
+         the frame dismissal happens to land in.
+         The scale is the same 1.06 the reveal overshoots to, so the mark leaves
+         the way it arrived. Two rules because the two states carry two different
+         lists: a formed mark (the gateway handover) never played a reveal, and
+         putting one back in its list here would rebuild it mid-exit. */
+      .boot-splash-leaving .boot-splash-mark {
+        animation: boot-mark-reveal 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out 1.3s infinite,
+                   boot-mark-out 0.3s cubic-bezier(0.4, 0, 1, 1) forwards;
+      }
+      .boot-splash-formed.boot-splash-leaving .boot-splash-mark {
+        animation: boot-mark-breathe 2.8s ease-in-out infinite,
+                   boot-mark-out 0.3s cubic-bezier(0.4, 0, 1, 1) forwards;
+      }
       @keyframes boot-mark-reveal {
         from { opacity: 0; transform: scale(0.86); }
         70%  { opacity: 1; transform: scale(1.04); }
@@ -515,11 +566,24 @@
         0%, 100% { opacity: 1; }
         50%      { opacity: 0.84; }
       }
+      /* No `from`: the underlying value is whatever the animations ahead of this
+         one in the list are producing, so the mark fades from where the breathe
+         has it rather than snapping to full opacity first. */
+      @keyframes boot-mark-out { to { opacity: 0; transform: scale(1.06); } }
       @keyframes boot-splash-out { to { opacity: 0; visibility: hidden; } }
       @media (prefers-reduced-motion: reduce) {
+        /* Both leaving selectors are restated for the same reason the quiet fade
+           is below: a media query adds no specificity, so the plain
+           `.boot-splash-mark` rule here would lose to the two-class (and
+           three-class) exit rules above and a reduced-motion user would get the
+           scale anyway. Same for the status, whose exit rule declares a
+           transition this one has to silence. */
         .boot-splash-mark,
-        .boot-splash-formed .boot-splash-mark { animation: none; }
-        .boot-splash-status { transition: none; }
+        .boot-splash-formed .boot-splash-mark,
+        .boot-splash-leaving .boot-splash-mark,
+        .boot-splash-formed.boot-splash-leaving .boot-splash-mark { animation: none; }
+        .boot-splash-status,
+        .boot-splash-leaving .boot-splash-status { transition: none; }
         .boot-splash-leaving,
         .boot-splash-quiet.boot-splash-leaving { animation-duration: 0.15s; }
       }

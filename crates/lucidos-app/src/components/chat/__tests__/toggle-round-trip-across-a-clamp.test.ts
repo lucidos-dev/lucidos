@@ -49,6 +49,7 @@ describe('a turn-control toggle returns the reader across a clamp', () => {
   const SHORT_MAX = SHORT - VIEWPORT; // 1342
 
   function makeContainer(scrollTop: number, scrollHeight: number) {
+    const listeners = new Set<() => void>();
     const el: any = {
       isConnected: true,
       style: { overflow: '' },
@@ -58,9 +59,16 @@ describe('a turn-control toggle returns the reader across a clamp', () => {
       children: [],
       _scrollTop: scrollTop,
       _scrollHeight: scrollHeight,
+      // A real container dispatches `scroll` for every offset change, its own
+      // writes included, which is what the debt's watcher reads.
+      addEventListener(type: string, fn: () => void) { if (type === 'scroll') listeners.add(fn); },
+      removeEventListener(type: string, fn: () => void) { if (type === 'scroll') listeners.delete(fn); },
       get scrollTop() { return this._scrollTop; },
       set scrollTop(v: number) {
-        this._scrollTop = Math.min(Math.max(0, v), Math.max(0, this.scrollHeight - this.clientHeight));
+        const next = Math.min(Math.max(0, v), Math.max(0, this.scrollHeight - this.clientHeight));
+        if (next === this._scrollTop) return;
+        this._scrollTop = next;
+        for (const fn of Array.from(listeners)) fn();
       },
       get scrollHeight() { return this._scrollHeight; },
       set scrollHeight(v: number) {
@@ -158,6 +166,26 @@ describe('a turn-control toggle returns the reader across a clamp', () => {
     toggle(el, anchor, ANCHOR_TALL, TALL);
 
     expect(el.scrollTop).toBe(400 + (ANCHOR_TALL - ANCHOR_SHORT));
+  });
+
+  it('drops it even when the reader scrolls away and comes back to the same offset', () => {
+    // The clamped offset IS the live edge of the shrunk transcript, so scrolling
+    // up to read and then back to the bottom lands on it to the pixel. Comparing
+    // offsets at the next reveal cannot tell that apart from never having moved,
+    // which is why the debt watches the scroll EVENT: the trip away is what
+    // retires it, and the bottom they chose to return to is theirs.
+    const el = makeContainer(START, TALL);
+    const anchor: any = makeAnchor(el, ANCHOR_TALL);
+    setActiveScrollElement(el);
+
+    toggle(el, anchor, ANCHOR_SHORT, SHORT);
+    expect(el.scrollTop).toBe(SHORT_MAX);
+
+    el.scrollTop = 400;        // the reader flicks up to re-read something
+    el.scrollTop = SHORT_MAX;  // and scrolls back down to the end
+
+    toggle(el, anchor, ANCHOR_TALL, TALL);
+    expect(el.scrollTop).toBe(SHORT_MAX + (ANCHOR_TALL - ANCHOR_SHORT));
   });
 
   it('does not pay a debt earned in another thread', () => {

@@ -683,7 +683,7 @@ describe('Flow: what the default view hides', () => {
     expect(hidesEarlierProse(exchangeResponseEvents(exchanges[0]))).toBe(false);
   });
 
-  it('steps + 2 text blocks → the earlier chunk is hidden by default', () => {
+  it('steps + 2 text blocks → the earlier chunk is what the collapse drops', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [

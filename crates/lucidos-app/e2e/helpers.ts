@@ -199,24 +199,30 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
   return response;
 }
 
-/** Turn the step log on, which is the door to everything a step row carries
- *  (the context counter, the detail modal). Inline steps are hidden by default
- *  (`stepsExpanded`, persisted in localStorage), so a spec that wants a step
- *  row must open them first.
+/** Leave the step log ON, which is the door to everything a step row carries
+ *  (the context counter, the detail modal).
  *
- *  Targets the toggle in its OFF state, so the click can only ever turn steps
- *  on. The control is an icon in the response header (`turnControls`) with no
- *  text to match on, and `aria-pressed` is the state the icon draws.
+ *  Steps SHOW by default (`stepsExpanded`, persisted in localStorage), so on a
+ *  fresh context this is a no-op and the click is the exception rather than the
+ *  point: it exists so a spec still gets its step rows from a context that
+ *  carries the off state, and so a spec reads as declaring what it needs. That
+ *  is why it asks for the control in any state and clicks conditionally. An
+ *  unconditional click would TURN STEPS OFF on the ordinary run, and a locator
+ *  pinned to `aria-pressed="false"` would simply time out there.
+ *
+ *  The control is an icon in the response header (`turnControls`) with no text
+ *  to match on, and `aria-pressed` is the state the icon draws.
  *
  *  It does NOT wait for a step to exist: every response turn carries the
- *  control now, whatever it holds. Keep asserting on the step row itself
+ *  control, whatever it holds. Keep asserting on the step row itself
  *  afterwards, which is what actually waits for the work to land. */
 export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
   const toggle = page
-    .locator('.response-controls [data-role="toggle-steps"][aria-pressed="false"]:visible')
+    .locator('.response-controls [data-role="toggle-steps"]:visible')
     .first();
   await expect(toggle).toBeVisible({ timeout });
-  await toggle.click();
+  if (await toggle.getAttribute('aria-pressed') === 'false') await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 }
 
 /** Wait for at least one physically visible element matching a selector (dual-layout safe). */

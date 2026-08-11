@@ -14,6 +14,50 @@
     align-self: flex-end;
 }
 
+/* Gated on the ROW's own width, not the viewport's. The two differ constantly on
+   a desktop: the row is only as wide as the content pane the split divider was
+   dropped at, and that width is the whole question here. Named, so the query
+   cannot silently resolve to some outer container (`.repo-preview-split` and
+   `step-row` are the others in this app) and match never or always. Safe to
+   contain: a row's width comes from `.trigger-group-section`, a stretching flex
+   column, never from its contents. */
+.trigger-row {
+    container-type: inline-size;
+    container-name: trigger-row;
+}
+
+/* A trigger row carries three actions (Delete, Pause, Run once) against an info
+   column that is already several lines tall: title, chips, cron description and
+   expression, next runs, last run. Side by side those buttons claim the width of
+   all three labels at once, and once the row is narrow the column pays for it in
+   wraps, the title breaking after two words and the cron expression breaking
+   mid-expression. Stack them at that point and the cost is nothing: the stack is
+   no taller than the lines already beside it, a third of the width, and the
+   buttons come out one width (a column flex container stretches them to the
+   widest label), so the group reads as one block.
+
+   The gate measures the row's CONTENT box, so the 1rem gutters on each side are
+   already out of it. Three buttons abreast come to 12.8rem plus a 0.75rem gap,
+   which at 28rem leaves the info column ~14.5rem: enough for the chips line and
+   for a title of around 27 characters to stay whole (a 20-character one wraps at
+   10.5rem, measured at both 100% and 125% scale). Below that the column starts
+   breaking the title after two words. In rem, so the gate tracks the user's UI
+   scale (the root font-size IS that scale) rather than pinning to a width
+   measured at 100%. Every row in a list has the same width, so they all turn
+   together and the list stays uniform.
+
+   Desktop only: below the mobile breakpoint `.list-row` is itself a column
+   (mobile.css), so the actions already have a full-width line of their own under
+   the info and a stack there would just spend three rows of a phone screen on
+   what fits in one. */
+@media (min-width: 769px) {
+    @container trigger-row (max-width: 28rem) {
+        .trigger-row .list-row-actions {
+            flex-direction: column;
+        }
+    }
+}
+
 /* Change rows carry up to four actions (Thread, Diff, Discard, Apply) — too
  * wide to sit beside the description without squeezing it into a narrow,
  * heavily-wrapped column. Stack like apps/triggers do on mobile: the
@@ -131,12 +175,15 @@
     gap: 0.375rem;
 }
 
+/* Built on `.label`, like the type chip beside it, rather than re-cutting the
+   same box: the chip sits inside `.list-row-info`, which sets
+   `word-break: break-word` for long names, and every descendant inherits it, so
+   a chip that draws its own box without `.label`'s `white-space: nowrap` breaks
+   between the two letters of OK the moment the column is squeezed. Only the
+   size and weight differ from the base chip. */
 .trigger-run-status {
     font-size: var(--font-size-2xs);
     font-weight: 600;
-    text-transform: uppercase;
-    padding: 0.0625rem 0.3125rem;
-    border-radius: 0.1875rem;
 }
 
 .trigger-run-status-ok {
@@ -174,7 +221,14 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
-    padding: 0.375rem 0.5rem;
+    /* Right padding matches `.pane-header`'s `--header-padding-x` (which is
+       scoped to that subtree, so this mirrors the value the way
+       `.mobile-thread-title-row` does), and the actions are as wide as the
+       title bar's icons, so both centre their glyph 1.5rem off the edge: on a
+       phone these sit directly under the thread title bar's pin and overflow,
+       and the old 0.5rem around a narrower button put them 0.3125rem further
+       out than the column they hang from. */
+    padding: 0.375rem 0.625rem 0.375rem 0.5rem;
     margin-top: 0.5rem;
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
@@ -225,12 +279,31 @@
     flex-shrink: 0;
 }
 
+/* Holds the name and the rename field in one box so the field can sit exactly
+   over the name while idle. It only grows while renaming: at rest the name
+   sizes the slot, which is what keeps the member count right beside it instead
+   of pushed to the far end of the heading. */
+.trigger-group-name-slot {
+    position: relative;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.trigger-group-renaming .trigger-group-name-slot {
+    flex: 1;
+}
+
 .trigger-group-name {
     font-weight: 600;
     color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.trigger-group-renaming .trigger-group-name {
+    display: none;
 }
 
 .trigger-group-name-input {
@@ -252,6 +325,32 @@
     flex: 1;
 }
 
+/* The idle rename field: laid over the name at the name's own size, invisible
+   and taking no pointer, so the heading looks and behaves exactly as it did and
+   the tap still reaches the collapse toggle underneath. It is here rather than
+   unmounted so the rename button can focus it inside the tap, which is the only
+   way iOS raises the keyboard (see TriggerGroupHeader). Deliberately NOT sized
+   to nothing: iOS scrolls the focused element into view, and it should be the
+   box the field is about to occupy. */
+.trigger-group-header:not(.trigger-group-renaming) .trigger-group-name-input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* The idle create field, same bargain a row down: clipped to nothing so the
+   panel looks unchanged, while the input inside keeps a real box to focus. */
+.trigger-group-create-idle {
+    height: 0;
+    margin-top: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+}
+
 .trigger-group-count {
     color: var(--text-muted);
     font-size: var(--font-size-sm);
@@ -262,6 +361,34 @@
     display: flex;
     gap: 0.25rem;
     flex-shrink: 0;
+}
+
+/* Rename and delete are .icon-btn, not filled .action-btn pills: every section
+   heading carries both, so five groups put ten coloured blocks down the panel,
+   louder than the group names they belong to. They keep .icon-btn's own muted
+   foreground, already quieter than the name beside them, so only the delete
+   needs rules of its own. Its .trigger-group-rename twin carries no style and
+   is the pair's stable hook for e2e/trigger-groups.spec.ts. */
+
+/* Destructive on hover only, matching the queued-message trash: the glyph
+   already says delete, and a permanently red icon on every heading would put
+   the alarm back that the pills were removed for. */
+@media (hover: hover) {
+    .trigger-group-delete:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    }
+}
+
+/* A group with members refuses deletion, and .icon-btn:disabled fades to 0.25,
+   which is a fine amount to take off a filled block and too much to take off a
+   2px stroke: the glyph all but vanished, so a group that CAN be deleted once
+   emptied read as one with no delete action at all. The pill it replaced said
+   that at 0.4, and the picker's disabled icons sit in the same band. The
+   tooltip naming what to do instead is out of reach either way, since a
+   disabled button dispatches no mouse events. */
+.trigger-group-delete:disabled {
+    opacity: 0.5;
 }
 
 .trigger-add-row {
@@ -277,7 +404,11 @@
 .trigger-group-create-row {
     display: flex;
     margin-top: 0.5rem;
-    padding: 0.375rem 0.5rem;
+    /* The same band box as `.trigger-group-header` above, down to the derived
+       right padding: this is that heading with a name field in it and nothing
+       yet to head, and the two stack in one panel on one background, so an
+       edge that differs between them reads as a box that moved. */
+    padding: 0.375rem 0.625rem 0.375rem 0.5rem;
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
 }

@@ -14,6 +14,7 @@ import {
   setFollowLiveEdge,
   scrollToEventAndPulse,
   setActiveScrollElement,
+  setThreadLive,
   stopFollowingBottom,
 } from '../components/chat/scrollState';
 import { _resetPageVisitForTesting } from '../utils/pageVisit';
@@ -31,6 +32,12 @@ import { installFakePage } from '../utils/__tests__/fakePage';
  *  preference. Pressing it off is therefore the honest reset, and it retires the
  *  follow on the way. */
 afterEach(() => setFollowLiveEdge(false));
+
+/** And un-say "the agent is running". `setThreadLive` is a module-global that
+ *  `ChatExchange` normally owns, so a test that sets it true leaks a live thread
+ *  into every later one, where the follow would then carry a reader the test
+ *  never meant to arm. */
+afterEach(() => setThreadLive(false));
 
 describe('isFullyRestorable', () => {
   it('true when scrollable range covers the saved offset', () => {
@@ -904,11 +911,11 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('records a landing that moved nobody as the OFFSET, because the link ended the ride', async () => {
+    it('records a landing that moved nobody as the OFFSET on a LIVE thread, because the link ended the ride', async () => {
       // A position is an offset OR the live edge, and the recorder has to answer
-      // the same way the scroll listener would. For a deep-link landing it
-      // always answers with the offset, and by construction rather than by
-      // luck: going to a link retires the standing follow, because the reader
+      // the same way the scroll listener would. On a LIVE thread a deep-link
+      // landing always answers with the offset, and by construction rather than
+      // by luck: going to a link retires the standing follow, because the reader
       // asked to be at ONE place and the transcript must stop moving under them
       // there. So coming back returns them to the event they went to, rather
       // than to a live edge they stopped riding when they followed the link.
@@ -918,6 +925,9 @@ describe('attachScrollMemory teardown', () => {
       // a landing with nowhere to move, is exactly the state where the container
       // has not left the follow's stamp. A same-thread deep-link is the way in,
       // since `focusThread` retires the follow only for a DIFFERENT thread.
+      //
+      // LIVE is now half the premise rather than scenery, so it is said out
+      // loud. The idle case is the test below, and it answers the other way.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
@@ -930,6 +940,7 @@ describe('attachScrollMemory teardown', () => {
           followsLiveEdge: true,
         });
         setFollowLiveEdge(true); // the reader armed the follow here
+        setThreadLive(true);     // and the agent is working
         expect(isFollowScroll(el)).toBe(true);
 
         try {
@@ -942,6 +953,42 @@ describe('attachScrollMemory teardown', () => {
           expect(isFollowScroll(el)).toBe(false);
           expect(localStorage.getItem('k')).toBe(String(el.scrollTop));
           expect(localStorage.getItem('k')).not.toBe(LIVE_EDGE_VALUE);
+        } finally {
+          detach();
+          stopFollowingBottom();
+          restoreDom();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps the LIVE EDGE for the same landing on an IDLE thread', async () => {
+      // The mirror of the test above, and the reason the recorder asks the
+      // POSITION rather than "did a link land". On an idle thread the landing
+      // retires nothing (following a link into a finished thread is browsing),
+      // and this link lands the reader exactly where the follow already had
+      // them. So they have not moved, they are still riding, and the live edge
+      // is the honest record: re-entering the thread resumes the ride rather
+      // than pinning them to a bottom that will have moved on by then.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 5000); // already AT the bottom, as above
+        const restoreDom = withFindableTarget(el);
+        captureObservers();
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+        setFollowLiveEdge(true); // armed, and `setThreadLive` deliberately unset
+
+        try {
+          scrollToEventAndPulse('e1');
+          await vi.advanceTimersByTimeAsync(200);
+          expect(isFollowScroll(el)).toBe(true);
+          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
           stopFollowingBottom();

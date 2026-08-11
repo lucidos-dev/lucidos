@@ -110,10 +110,27 @@
    root. A rem here would stop tracking the moment that font-size changed. A
    glyph wider than its box is not clipped, it just reaches into the gap after
    it, which is why this is a plain `width` rather than a `min-width` that would
-   let the description move. */
+   let the description move.
+
+   Three quarters of an em, down from the full one it was: the slot was wider
+   than the marks standing in it. `--font-ui` is a monospace stack, whose
+   advance is well under an em, so the leftover inside the box sat between the
+   mark and the text it belongs to and read as part of the gap after the slot.
+   The visible distance from a check to its description was the slack plus the
+   0.375rem `.step-main` gap, not the gap, and the mark read as adrift from its
+   own row rather than attached to it. Only the icon's side of the row moves:
+   the gap itself is shared with the description-to-detail break, which was
+   never the loose one.
+
+   Nothing here assumes every mark fits. Where the face lacks one (the warning
+   sign and the slashed circle are the likely two) the browser substitutes per
+   glyph, and a substitute wider than the slot reaches into the gap instead of
+   pushing the text, exactly the tolerance the paragraph above relies on. What
+   the fixed width buys is that every row starts its text on ONE column, and
+   the number does not change that. */
 .inline-step .step-icon {
     flex-shrink: 0;
-    width: 1em;
+    width: 0.75em;
 }
 
 .inline-step.success .step-icon {

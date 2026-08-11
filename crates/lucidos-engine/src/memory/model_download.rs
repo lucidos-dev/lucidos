@@ -15,18 +15,20 @@
 //!   `.fastembed_cache`, `HF_ENDPOINT` overrides the hub, and the repo id is
 //!   `ModelInfo::model_code`. Drift there means the model downloads TWICE. It is
 //!   also why `hf-hub` is a direct dependency pinned to the version fastembed
-//!   resolves (see this crate's `Cargo.toml`).
+//!   resolves (see this crate's `Cargo.toml`). It is also why the shared default
+//!   ([`apply_default_cache_dir`]) is applied by SETTING the environment
+//!   variable rather than by giving [`cache_dir`] another fallback.
 //! * **Local first.** Every required file is probed in the cache before any API
 //!   object is built, through the same `Cache::repo().get()` lookup
 //!   `ApiRepo::get` performs, so a warm cache makes ZERO network requests and an
 //!   offline machine still brings memory online.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fastembed::TextEmbedding;
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::api::sync::{ApiBuilder, ApiError};
 use hf_hub::api::Progress;
 use hf_hub::Cache;
 
@@ -36,6 +38,11 @@ const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 
 /// fastembed's default hub endpoint when `HF_ENDPOINT` is unset.
 const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
+
+/// Sub-path under the per-user cache root holding the shared model cache. The
+/// same path `scripts/e2e-embedder.sh` and `scripts/e2e-packaged.sh` already
+/// seed, so an e2e run and the dev workspaces warm one copy between them.
+const SHARED_CACHE_SUBPATH: &str = "lucidos/fastembed";
 
 /// The tokenizer/config files `fastembed::common::load_tokenizer_hf_hub` reads
 /// on top of the model's own `model_file` + `additional_files`. Listed here
@@ -61,6 +68,27 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(250);
 pub struct DownloadFrame {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// How a cache-warming pass ended.
+///
+/// [`PeerDownloading`](Self::PeerDownloading) is why this is an enum rather than
+/// the "did anything get fetched" boolean it started as: with one cache shared
+/// by every workspace on the machine, "another engine is already fetching this"
+/// is a normal state of the world, and the caller has to tell it apart from a
+/// failure so it neither backs off as if the network were down nor tells the
+/// user memory is degraded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// Every required file was already local. Nothing was fetched and the
+    /// network was never touched.
+    AlreadyCached,
+    /// Files were fetched and the cache is now complete.
+    Downloaded,
+    /// Another process holds `hf-hub`'s download lock on a file this pass still
+    /// needs, so the cache is NOT complete yet. Wait briefly and look again: the
+    /// files land as soon as the peer finishes.
+    PeerDownloading,
 }
 
 /// Sink for [`ensure_model_cached`]'s progress. Implemented by the engine's
@@ -190,7 +218,7 @@ impl Progress for ProgressHandle<'_> {
 /// Cache directory fastembed will look in, resolved exactly as `pull_from_hf`
 /// does: `HF_HOME` wins over `FASTEMBED_CACHE_DIR`, which wins over the
 /// CWD-relative default.
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HF_HOME") {
         if !home.is_empty() {
             return PathBuf::from(home);
@@ -201,6 +229,109 @@ fn cache_dir() -> PathBuf {
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_DIR))
+}
+
+/// The shared per-user cache location, given the two environment values that
+/// decide it. Pure so both branches are testable without touching process env.
+///
+/// `None` when neither is usable (no `HOME` under a bare service manager), which
+/// leaves the CWD-relative default in place rather than inventing a path.
+fn shared_cache_dir_from(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let root = match xdg_cache_home.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => Path::new(home.filter(|h| !h.is_empty())?).join(".cache"),
+    };
+    Some(root.join(SHARED_CACHE_SUBPATH))
+}
+
+/// Point this process's model cache at the shared per-user directory, unless
+/// something already chose one.
+///
+/// The model is hundreds of MB and byte-identical for every workspace on the
+/// machine, so it is cached per USER, not per workspace: one copy serves every
+/// engine (see the ADR on the shared embedding-model cache).
+///
+/// Two properties matter:
+///
+/// * **Inheritance wins.** An explicit `HF_HOME` or `FASTEMBED_CACHE_DIR` is
+///   never overwritten, which is what keeps a packaged install under its
+///   app-data directory, a headless service under its data directory, and a
+///   user's own Hugging Face cache theirs.
+/// * **It sets the variable.** Giving [`cache_dir`] another fallback would not
+///   do: `fastembed` reads `FASTEMBED_CACHE_DIR` itself inside
+///   `InitOptions::new`, so a default only this module knew about would leave
+///   the two halves reading different directories and the model would download
+///   twice.
+///
+/// Called once, early in `main`, and deliberately BEFORE
+/// `environment_variables::apply_to_process_env`, so a value the user stored in
+/// Settings still wins. Best effort throughout: it never fails boot.
+///
+/// `workspace` is the LAST resort, used only when there is no per-user cache
+/// root to share (no `HOME`, no `XDG_CACHE_HOME`) or it cannot be created. It
+/// resolves to the pre-ADR-0061 per-workspace location, which is deliberate on
+/// two counts: it sits inside the workspace's gitignored `.lucidos/`, where
+/// fastembed's own CWD-relative `.fastembed_cache` default would NOT (a
+/// workspace ignores `.lucidos/`, so the default would leave a
+/// multi-hundred-MB directory showing up as untracked in the user's own repo);
+/// and [`legacy_cache`](super::legacy_cache) already reads "the active cache IS
+/// the legacy path" as live data, so nothing tries to migrate or reclaim it.
+pub fn apply_default_cache_dir(workspace: &Path) {
+    for already_chosen in ["HF_HOME", "FASTEMBED_CACHE_DIR"] {
+        if std::env::var(already_chosen)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            return;
+        }
+    }
+    let shared = shared_cache_dir_from(
+        std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    );
+    match &shared {
+        Some(dir) => match std::fs::create_dir_all(dir) {
+            Ok(()) => {
+                std::env::set_var("FASTEMBED_CACHE_DIR", dir);
+                log!(
+                    @Memory,
+                    "Embedding-model cache: {} (shared by every workspace on this machine)",
+                    dir.display()
+                );
+                return;
+            }
+            Err(e) => log!(
+                @Memory,
+                "Could not create the shared embedding-model cache at {}: {}",
+                dir.display(),
+                e
+            ),
+        },
+        None => log!(
+            @Memory,
+            "Neither HOME nor XDG_CACHE_HOME is set, so there is no per-user cache to share"
+        ),
+    }
+
+    let own = super::legacy_cache::legacy_cache_path(workspace);
+    if let Err(e) = std::fs::create_dir_all(&own) {
+        log!(
+            @Memory,
+            "Could not create this workspace's embedding-model cache at {}: {}. Leaving it to \
+             fastembed's own default, '{}' relative to the working directory",
+            own.display(),
+            e,
+            DEFAULT_CACHE_DIR
+        );
+        return;
+    }
+    std::env::set_var("FASTEMBED_CACHE_DIR", &own);
+    log!(
+        @Memory,
+        "Embedding-model cache: {} (this workspace only, since there is no shared location to use)",
+        own.display()
+    );
 }
 
 /// Hub endpoint, mirroring fastembed's `HF_ENDPOINT` override.
@@ -222,9 +353,64 @@ fn required_files(model_file: &str, additional_files: &[String]) -> Vec<String> 
     files
 }
 
+/// What one file's `hf-hub` result means for the pass.
+///
+/// The split that matters is lock contention versus everything else.
+/// `download_with_progress` takes an exclusive lock on the blob for the WHOLE
+/// download and a waiter gives up after five one-second tries
+/// (`hf_hub::api::sync::lock_file`), which is nothing against a
+/// multi-hundred-MB file. So on a shared cache a parallel cold start has exactly
+/// one winner, and every other engine lands here within seconds. Treating that
+/// as a fetch failure would back each loser off for minutes and tell its user
+/// memory was degraded, for a download that is proceeding normally one process
+/// over.
+///
+/// Anything else keeps the treatment it had: wrapped so it stays fetch-class
+/// (see the two notes below) and therefore retried with backoff.
+///
+/// Pure, and takes the result rather than performing it, so both branches are
+/// testable without a hub.
+fn classify_download(
+    model_id: &str,
+    file: &str,
+    result: Result<PathBuf, ApiError>,
+) -> Result<CacheOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    match result {
+        Ok(_) => Ok(CacheOutcome::Downloaded),
+        Err(ApiError::LockAcquisition(lock)) => {
+            log!(
+                @Memory,
+                "Another process is already fetching '{}' into the shared model cache (lock: {}); \
+                 waiting for it rather than fetching a second copy",
+                file,
+                lock.display()
+            );
+            Ok(CacheOutcome::PeerDownloading)
+        }
+        // Two things this wrapper has to keep doing, both inherited from the
+        // path fastembed used to own:
+        //
+        // 1. "failed to retrieve" is one of the markers
+        //    `is_model_fetch_failure` keys on, and it is the phrase fastembed
+        //    wrapped its own fetch errors with. Anything that goes wrong while
+        //    pulling bytes therefore stays fetch-class and keeps its
+        //    backoff-and-retry. Corruption is still caught later, by
+        //    `with_model`, and classified on its own text.
+        // 2. `init_error_message` adds the actionable half (the cache dir, the
+        //    CA bundle, pre-seeding), which is written for precisely this
+        //    cold-cache case and would otherwise have been lost when the
+        //    download moved out of `with_model`.
+        Err(e) => Err(super::fastembed::init_error_message(
+            model_id,
+            format!("failed to retrieve embedding-model file '{file}': {e}"),
+        )),
+    }
+}
+
 /// Make sure every file the model needs is in fastembed's cache, reporting byte
-/// progress as it goes. Returns whether anything was actually fetched, so a warm
-/// boot can stay silent.
+/// progress as it goes. The [`CacheOutcome`] says whether anything was fetched
+/// (so a warm boot can stay silent) and whether the cache is actually complete
+/// (it is not, if a peer holds the lock).
 ///
 /// Blocking: call from `spawn_blocking`. Only the *download* happens here; the
 /// ONNX session is still built by `FastEmbedProvider::with_model`, which then
@@ -232,7 +418,7 @@ fn required_files(model_file: &str, additional_files: &[String]) -> Vec<String> 
 pub fn ensure_model_cached(
     model_id: &str,
     observer: &dyn ModelDownloadObserver,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<CacheOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let (model, _dimensions) = super::fastembed::resolve_model(model_id)?;
     let info = TextEmbedding::get_model_info(&model)?;
     let files = required_files(&info.model_file, &info.additional_files);
@@ -247,7 +433,7 @@ pub fn ensure_model_cached(
         .filter(|f| cache_repo.get(f).is_none())
         .collect();
     if missing.is_empty() {
-        return Ok(false);
+        return Ok(CacheOutcome::AlreadyCached);
     }
 
     log!(
@@ -269,43 +455,34 @@ pub fn ensure_model_cached(
 
     let state = RefCell::new(DownloadState::default());
     for file in missing {
-        repo.download_with_progress(
+        let fetched = repo.download_with_progress(
             file,
             ProgressHandle {
                 state: &state,
                 observer,
             },
-        )
-        // Two things this wrapper has to keep doing, both inherited from the
-        // path fastembed used to own:
-        //
-        // 1. "failed to retrieve" is one of the markers
-        //    `is_model_fetch_failure` keys on, and it is the phrase fastembed
-        //    wrapped its own fetch errors with. Anything that goes wrong while
-        //    pulling bytes therefore stays fetch-class and keeps its
-        //    backoff-and-retry. Corruption is still caught later, by
-        //    `with_model`, and classified on its own text.
-        // 2. `init_error_message` adds the actionable half (the cache dir, the
-        //    CA bundle, pre-seeding), which is written for precisely this
-        //    cold-cache case and would otherwise have been lost when the
-        //    download moved out of `with_model`.
-        .map_err(|e| {
-            super::fastembed::init_error_message(
-                model_id,
-                format!("failed to retrieve embedding-model file '{file}': {e}"),
-            )
-        })?;
+        );
+        // The peer case leaves WITHOUT a terminal frame, deliberately: this pass
+        // did not complete the set, and reporting 100% for a cache that is still
+        // missing files would be a lie the next pass has to walk back.
+        if classify_download(model_id, file, fetched)? == CacheOutcome::PeerDownloading {
+            return Ok(CacheOutcome::PeerDownloading);
+        }
     }
     state
         .borrow_mut()
         .maybe_emit(observer, Instant::now(), true);
-    Ok(true)
+    Ok(CacheOutcome::Downloaded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Any known model id: these tests exercise the classification, never the
+    /// model, so which one it is does not matter as long as it resolves.
+    const DEFAULT_MODEL_FOR_TESTS: &str = super::super::fastembed::DEFAULT_MODEL;
 
     fn frame(downloaded: u64, total: u64) -> DownloadFrame {
         DownloadFrame {
@@ -583,6 +760,166 @@ mod tests {
         drop(restore);
     }
 
+    /// The whole point of [`CacheOutcome::PeerDownloading`]: a lock held by
+    /// another engine is a normal state of a shared cache, so it must NOT
+    /// surface as an error. If it did, the loser of a parallel cold start would
+    /// back off for minutes and tell its user memory was degraded, for a
+    /// download that is proceeding fine one process over.
+    #[test]
+    fn a_lock_held_by_a_peer_is_an_outcome_and_not_a_failure() {
+        let locked = classify_download(
+            DEFAULT_MODEL_FOR_TESTS,
+            "onnx/model.onnx",
+            Err(ApiError::LockAcquisition(PathBuf::from(
+                "/cache/blobs/abc.lock",
+            ))),
+        )
+        .expect("a peer's lock is not an error");
+        assert_eq!(locked, CacheOutcome::PeerDownloading);
+    }
+
+    /// Everything else keeps the treatment it had: fetch-class, so the loader
+    /// retries with backoff rather than giving up.
+    #[test]
+    fn any_other_hub_failure_stays_a_fetch_class_error() {
+        let err = classify_download(
+            DEFAULT_MODEL_FOR_TESTS,
+            "onnx/model.onnx",
+            Err(ApiError::InvalidResume),
+        )
+        .expect_err("a real fetch failure must stay an error");
+        assert!(
+            super::super::fastembed::is_model_fetch_failure(err.as_ref()),
+            "must classify as fetch so the loader keeps retrying: {err}"
+        );
+        assert!(
+            err.to_string().contains("onnx/model.onnx"),
+            "the message must name the file: {err}"
+        );
+    }
+
+    #[test]
+    fn a_completed_file_reports_as_downloaded() {
+        assert_eq!(
+            classify_download(
+                DEFAULT_MODEL_FOR_TESTS,
+                "tokenizer.json",
+                Ok(PathBuf::from("/cache/snapshots/deadbeef/tokenizer.json"))
+            )
+            .expect("a completed download is not an error"),
+            CacheOutcome::Downloaded
+        );
+    }
+
+    /// The shared location: an explicit `XDG_CACHE_HOME` wins, else
+    /// `$HOME/.cache`, and the sub-path is the one the e2e scripts already seed.
+    #[test]
+    fn shared_cache_dir_prefers_xdg_cache_home_over_home() {
+        assert_eq!(
+            shared_cache_dir_from(Some("/tmp/xdg"), Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/xdg/lucidos/fastembed"))
+        );
+        assert_eq!(
+            shared_cache_dir_from(None, Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/home/.cache/lucidos/fastembed"))
+        );
+        // Empty reads as unset, matching how `cache_dir` treats its own vars.
+        assert_eq!(
+            shared_cache_dir_from(Some(""), Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/home/.cache/lucidos/fastembed"))
+        );
+    }
+
+    /// With neither variable there is no per-user root to share, so the caller
+    /// keeps the CWD-relative default instead of inventing a path.
+    #[test]
+    fn shared_cache_dir_is_unresolvable_without_a_root() {
+        assert_eq!(shared_cache_dir_from(None, None), None);
+        assert_eq!(shared_cache_dir_from(Some(""), Some("")), None);
+    }
+
+    /// The whole point of the default is that it yields to an explicit choice:
+    /// this is what keeps a packaged install under app-data, a headless service
+    /// under its data dir, and a user's own `HF_HOME` theirs.
+    #[test]
+    fn the_default_never_overwrites_an_explicit_choice() {
+        let _guard = env_lock();
+        let restore = EnvRestore::capture(&["HF_HOME", "FASTEMBED_CACHE_DIR", "XDG_CACHE_HOME"]);
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/should-not-be-used");
+        std::env::remove_var("HF_HOME");
+        std::env::set_var("FASTEMBED_CACHE_DIR", "/tmp/chosen-by-the-service");
+        apply_default_cache_dir(workspace.path());
+        assert_eq!(cache_dir(), PathBuf::from("/tmp/chosen-by-the-service"));
+
+        // `HF_HOME` alone is equally a choice, and outranks the variable this
+        // would otherwise set, so setting one would only confuse a later reader.
+        std::env::remove_var("FASTEMBED_CACHE_DIR");
+        std::env::set_var("HF_HOME", "/tmp/the-users-own-hub-cache");
+        apply_default_cache_dir(workspace.path());
+        assert_eq!(std::env::var("FASTEMBED_CACHE_DIR").ok(), None);
+
+        drop(restore);
+    }
+
+    /// With no per-user cache root at all, the last resort is the workspace's
+    /// own gitignored `.lucidos/`, NOT fastembed's CWD-relative default: the
+    /// engine's working directory IS the workspace, and a workspace ignores
+    /// `.lucidos/` but not `.fastembed_cache/`, so the default would leave a
+    /// multi-hundred-MB directory sitting untracked in the user's own repo.
+    #[test]
+    fn without_a_per_user_root_the_cache_lands_inside_the_workspace() {
+        let _guard = env_lock();
+        // HOME is captured too: this is the one test that unsets it, and every
+        // later test (and the real loader) would follow it into the wrong home.
+        let restore =
+            EnvRestore::capture(&["HF_HOME", "FASTEMBED_CACHE_DIR", "XDG_CACHE_HOME", "HOME"]);
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("FASTEMBED_CACHE_DIR");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+
+        apply_default_cache_dir(workspace.path());
+
+        let expected = workspace.path().join(".lucidos/fastembed");
+        assert_eq!(cache_dir(), expected);
+        assert!(expected.is_dir());
+
+        drop(restore);
+    }
+
+    /// With nothing chosen, the shared per-user directory is created and
+    /// EXPORTED, which is what makes `fastembed`'s own `get_cache_dir()` agree
+    /// with this module's [`cache_dir`]. A default only `cache_dir` knew about
+    /// would split the two and download the model twice.
+    #[test]
+    fn the_default_exports_the_shared_dir_so_fastembed_agrees() {
+        let _guard = env_lock();
+        let restore = EnvRestore::capture(&["HF_HOME", "FASTEMBED_CACHE_DIR", "XDG_CACHE_HOME"]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = tempfile::tempdir().expect("tempdir");
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("FASTEMBED_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", root.path());
+
+        apply_default_cache_dir(workspace.path());
+
+        let expected = root.path().join("lucidos/fastembed");
+        assert_eq!(
+            std::env::var("FASTEMBED_CACHE_DIR").ok().map(PathBuf::from),
+            Some(expected.clone()),
+            "the variable fastembed itself reads must carry the shared path"
+        );
+        assert_eq!(cache_dir(), expected);
+        assert!(expected.is_dir(), "the shared cache directory must exist");
+
+        drop(restore);
+    }
+
     #[test]
     fn endpoint_mirrors_the_hf_endpoint_override() {
         let _guard = env_lock();
@@ -625,27 +962,6 @@ mod tests {
         }
     }
 
-    /// Total bytes under `dir`, counting symlinks as themselves so hf-hub's
-    /// `snapshots/<commit>/<file>` pointers are not summed on top of the
-    /// `blobs/<etag>` files they target.
-    #[cfg(feature = "real-embedder-tests")]
-    fn cache_tree_bytes(dir: &std::path::Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|entry| {
-                let path = entry.path();
-                match std::fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.is_dir() => cache_tree_bytes(&path),
-                    Ok(meta) => meta.len(),
-                    Err(_) => 0,
-                }
-            })
-            .sum()
-    }
-
     /// The cache-layout invariant: what [`ensure_model_cached`] writes must be
     /// exactly what `FastEmbedProvider` then reads, or the model is fetched
     /// twice (once by us, once by fastembed) and a first run takes double the
@@ -666,8 +982,8 @@ mod tests {
 
         let model_id = model_id_from_env();
         let observer = RecordingObserver::default();
-        let downloaded = match ensure_model_cached(&model_id, &observer) {
-            Ok(downloaded) => downloaded,
+        let outcome = match ensure_model_cached(&model_id, &observer) {
+            Ok(outcome) => outcome,
             // Same resilience contract as `shared_embedder()`: a HuggingFace
             // outage skips, it never reds the suite. A non-fetch error is a
             // real bug and still panics.
@@ -682,32 +998,44 @@ mod tests {
         };
 
         let frames = observer.frames();
-        if downloaded {
-            let last = *frames
-                .last()
-                .expect("a real download must report at least one frame");
-            assert_eq!(
-                last.downloaded_bytes, last.total_bytes,
-                "the terminal frame must report the set as complete: {last:?}"
-            );
-            assert!(
-                last.total_bytes > 100_000_000,
-                "the ONNX model alone is hundreds of MB; got {} bytes",
-                last.total_bytes
-            );
-        } else {
-            assert!(
-                frames.is_empty(),
-                "a warm cache must report nothing (and must not touch the network): {frames:?}"
-            );
+        match outcome {
+            CacheOutcome::Downloaded => {
+                let last = *frames
+                    .last()
+                    .expect("a real download must report at least one frame");
+                assert_eq!(
+                    last.downloaded_bytes, last.total_bytes,
+                    "the terminal frame must report the set as complete: {last:?}"
+                );
+                assert!(
+                    last.total_bytes > 100_000_000,
+                    "the ONNX model alone is hundreds of MB; got {} bytes",
+                    last.total_bytes
+                );
+            }
+            CacheOutcome::AlreadyCached => {
+                assert!(
+                    frames.is_empty(),
+                    "a warm cache must report nothing (and must not touch the network): {frames:?}"
+                );
+            }
+            // Only reachable when a real engine on this machine is fetching the
+            // same model right now. Nothing below can be asserted (the cache is
+            // still incomplete), and it is not a defect in either process.
+            CacheOutcome::PeerDownloading => {
+                eprintln!(
+                    "[real-embedder-tests] SKIP: another process holds the model-download lock"
+                );
+                return;
+            }
         }
 
         let dir = cache_dir();
-        let before = cache_tree_bytes(&dir);
+        let before = super::super::legacy_cache::dir_bytes(&dir);
         let provider =
             FastEmbedProvider::with_model(&model_id).expect("the cached model must load");
         assert_eq!(provider.model_id(), model_id);
-        let after = cache_tree_bytes(&dir);
+        let after = super::super::legacy_cache::dir_bytes(&dir);
         assert_eq!(
             before,
             after,
@@ -719,8 +1047,9 @@ mod tests {
 
         // ...and with everything present, a second pass is a pure no-op.
         let second = RecordingObserver::default();
-        assert!(
-            !ensure_model_cached(&model_id, &second).expect("warm pass must not fail"),
+        assert_eq!(
+            ensure_model_cached(&model_id, &second).expect("warm pass must not fail"),
+            CacheOutcome::AlreadyCached,
             "a warm cache must report nothing fetched"
         );
         assert!(second.frames().is_empty());

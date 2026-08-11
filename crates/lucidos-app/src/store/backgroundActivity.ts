@@ -29,7 +29,7 @@
 import { signal } from '@preact/signals';
 import type { EmbeddingModelStatus } from '../api/types';
 import type { TailscaleServeProgress } from '../utils/tauri';
-import type { PendingCommits } from '../api/client';
+import type { CommitGroupKind, PendingCommits } from '../api/client';
 import { formatBytes } from '../utils/formatBytes';
 import { formatElapsed } from '../utils/formatTime';
 
@@ -241,9 +241,30 @@ function buildElapsedDetail(
   return formatElapsed(detail.elapsedMs + Math.max(0, nowMs - detail.anchoredAt));
 }
 
-/** The commits this build will bring, as a toast section: a title line naming
- *  the count, then one `• ` bullet per subject (see `shared/toastMessage.ts` for
- *  the parse contract this writes to).
+/** What each commit group is called in the toast. The engine decides which
+ *  bucket a commit is in (it is the side parsing the log); the wording is the
+ *  frontend's, like every other string here.
+ *
+ *  `housekeeping` has no heading because it is never a section: it is one
+ *  counted line, worded at its callsite below. */
+const GROUP_LABEL: Record<Exclude<CommitGroupKind, 'housekeeping'>, string> = {
+  new: 'New',
+  fixed: 'Fixed',
+  improved: 'Improved',
+  other: 'Other',
+};
+
+/** The commits this build will bring, as toast sections: a title line naming
+ *  the count, then one titled section per group (see `shared/toastMessage.ts`
+ *  for the parse contract this writes to, and note that a blank line is what
+ *  starts a section).
+ *
+ *  It describes rather than recites. A flat list of subjects was what shipped
+ *  first, and on a range spanning several Applies it read as five consecutive
+ *  `Merge branch 'main' into …` lines: merges are dropped engine-side now, and
+ *  what is left is grouped so the reader learns what they are getting before
+ *  they read a single sentence. Housekeeping is counted on one line rather than
+ *  listed, because forty doc commits are not what "what is being built" means.
  *
  *  `undefined` in the two cases that must not become text. **Unknown** (`null`,
  *  git could not answer) would otherwise be reported as "0 commits", telling the
@@ -253,15 +274,35 @@ function buildElapsedDetail(
  *  information (it happens legitimately, e.g. a rebuild of a dirty tree whose
  *  commit has not moved). */
 function pendingCommitsNote(commits: PendingCommits | null): string | undefined {
-  if (!commits || commits.total === 0 || commits.subjects.length === 0) return undefined;
-  const title =
+  if (!commits || commits.total === 0 || commits.groups.length === 0) return undefined;
+  const sections: string[] = [
     commits.total === 1
       ? '1 commit since your running version'
-      : `${commits.total} commits since your running version`;
-  const lines = commits.subjects.map((s) => `• ${s}`);
-  const hidden = commits.total - commits.subjects.length;
-  if (hidden > 0) lines.push(`• and ${hidden} more`);
-  return [title, ...lines].join('\n');
+      : `${commits.total} commits since your running version`,
+  ];
+  for (const group of commits.groups) {
+    if (group.kind === 'housekeeping') {
+      // Title-less, so it reads as a footnote under the described work rather
+      // than as another category of it.
+      sections.push(`• ${housekeepingLine(group.total)}`);
+      continue;
+    }
+    const lines = group.descriptions.map((d) => `• ${d}`);
+    const hidden = group.total - group.descriptions.length;
+    if (hidden > 0) lines.push(`• and ${hidden} more`);
+    sections.push([GROUP_LABEL[group.kind], ...lines].join('\n'));
+  }
+  return sections.join('\n\n');
+}
+
+/** The one counted line for the commits the toast does not describe. Names what
+ *  is in the bucket rather than calling it "other", so the number reconciles
+ *  with the heading without pretending the work was hidden. The parenthetical
+ *  carries the contents in both forms, since "1 docs commit" does not read. */
+function housekeepingLine(total: number): string {
+  return total === 1
+    ? '1 housekeeping commit (docs, tests, chores)'
+    : `${total} housekeeping commits (docs, tests, chores)`;
 }
 
 /** "212 MB of 465 MB", or just the bytes so far when the total is not known

@@ -170,6 +170,15 @@ pub struct JudgedClassification {
     pub category: Option<SideEffectCategory>,
 }
 
+/// Shells whose `-c` payload [`unwrap_shell_command`] descends into.
+///
+/// Deliberately a SUBSET of `core::WRAPPER_SHELLS`, which the step-row labeller
+/// uses for the same shapes; that constant carries the reasoning. Read it before
+/// adding a shell here: the tail-discard in `tail_runs_more_commands` is only
+/// sound for a shell whose operands after the script set `$0`, and a label has no
+/// such requirement.
+pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "ash"];
+
 /// Unwrap a single shell `-c`-style wrapper so the inner script is what gets
 /// classified.
 ///
@@ -180,7 +189,7 @@ pub struct JudgedClassification {
 /// Returns the original command when it isn't a recognized shell wrapper (Claude
 /// Code's `Bash` passes the raw command, which falls through unchanged).
 pub(crate) fn unwrap_shell_command(command: &str) -> &str {
-    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
+    const SHELLS: &[&str] = &GUARD_SHELLS;
     let trimmed = command.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
         return command;

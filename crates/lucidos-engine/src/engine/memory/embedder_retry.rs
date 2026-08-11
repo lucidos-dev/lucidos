@@ -18,7 +18,10 @@ use std::sync::Arc;
 use crate::engine::event_bus::SystemEvent;
 use crate::engine::LucidosEngine;
 use crate::memory::fastembed::{is_model_fetch_failure, FastEmbedProvider};
-use crate::memory::model_download::{ensure_model_cached, DownloadFrame, ModelDownloadObserver};
+use crate::memory::legacy_cache::{reclaim_legacy_cache, seed_shared_cache_from_legacy};
+use crate::memory::model_download::{
+    cache_dir, ensure_model_cached, CacheOutcome, DownloadFrame, ModelDownloadObserver,
+};
 // Brings the `model_id()` trait method into scope so the loader can read the
 // slot's captured id (the slot also has a private `model_id` field).
 use crate::memory::provider::EmbeddingProvider;
@@ -35,6 +38,11 @@ const RETRY_DELAYS_SECS: &[u64] = &[30, 60, 120, 300, 600];
 /// blips that heal on an early retry.
 const NOTIFY_AFTER_ATTEMPTS: u32 = 3;
 
+/// How long to wait when another engine holds the model-download lock. Short,
+/// because this is a poll of the shared cache and not a retry of a failure: the
+/// files appear the moment the peer's download lands.
+const PEER_DOWNLOAD_POLL_SECS: u64 = 5;
+
 /// Sleep to apply BEFORE the next load attempt, given how many attempts have
 /// already completed. `None` for the first attempt (nothing done yet) so a warm
 /// cache comes online immediately; then [`RETRY_DELAYS_SECS`], clamped to its
@@ -50,6 +58,23 @@ fn delay_before_attempt(completed_attempts: u32) -> Option<std::time::Duration> 
         .copied()
         .unwrap_or(*RETRY_DELAYS_SECS.last().expect("non-empty schedule"));
     Some(std::time::Duration::from_secs(secs))
+}
+
+/// Sleep before the next pass of the load loop.
+///
+/// `peer_wait` means the previous pass stopped because another engine on this
+/// machine held the download lock for the SHARED model cache. That is not a
+/// failed attempt: nothing is wrong, the bytes are arriving in the very
+/// directory this engine reads, and the only sane thing to do is look again
+/// shortly. So it takes [`PEER_DOWNLOAD_POLL_SECS`] instead of the failure
+/// backoff, and the caller leaves `completed_attempts` alone, which is what
+/// keeps a parallel cold start from marching its losers to
+/// [`NOTIFY_AFTER_ATTEMPTS`] and announcing a degradation that is not happening.
+fn delay_before_pass(completed_attempts: u32, peer_wait: bool) -> Option<std::time::Duration> {
+    if peer_wait {
+        return Some(std::time::Duration::from_secs(PEER_DOWNLOAD_POLL_SECS));
+    }
+    delay_before_attempt(completed_attempts)
 }
 
 /// Broadcast the slot's CURRENT status to connected clients, without changing
@@ -151,7 +176,10 @@ impl LucidosEngine {
         // actually loaded. Resolving from the slot keeps the two in lockstep.
         let model_id = engine.embedder().model_id().to_string();
         tokio::spawn(async move {
-            let mut attempt: u32 = 0;
+            // Real attempts COMPLETED. A pass that only found a peer holding the
+            // download lock does not count as one: see `delay_before_pass`.
+            let mut attempts: u32 = 0;
+            let mut peer_wait = false;
             // Whether the user has been told memory is degraded/waiting. Gates
             // the "Memory is ready" notification so a healthy warm-cache boot
             // (which loads on the first attempt) stays silent — no per-boot
@@ -160,13 +188,14 @@ impl LucidosEngine {
             loop {
                 // Immediate first attempt; back off only AFTER a failure so a
                 // warm cache comes online within seconds.
-                if let Some(delay) = delay_before_attempt(attempt) {
+                if let Some(delay) = delay_before_pass(attempts, peer_wait) {
                     tokio::time::sleep(delay).await;
                 }
                 if engine.is_shutting_down() {
                     return;
                 }
-                attempt += 1;
+                peer_wait = false;
+                let attempt = attempts + 1;
                 // Each attempt starts by declaring itself, which is what takes
                 // the UI out of a previous attempt's `Waiting`.
                 publish(&engine, EmbeddingModelLoadState::Loading);
@@ -175,21 +204,56 @@ impl LucidosEngine {
                     engine: Arc::clone(&engine),
                 };
                 let load_engine = Arc::clone(&engine);
+                let workspace = engine.workspace_path().to_path_buf();
                 // Download and ONNX load share one blocking thread. Splitting
                 // the fetch out of `with_model` is what buys byte progress:
                 // fastembed offers no hook, so the files are pulled first (with
-                // one) and `with_model` then finds them local.
-                match tokio::task::spawn_blocking(move || {
-                    let downloaded = ensure_model_cached(&id, &reporter)?;
-                    if downloaded {
+                // one) and `with_model` then finds them local. The two
+                // legacy-cache steps are blocking filesystem work too, so they
+                // belong on this thread rather than the runtime's.
+                //
+                // `None` means a peer holds the lock: the cache is not complete,
+                // so there is nothing to load yet and `with_model` would only
+                // queue behind the same lock.
+                type LoadResult =
+                    Result<Option<FastEmbedProvider>, Box<dyn std::error::Error + Send + Sync>>;
+                match tokio::task::spawn_blocking(move || -> LoadResult {
+                    let active_cache = cache_dir();
+                    // Free upgrade: a workspace still carrying its own copy from
+                    // the per-workspace era donates it to the shared cache
+                    // instead of everyone re-downloading the same model.
+                    seed_shared_cache_from_legacy(&workspace, &active_cache);
+
+                    let outcome = ensure_model_cached(&id, &reporter)?;
+                    if outcome == CacheOutcome::PeerDownloading {
+                        return Ok(None);
+                    }
+                    if outcome == CacheOutcome::Downloaded {
                         // Bytes are in; the ONNX session build is what is left.
                         publish(&load_engine, EmbeddingModelLoadState::Loading);
                     }
-                    FastEmbedProvider::with_model(&id)
+                    let provider = FastEmbedProvider::with_model(&id)?;
+                    // A built provider is the proof that the active cache is
+                    // complete and usable, which is exactly what makes any
+                    // per-workspace copy safe to drop.
+                    reclaim_legacy_cache(&workspace, &active_cache);
+                    Ok(Some(provider))
                 })
                 .await
                 {
-                    Ok(Ok(provider)) => {
+                    Ok(Ok(None)) => {
+                        // Another engine on this machine is fetching into the
+                        // shared cache. Not a failure, so the attempt counter
+                        // and the degraded notification both stay put.
+                        peer_wait = true;
+                        log!(
+                            @Memory,
+                            "Another engine is downloading the embedding model into the shared \
+                             cache; checking again in {}s",
+                            PEER_DOWNLOAD_POLL_SECS
+                        );
+                    }
+                    Ok(Ok(Some(provider))) => {
                         // The model loads fine but may not FIT: an existing
                         // workspace's vector column keeps the width it was
                         // created with. Refuse before installing, or every
@@ -246,6 +310,7 @@ impl LucidosEngine {
                         return;
                     }
                     Ok(Err(e)) if is_model_fetch_failure(e.as_ref()) => {
+                        attempts = attempt;
                         log!(
                             "[Memory] Embedding model load attempt #{} failed (fetch): {} — retrying in the background",
                             attempt,
@@ -294,6 +359,7 @@ impl LucidosEngine {
                         return;
                     }
                     Err(join_err) => {
+                        attempts = attempt;
                         log!(
                             "[Memory] Embedding model load task panicked: {} — retrying",
                             join_err
@@ -359,5 +425,33 @@ mod tests {
             Some(Duration::from_secs(last)),
             "backoff clamps to the last entry, never panics"
         );
+    }
+
+    /// Waiting on a peer is not a failed attempt. Since the model cache is
+    /// shared by every workspace on the machine, a parallel cold start has one
+    /// winner and the rest find the lock held: if that advanced the schedule,
+    /// each loser would march to `NOTIFY_AFTER_ATTEMPTS` and announce a
+    /// degradation while the download it is waiting for proceeds normally.
+    #[test]
+    fn a_peer_wait_polls_briefly_and_does_not_advance_the_backoff() {
+        assert_eq!(
+            delay_before_pass(0, true),
+            Some(Duration::from_secs(PEER_DOWNLOAD_POLL_SECS)),
+            "a peer wait polls, even before any real attempt has completed"
+        );
+        // However many peer waits happen, the schedule stays where the real
+        // attempts left it, because the caller never advances the counter.
+        assert_eq!(
+            delay_before_pass(2, true),
+            Some(Duration::from_secs(PEER_DOWNLOAD_POLL_SECS))
+        );
+        assert!(
+            PEER_DOWNLOAD_POLL_SECS < RETRY_DELAYS_SECS[0],
+            "a peer wait must be shorter than the first failure backoff, or the \
+             loser lags the winner by minutes for no reason"
+        );
+        // Without a peer, the failure schedule is untouched.
+        assert_eq!(delay_before_pass(0, false), None);
+        assert_eq!(delay_before_pass(2, false), delay_before_attempt(2));
     }
 }

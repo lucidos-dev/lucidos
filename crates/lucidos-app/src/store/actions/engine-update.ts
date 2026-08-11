@@ -1,6 +1,6 @@
 import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
-import type { EngineVersionStatus } from '../../api/client';
+import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { initiateEngineRestart } from './chat-changes';
 import { noteSwitchBuildId, wasSwitchDismissed } from '../../hooks/sw-update';
 import { syncBackgroundActivityToast } from './backgroundActivity';
@@ -51,8 +51,29 @@ function setEngineBuilding(building: boolean, status?: EngineVersionStatus): voi
   engineBuildDetail.value = {
     elapsedMs: status?.build_elapsed_ms ?? null,
     anchoredAt: Date.now(),
-    pendingCommits: status?.pending_commits ?? null,
+    pendingCommits: groupedCommits(status?.pending_commits),
   };
+}
+
+/** The wire's pending-commits payload, or `null` when this engine cannot speak
+ *  the grouped shape.
+ *
+ *  This is the ONE place a version-status response becomes store state, so it is
+ *  where a cross-version payload has to be caught. A new frontend against an OLD
+ *  engine is not a race here, it is the ordinary state of the very window this
+ *  toast narrates: an Apply rebuilds and republishes `dist/` in seconds while
+ *  the engine binary keeps serving the old version until the user clicks
+ *  *Switch*. That engine answers with the pre-grouping `{ total, subjects }`
+ *  shape, whose `groups` is `undefined`, and reading `.length` off it throws
+ *  inside the badge's own render.
+ *
+ *  Absent is the honest answer rather than a rebuilt list: an engine that
+ *  predates the grouping cannot say which commits are features, and its
+ *  `subjects` still carry the merge lines this whole change removed. So the
+ *  toast shows the elapsed time alone until the Switch lands, which is exactly
+ *  what it showed before any of this existed. */
+function groupedCommits(pending: EngineVersionStatus['pending_commits']): PendingCommits | null {
+  return pending && Array.isArray(pending.groups) ? pending : null;
 }
 
 /** Poll the engine's version status and surface the unified "New version

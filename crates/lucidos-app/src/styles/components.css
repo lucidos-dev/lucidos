@@ -500,27 +500,19 @@
     overflow: hidden;
 }
 
+/* NOT the scroll container: `.toast-message` below is (see the comment there).
+   The body stays `overflow: visible` so the mini-spinner, which rotates via CSS
+   transform and at 45° paints ~√2 outside its square layout box, can bleed that
+   excess into the toast's 0.5rem padding instead of being clipped. */
 .toast-body {
     display: flex;
     align-items: flex-start;
     gap: 0.5rem;
-    overflow-y: auto;
-    overscroll-behavior: contain;
     min-height: 0;
     /* Reserve room for the absolute-positioned close-X (top-right of .toast).
        Kept on the body, not the whole .toast, so .toast-actions sits flush
        to the toast's natural horizontal padding on both sides. */
     padding-right: 1.375rem;
-}
-
-/* The mini-spinner rotates via CSS transform, and at 45° its square
-   bounding box inflates by ~√2, briefly exceeding the body's height.
-   `overflow: hidden` would suppress the resulting scrollbar but also
-   clips the spinner's top edge; `overflow: visible` lets the small
-   excess bleed into the toast's 0.5rem top padding without a scrollbar.
-   These toasts are always single-line. */
-.toast-body:has(.mini-spinner) {
-    overflow: visible;
 }
 
 .toast-icon {
@@ -532,9 +524,31 @@
     color: var(--toast-accent);
 }
 
+/* The toast's scroll container, so a body taller than the 14rem cap on `.toast`
+   can be read to its last line instead of being clipped by that element's
+   `overflow: hidden`.
+
+   The scroll starts HERE rather than on `.toast-body` because the spinner is
+   the message's SIBLING, and a scroll container clips its own painted overflow
+   on both axes: with the body scrolling, the mini-spinner's rotated corners
+   were sheared off. That was patched with a `.toast-body:has(.mini-spinner)
+   { overflow: visible }` rule written when a spinning toast was always one
+   line, which then silently switched the scroll off for every spinning toast
+   that grew a body: the build toast's commit list was unreachable below the cap
+   (reported 2026-08-11). Scrolling the message instead leaves the spinner
+   outside the container entirely, so there is nothing to switch off.
+
+   `align-self: stretch` overrides `.toast-body`'s `align-items: flex-start`, so
+   this box takes the body's own (shrunk-to-cap) height and scrolls inside it,
+   rather than growing to its content and overflowing. `min-height: 0` is what
+   lets that shrink happen at all. */
 .toast-message {
     flex: 1;
     min-width: 0;
+    align-self: stretch;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .toast-clickable {

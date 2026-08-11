@@ -3,6 +3,7 @@ use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES};
 use crate::core::oauth::{self, provider_for_url};
 use crate::core::WriteAnnouncement;
 use crate::core::{AuthType, CredentialStore, OAuthStore};
+use bytes::Bytes;
 use std::time::Duration;
 
 /// Per-request timeout for the `http_request` LLM tool. A server that accepts
@@ -19,6 +20,32 @@ pub(crate) fn build_http_tool_client(timeout: Duration) -> reqwest::Result<reqwe
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
+}
+
+/// Read a response body as the bytes the server actually sent.
+///
+/// Deliberately NOT `Response::text()`. That decodes the body as UTF-8
+/// *lossily*, so every byte the decoder can't map becomes U+FFFD, which is
+/// three bytes on the way back out. `output_path` and `temp_path` persist this
+/// body verbatim, so the decode silently rewrote every binary download the
+/// tool has ever saved: a 220,656-byte WebP product photo landed on disk as
+/// 399,717 bytes of replacement characters (2026-08-11), `file` no longer
+/// recognised it as an image, and the model's `read_file` of it came back from
+/// the provider as `400 Could not process image`.
+///
+/// Nothing is lost on the text side, and that is checkable rather than a
+/// judgement call: we build reqwest with `default-features = false` and no
+/// `charset` feature, so `Response::text()` is not the charset-aware decoder
+/// its name suggests. It is `self.bytes()` followed by
+/// `String::from_utf8_lossy` (reqwest 0.12.28 `async_impl/response.rs`), which
+/// is exactly what the two model-facing branches below now do for themselves,
+/// at the end, where lossiness is harmless. Enabling `charset` later would
+/// change that, and those branches would then need the header.
+///
+/// Returns `Bytes` rather than `Vec<u8>` so the body is never copied: the
+/// persisted paths want `&[u8]`, and a download may run to `MAX_BULK_BYTES`.
+pub(crate) async fn read_response_body(response: reqwest::Response) -> reqwest::Result<Bytes> {
+    response.bytes().await
 }
 
 impl LucidosEngine {
@@ -149,7 +176,7 @@ impl LucidosEngine {
         };
         const MAX_RETRIES: u32 = 3;
         let mut status: u16 = 0;
-        let mut body_text = String::new();
+        let mut body_bytes = Bytes::new();
         let mut request_error: Option<String> = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -190,13 +217,13 @@ impl LucidosEngine {
                     }
                     // A body-read failure (connection dropped mid-body, decode
                     // error) is NOT a successful empty response. The old
-                    // `.unwrap_or_default()` left `body_text` empty and then
+                    // `.unwrap_or_default()` left the body empty and then
                     // cleared `request_error` unconditionally on the next line,
                     // so the tool reported success: with `output_path` set and a
                     // 2xx status, the block below wrote a ZERO-BYTE artifact
                     // over the user's file and announced it as an update.
-                    body_text = match response.text().await {
-                        Ok(t) => t,
+                    body_bytes = match read_response_body(response).await {
+                        Ok(b) => b,
                         Err(e) => {
                             request_error = Some(format!("reading response body: {}", e));
                             break;
@@ -291,7 +318,7 @@ impl LucidosEngine {
                         ));
                     }
                 }
-                if let Err(e) = std::fs::write(&full_path, &body_text) {
+                if let Err(e) = std::fs::write(&full_path, &body_bytes) {
                     return Ok(format!(
                         "Error: failed to write {}: {}",
                         crate::core::home_path::abbreviate(&full_path),
@@ -322,12 +349,12 @@ impl LucidosEngine {
                         ))
                     }
                 };
-                let body_bytes = body_text.len() as u64;
-                if body_bytes > MAX_BULK_BYTES {
+                let downloaded = body_bytes.len() as u64;
+                if downloaded > MAX_BULK_BYTES {
                     return Ok(bulk_threshold_error(
                         BulkContext::HttpResponse { dest: data_path },
                         None,
-                        body_bytes,
+                        downloaded,
                     ));
                 }
                 // The store captures the pre-write existence and announces.
@@ -338,14 +365,14 @@ impl LucidosEngine {
                     .write_and_commit(
                         &self.event_bus,
                         artifact_path,
-                        &body_text,
+                        &body_bytes,
                         &format!("HTTP response: {}", artifact_path),
                         WriteAnnouncement::Entity {
                             source: Some("http_request".to_string()),
                         },
                     )
                     .await?;
-                // Re-read rather than publish `body_text`: this tool is the one
+                // Re-read rather than publish `body_bytes`: this tool is the one
                 // artifact writer that does NOT take `lock_workspace_repo`, so
                 // a concurrent writer may already have landed newer bytes, and
                 // the cache must never hold content the file does not.
@@ -355,25 +382,39 @@ impl LucidosEngine {
             }
         }
 
+        // Only the branches that hand the body back to the model decode it.
+        // The model reads prose, so a replacement character in a stray byte
+        // costs nothing, while the persisted copy above had to stay
+        // byte-exact.
         if (200..300).contains(&status) {
             if let Some(path) = saved_temp {
-                Ok(format!("[SAVED] {} ({} bytes)", path, body_text.len()))
+                Ok(format!("[SAVED] {} ({} bytes)", path, body_bytes.len()))
             } else if let Some(ref data_path) = resolved_output {
-                Ok(format!("[SAVED] {} ({} bytes)", data_path, body_text.len()))
-            } else if body_text.len() > 50000 {
                 Ok(format!(
-                    "{}...\n[truncated, {} total bytes]",
-                    &body_text[..body_text.floor_char_boundary(45000)],
-                    body_text.len()
+                    "[SAVED] {} ({} bytes)",
+                    data_path,
+                    body_bytes.len()
                 ))
             } else {
-                Ok(body_text)
+                let body_text = String::from_utf8_lossy(&body_bytes);
+                if body_text.len() > 50000 {
+                    Ok(format!(
+                        "{}...\n[truncated, {} total bytes]",
+                        &body_text[..body_text.floor_char_boundary(45000)],
+                        body_text.len()
+                    ))
+                } else {
+                    Ok(body_text.into_owned())
+                }
             }
         } else {
             Ok(format!(
                 "HTTP Error {}: {}",
                 status,
-                body_text.chars().take(500).collect::<String>()
+                String::from_utf8_lossy(&body_bytes)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
             ))
         }
     }
@@ -489,6 +530,102 @@ mod tests {
         assert!(
             !seen_target_auth.load(std::sync::atomic::Ordering::SeqCst),
             "client followed redirect and replayed Authorization"
+        );
+    }
+
+    /// A WebP header followed by every byte value, i.e. a body that is not
+    /// valid UTF-8 in the same way a real image isn't.
+    fn binary_payload() -> Vec<u8> {
+        let mut body = b"RIFF\x90\x5d\x03\x00WEBPVP8 ".to_vec();
+        body.extend((0u16..=255).map(|b| b as u8));
+        body
+    }
+
+    /// Serve `body` once over a loopback listener and return its address.
+    async fn serve_once(body: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/webp\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        addr
+    }
+
+    /// Regression guard: `http_request` persists the response body verbatim,
+    /// so the body read must preserve every byte. Reading it as text instead
+    /// replaced each non-UTF-8 byte with U+FFFD and wrote that to
+    /// `artifacts/`, which is how a downloaded WebP reached the provider as an
+    /// undecodable file (`400 Could not process image`).
+    #[tokio::test]
+    async fn read_response_body_preserves_non_utf8_bytes() {
+        let body = binary_payload();
+        let addr = serve_once(body.clone()).await;
+
+        let client = build_http_tool_client(Duration::from_secs(5)).expect("client builds");
+        let response = client
+            .get(format!("http://{addr}/image.webp"))
+            .send()
+            .await
+            .expect("response");
+        let read = read_response_body(response).await.expect("body reads");
+
+        assert_eq!(read, body, "body must round-trip byte for byte");
+    }
+
+    /// The trap the guard above exists for, pinned so the two stay comparable:
+    /// the lossy decode both mangles the bytes AND inflates the length, which
+    /// is why the corruption showed up as a file larger than the original.
+    #[tokio::test]
+    async fn reading_the_same_body_as_text_would_corrupt_and_inflate_it() {
+        let body = binary_payload();
+        let addr = serve_once(body.clone()).await;
+
+        let client = build_http_tool_client(Duration::from_secs(5)).expect("client builds");
+        let text = client
+            .get(format!("http://{addr}/image.webp"))
+            .send()
+            .await
+            .expect("response")
+            .text()
+            .await
+            .expect("body reads");
+
+        assert_ne!(text.as_bytes(), body.as_slice());
+        assert!(
+            text.len() > body.len(),
+            "lossy decode should inflate {} bytes, got {}",
+            body.len(),
+            text.len()
+        );
+        assert!(text.contains('\u{FFFD}'));
+    }
+
+    /// The two tests above only exercise the helper. This one pins the tool
+    /// itself to it: `execute_http_tool` must not reach for `.text()` on the
+    /// response, because that body is what `output_path` / `temp_path` write
+    /// to disk. The error-formatting branches decode `body_bytes` at the end
+    /// instead, so no `.text()` call belongs in this file's production code.
+    #[test]
+    fn the_http_tool_never_reads_its_response_body_as_text() {
+        let source = crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/tools/http.rs"),
+        );
+        assert!(
+            !source.contains(".text().await"),
+            "engine/tools/http.rs reads the response body as text again. That is \
+             a lossy UTF-8 decode and the body is persisted verbatim, so use \
+             read_response_body instead."
         );
     }
 }

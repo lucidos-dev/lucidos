@@ -15,6 +15,8 @@ vi.mock('../../hooks/sw-update', () => ({
 
 import { checkEngineVersion, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
+// Type-only, so it is erased before the `vi.mock` above replaces that module.
+import type { PendingCommits } from '../../api/client';
 import { noteSwitchBuildId, wasSwitchDismissed, markSwitchDismissed } from '../../hooks/sw-update';
 import { toasts, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
@@ -33,7 +35,7 @@ function status(over: Partial<{
   source_behind_head: boolean;
   shared_build_in_progress: boolean;
   build_elapsed_ms: number;
-  pending_commits: { total: number; subjects: string[] };
+  pending_commits: PendingCommits;
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -325,7 +327,13 @@ describe('checkEngineVersion: the build narration cannot outlive the build', () 
       build_state: 'building',
       source_behind_head: true,
       build_elapsed_ms: 42_000,
-      pending_commits: { total: 2, subjects: ['fix: one', 'docs: two'] },
+      pending_commits: {
+        total: 2,
+        groups: [
+          { kind: 'fixed', total: 1, descriptions: ['one'] },
+          { kind: 'housekeeping', total: 1, descriptions: [] },
+        ],
+      },
     }));
     await checkEngineVersion();
     expect(engineBuilding.value).toBe(true);
@@ -336,6 +344,26 @@ describe('checkEngineVersion: the build narration cannot outlive the build', () 
     expect(engineBuildDetail.value?.anchoredAt).toBeLessThanOrEqual(Date.now());
   });
 
+  /** The window this toast exists for IS the cross-version window: an Apply
+   *  republishes `dist/` in seconds while the engine keeps serving the old
+   *  binary until the Switch, so a new frontend routinely polls an engine that
+   *  predates the grouped shape and answers `{ total, subjects }`. Reading
+   *  `.length` off its absent `groups` threw inside the badge's render. */
+  it('survives an engine that predates the grouped commit shape', async () => {
+    mockStatus.mockResolvedValue(status({
+      build_state: 'building',
+      build_elapsed_ms: 42_000,
+      // The pre-grouping wire shape, exactly as an older engine sends it.
+      pending_commits: { total: 79, subjects: ["Merge branch 'main' into x"] } as unknown as PendingCommits,
+    }));
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(true);
+    // The timer still runs; the commits are simply not described, which is what
+    // the toast did before grouping existed.
+    expect(engineBuildDetail.value?.elapsedMs).toBe(42_000);
+    expect(engineBuildDetail.value?.pendingCommits).toBeNull();
+  });
+
   it.each([
     ['the build failed', status({ source_behind_head: true, build_state: 'failed' })],
     ['the build finished', status({ build_state: 'idle' })],
@@ -344,7 +372,10 @@ describe('checkEngineVersion: the build narration cannot outlive the build', () 
     mockStatus.mockResolvedValue(status({
       build_state: 'building',
       build_elapsed_ms: 42_000,
-      pending_commits: { total: 1, subjects: ['fix: one'] },
+      pending_commits: {
+        total: 1,
+        groups: [{ kind: 'fixed', total: 1, descriptions: ['one'] }],
+      },
     }));
     await checkEngineVersion();
     expect(engineBuildDetail.value).not.toBeNull();
@@ -364,12 +395,17 @@ describe('checkEngineVersion: the build narration cannot outlive the build', () 
       shared_build_in_progress: true,
       source_behind_head: true,
       update_available: false,
-      pending_commits: { total: 1, subjects: ['fix: one'] },
+      pending_commits: {
+        total: 1,
+        groups: [{ kind: 'fixed', total: 1, descriptions: ['one'] }],
+      },
     }));
     await checkEngineVersion();
     expect(engineBuilding.value).toBe(true);
     expect(engineBuildDetail.value?.elapsedMs).toBeNull();
-    expect(engineBuildDetail.value?.pendingCommits?.subjects).toEqual(['fix: one']);
+    expect(engineBuildDetail.value?.pendingCommits?.groups).toEqual([
+      { kind: 'fixed', total: 1, descriptions: ['one'] },
+    ]);
   });
 });
 

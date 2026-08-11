@@ -67,6 +67,13 @@ import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMa
  *  the last three are presses rather than gestures, so each retires the ride at
  *  its own call site.
  *
+ *  Three of those four ask first whether the agent is LIVE, and so does the
+ *  follow's own writing. Nothing about a standing follow happens on a thread
+ *  that is doing nothing: the reader scrolls and clicks freely, keeps the lit
+ *  toggle, and is picked back up the moment the thread runs again. Opening
+ *  another thread is the one that asks nothing, because it is not this thread's
+ *  question. See `_threadLive` and `followIsCarrying`.
+ *
  *  This module used to hold the opposite policy, and most of its size was the
  *  machinery for deciding WHEN to pin: an 80px stickiness window (`scrolledUp`),
  *  two ResizeObserver modes behind a 500ms suppression window, a 16ms
@@ -313,9 +320,17 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
 /* ── The standing request to ride the live edge ──────────────────────────────
  *  ONE reader action means "take me to the bottom and KEEP me there" rather than
  *  "jump once": the FOLLOW TOGGLE in the prompt area (`setFollowLiveEdge`). It
- *  arms the flag below, and while it is armed, content growth writes the reader
- *  back to the live edge (the growth branch in `makeScrollObservers`' onResize,
- *  which is where the old force-pin used to live).
+ *  arms the flag below, and while it is armed AND the agent is LIVE, content
+ *  growth writes the reader back to the live edge (the growth branch in
+ *  `makeScrollObservers`' onResize, which is where the old force-pin used to
+ *  live).
+ *
+ *  ARMED and CARRYING are two states, and the flag below is only the first. The
+ *  request persists across an idle spell untouched, so the reader keeps the lit
+ *  toggle, keeps the recorded live-edge reading position, and is picked back up
+ *  when the thread runs again. What stops while idle is the writing: there is
+ *  nothing to be carried toward on a thread that is doing nothing, and growth
+ *  there is the transcript finishing its own rendering. See `followIsCarrying`.
  *
  *  Nothing else arms it. Not the down chevron, which navigates and nothing else,
  *  and not any SUBMIT: a submit gets the one-shot reaction `followSubmit`
@@ -371,10 +386,11 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
  *  `isFollowScroll` and `onFollowArmed` are the two things the recording side
  *  needs; both are below.
  *
- *  The condition for following is this flag and NOTHING ELSE. There is no
- *  proximity term (the retired 80px stickiness window) and no timing term (the
- *  retired 500ms suppression window); both of those tried to INFER the request
- *  that the flag now records.
+ *  The condition for following is this flag AND the agent being live, and
+ *  nothing else. There is no proximity term (the retired 80px stickiness window)
+ *  and no timing term (the retired 500ms suppression window); both of those
+ *  tried to INFER the request that the flag now records. The live term infers
+ *  nothing either: it asks whether there is anything to follow.
  *
  *  A DEEP LINK is the one navigation that retires the follow by calling
  *  `stopFollowingBottom` rather than being read off the position (see
@@ -382,7 +398,10 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
  *  usually points at its newest turn, and a landing at the live edge is exactly
  *  the shape of "content changed and the reader did not leave". Read off the
  *  position alone it would keep the follow, and the next token would carry the
- *  reader off the event they asked for. */
+ *  reader off the event they asked for. On an IDLE thread it retires nothing, in
+ *  step with every other retirement: there is no next token, and the reader who
+ *  followed a link into a finished thread has not asked to stop riding the ones
+ *  that come later. */
 const _followingBottom = signal(false);
 
 /** Is the standing follow armed? Read by the follow toggle, which RENDERS it.
@@ -466,13 +485,33 @@ export function applyFollowSeed(el: HTMLElement): boolean {
  *  `_activeScrollElement`:
  *  nothing needs to react to it changing, it is read imperatively.
  *
- *  Read at EXACTLY ONE site, the disarm in `onScroll`, through `threadIsLive`,
- *  and that narrowness is the invariant rather than an implementation detail. It
- *  answers "is the reader fleeing a reply, or merely browsing", which is a
- *  question about what their scroll MEANS. It must never become a second
- *  condition on following, on landing, or on any write: a lull between two tool
- *  calls would then stop a reader being followed, which is the opposite of what
- *  it is for. */
+ *  It answers ONE question, asked through `threadIsLive` at every site that
+ *  moves a reader on the follow's behalf or takes the follow away from them:
+ *  IS ANYTHING RUNNING. Nothing about a standing follow happens on a thread that
+ *  is doing nothing. The reader's scroll does not end the ride (they are
+ *  browsing, not fleeing a reply), the up chevron, turn stepping and a
+ *  deep-link landing do not either, and growth does not carry them, because on
+ *  an idle thread growth is the transcript finishing its own rendering rather
+ *  than the agent producing anything to be carried toward.
+ *
+ *  It used to gate the disarm ALONE, and that narrowness was written here as the
+ *  invariant. It was half a rule: the reader kept the ride when they scrolled an
+ *  idle thread and was then written back to the live edge by the next thing that
+ *  changed the transcript's height, which on an idle thread is markdown
+ *  settling, an image decoding or a card mounting. Reported 2026-08-11, while
+ *  reading a finished reply parked on a question card.
+ *
+ *  What that narrowness was PROTECTING still holds, and is now protected by
+ *  something else: a lull between two tool calls must never cost the reader
+ *  their ride. It cannot, because a lull is not idle. `exchangeMarksThreadLive`
+ *  keeps the last turn's status generous through the gap, and a SUBMIT claims
+ *  live by itself for `SUBMIT_LIVE_CLAIM_MS` before any status can say so.
+ *
+ *  Two things deliberately DO NOT ask it, and both are the reader asking
+ *  directly rather than the follow acting on their behalf: pressing the toggle
+ *  (`setFollowLiveEdge`) and resuming a request recorded in this thread
+ *  (`resumeFollowingBottom`). Pressing the toggle on a finished thread must
+ *  still take the reader to the bottom. */
 let _threadLive = false;
 
 /** When the SUBMIT's own claim that the thread is live runs out. A submit says
@@ -515,15 +554,92 @@ const SUBMIT_LIVE_CLAIM_MS = 20_000;
  *  there destroyed it in the one window it was invented for, and a reader who
  *  submitted and then scrolled away kept a follow they had just fled (reported
  *  2026-08-10, intermittent because it depended on landing inside the gap).
- *  Nothing is lost by ignoring `false`: the claim expires on its own. */
+ *  Nothing is lost by ignoring `false`: the claim expires on its own.
+ *
+ *  A `true` that WAKES the thread also does the growth round the observer
+ *  missed, because this call arrives too late to be seen by it: see
+ *  `honourWake`. */
 export function setThreadLive(live: boolean): void {
+  const waking = live && !_threadLive;
   _threadLive = live;
   if (live) _submitLiveUntil = -Infinity;
+  if (waking) honourWake();
+}
+
+/** The ride resumes on the WAKE itself, not on the next growth round.
+ *
+ *  The follow does its work from the transcript's ResizeObserver
+ *  (`honourGrowth`), and this module learns the thread is live from a Preact
+ *  `useEffect` in `ChatExchange`. Those two are delivered in the wrong order for
+ *  exactly the mutation that matters: the new turn's row mounting fires the
+ *  observer inside the same frame, while Preact defers its effects to a task
+ *  AFTER that frame. So the WAKING resize is handed to `honourGrowth` while this
+ *  module still believes the thread is idle, and is the one resize the follow
+ *  stands down for.
+ *
+ *  Usually invisible, because a streaming reply resizes again milliseconds later
+ *  and that round carries the reader. The case where it is not invisible is a
+ *  turn that mounts its row and then produces nothing for a while, which is
+ *  ordinary rather than exotic: a coding-agent turn RESUMING its subprocess sits
+ *  on `SessionStarted` for fifteen to twenty seconds before its first tool call
+ *  (see the live row in `ChatExchange`). An armed reader would spend that
+ *  stranded short of the live edge with the toggle lit, which is the toggle
+ *  lying about what it is doing.
+ *
+ *  So the transition replays the missed round through `honourGrowth` itself,
+ *  guards and all: it stands down for a tween in flight and resolves a pending
+ *  landing exactly as a resize would. Nothing here decides anything of its own,
+ *  which is the point, since a second copy of the follow's rule would be a
+ *  second thing to keep in step. It is a no-op for everyone else: an unarmed
+ *  reader is not carried by growth either.
+ *
+ *  Only on the false to true EDGE, never on a repeat. `ChatExchange` re-runs its
+ *  effect whenever the derived liveness changes, and a `true` that says what the
+ *  module already knew describes no new content. Writing on every one of those
+ *  would put the reader back at the live edge after they had scrolled away from
+ *  a reply, which is the disarm's job to prevent and this must not undo.
+ *
+ *  Found by the Codex reviewer in `/harden`, 2026-08-11. */
+function honourWake(): void {
+  const el = resolveTarget();
+  if (el) honourGrowth(el);
 }
 
 /** Is the agent live, by the status or by a submit's unexpired claim? */
 function threadIsLive(): boolean {
   return _threadLive || nowMs() < _submitLiveUntil;
+}
+
+/** Is the standing follow CARRYING the reader right now, as opposed to merely
+ *  being armed? Armed and live, and those are two different states on purpose.
+ *
+ *  ARMED is the reader's request, and it persists: the toggle stays lit, the
+ *  live-edge form of this thread's *reading position* keeps recording it, and
+ *  nothing about an idle spell takes it away. CARRYING is whether the app is
+ *  acting on that request this instant, and on an idle thread it is not. The
+ *  reader is free to scroll and to click, and the transcript stays where they
+ *  put it; the moment the thread runs again the same armed request picks them
+ *  back up with no second press.
+ *
+ *  Three writers ask it and they are the whole of what the follow DOES: the
+ *  growth branch (`honourGrowth`), the reveal snap (`honourAnchoredMutation`),
+ *  and `withScrollAnchor`'s decision to skip the anchor correction. The last
+ *  two are one act split across the DOM/layout line, so they must answer the
+ *  same or an idle armed reader gets neither the correction nor the snap and
+ *  drifts on the content that grew above them.
+ *
+ *  What a reader on an idle thread is NOT being denied: growth there is the
+ *  transcript finishing its own rendering (markdown settling, an image
+ *  decoding, a card mounting), never the agent producing something worth being
+ *  carried toward. Being written to the bottom for it was the 2026-08-11
+ *  report.
+ *
+ *  Deliberately NOT asked by the reader's own explicit requests, which write
+ *  the live edge directly: pressing the toggle, resuming a recorded request on
+ *  re-entry, and the seed. Pressing the toggle on a finished thread must still
+ *  take the reader to the bottom. */
+export function followIsCarrying(): boolean {
+  return _followingBottom.value && threadIsLive();
 }
 
 /** Subscribers notified when the follow is ARMED, and never when it is retired.
@@ -747,13 +863,15 @@ export function isFollowScroll(el: HTMLElement): boolean {
  *  asked to follow, and a restore that happens to land on that thread's saved
  *  bottom position writes no scroll the disarm could see. See `focusThread`.
  *
- *  A DEEP-LINK LANDING: the reader asked to be at one specific place, so the
- *  ride ends there and nothing may carry them off it. The disarm cannot see this
- *  one either, and the case it misses is the ordinary one rather than a corner:
- *  a link into the thread the reader is already riding usually points at its
- *  newest turn, so the landing leaves them AT the live edge, where the disarm's
- *  first condition is false and the follow survives to drag them along with the
- *  next token. See `scrollToSelectorAndPulse`. */
+ *  A DEEP-LINK LANDING on a LIVE thread: the reader asked to be at one specific
+ *  place, so the ride ends there and nothing may carry them off it. The disarm
+ *  cannot see this one either, and the case it misses is the ordinary one rather
+ *  than a corner: a link into the thread the reader is already riding usually
+ *  points at its newest turn, so the landing leaves them AT the live edge, where
+ *  the disarm's first condition is false and the follow survives to drag them
+ *  along with the next token. On an idle thread the landing calls nothing, since
+ *  there is no next token and the reader is browsing. See
+ *  `scrollToSelectorAndPulse`, which owns that test. */
 export function stopFollowingBottom() {
   // Both of the things that hold a reader are OUR motion, so both stop here.
   // Without it the reader who just scrolled away is dragged back for the rest of
@@ -828,11 +946,18 @@ function carryHeldScroll(el: HTMLElement): void {
  *  correction (which pins that root) leaves the reader short of the live edge
  *  and the follow saw a move it had not made.
  *
- *  Then, ARMED ONLY, put them back ON the live edge in ONE held write, in the
- *  same frame the caller unfreezes: `snapToLiveEdge`. Being short of the edge is
- *  exactly what the standing follow exists to undo, and here it is not a
- *  position the reader ever occupied, only one the mutation left them at between
- *  two writes the browser has not painted yet.
+ *  Then, while the follow is CARRYING them, put them back ON the live edge in
+ *  ONE held write, in the same frame the caller unfreezes: `snapToLiveEdge`.
+ *  Being short of the edge is exactly what the standing follow exists to undo,
+ *  and here it is not a position the reader ever occupied, only one the mutation
+ *  left them at between two writes the browser has not painted yet.
+ *
+ *  Carrying rather than merely ARMED (see `followIsCarrying`), and this is the
+ *  half of that test `withScrollAnchor` cannot make on its own: it asks the same
+ *  question to decide whether to skip the anchor correction, and the two answers
+ *  are one decision. On an IDLE thread the reveal is the reader clicking around
+ *  a finished thread, so they get the anchor correction like anybody else and
+ *  nothing snaps them anywhere.
  *
  *  A TWEEN was tried here first, on the reasoning that one click can add the
  *  height of the whole transcript and an instant write teleports the reader. It
@@ -850,7 +975,7 @@ function carryHeldScroll(el: HTMLElement): void {
  *  and the anchor correction has already kept them on what they were reading. */
 export function honourAnchoredMutation(el: HTMLElement): void {
   carryHeldScroll(el);
-  if (!_followingBottom.value || isAtLiveEdge(el)) return;
+  if (!followIsCarrying() || isAtLiveEdge(el)) return;
   snapToLiveEdge(el);
 }
 
@@ -1543,13 +1668,24 @@ function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
 
 /** What one growth round owes the reader, which is at most one of two things: a
  *  submit is waiting for its own turn to render (land on it, once, on the status
- *  line under it), or the reader is riding the live edge (write it). Never both,
- *  because a submit arms nothing and arming drops a pending landing
+ *  line under it), or the follow is CARRYING them to the live edge (write it).
+ *  Never both, because a submit arms nothing and arming drops a pending landing
  *  (`armFollowOn`), and nothing at all for a reader who asked for neither.
  *
  *  Stands down while a navigation tween owns the scroll, including the landing
  *  glide itself: a tween re-reads its own target every frame, so a live-edge
- *  write beside it would drag the glide past the turn it is landing on. */
+ *  write beside it would drag the glide past the turn it is landing on.
+ *
+ *  And stands down on an IDLE thread even for an armed reader, which is the
+ *  whole of `followIsCarrying`'s live half. Growth on an idle thread is the
+ *  transcript finishing its own rendering, so there is nothing to be carried
+ *  toward and the reader is browsing: they scrolled up to re-read a turn, or
+ *  clicked something, and this line used to write them to the bottom for it on
+ *  the next markdown reflow, decoded image or arriving card. The two halves of
+ *  the follow disagreed about liveness until 2026-08-11, the disarm asking and
+ *  this write not, so the reader kept the ride the scroll rule promised them and
+ *  lost their position anyway. The SUBMIT's own claim is what keeps this write
+ *  running through the gap before a fresh turn's status catches up. */
 function honourGrowth(el: HTMLElement): void {
   if (_scrollAnimRaf !== null) return;
   if (_pendingLanding) {
@@ -1569,7 +1705,7 @@ function honourGrowth(el: HTMLElement): void {
     dropLapsedLanding();
     return;
   }
-  if (_followingBottom.value) markHeldScroll(el, liveEdgeTop(el));
+  if (followIsCarrying()) markHeldScroll(el, liveEdgeTop(el));
 }
 
 /** rAF easeOutCubic scroll of the active container toward a target, shared by
@@ -2091,18 +2227,26 @@ function scrollToSelectorAndPulse(
     if (typeof document !== 'undefined' && document.dispatchEvent) {
       document.dispatchEvent(new Event('reveal-mobile-header'));
     }
-    // Going to a link ends any ride: the reader asked to be at THIS place, and
-    // the standing follow would carry them off it on the next token. Retired
-    // before the scroll below rather than after, so the landing's own frames are
-    // marked as a plain navigation and the reading position recorded for this
-    // thread is the offset the link landed on rather than the live edge.
+    // Going to a link on a LIVE thread ends the ride: the reader asked to be at
+    // THIS place, and the standing follow would carry them off it on the next
+    // token. Retired before the scroll below rather than after, so the landing's
+    // own frames are marked as a plain navigation and the reading position
+    // recorded for this thread is the offset the link landed on rather than the
+    // live edge.
     //
-    // Ungated, and on the line above the scroll on purpose: the two describe one
-    // landing and must not disagree. A superseded call still lands (the pin, the
-    // scroll and the pulse below are all ungated, unlike the resolve broadcast),
-    // so gating only this would leave a reader who was just moved still
-    // following.
-    stopFollowingBottom();
+    // TWO gates are in play here and only one of them is asked. Not gated on the
+    // CLAIM being ours, on the line above the scroll on purpose: the two describe
+    // one landing and must not disagree, and a superseded call still lands (the
+    // pin, the scroll and the pulse below are all ungated, unlike the resolve
+    // broadcast), so gating that way would leave a reader who was just moved
+    // still following. Gated on LIVE, which is a different question entirely and
+    // the same one the scroll disarm, the up chevron and turn stepping ask: on an
+    // idle thread the reader is browsing, so following a link costs them nothing
+    // and their next submit still takes them to the live edge. Nothing carries
+    // them off the event meanwhile, because the follow stands down on an idle
+    // thread too (see `followIsCarrying`); if the thread WAKES they are carried,
+    // which is what the lit toggle says will happen.
+    if (threadIsLive()) stopFollowingBottom();
     smoothScrollToElement(target);
     // Record and announce the landing, AFTER the scroll above rather than
     // before it. Two things read this, and the second is why the order matters:
@@ -2724,14 +2868,19 @@ export function makeScrollObservers(el: HTMLElement) {
   // reader paid for it at their next submit.
   //
   // It applies to a NAVIGATION as much as to a gesture, which is a real
-  // consequence rather than an oversight: the up chevron and ⌘↑ turn stepping
-  // retire the follow only while the agent is live, so on an idle thread the
-  // reader can step back through turns and still have their next submit take
-  // them to the live edge. The lit toggle is what makes that fair, since it says
-  // on screen that they are still riding. A DEEP LINK is the exception and
-  // retires the follow whatever the thread is doing, by calling
-  // `stopFollowingBottom` itself: a link is a request to be at ONE place, and
-  // nothing may carry the reader off it.
+  // consequence rather than an oversight: the up chevron, ⌘↑ turn stepping and a
+  // deep-link landing all retire the follow only while the agent is live, so on
+  // an idle thread the reader can step back through turns, or follow a link to
+  // one, and still have their next submit take them to the live edge. The lit
+  // toggle is what makes that fair, since it says on screen that they are still
+  // riding.
+  //
+  // The deep link was the last exception to that, on the reasoning that a link
+  // is a request to be at ONE place and nothing may carry the reader off it. The
+  // second half of that is now true without retiring anything, because the
+  // follow does not WRITE on an idle thread either (`followIsCarrying`). Two
+  // halves of one rule: on an idle thread nothing takes the ride away and
+  // nothing acts on it.
   //
   // The LANDING takes only the moved term, and both differences are deliberate.
   // A reader who flicks down to the live edge mid-glide has gone exactly where
@@ -2756,14 +2905,20 @@ export function makeScrollObservers(el: HTMLElement) {
     recordAnchor();
   }
   // Resize events. A resize moves the reader for exactly two reasons, and both
-  // are things they asked for: they ASKED to ride the live edge and have not
-  // taken it back, or they just SUBMITTED and the turn their landing is waiting
-  // for has finally rendered (see "The standing request to ride the live edge",
-  // and `followSubmit`). For everyone else it moves nobody, whatever grew and
-  // however far off the bottom it leaves them: a streaming reply, a decoded
-  // image, an expanded step, a growing composer all leave the transcript exactly
-  // where it is, and the handler's remaining job is to reconcile the signals so
-  // the chevrons describe the new geometry.
+  // are things they asked for: they ASKED to ride the live edge, have not taken
+  // it back, and there is something live to ride, or they just SUBMITTED and the
+  // turn their landing is waiting for has finally rendered (see "The standing
+  // request to ride the live edge", and `followSubmit`). For everyone else it
+  // moves nobody, whatever grew and however far off the bottom it leaves them: a
+  // streaming reply, a decoded image, an expanded step, a growing composer all
+  // leave the transcript exactly where it is, and the handler's remaining job is
+  // to reconcile the signals so the chevrons describe the new geometry.
+  //
+  // "Everyone else" includes an ARMED reader on an idle thread, which is the
+  // part that was missing until 2026-08-11: growth there is the transcript
+  // finishing its own rendering, not the agent producing anything, so a reader
+  // who scrolled up to re-read a turn was written back to the bottom by the next
+  // markdown reflow. See `followIsCarrying`.
   //
   // This is where the old force-pin lived, and the two rules that fought over
   // it: a 'scroll'-mode branch that slammed `scrollTop = scrollHeight` on every

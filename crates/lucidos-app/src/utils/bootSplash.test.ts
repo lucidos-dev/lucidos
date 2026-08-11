@@ -25,15 +25,25 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     textContent: '',
     classList: { toggle: (c: string, on: boolean) => { on ? statusClasses.add(c) : statusClasses.delete(c); } },
   };
-  const listeners: Record<string, Array<() => void>> = {};
+  // Handlers take the event, because the controller reads `event.target`: the
+  // exit choreography animates the mark and the status inside the splash's own
+  // fade, and `animationend` bubbles, so a child's event must not be mistaken
+  // for the veil finishing.
+  const listeners: Record<string, Array<(e: { target: unknown }) => void>> = {};
   let removed = false;
   const classes = new Set<string>(initialClasses);
   const splashEl = {
     classList: { add: (c: string) => classes.add(c), contains: (c: string) => classes.has(c) },
-    addEventListener: (type: string, fn: () => void) => { (listeners[type] ??= []).push(fn); },
+    addEventListener: (type: string, fn: (e: { target: unknown }) => void) => { (listeners[type] ??= []).push(fn); },
+    removeEventListener: (type: string, fn: (e: { target: unknown }) => void) => {
+      listeners[type] = (listeners[type] ?? []).filter(f => f !== fn);
+    },
     remove: () => { removed = true; },
-    fire: (type: string) => { for (const fn of listeners[type] ?? []) fn(); },
+    fire: (type: string, target: unknown) => { for (const fn of [...(listeners[type] ?? [])]) fn({ target }); },
   };
+  // Stands in for the mark / status inside the splash, whose shorter exit
+  // animations end first and bubble their `animationend` through it.
+  const childEl = {};
   const prev = (globalThis as any).document.querySelector;
   (globalThis as any).document.querySelector = (sel: string) => {
     if (!present) return null;
@@ -51,7 +61,8 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     statusShown: () => statusClasses.has('boot-splash-status-shown'),
     hasLeaving: () => classes.has('boot-splash-leaving'),
     isRemoved: () => removed,
-    fireAnimationEnd: () => splashEl.fire('animationend'),
+    fireAnimationEnd: () => splashEl.fire('animationend', splashEl),
+    fireChildAnimationEnd: () => splashEl.fire('animationend', childEl),
     restore: () => { (globalThis as any).document.querySelector = prev; },
   };
 }
@@ -98,14 +109,32 @@ describe('bootSplash controller', () => {
     expect(fake.isRemoved()).toBe(true);
   });
 
+  // The exit is choreographed (index.html): the status and the mark run their
+  // own, SHORTER animations inside the veil's 0.65s one, and `animationend`
+  // bubbles. Acting on a child's event removed the splash at 57% veil opacity in
+  // a live probe, snapping the app in mid-fade. Only the splash's own fade ends
+  // the splash.
+  it('ignores an animationend bubbling up from a child of the splash', async () => {
+    fake = installFakeSplash(true);
+    const c = await freshController();
+    c.dismissBootSplash();
+    fake.fireChildAnimationEnd();
+    expect(fake.isRemoved()).toBe(false);
+    fake.fireAnimationEnd();
+    expect(fake.isRemoved()).toBe(true);
+  });
+
   it('dismiss removes via the timeout fallback when no animationend fires', async () => {
     vi.useFakeTimers();
     try {
       fake = installFakeSplash(true);
       const c = await freshController();
       c.dismissBootSplash();
+      // Still fading: the fallback must outlive the veil's own 0.65s, or it
+      // becomes the thing that removes the splash rather than a backstop.
+      vi.advanceTimersByTime(700);
       expect(fake.isRemoved()).toBe(false);
-      vi.advanceTimersByTime(600);
+      vi.advanceTimersByTime(200);
       expect(fake.isRemoved()).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -797,8 +826,10 @@ describe('index.html inline boot splash', () => {
       expect(html).toMatch(
         /\.boot-splash-formed\s+\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-breathe/,
       );
+      // Named among the selectors the reduced-motion block silences (it is a
+      // list now: the two leaving states are silenced there too).
       expect(html).toMatch(
-        /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.boot-splash-formed\s+\.boot-splash-mark\s*\{\s*animation:\s*none/,
+        /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.boot-splash-formed\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/,
       );
     });
   });
@@ -1116,5 +1147,69 @@ describe('index.html inline boot splash', () => {
     // raw attribute; see the absolute-base-href test above.)
     expect(html).toMatch(/\.boot-splash-reload\s+\.boot-splash-mark\s*\{[^}]*visibility:\s*hidden/);
     expect(html).toContain("getAttribute('href') !== '/~/'");
+  });
+
+  // THE EXIT IS TWO BEATS: the brand (status, then mark) leaves the stage while
+  // the gradient veil is still opaque, and only the veil is left dissolving over
+  // the app. A single uniform fade is what made the hand-off read as unsmooth:
+  // a 240px white mark and a line of status text ghosting over the app's own
+  // content for most of the fade, worst at the low opacities where the UI
+  // underneath is readable.
+  describe('leaving choreography', () => {
+    it('lets the status and the mark leave inside the veil fade', () => {
+      const veil = /\.boot-splash-leaving\s*\{[^}]*animation:\s*boot-splash-out\s+([\d.]+)s/.exec(html);
+      expect(veil).toBeTruthy();
+      const veilMs = parseFloat(veil![1]) * 1000;
+      const status = /\.boot-splash-leaving\s+\.boot-splash-status\s*\{[^}]*opacity:\s*0;[^}]*transition:\s*opacity\s+([\d.]+)s/.exec(html);
+      expect(status).toBeTruthy();
+      expect(html).toContain('@keyframes boot-mark-out');
+      const mark = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{[^}]*boot-mark-out\s+([\d.]+)s/.exec(html);
+      expect(mark).toBeTruthy();
+      // Strictly inside, not merely equal: a brand element still fading when the
+      // veil hits zero is the ghost this choreography exists to remove.
+      expect(parseFloat(mark![1]) * 1000).toBeLessThan(veilMs);
+      expect(parseFloat(status![1]) * 1000).toBeLessThan(veilMs);
+    });
+
+    // The exit is APPENDED to the mark's animation list, and the entries ahead of
+    // it are restated verbatim, so the reveal keeps its start time (an animation
+    // is matched by name and position) and the exit's implicit `from` composites
+    // over the breathe. Declaring the shorthand with the exit alone would drop
+    // the breathe and start from the base opacity 1, jumping the mark up to 16%
+    // brighter on whichever frame dismissal lands in. The two states carry two
+    // different lists: a formed mark (the gateway handover) never played a
+    // reveal, and putting one back into its list would rebuild it mid-exit.
+    it('appends the exit to each mark state list instead of replacing it', () => {
+      const leaving = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{([^}]*)\}/.exec(html)?.[1];
+      expect(leaving).toBeTruthy();
+      expect(leaving).toMatch(/boot-mark-reveal[\s\S]*boot-mark-breathe[\s\S]*boot-mark-out/);
+      const formed = /\.boot-splash-formed\.boot-splash-leaving\s+\.boot-splash-mark\s*\{([^}]*)\}/.exec(html)?.[1];
+      expect(formed).toBeTruthy();
+      expect(formed).toMatch(/boot-mark-breathe[\s\S]*boot-mark-out/);
+      expect(formed).not.toMatch(/boot-mark-reveal/);
+    });
+
+    // Same trap as the quiet fade above: the exit rules carry two- and
+    // three-class specificity, a media query adds none, so the plain
+    // `.boot-splash-mark` / `.boot-splash-status` rules in the reduced-motion
+    // block would lose and an accessibility preference would get the scale and
+    // the fade anyway.
+    it('silences the exit under prefers-reduced-motion', () => {
+      const reduced = /@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*?)\n {6}\}/.exec(html)?.[1];
+      expect(reduced).toBeTruthy();
+      expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/);
+      expect(reduced).toMatch(/\.boot-splash-formed\.boot-splash-leaving\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/);
+      expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-status[^{}]*\{\s*transition:\s*none/);
+    });
+
+    // A cover on its way out is not a target. `.boot-splash-escape` takes its own
+    // pointer events back and `.boot-splash-stalled` takes the container's, both
+    // for a splash that is still standing; a click during the hand-off belongs to
+    // the app underneath, and the longer exit widens that window.
+    it('stops taking pointer input once it is leaving', () => {
+      expect(html).toMatch(
+        /\.boot-splash\.boot-splash-leaving,\s*\.boot-splash-leaving\s+\.boot-splash-escape\s*\{[^}]*pointer-events:\s*none/,
+      );
+    });
   });
 });

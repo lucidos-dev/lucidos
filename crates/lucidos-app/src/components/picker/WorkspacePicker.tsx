@@ -684,7 +684,7 @@ export function WorkspacePicker() {
   // other view — a fast local gateway resolves well inside that window, so the
   // skeleton never appears and can't flash. There IS competing content behind it
   // (the brand header + footer render immediately) and the inline boot splash
-  // fades over the picker for ~0.45s on every open, masking the brief empty→list
+  // fades over the picker for ~0.65s on every open, masking the brief empty→list
   // transition on a fast load — so the earlier "show it immediately" approach
   // (the picker as a no-competing-content exception) just produced a skeleton
   // blink under the clearing splash. Only a genuinely slow load (>300ms) now
