@@ -59,6 +59,37 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Recorded mirror-history exceptions
+
+- **Added:** 2026-08-11
+- **Lives in:** `RELEASE_MIRROR_HISTORY_EXCEPTIONS` in `scripts/lib/release_tree.sh`
+  (itself in `RELEASE_TREE_EXCLUDE_PATHS`, so the list never reaches the mirror).
+- **Impermanent because:** It carries one commit,
+  `df6ef7ca7d748ae5e340993230315ebb096d8095`, the abandoned v0.26.3 Phase A that
+  pushed its stripped commit to the mirror's `main` and then died in notarize
+  (notarytool `abortedUpload`), so it was never tagged and never published. It is
+  the parent of `76345548`, which carries `v0.26.3`, so it cannot be rewritten
+  away without changing a published release's SHA. The list exists to record that
+  one anomaly rather than tolerate it silently, and it is meant to stay at one
+  entry: a second entry means Phase A dropped another commit on `main`, which is
+  a bug to fix at the source, not a row to add here.
+- **Removal / resolution condition:** Drop the whole array (and the
+  `<exceptions>` argument threaded through
+  `release_mirror_history_is_complete`) if the mirror is ever rebuilt from the
+  published trees for an unrelated reason, since a rebuild re-derives a chain
+  with no untagged commits in it. Until then the entry stays, because the
+  anomaly it describes is permanent in the published history. Verify by running
+  `scripts/lib/release_tree_test.sh` with the array emptied: every assertion
+  outside the two exception blocks must still pass, which is what pins that the
+  list narrows the guard by exactly its entries and nothing more.
+- **Status:** `active`
+- **Not a softening of the guard.** Every entry is re-verified on every run
+  against the live remote (still an ancestor of `main`, still untagged), and an
+  entry that fails either test fails the release by name. Any untagged commit
+  that is *not* recorded still refuses the release exactly as before. The stale
+  arm is exercised on real data by the test suite, which points the shipped list
+  at a stand-in mirror and asserts it is refused.
+
 ### One-time mirror history rebuild script
 
 - **Added:** 2026-08-03 (re-armed and wired to a gate 2026-08-04)

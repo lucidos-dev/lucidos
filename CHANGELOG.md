@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.26.4 — 2026-08-11
+
+### Fixed
+
+- The delete icon on a queued chat message renders at a size that matches the "Queued" label next to it, and keeps its full tap target on mobile.
 ## v0.26.3 — 2026-08-11
 
 ### Changed

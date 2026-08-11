@@ -4,8 +4,10 @@ import { navigateToApp, assertHealthy, openTriggersPanel } from './helpers';
 /** The trigger group heading's two glyphs read at the same size.
  *
  *  Reported three times as the trash being small. The box was never the
- *  problem: both buttons are one `.icon-btn.row-icon`, 2.25rem holding a
- *  `--icon-size-lg` glyph. What differs is how much of that glyph each icon
+ *  problem: both buttons are one `.icon-btn.row-icon`, 2.25rem holding a glyph
+ *  at the box's nominal size (`--icon-glyph`, which defaults to
+ *  `--icon-size-lg`; this pair takes the default, only the queued message's
+ *  trash turns it down). What differs is how much of that glyph each icon
  *  actually paints. Measured here at a 20px box, the pencil's ink is 20.12 of
  *  its 24 viewBox units and the trash's is 16.00, so the trash rendered a fifth
  *  shorter inside an identical box.

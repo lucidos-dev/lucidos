@@ -990,13 +990,32 @@
     font-size: var(--font-size-md);
 }
 
-/* Box and glyph come from `.icon-btn.row-icon` (host-components.css), shared
-   with the trigger group heading's trash. It used to be hand-sized here, at
-   1.25rem around a 0.85rem glyph that was on no icon step: a target a thumb
-   misses, and the same trash a step smaller than the one two panes over. Only
-   the colour is local. */
+/* Box and correction come from `.icon-btn.row-icon` (host-components.css),
+   shared with the trigger group heading's trash. It used to be hand-sized
+   here, at 1.25rem around a 0.85rem glyph on no icon step: a target a thumb
+   misses, holding a glyph off the scale entirely. Being smaller than the
+   heading's trash was never the defect (it is smaller again below, on purpose
+   and by one step); being off the scale in an undersized box was. The colour
+   and the nominal glyph size are what stay local. */
 .queued-message-remove {
     color: var(--text-muted);
+}
+
+/* One step down from the trigger group heading's twin, because it sits in a
+   different place: inline against a --font-size-md "Queued" label rather than
+   in a heading band, where the heading's nominal read as a trash bin looming
+   over its own caption. The heading's pair is unchanged, this turns down only
+   the nominal for this button and the shared rule applies its ink correction
+   and its stroke division at that nominal as usual.
+
+   Only the GLYPH shrinks. The 2.25rem button box is the tap target, grown
+   deliberately after this very trash was reported unhittable on mobile, so it
+   stays exactly as it is and nothing here sets width, height or padding.
+
+   Three classes (0,3,0) so it outranks the two-class default in
+   host-components.css on specificity, whatever order the two sheets land in. */
+.icon-btn.row-icon.queued-message-remove {
+    --icon-glyph: var(--icon-size-md);
 }
 
 @media (hover: hover) {
