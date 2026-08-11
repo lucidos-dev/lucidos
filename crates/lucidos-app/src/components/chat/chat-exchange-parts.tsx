@@ -869,9 +869,11 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
         data-role="step-main"
         onClick={() => { stepDetailModal.value = event; }}
       >
-        {/* In-progress step: no leading icon (`stepStatus` returns an empty one),
-            because the shimmering description is the "live" affordance. The empty
-            slot itself is hidden via CSS for `.pending`. */}
+        {/* In-progress step: no leading mark (`stepStatus` returns an empty
+            icon), because the shimmering description is the "live" affordance.
+            The span still renders, empty: the slot is a fixed-width column in
+            CSS, so the running row's text sits on the same column as the
+            finished rows above it. */}
         <span class="step-icon">{icon || null}</span>
         <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
         {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}

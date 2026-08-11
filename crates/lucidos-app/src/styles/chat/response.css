@@ -17,7 +17,20 @@
     align-items: flex-start;
     gap: 0.5rem;
     padding-left: var(--turn-body-inset);
-    margin-bottom: 0.7rem;
+    /* One measurement, shared with `.initiator-header` (chat/input-messages.css):
+       the two rows sit one above the other in a turn, so the gap under each of
+       them moves in step or the transcript reads as two rhythms.
+
+       Down from the 0.7rem that 9dc95f66a set on 2026-06-09. That value was
+       measured against a body opening on PROSE, which runs at 1.5 leading
+       (`.response-content` below), and the common case is a body opening on the
+       step list instead, whose rows run at 1.4 on --font-size-sm (`.inline-step`
+       in styles/steps.css). Against that tighter pitch the 0.7rem stopped
+       reading as the label's own clearance and started reading as a hole between
+       the label and the run it labels. 0.5rem is still clearly above the 0.35rem
+       the same change replaced, which was rejected for not registering as a
+       break at all, so this is a step back toward it and not a return to it. */
+    margin-bottom: 0.5rem;
     min-height: var(--turn-header-line);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);

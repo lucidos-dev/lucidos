@@ -53,6 +53,31 @@ describe('turn header gutter', () => {
     );
   });
 
+  // The feed rhythm separates a turn from the NEXT one, so the LAST turn has
+  // nothing below it for its bottom half to separate from: there it stacked on
+  // the transcript's own bottom padding (--prompt-fade + --nav-focus-reach) and
+  // opened a hole under the running step, floating the reply's live edge clear
+  // of the composer. Both panel kinds are covered, because a turn whose
+  // response has not started ends on its initiator panel.
+  it('drops the feed rhythm below the last turn, where nothing follows it', () => {
+    const re = /\.thread-content > \.chat-exchange:last-child > ([^{]*)\{([^}]*)\}/;
+    const [, selectorTail, block] = inputCss.match(re) ?? [];
+    expect(block, 'no last-turn rule').toBeTruthy();
+    expect(declarationValue(block!, 'padding-bottom')).toBe('0');
+
+    for (const panel of ['initiator-panel', 'response-panel']) {
+      // Both panel kinds, because either can be the turn's last child: a turn
+      // whose response has not started yet ends on its initiator panel.
+      expect(selectorTail, `.${panel} not covered`).toContain(`.${panel}:last-child`);
+    }
+    // It must YIELD to the panel-level nav focus marker. At (0,5,0) it
+    // out-ranks that rule's (0,2,0), so without the exclusion a deep link
+    // landing on the last turn paints the marker's wash flush against the last
+    // line while the other three sides keep their inset, which is the exact
+    // asymmetry the marker rule exists to remove.
+    expect(selectorTail).toContain(':not(.nav-focus-stuck)');
+  });
+
   // The action footer (Diff/Revert on a change card) is the panel's LAST child, so
   // any padding-bottom here stacks on the panel's own bottom padding and shows up as
   // an oversized BOTTOM gap under the nav focus marker — while the panel rule below

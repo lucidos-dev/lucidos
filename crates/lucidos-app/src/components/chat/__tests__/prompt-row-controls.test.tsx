@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
+import { FollowLiveEdgeIcon } from '../../shared/icons';
 import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
 import { EventWaitIndicator } from '../EventWaitPanel';
 import { LucidosControlMenu } from '../LucidosControlMenu';
@@ -81,10 +82,22 @@ describe('PromptRowControls', () => {
 
   /** `.prompt-actions-row` is a flex row whose children are diffed
    *  positionally, so the order is part of the contract, not an accident of
-   *  how the JSX reads. The Lucidos branch keeps exactly the order it had
-   *  before the indicator moved out of it. */
-  it('puts the indicator last, after whichever control menu the thread resolved', () => {
-    expect(cluster(null)).toEqual([LucidosControlMenu, TodoListIndicator, EventWaitIndicator]);
-    expect(cluster('claude-code')).toEqual([CodingAgentControlMenu, EventWaitIndicator]);
+   *  how the JSX reads.
+   *
+   *  The first two slots are FIXED and the rest float behind them: the control
+   *  menu anchors the row, and the follow toggle is second on every thread
+   *  because it is the only control here that renders in every state. Behind
+   *  the indicators it was third on a Lucidos Agent thread, second on a
+   *  coding-agent one, and fourth with a subscription armed, so the button
+   *  moved under the thumb depending on what the thread was doing. The toggle
+   *  shows up here as its ICON, the one function component inside the
+   *  `<button>` this walk can see. */
+  it('pins the menu and the follow toggle, and floats the indicators behind them', () => {
+    expect(cluster(null)).toEqual([
+      LucidosControlMenu, FollowLiveEdgeIcon, TodoListIndicator, EventWaitIndicator,
+    ]);
+    expect(cluster('claude-code')).toEqual([
+      CodingAgentControlMenu, FollowLiveEdgeIcon, EventWaitIndicator,
+    ]);
   });
 });

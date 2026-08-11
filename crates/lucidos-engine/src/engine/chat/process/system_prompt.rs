@@ -547,7 +547,7 @@ WAITING FOR A STATE CHANGE IN LUCIDOS: USE `await_event`, NEVER A POLL LOOP:
 - Everything above is about the OUTPUT of a process you started. A STATE CHANGE in Lucidos is a different thing: a change being proposed, a trigger firing, a thread you did NOT spawn going idle, a domain event. `await_event` subscribes you and re-opens this thread when it arrives.
 - Reach for it INSTEAD of a bash_output drain loop, a sleep-and-recheck script, or a `threads list` / `changes list` poll: a poll costs a turn per check and can miss a transition between samples. It is ALSO how you deliver, not only how you wait, so nothing has to be blocking you. It is NOT for external state with no Lucidos event (a third-party API, a file another process writes), which you poll with the background tools.
 - One subscription resolves on one match, which is the duration half of the choice; the destination half is TELL ME WHEN X HAPPENS above, which decides "let me know HERE".
-- AND IT IS NOT FOR A THREAD YOU SPAWNED YOURSELF. A child thread already re-opens this one when it finishes, carrying its status, summary and pending change ids: that is the engine's own fan-in and needs no subscription. Say you'll report back, and end the turn. A completion that is NOT your own child's (a grandchild's) is a real wait, named with a `child_thread_id` condition.
+- IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD: it already re-opens this thread with its status, summary and pending change ids, so a wait on it is a second wake. Say you'll report back, and end the turn.
 - IT RETURNS IMMEDIATELY AND BLOCKS NOTHING, so say what you're waiting for and END YOUR TURN. The tool's own schema carries the rest.
 - NEVER ANSWER "AM I STILL WATCHING FOR THAT?" FROM MEMORY: call `list_event_waits`, and `cancel_event_wait` to STOP.
 
@@ -1689,6 +1689,14 @@ mod tests {
     /// coding-agent child, spending a subscription and arming a 90-minute
     /// timeout for a wake it was going to get anyway.
     ///
+    /// **The carve-out is a redundancy, not a limit, and the section has to say
+    /// so in that order.** Worded as a bare "not for a thread you spawned", it
+    /// was generalised into "cross-thread waits are unreliable": a live thread
+    /// armed a `child_thread_id` wait on someone else's coding-agent session and
+    /// warned the user it "may never fire". Matching is workspace-wide (see
+    /// `a_wait_matches_a_child_completion_belonging_to_another_thread`), so the
+    /// positive claim leads and the exclusion follows it.
+    ///
     /// Source-scanned rather than asserted against a const, like
     /// `every_prompt_placeholder_is_substituted` above: this section is plain
     /// text inside [`SYSTEM_PROMPT_BASE`], and extracting it would only move the
@@ -1711,9 +1719,19 @@ mod tests {
         let section = &section[..section.find("\n\n").unwrap_or(section.len())];
 
         assert!(
-            section.contains("AND IT IS NOT FOR A THREAD YOU SPAWNED YOURSELF"),
+            section.contains("IT WATCHES THE WHOLE WORKSPACE"),
+            "another thread's lifecycle is a first-class wait, and the resident \
+             prompt has to say so, or the exclusion below reads as 'a wait on a \
+             thread that is not mine might not fire':\n{section}"
+        );
+        assert!(
+            section.contains("NOT YOUR OWN CHILD"),
             "the resident prompt must exclude the caller's own child, or the \
              fan-in is invisible at the moment the model picks a mechanism:\n{section}"
+        );
+        assert!(
+            section.contains("a second wake"),
+            "the exclusion's reason must be redundancy, never impossibility:\n{section}"
         );
         assert!(
             !section.contains("coding agent finishing"),

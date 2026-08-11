@@ -124,6 +124,35 @@ describe('inline step layout (CSS regression)', () => {
     });
   });
 
+  // Every outcome's mark shares one column, and the running row has to sit on
+  // it while carrying no mark at all (`stepStatus` returns an empty icon for
+  // pending, so its slot is an empty span). A fixed slot width is the only
+  // thing that holds the column in both directions; the slot used to be
+  // `display: none`, which took the span out of the flex line entirely, its
+  // width AND the gap after it, so the one row still running sat a mark's width
+  // to the left of every finished row above it.
+  describe('the mark column, held open even by a row with no mark', () => {
+    const iconRules = rulesTargeting(css, 'step-icon');
+
+    it('the slot is a fixed box, sized against the row and not the root', () => {
+      const widths = iconRules.map(r => r.props.get('width')).filter(Boolean);
+      expect(widths).toHaveLength(1);
+      // `em`, not `rem`: the box has to match the glyph the ROW renders, and the
+      // row sets its own font-size rather than inheriting the root's.
+      expect(widths[0]).toMatch(/^\d*\.?\d+em$/);
+      // A `min-width` would let a wide glyph push the description instead, which
+      // is the raggedness the fixed box exists to remove.
+      expect(iconRules.some(r => r.props.has('min-width'))).toBe(false);
+    });
+
+    it('nothing anywhere collapses the slot', () => {
+      // Deliberately unfiltered: `display: none` on ANY rule that styles the
+      // slot re-opens the bug, and it beats the width whatever the source order
+      // and whichever outcome class the rule is qualified with.
+      expect(iconRules.filter(r => r.props.get('display') === 'none')).toEqual([]);
+    });
+  });
+
   // A step killed mid-execution (the turn died before the tool reported a
   // result) reads as "did not finish": muted and struck. Deliberately NOT the
   // red .error treatment, which asserts the tool ran and returned a failure.

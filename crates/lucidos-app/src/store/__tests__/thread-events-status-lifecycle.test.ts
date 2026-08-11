@@ -658,10 +658,13 @@ describe('ContextCaptured projection — main_llm vs claude_code', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; contextCapture?: { producer: string; usage?: { input_tokens: number } } }>;
-    // Find the Read step (the most recent step before the ContextCaptured event)
-    const lastStep = respSteps[respSteps.length - 1];
-    expect(lastStep.contextCapture?.producer).toBe('claude_code');
-    expect(lastStep.contextCapture?.usage?.input_tokens).toBe(5000);
+    // The Read step: the most recent step at the moment the ContextCaptured
+    // event landed. Selected by name rather than by position, because the turn
+    // has no terminator and therefore also carries a trailing live "Thinking"
+    // row (see `needsLiveThinkingRow`), which the snapshot predates.
+    const readStep = respSteps.find(s => s.description === 'Read a.rs')!;
+    expect(readStep.contextCapture?.producer).toBe('claude_code');
+    expect(readStep.contextCapture?.usage?.input_tokens).toBe(5000);
   });
 });
 

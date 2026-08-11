@@ -324,6 +324,41 @@ fn every_subscription_text_says_where_the_subscription_stands() {
     }
 }
 
+/// Persist a `ChildThreadCompleted` on `parent_id` and hand back the stored
+/// row.
+///
+/// The row rather than a hand-built `json!`, because every consumer of this
+/// event reads the **persisted payload column**, whose `type` tag is stripped
+/// on the way in (see `ThreadEvent::to_payload`). A literal would be a shape
+/// nothing actually emits, which is precisely what the two tests below exist to
+/// rule out.
+async fn seed_completion_card(
+    bus: &EventBus,
+    pool: &sqlx::PgPool,
+    parent_id: Uuid,
+    child_thread_id: Uuid,
+    child_thread_title: &str,
+) -> crate::core::EventRow {
+    seed_thread(bus, parent_id).await;
+    let card_id = seed_thread_event(
+        bus,
+        parent_id,
+        ThreadEvent::ChildThreadCompleted {
+            child_thread_id,
+            child_thread_title: Some(child_thread_title.to_string()),
+            status: crate::engine::thread_events::ChildCompletionStatus::Success,
+            summary: "all green".into(),
+            pending_change_ids: vec![],
+        },
+    )
+    .await;
+    crate::core::store::EventStore::new(pool.clone())
+        .get_event_by_id(card_id)
+        .await
+        .unwrap()
+        .expect("the card row")
+}
+
 /// The fan-in's dedupe gate (`child_completion_has_an_event_wait`) hands the
 /// matcher the `ChildThreadCompleted`'s **persisted payload column**, so that
 /// column has to be a shape the matcher understands. Both halves are pinned
@@ -340,25 +375,7 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = Uuid::new_v4();
-    seed_thread(&bus, parent_id).await;
-    let card_id = seed_thread_event(
-        &bus,
-        parent_id,
-        ThreadEvent::ChildThreadCompleted {
-            child_thread_id: Uuid::new_v4(),
-            child_thread_title: Some("Nightly E2E".into()),
-            status: crate::engine::thread_events::ChildCompletionStatus::Success,
-            summary: "all green".into(),
-            pending_change_ids: vec![],
-        },
-    )
-    .await;
-
-    let row = crate::core::store::EventStore::new(pool.clone())
-        .get_event_by_id(card_id)
-        .await
-        .unwrap()
-        .expect("the card row");
+    let row = seed_completion_card(&bus, &pool, parent_id, Uuid::new_v4(), "Nightly E2E").await;
 
     let bare = wait_with(parent_id, vec![sub("ChildThreadCompleted", None)], 0);
     assert_eq!(
@@ -387,6 +404,82 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
     assert!(
         waits_matching(&[other], &row.event_type, &row.payload).is_empty(),
         "a wait watching something else must NOT suppress the fan-in"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// **A wait is matched against the whole workspace's events, never only the
+/// subscribing thread's.** Nothing in the dispatch path compares the wait's
+/// `thread_id` to the event's: `offer_event_to_waits` hands
+/// [`LiveWaits::snapshot`] (every live wait, on every thread) to
+/// [`waits_matching`], which asks only [`EventSubscription::matches`]. The
+/// thread scope in this module is on the READ and CANCEL side only
+/// ([`LiveWaits::for_thread`], [`LiveWaits::take_on_thread`]).
+///
+/// The observed failure this pins: a thread armed on `ChildThreadCompleted`
+/// with a `child_thread_id` condition naming a coding-agent session belonging to
+/// a DIFFERENT parent, then told the user the subscription "may never fire". It
+/// fires. `ChildThreadCompleted` is emitted on the other parent's thread and
+/// carries the child's id in its payload, which is exactly what the condition
+/// reads, so the owning thread never enters the decision.
+///
+/// This covers the LIVE path. The restart path holds for the same reason and is
+/// covered separately: `catch_up_from_watermark`'s SQL filters on `sequence` and
+/// `event_type` with no thread predicate, and
+/// `catch_up_finds_matches_after_the_watermark_and_ignores_earlier_ones` already
+/// scans a wait against events on another thread, so adding one would fail it.
+#[tokio::test]
+async fn a_wait_matches_a_child_completion_belonging_to_another_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    // Thread B's own child, completing. The card lands on B, not on A.
+    let other_child_id = Uuid::new_v4();
+    let row = seed_completion_card(
+        &bus,
+        &pool,
+        Uuid::new_v4(),
+        other_child_id,
+        "Someone else's coding agent",
+    )
+    .await;
+
+    // Thread A, watching that completion. A is not the child's parent and is
+    // not an ancestor of it, which is the whole point.
+    let watcher_id = Uuid::new_v4();
+    let watching = wait_with(
+        watcher_id,
+        vec![sub(
+            "ChildThreadCompleted",
+            Some(json!({"child_thread_id": other_child_id.to_string()})),
+        )],
+        0,
+    );
+    let watching_id = watching.wait_id;
+    let wrong_child = wait_with(
+        watcher_id,
+        vec![sub(
+            "ChildThreadCompleted",
+            Some(json!({"child_thread_id": Uuid::new_v4().to_string()})),
+        )],
+        0,
+    );
+
+    // Through the cache the dispatcher actually reads, so the candidate set is
+    // pinned as workspace-wide too, not just the predicate.
+    let live = LiveWaits::new();
+    live.insert(watching).await;
+    live.insert(wrong_child).await;
+    let hits = waits_matching(&live.snapshot().await, &row.event_type, &row.payload);
+
+    assert_eq!(
+        hits,
+        vec![(watching_id, 0)],
+        "a cross-thread ChildThreadCompleted must resolve the wait whose \
+         child_thread_id it carries, and only that one: {:?}",
+        row.payload
     );
 
     pool.close().await;

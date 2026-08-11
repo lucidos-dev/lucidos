@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.26.3 — 2026-08-11
+
+### Changed
+
+- A coding-agent turn shows a live step row between tool calls and from the moment the session starts, so the transcript keeps a running row for as long as the turn is working.
+
+### Fixed
+
+- The live-edge follow stays on through an iOS keyboard opening, an app resumed from the background, and the full-response toggle. Only your own scrolling retires it.
+- A press inside the transcript keeps the follow: answering a question card, granting a permission or expanding a turn is not a scroll. Movement retires it, and a scroll key counts only on the transcript itself.
+- Turning steps on while riding the live edge holds the newest content still, with the growth appearing above it.
+- Expanding a turn and collapsing it again leaves the transcript where it started, even when the expansion was tall enough to hit the bottom of the scroll.
+- Expanding or collapsing a turn holds that turn exactly where it sat, down to the fraction of a pixel, so the text around it stays on the same rows. Most visible on a phone, where a fraction of a CSS pixel is several device pixels.
+- A wake that arrives mid-turn renders in the place it happened, above the work it woke the thread to do, rather than below everything that turn produced.
+- The Lucidos agent treats a wait on another thread's completion as a supported subscription, so it no longer hedges that such a wait may never fire.
+- The gap under a turn header is tighter, so a turn's first line sits closer to its heading.
+- The running step keeps its icon column, so nothing shifts sideways when the check lands, and the success, error and unfinished marks all land in the same column.
+- The last turn sits directly above the composer, with no gap under the running step.
+- The follow-the-live-edge toggle holds the second slot in the prompt bar, directly after the control menu, on every kind of thread.
+- The boot splash keeps one text weight as it hands over to the app, so the status line no longer changes weight on the frame its text changes.
 ## v0.26.2 — 2026-08-11
 
 ### Changed

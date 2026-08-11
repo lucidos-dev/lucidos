@@ -561,6 +561,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **The derived live `Thinking` row carrying no `created` is deliberate, and no
+  consumer reads a missing one.** Every other `pushStep` in
+  `store/thread-events/exchange-render.ts` stamps the source event's `created`,
+  so the one in the `needsLiveThinkingRow` branch reads as an omission that
+  will render an invalid timestamp. It cannot: the row is DERIVED from the
+  turn's live state and corresponds to no event, so there is no honest
+  timestamp to stamp (`frontend.md` § No Silent Defaults), and both consumers
+  handle its absence, `InlineStep` because it never reads `created` at all and
+  `StepDetailModal` because its timestamp is behind `{step.created && …}`. The
+  field is optional on the `ResponseEvent` step variant for this reason.
+  Re-flag only if a consumer starts reading `created` unguarded, or if the row
+  acquires an event of its own. (`store/thread-events/exchange-render.ts`,
+  `components/chat/chat-exchange-parts.tsx`, `components/chat/StepDetailModal.tsx`.)
+
 - **The shared `Dropdown` portals its menu to `<body>` at a z-index BELOW
   `--z-modal`, and no dropdown is nested in a modal, so the "hidden behind the
   modal it belongs to" bug has no instance.** The shape invites the finding
@@ -1370,6 +1384,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   line so they cannot disagree. Re-flag only if the late landing itself is made
   to stand down, in which case the retirement goes with it.
   (`components/chat/scrollState.ts`.)
+
+- **`reachableScrollTop` rounding the anchor correction does NOT throw away
+  subpixel precision the engines would have kept** (2026-08-11, Codex).
+  `withScrollAnchor` (`components/chat/CreateThreadView.tsx`) measures the
+  anchor through rects, in doubles, and then rounds the one number it writes,
+  which reads as undoing the precision the measurement just won: `scrollTop` is
+  a double on the way in and out, so an unconditional `Math.round` looks like up
+  to half a pixel of self-inflicted drift. The engines do not keep the fraction.
+  Measured on a seeded 12-turn transcript at a 105% root: WebKit stored **2377**
+  for a written **2377.8** and the reader moved 0.8px, and Chromium stored
+  **2499** for **2498.8**, at both device pixel ratios. WebKit TRUNCATES where
+  Chromium rounds, so handing the engines the fraction is not neutral, it hands
+  iOS up to twice the desktop's error; rounding first took the worst press in
+  that run from 0.75px to 0.39px. The residual under half a pixel is the floor
+  for any anchor correction, because layout is fractional and a scroll offset is
+  not. Re-flag only with a measurement showing an engine that stores a
+  fractional `scrollTop` it was handed.
+  (`components/chat/CreateThreadView.tsx`,
+  `e2e/turn-control-holds-the-reader-still.spec.ts`.)
 
 ## Scripts (bash)
 

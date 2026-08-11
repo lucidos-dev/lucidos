@@ -940,8 +940,16 @@ fn await_event_description_names_the_real_subscription_cap() {
 /// subscription slot plus a timeout that can fire while the child still works.
 /// The use-list used to say "a thread finishing" with no carve-out, which is the
 /// nearest matching instruction for exactly this case, and on 2026-08-06 a live
-/// thread duly subscribed to its own coding-agent child. So the assertion is
-/// that the exclusion is stated AND that the use-list no longer invites it.
+/// thread duly subscribed to its own coding-agent child.
+///
+/// **The exclusion's REASON is load-bearing and has to read as redundancy.**
+/// Matching is workspace-wide, so any thread's completion is a wait that
+/// genuinely fires; the matcher side of that is pinned by
+/// `a_wait_matches_a_child_completion_belonging_to_another_thread`. Worded as a
+/// bare prohibition, the carve-out was read as impossibility instead: a live
+/// thread armed a cross-thread `child_thread_id` wait and then told the user,
+/// unprompted, that it "may never fire". So the first assertion is the positive
+/// claim, and the exclusion is only allowed after it.
 #[test]
 fn await_event_description_carves_out_the_threads_own_child() {
     let tools = get_default_tools();
@@ -952,9 +960,19 @@ fn await_event_description_carves_out_the_threads_own_child() {
     let d = &tool.description;
 
     assert!(
-        d.contains("NOT FOR A THREAD YOU SPAWNED AS A CHILD OF THIS ONE"),
+        d.contains("MATCHING IS WORKSPACE-WIDE"),
+        "watching another thread is a supported use, and saying so is what stops \
+         the exclusion below being read as 'a cross-thread wait might not \
+         fire':\n{d}"
+    );
+    assert!(
+        d.contains("NOT YOUR OWN CHILD'S"),
         "the redundant case has to be excluded by name, or the fan-in is \
          invisible to the model:\n{d}"
+    );
+    assert!(
+        d.contains("so a wait duplicates it"),
+        "the exclusion's reason must be redundancy, never impossibility:\n{d}"
     );
     assert!(
         d.contains("a thread you did not spawn finishing"),

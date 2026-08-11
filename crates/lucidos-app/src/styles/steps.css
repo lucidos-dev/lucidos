@@ -91,8 +91,29 @@
     box-shadow: var(--focus-ring);
 }
 
+/* One column for the mark, whatever mark the row ends up carrying, so a column
+   of steps reads as a list rather than as a ragged left edge.
+
+   The width is what makes that true, and it is doing two jobs. Across rows, the
+   four outcomes are four different glyphs (see `stepStatus`), and a check, a
+   warning sign and a slashed circle are not the same width in a proportional
+   font, nor even in a monospace one once the font lacks them and the browser
+   falls back per glyph. Within a row, the in-progress step carries NO mark at
+   all: `stepStatus` returns an empty icon, so the slot is an empty span, and a
+   fixed width is the only thing holding the column open while the step runs.
+   That slot used to be `display: none`, which took the span out of the flex
+   line entirely (its width AND the gap after it), so the one row that was still
+   running sat a mark's width to the left of every finished row above it.
+
+   `em`, not `rem`, and deliberately: the box has to match the glyph the ROW
+   renders, and the row sets its own `--font-size-sm` rather than inheriting the
+   root. A rem here would stop tracking the moment that font-size changed. A
+   glyph wider than its box is not clipped, it just reaches into the gap after
+   it, which is why this is a plain `width` rather than a `min-width` that would
+   let the description move. */
 .inline-step .step-icon {
     flex-shrink: 0;
+    width: 1em;
 }
 
 .inline-step.success .step-icon {
@@ -103,12 +124,10 @@
     color: var(--accent-red);
 }
 
-/* In-progress step shows no leading icon — the shimmering description
-   (.running-shimmer) is the "live" affordance, so hide the empty icon slot to
-   keep the text flush-left rather than leaving its inter-item gap. */
-.inline-step.pending .step-icon {
-    display: none;
-}
+/* There is deliberately no `.inline-step.pending .step-icon` rule: the running
+   row carries no mark (the shimmering description is its "live" affordance) and
+   the shared slot above already holds its column open. Anything that hid the
+   slot here would put the running row's text back off the column. */
 
 /* Killed mid-execution: the turn died (failed / aborted / canceled) while this
    tool call was still running, so it never reported a result. Struck and muted

@@ -1,5 +1,6 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
 import { prefersReducedMotion } from '../../utils/platform';
+import { USER_SCROLL_WINDOW_MS } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 
@@ -57,10 +58,14 @@ import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMa
  *  construction. Two earlier branches tried to reach the same conclusion BEFORE
  *  the turn rendered, and both got the ordinary case wrong; see `followSubmit`.
  *
- *  Three things retire a standing follow: the reader's own scroll, opening
- *  another thread, and a DEEP-LINK LANDING. A link is the reader asking to be at
- *  one specific place, so the ride ends where it puts them and the transcript
- *  stops moving underneath them.
+ *  Four things retire a standing follow, and all four are the reader: their own
+ *  scroll GESTURE, a chevron or turn-nav press, opening another thread, and a
+ *  DEEP-LINK LANDING. A link is the reader asking to be at one specific place,
+ *  so the ride ends where it puts them and the transcript stops moving
+ *  underneath them. A GESTURE and not merely a scroll, because the platform
+ *  scrolls the container too (see "Was this scroll the reader's own GESTURE?");
+ *  the last three are presses rather than gestures, so each retires the ride at
+ *  its own call site.
  *
  *  This module used to hold the opposite policy, and most of its size was the
  *  machinery for deciding WHEN to pin: an 80px stickiness window (`scrolledUp`),
@@ -823,22 +828,30 @@ function carryHeldScroll(el: HTMLElement): void {
  *  correction (which pins that root) leaves the reader short of the live edge
  *  and the follow saw a move it had not made.
  *
- *  Then, ARMED ONLY, ride the growth GENTLY. Being short of the edge is exactly
- *  what the standing follow exists to undo, and the growth branch would already
- *  undo it a frame later, but as one instant write: right for streaming, where
- *  each round adds a line and the writes read as motion, and wrong here, where
- *  one click can add the height of the whole transcript and the reader is simply
- *  teleported. So take it as a tween, like every other discrete thing the reader
- *  clicks. `glideToLiveEdge` re-reads its target per frame, so a reply arriving
- *  mid-glide is tracked, and it falls back to the instant write under reduced
- *  motion. `honourGrowth` stands down while it runs, so the two never both write.
+ *  Then, ARMED ONLY, put them back ON the live edge in ONE held write, in the
+ *  same frame the caller unfreezes: `snapToLiveEdge`. Being short of the edge is
+ *  exactly what the standing follow exists to undo, and here it is not a
+ *  position the reader ever occupied, only one the mutation left them at between
+ *  two writes the browser has not painted yet.
+ *
+ *  A TWEEN was tried here first, on the reasoning that one click can add the
+ *  height of the whole transcript and an instant write teleports the reader. It
+ *  is what the reader then reported (2026-08-11): turning the steps on grows
+ *  every turn ABOVE them too, so the transcript arrived a screenful or more
+ *  short of the live edge and then scrolled itself down. The teleport argument
+ *  does not survive contact with what a riding reader is looking at, which is
+ *  the newest content: this write keeps that content exactly where it is on
+ *  screen and lets the growth appear above it, while it is the ANCHOR
+ *  correction, and the pause before a tween, that move it. So the snap is the
+ *  SMALLER motion of the two, and it is invisible rather than instant, because
+ *  it lands before the paint the mutation causes.
  *
  *  Nothing at all for an unarmed reader: a toggle is not a request to be moved,
  *  and the anchor correction has already kept them on what they were reading. */
 export function honourAnchoredMutation(el: HTMLElement): void {
   carryHeldScroll(el);
   if (!_followingBottom.value || isAtLiveEdge(el)) return;
-  glideToLiveEdge(el);
+  snapToLiveEdge(el);
 }
 
 /** Is the container still exactly where our last held write left it? The exact
@@ -847,6 +860,241 @@ export function honourAnchoredMutation(el: HTMLElement): void {
  *  ratio) and the iOS repaint nudge's deliberate ±1. */
 function isWhereWeHeldIt(el: HTMLElement): boolean {
   return _heldEl === el && Math.abs(el.scrollTop - _heldTop) <= 1;
+}
+
+/* ── Was this scroll the reader's own GESTURE? ───────────────────────────────
+ *  The position test above answers "did the container move away from our
+ *  write", and the block over it states the premise that made that the same
+ *  question as "did the reader take over": content growth changes
+ *  `scrollHeight` and never `scrollTop`, so growth cannot look like a gesture.
+ *
+ *  That premise covers growth and nothing else, and three things move the
+ *  container with no gesture behind them at all:
+ *
+ *  - The iOS soft keyboard. Opening or closing it rewrites `--app-height`
+ *    (`MobileSwipeContainer`), the transcript's height changes with it, and
+ *    WebKit adjusts the offset ASYNCHRONOUSLY through the ~350ms animation, so
+ *    the correction lands well after any write of ours to stamp it against.
+ *  - An app backgrounded and resumed. The PWA restores an offset nobody wrote.
+ *  - Anything the platform decides to scroll on its own (a focus ring brought
+ *    into view, a restored session).
+ *
+ *  Each of those retired a follow the reader had armed and never touched, while
+ *  a reply was streaming, which is the whole value of the feature gone at the
+ *  moment it is worth most. So the question is asked of the INPUT instead: a
+ *  scroll may retire the follow only while a reader gesture is in flight. That
+ *  is a direct signal where the position was an inference, which is what this
+ *  module says it wants everywhere else.
+ *
+ *  The gesture term is added to the position one rather than replacing it: both
+ *  must hold. A real scroll satisfies both by construction (a gesture moves the
+ *  container), so nothing that used to retire the follow stops doing so, and
+ *  the pairing keeps a stray tap during a growth write from ever standing in
+ *  for a scroll.
+ *
+ *  A NAVIGATION is not a gesture and must say so itself, which is what the up
+ *  chevron, turn stepping and the deep link do (see `stopFollowingBottom`). */
+
+/** How long after the reader lifts off their scroll events still count as
+ *  theirs: `USER_SCROLL_WINDOW_MS`, which `utils/scrollActivity.ts` already
+ *  defines as "the drag plus the momentum tail" for the repaint nudge's own
+ *  stand-down. The same question, so the same answer, shared rather than
+ *  restated: it has to outlive `touchend` because iOS momentum fires its scroll
+ *  events after the finger is gone, and a flick that only crosses the live-edge
+ *  threshold during the coast would otherwise read as the platform's. Two
+ *  constants that must agree and nothing saying so is exactly the drift the
+ *  repo's glossary rule is about.
+ *
+ *  The EVENT SET is deliberately not shared. `utils/userAction.ts` owns "the
+ *  user did something" for the surfaces that stand down on any interaction, and
+ *  it includes `pointerdown`, which is right there and wrong here: a press is
+ *  how the reader answers a question or grants a permission, and this signal
+ *  must survive both. See `_scrollbarPressEl`. */
+const READER_GESTURE_WINDOW_MS = USER_SCROLL_WINDOW_MS;
+
+/** The element the last MOVEMENT was on, so a gesture in one pane cannot speak
+ *  for the transcript in another. */
+let _gestureEl: HTMLElement | null = null;
+/** When that movement was. */
+let _gestureAt = -Infinity;
+/** The container whose SCROLLBAR is currently held, or null.
+ *
+ *  Only a scrollbar press goes in here, and that narrowness is the whole of the
+ *  variable's job. A press on CONTENT is how the reader answers a question,
+ *  grants a permission or expands a turn, all inside the transcript and all
+ *  changing content; a mouse drag on content selects text and scrolls nothing.
+ *  Recording those too would let the jitter every real click carries reach
+ *  `pointermove` below and stamp a gesture, putting the window back over
+ *  exactly the interactions this module documents as KEEPING the follow. With
+ *  only the gutter recorded, that is unrepresentable rather than merely
+ *  avoided.
+ *
+ *  What it buys is the length of a drag: the press itself stamps once, and a
+ *  slow haul down the scrollbar can outlast the window, so `pointermove` keeps
+ *  it fresh while the thumb is held. */
+let _scrollbarPressEl: HTMLElement | null = null;
+
+/** Record MOVEMENT: a wheel notch, a finger travelling, a drag, a scroll key.
+ *  Never a bare press. */
+function stampGesture(el: HTMLElement) {
+  _gestureEl = el;
+  _gestureAt = nowMs();
+}
+
+/** Did the reader move `el` themselves, counting the coast after a flick?
+ *
+ *  Freshness is the whole test, with no "still holding" term beside it. A drag
+ *  fires movement continuously, so a real one keeps re-stamping for as long as
+ *  it lasts, and a finger resting on the transcript scrolls nothing for the
+ *  question to be asked about. A held-down term would also be a state that can
+ *  STICK: a release the page never sees (a touch that ends while the PWA is
+ *  backgrounded) would leave the reader's hand permanently on the transcript,
+ *  and the first platform scroll after the resume would retire the follow,
+ *  which is one of the three bugs this exists to fix. */
+function readerGestureActive(el: HTMLElement): boolean {
+  return _gestureEl === el && nowMs() - _gestureAt < READER_GESTURE_WINDOW_MS;
+}
+
+/** Keys that scroll a focused container. The transcript is `tabindex=0`, so it
+ *  takes them directly; there is no other way for a keyboard reader to move it,
+ *  which is why the list is closed rather than "any key". */
+const SCROLL_KEYS = new Set([
+  'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar',
+]);
+
+/** Wire the reader-gesture signal to a scroll container, returning its
+ *  teardown. NOT exported and NOT called by the view: `makeScrollObservers`
+ *  owns it, so the signal and the `onScroll` that consumes it are attached
+ *  together by construction. Wiring them separately would make "observers
+ *  attached, gestures forgotten" expressible, and that state is silent: the
+ *  transcript behaves normally right up until a reader scrolls away from a live
+ *  reply and is dragged back.
+ *
+ *  `pointermove` is the one that needs the press beside it. On a mouse it fires
+ *  for the pointer merely CROSSING the transcript, which is most of a desktop
+ *  session, so stamping it unconditionally would leave a gesture permanently
+ *  in flight; gated on the press it means a drag, which is how a scrollbar is
+ *  pulled. `touchmove` needs no such gate: a finger on the glass is already a
+ *  press by definition.
+ *
+ *  The release goes on `window` rather than the element: a drag that ends with
+ *  the pointer outside the transcript (a scrollbar drag flung past the pane
+ *  edge) would otherwise leave the press recorded forever.
+ *
+ *  A container with no `addEventListener` is a test double, and gets a no-op
+ *  teardown; such a test drives the signal through `readerGestureForTest`. So
+ *  is a `window` without one, which is what the unit-test setup's minimal stub
+ *  can be. */
+function attachReaderGestures(el: HTMLElement): () => void {
+  const root = typeof window !== 'undefined' && typeof window.addEventListener === 'function'
+    ? window
+    : null;
+  if (typeof el.addEventListener !== 'function' || !root) return () => {};
+  const onDown = (e: PointerEvent) => {
+    // A press in the SCROLLBAR gutter is a scroll by itself, with no movement
+    // to follow it: clicking the track pages the transcript in one jump. It is
+    // also the ONLY press that can be a scroll at all, which is why it is the
+    // only one recorded. The gutter is outside the client box, so it cannot be
+    // a content control, and a mouse drag anywhere else in the transcript
+    // selects text rather than scrolling.
+    //
+    // `e.target === el` is load-bearing, not a tidy-up. `offsetX` is measured
+    // from the padding box of the TARGET, and `pointerdown` bubbles from the
+    // deepest element under the pointer, so on a press that lands on a
+    // descendant the comparison is against the wrong box entirely: in a turn
+    // taller than the viewport, an ordinary tap in the body reads as past the
+    // gutter and stamps a gesture, which is the bare-press case the whole
+    // signal exists to refuse. Only a press on the container ITSELF can be in
+    // its gutter.
+    //
+    // Horizontal only: `.thread-content` is `overflow-x: hidden`, so there is
+    // no bottom scrollbar for an `offsetY` arm to ever be right about. Always
+    // false where scrollbars overlay, which is every touch device.
+    if (e.target !== el || e.offsetX <= el.clientWidth) return;
+    _scrollbarPressEl = el;
+    stampGesture(el);
+  };
+  const onDrag = (e: PointerEvent) => {
+    // A move with no button held means the press ended somewhere this listener
+    // never saw: released over a nested iframe, or while the PWA was
+    // backgrounded. Clearing here is what stops `_scrollbarPressEl` becoming a
+    // state that can STICK, where a mouse merely crossing the transcript would
+    // then read as a drag.
+    if (e.buttons === 0) { if (_scrollbarPressEl === el) _scrollbarPressEl = null; return; }
+    if (_scrollbarPressEl === el) stampGesture(el);
+  };
+  // `wheel` and `touchmove` are stamped WHEREVER in the transcript they land,
+  // and the asymmetry with the two gated listeners is the point rather than an
+  // oversight. Those two can be ACTIVATIONS: a press is how a card is answered,
+  // Space on a focused button is the same act from the keyboard, and neither
+  // scrolls anything, so each is gated to the container itself. A wheel notch
+  // and a finger travelling are scroll intent by definition, whatever they land
+  // on. The worst they can be wrong about is a nested scroller (a step detail's
+  // `<pre>`), where the reader is still scrolling, just not this box.
+  const onMove = () => stampGesture(el);
+  const onUp = () => { if (_scrollbarPressEl === el) _scrollbarPressEl = null; };
+  const onKey = (e: KeyboardEvent) => {
+    // Only a key the CONTAINER itself received scrolls it. `keydown` bubbles
+    // like everything else here, and the transcript is full of controls that
+    // take these very keys and scroll nothing: Space on a focused button is how
+    // the reader ANSWERS a question card, Arrow and Home/End move a caret in a
+    // text field. Each of those changes content, so stamping them would put a
+    // window over the interactions the press rule above already refuses. The
+    // container is `tabindex=0`, so a reader scrolling it by keyboard has focus
+    // on it and is the target.
+    if (e.target !== el) return;
+    // A CHORD is a shortcut, not a scroll key. The two overlap: turn stepping
+    // is Cmd+Arrow, and its own keystroke stamping a gesture would defeat the
+    // one case `stepThreadTurn` deliberately keeps the ride for, a step onto
+    // the last turn, by retiring it from `onScroll` mid-glide instead.
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (SCROLL_KEYS.has(e.key)) stampGesture(el);
+  };
+
+  el.addEventListener('pointerdown', onDown as EventListener, { passive: true });
+  el.addEventListener('pointermove', onDrag as EventListener, { passive: true });
+  el.addEventListener('touchmove', onMove, { passive: true });
+  el.addEventListener('wheel', onMove, { passive: true });
+  el.addEventListener('keydown', onKey);
+  root.addEventListener('pointerup', onUp, { passive: true });
+  root.addEventListener('pointercancel', onUp, { passive: true });
+  root.addEventListener('touchend', onUp, { passive: true });
+  root.addEventListener('touchcancel', onUp, { passive: true });
+
+  return () => {
+    el.removeEventListener('pointerdown', onDown as EventListener);
+    el.removeEventListener('pointermove', onDrag as EventListener);
+    el.removeEventListener('touchmove', onMove);
+    el.removeEventListener('wheel', onMove);
+    el.removeEventListener('keydown', onKey);
+    root.removeEventListener('pointerup', onUp);
+    root.removeEventListener('pointercancel', onUp);
+    root.removeEventListener('touchend', onUp);
+    root.removeEventListener('touchcancel', onUp);
+    if (_gestureEl === el) { _gestureEl = null; _gestureAt = -Infinity; }
+    if (_scrollbarPressEl === el) _scrollbarPressEl = null;
+  };
+}
+
+/** Test seam: record that the reader just MOVED `el`, or forget it.
+ *
+ *  The observer tests drive plain objects rather than DOM nodes, so there is no
+ *  event to dispatch and no listener to dispatch it to. This is the same fact
+ *  the listeners record, stated directly, which keeps "the reader scrolls" one
+ *  line in a test instead of a fake event system. Production never calls it:
+ *  there the fact comes from the input events, and it expires on its own.
+ *
+ *  `moved: false` forgets it, which is what a test asserting the PLATFORM moved
+ *  the container (the keyboard, an app resume) needs, and what the shared reset
+ *  in a `beforeEach` uses so one test's flick cannot carry into the next. */
+export function readerGestureForTest(el: HTMLElement | null, moved = true): void {
+  if (!el || !moved) {
+    _gestureEl = null;
+    _gestureAt = -Infinity;
+    _scrollbarPressEl = null;
+    return;
+  }
+  stampGesture(el);
 }
 
 /** The reader's own newest message: the LAST `.initiator-panel-user`, which is
@@ -961,6 +1209,26 @@ function landingClearancePx(anchor: HTMLElement): number {
   return Number.isFinite(px) && px > 0 ? px : 0;
 }
 
+/** Put the container ON the live edge in one held write, and reconcile the
+ *  chevron behind it: the write can land where the container already was, and
+ *  then no scroll event arrives to do that reconcile itself.
+ *
+ *  The instant half of `glideToLiveEdge`, factored out because two callers want
+ *  exactly it and neither may drift from the other on what the live edge is or
+ *  on the bookkeeping a write there owes: the reduced-motion branch below, and
+ *  `honourAnchoredMutation`, where landing inside the frame IS the point.
+ *
+ *  It supersedes EVERY tween, including a live-edge one that `glideToLiveEdge`
+ *  would have stood down for. That stand-down exists so a second call cannot
+ *  restart the easing part-way, and there is no easing here: a reader who
+ *  toggles the steps 200ms into a submit's glide lands on the same live edge,
+ *  just at once, which is what they asked for by toggling. */
+function snapToLiveEdge(el: HTMLElement): void {
+  cancelScrollAnim();
+  markHeldScroll(el, liveEdgeTop(el));
+  syncAwayFromBottom();
+}
+
 /** Glide to the LIVE EDGE, marking every frame as a held scroll: what a submit
  *  does for a reader who was ALREADY riding it (see `followSubmit`). The target
  *  is `scrollHeight - clientHeight` re-read per frame, so a reply streaming
@@ -982,9 +1250,7 @@ function landingClearancePx(anchor: HTMLElement): number {
 function glideToLiveEdge(el: HTMLElement): void {
   if (_heldAnim && _heldAnimTarget === 'live-edge') return;
   if (prefersReducedMotion()) {
-    cancelScrollAnim();
-    markHeldScroll(el, liveEdgeTop(el));
-    syncAwayFromBottom();
+    snapToLiveEdge(el);
     return;
   }
   // Reconcile the chevron on landing for the same reason `scrollToBottomAnimated`
@@ -1425,6 +1691,20 @@ export function scrollToTop() {
 
   const el = resolveTarget();
   if (!el) return;
+
+  // Going to the top ends the ride, and the press has to say so ITSELF: a
+  // scroll only speaks for the reader when a gesture is behind it, and a
+  // chevron tap lands on the button rather than on the transcript (see "Was
+  // this scroll the reader's own GESTURE?"). It used to come free from the
+  // position test, which read this write as a flick.
+  //
+  // Only while the agent is LIVE, matching the scroll disarm: going back to
+  // re-read an idle thread is browsing, not a decision about how the next reply
+  // should behave, and the lit toggle says on screen that the ride survived.
+  //
+  // After the target resolves, so a press with no transcript to move retires
+  // nothing.
+  if (threadIsLive()) stopFollowingBottom();
 
   // Reduced motion: jump instantly, with one rAF re-assert to defeat an iOS no-op
   // / a late render-all ResizeObserver settle.
@@ -2179,6 +2459,20 @@ export function stepThreadTurn(direction: 1 | -1): void {
   // the second time you click down arrow"). (2px slack mirrors isVisuallyAtBottom.)
   awayFromBottom.value = targetOf(el) < liveEdgeTop(el) - 2;
 
+  // A deliberate jump AWAY from the live edge ends the ride, and it has to say
+  // so itself: a scroll only speaks for the reader when a gesture is behind it,
+  // and a keyboard chord is not one (see "Was this scroll the reader's own
+  // GESTURE?"). This used to come free from the position test, which read the
+  // jump's unstamped write as a flick.
+  //
+  // Reuses the line above rather than asking again, so the chevron's state and
+  // the ride's cannot disagree: a step onto the LAST turn lands at the clamped
+  // live edge, which is where the ride was taking them anyway. And only while
+  // the agent is LIVE, matching the scroll disarm: stepping back through an
+  // idle thread is browsing, and the reader's next submit should still carry
+  // them.
+  if (awayFromBottom.value && threadIsLive()) stopFollowingBottom();
+
   // Mark the landed turn with the shared navigation focus marker (a background
   // highlight that sticks until the user's next scroll gesture, and for its hold even
   // then). clearPendingEventScroll
@@ -2279,9 +2573,16 @@ export function isElementOnScreen(el: HTMLElement): boolean {
 }
 
 /** Build the scroll- and resize-event handlers for a single .thread-content
- *  element. The visibility gate at the top of each handler is required by the
- *  dual-mounting contract documented at the top of this file. */
+ *  element, and wire the reader-gesture signal `onScroll` reads. The visibility
+ *  gate at the top of each handler is required by the dual-mounting contract
+ *  documented at the top of this file.
+ *
+ *  `detachGestures` is the caller's ONE teardown obligation, and it exists
+ *  because the gesture listeners are the only thing here that touches the DOM:
+ *  the caller attaches `onScroll`/`onResize` itself and removes them itself,
+ *  but it never sees these. Call it wherever the `scroll` listener is removed. */
 export function makeScrollObservers(el: HTMLElement) {
+  const detachGestures = attachReaderGestures(el);
   function isAtTop() {
     return el.scrollTop <= 80;
   }
@@ -2384,22 +2685,35 @@ export function makeScrollObservers(el: HTMLElement) {
   // signals against where it now sits, and re-take the reflow anchor. There is
   // no longer anything to suppress, because nothing infers intent from a scroll.
   //
-  // One question IS asked of the scroll, and it is the only place a standing
-  // follow is retired or a landing cancelled from a scroll: has the reader taken
-  // the container away from where our own last held write put it (see
-  // `markHeldScroll`).
+  // Two questions ARE asked of the scroll, and this is the only place a standing
+  // follow is retired or a landing cancelled from one: has the reader taken the
+  // container away from where our own last held write put it (see
+  // `markHeldScroll`), and was a reader GESTURE behind it (see "Was this scroll
+  // the reader's own GESTURE?"). The landing asks only the first, deliberately.
   //
-  // The FOLLOW takes THREE terms. Off the live edge alone is not enough, because
+  // The FOLLOW takes FOUR terms. Off the live edge alone is not enough, because
   // a shrink clamps the reader down and the app's own anchor correction moves
   // them while holding them on the same content; moved alone is not enough
-  // either, because a tween mid-glide is our own. Together those two are true
-  // for a wheel, a scrollbar drag, a touch flick and its momentum, a keypress
-  // and a mobile pane swipe, and for a navigation that deliberately lands the
-  // reader elsewhere. They are false for everything that changes content without
-  // moving the reader off the edge, which is why answering a question, granting
-  // a permission or expanding a turn all keep the follow. A deep-link landing is
-  // false for them too, and is the one navigation that therefore has to retire
-  // the follow itself (see `stopFollowingBottom`).
+  // either, because a tween mid-glide is our own. They are false for everything
+  // that changes content without moving the reader off the edge, which is why
+  // answering a question, granting a permission or expanding a turn all keep
+  // the follow.
+  //
+  // The two of them together were the whole test until 2026-08-11, on the
+  // premise that a container that moved away from our write had been moved by
+  // the reader. That premise covers CONTENT growth and nothing else, so the
+  // keyboard, an app resume and every other platform-driven scroll read as the
+  // reader and retired a follow nobody touched (see "Was this scroll the
+  // reader's own GESTURE?"). `readerGestureActive` is that missing term, ANDed
+  // rather than swapped in: a real scroll satisfies all of them by
+  // construction, so nothing that used to retire the follow stops doing so.
+  //
+  // A NAVIGATION is not a gesture and now retires the follow itself, which is
+  // what the up chevron, turn stepping and the deep link do (see
+  // `stopFollowingBottom`). Before the gesture term they came free from the
+  // position test, and that was always an accident: their write lands where we
+  // did not stamp for the same reason a flick does, not because the reader's
+  // hand was on the transcript.
   //
   // The third is whether the agent is LIVE (`_threadLive`), and it separates two
   // acts that produce an identical scroll event. Scrolling away from a reply IN
@@ -2434,7 +2748,7 @@ export function makeScrollObservers(el: HTMLElement) {
     awayFromBottom.value = !atEdge;
     const tookOver = !isWhereWeHeldIt(el);
     if (_followingBottom.value) {
-      if (threadIsLive() && !atEdge && tookOver) stopFollowingBottom();
+      if (threadIsLive() && !atEdge && tookOver && readerGestureActive(el)) stopFollowingBottom();
     } else if (tookOver && landingInFlight()) {
       cancelLanding();
     }
@@ -2487,5 +2801,5 @@ export function makeScrollObservers(el: HTMLElement) {
     // any earlier would describe a position the reader is no longer at.
     recordAnchor();
   }
-  return { onScroll, onResize };
+  return { onScroll, onResize, detachGestures };
 }

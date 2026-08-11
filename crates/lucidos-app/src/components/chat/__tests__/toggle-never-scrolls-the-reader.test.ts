@@ -46,8 +46,8 @@ describe('no transcript toggle scrolls the reader', () => {
    *  It is also the ONE place a reveal may legitimately move somebody, and the
    *  exception proves the rule rather than bending it. A reader riding the live
    *  edge asked to be kept there, and a transcript-wide reveal grows the turns
-   *  below them, so `honourAnchoredMutation` glides them back to it (armed only,
-   *  gently, and never as something a toggle HANDLER decided). Everyone else is
+   *  below them, so `honourAnchoredMutation` puts them back on it (armed only,
+   *  in one write, and never as something a toggle HANDLER decided). Everyone else is
    *  left exactly where the correction put them, which is what this scan is
    *  about: the failure it exists for is a new handler reaching for
    *  `scrollToBottom()` to "make sure you see it".

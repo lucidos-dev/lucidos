@@ -23,6 +23,7 @@ import {
   isFollowScroll,
   isNavigationScroll,
   makeScrollObservers,
+  readerGestureForTest,
   resumeFollowingBottom,
   scrollToBottom,
   scrollToBottomAnimated,
@@ -300,6 +301,27 @@ function resetFollow() {
   setActiveScrollElement(null);
   setThreadLive(true);
   awayFromBottom.value = false;
+  readerGestureForTest(null, false);
+}
+
+/** THE READER'S OWN SCROLL: their hand on the transcript, the position it left
+ *  it at, and the event that follows a frame later.
+ *
+ *  Both halves are required, and that is the contract this file is mostly
+ *  about. A scroll retires the follow only when a GESTURE is behind it, because
+ *  the position alone cannot tell a flick from the iOS keyboard resizing the
+ *  container or a backgrounded app being resumed, and those were retiring a
+ *  follow the reader had armed and never touched. So writing `scrollTop` and
+ *  calling `onScroll` WITHOUT this helper now models exactly that: the platform
+ *  moving the container, which deliberately retires nothing.
+ *
+ *  Every kind of reader scroll is one call: a wheel notch, a scrollbar drag, a
+ *  touch flick and its momentum, a scroll key. The signal does not distinguish
+ *  them, and neither does the follow. */
+function readerScrollsTo(el: { scrollTop: number }, top: number, onScroll: () => void) {
+  readerGestureForTest(el as unknown as HTMLElement);
+  el.scrollTop = top;
+  onScroll();
 }
 
 describe('the follow toggle arms a standing follow', () => {
@@ -371,8 +393,7 @@ describe('the follow toggle arms a standing follow', () => {
     setActiveScrollElement(el);
 
     setFollowLiveEdge(true);
-    el.scrollTop = 2000;          // wheel, drag, flick, momentum or a keypress
-    onScroll();
+    readerScrollsTo(el, 2000, onScroll); // wheel, drag, flick, momentum or a keypress
 
     el.scrollHeight = 3400;
     onResize();
@@ -564,10 +585,213 @@ describe('the follow toggle is the whole of the follow\'s controls', () => {
     vi.advanceTimersByTime(1500);
     expect(followingLiveEdge.value).toBe(true);
 
-    el.scrollTop = 1200; // a wheel, a flick, a keypress
+    readerScrollsTo(el, 1200, onScroll); // a wheel, a flick, a keypress
+
+    expect(followingLiveEdge.value).toBe(false);
+  });
+});
+
+/**
+ * **Only the READER retires a follow, and only with their hand on the
+ * transcript or on a chevron.**
+ *
+ * The retirement used to be read off the POSITION alone: a container that had
+ * moved away from our last write had, it was reasoned, been moved by the
+ * reader, because content growth changes `scrollHeight` and never `scrollTop`.
+ * That premise covers growth and nothing else, and three things move the
+ * container with no gesture behind them, all reported from an iOS PWA on
+ * 2026-08-11:
+ *
+ *   - the soft keyboard opening or closing, which rewrites `--app-height`,
+ *     resizes the transcript under the reader, and lets WebKit adjust the
+ *     offset asynchronously through the ~350ms animation;
+ *   - an app backgrounded and resumed, where the PWA restores an offset nobody
+ *     wrote;
+ *   - the full response / steps toggle, whose anchor correction is a write of
+ *     ours made from a position we could not stamp in advance.
+ *
+ * Each retired a follow the reader had armed and never touched, while a reply
+ * was streaming, which is the one moment the feature is worth anything. So the
+ * question is asked of the INPUT now. These tests are the two directions of
+ * that: the platform moves the container and the ride survives, the reader
+ * moves it and the ride ends.
+ */
+describe('a scroll retires the follow only when the READER made it', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** An armed reader riding a live thread, which is the state all of these are
+   *  about. Returns the observers so each case can move the container its own
+   *  way. */
+  function riding() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setThreadLive(true);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    expect(followingLiveEdge.value).toBe(true);
+    return { el, ...observers };
+  }
+
+  it('survives the iOS keyboard opening under a streaming reply', () => {
+    // The keyboard takes ~300px of viewport, so the transcript shrinks and the
+    // reader is left well above the live edge. Then WebKit adjusts the offset
+    // itself, asynchronously, which is the scroll event that used to read as a
+    // flick. No finger has touched the transcript in any of it.
+    const { el, onScroll, onResize } = riding();
+
+    el.clientHeight = 200;
+    onResize();
+    el.scrollTop = 1400;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('survives the keyboard closing again', () => {
+    // Each step is the resize AND an offset WebKit adjusted on its own, off the
+    // live edge. The offset is what makes this test say anything: a resize
+    // alone runs `honourGrowth`, which writes the live edge and re-stamps the
+    // hold, so `atEdge` and `tookOver` would both answer "not the reader"
+    // before the gesture term was ever consulted.
+    const { el, onScroll, onResize } = riding();
+
+    for (const clientHeight of [200, 260, 340, 420, 500]) {
+      el.clientHeight = clientHeight;
+      onResize();
+      el.scrollTop = Math.max(0, el.scrollTop - 200);
+      onScroll();
+    }
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('survives an app backgrounded and resumed onto a restored offset', () => {
+    // Nothing observes the transcript while the app is away, so the resume
+    // arrives as one scroll event at a position nobody here wrote.
+    const { el, onScroll } = riding();
+
+    el.scrollTop = 0;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('survives the platform scrolling the container for any other reason', () => {
+    // A focus ring brought into view, a restored session, a UA doing what UAs
+    // do. The rule is about the ABSENCE of a gesture, not about enumerating the
+    // platform's reasons.
+    const { el, onScroll } = riding();
+
+    el.scrollTop = 700;
+    onScroll();
+    el.scrollTop = 1900;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('ends on the reader flicking, and on every other way they scroll', () => {
+    // One signal covers the lot: a wheel notch, a scrollbar drag, a touch flick
+    // and its momentum, a scroll key. The follow does not distinguish them, so
+    // neither does this.
+    const { el, onScroll } = riding();
+
+    readerScrollsTo(el, 900, onScroll);
+
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('ends on the coast after the finger lifts, not just under it', () => {
+    // iOS momentum fires its scroll events AFTER `touchend`, so the window has
+    // to outlive the gesture. A flick that only crosses the live-edge threshold
+    // during the coast would otherwise read as the platform's.
+    const { el, onScroll } = riding();
+
+    readerGestureForTest(el);     // touchstart … touchend, finger gone
+    vi.advanceTimersByTime(200);  // and the coast begins
+    el.scrollTop = 900;
     onScroll();
 
     expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('ends on the up chevron, which is a press rather than a gesture', () => {
+    // The tap lands on the BUTTON, so no gesture reaches the transcript and the
+    // press has to retire the ride itself.
+    riding();
+
+    scrollToTop();
+
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('keeps the ride when the up chevron is pressed on an IDLE thread', () => {
+    // Same rule as the scroll disarm: re-reading a thread nothing is writing to
+    // is browsing, and the reader's next submit should still carry them.
+    riding();
+    setThreadLive(false);
+
+    scrollToTop();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('keeps the ride when the platform scrolls an IDLE thread', () => {
+    const { el, onScroll } = riding();
+    setThreadLive(false);
+
+    el.scrollTop = 0;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('lets the coast lapse, so a scroll long after the flick is the platform again', () => {
+    // The other end of the window, and the half that keeps it a WINDOW rather
+    // than a latch: a flick five seconds ago says nothing about a scroll now,
+    // and if it did, the keyboard opening after any earlier scroll would retire
+    // the follow all over again.
+    const { el, onScroll } = riding();
+
+    readerGestureForTest(el);
+    vi.advanceTimersByTime(5000);
+    el.scrollTop = 900;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('does not read a PRESS inside the transcript as a scroll', () => {
+    // Answering a question, granting a permission, expanding a turn: each is a
+    // press on a control INSIDE the transcript, and each changes content, which
+    // is exactly the combination this module documents as keeping the follow.
+    // Arming attribution on the press would put a 1.2s window over every one of
+    // them, so only MOVEMENT arms it. Modelled here the way the listeners see
+    // it: a press records no movement, so the signal stays cold and the content
+    // change that follows is attributed to the app.
+    const { el, onScroll } = riding();
+
+    readerGestureForTest(el, false); // pressed, and never moved
+    el.scrollTop = 900;              // the card resolving reflows the transcript
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('forgets a gesture made on a DIFFERENT transcript', () => {
+    // One thread's flick may not speak for another's. The panes are mounted
+    // together on mobile, so this is a real arrangement rather than a
+    // hypothetical one.
+    const { el, onScroll } = riding();
+    const other = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+
+    readerGestureForTest(other);
+    el.scrollTop = 900;
+    onScroll();
+
+    expect(followingLiveEdge.value).toBe(true);
   });
 });
 
@@ -590,8 +814,10 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     setThreadLive(live);
-    el.scrollTop = 800;      // the reader goes back to re-read something
-    observers.onScroll();
+    // The reader goes back to re-read something, with their own hand: the
+    // whole question here is what a READER's scroll means on a live thread
+    // versus an idle one, so it has to be one.
+    readerScrollsTo(el, 800, observers.onScroll);
     return { el, ...observers };
   }
 
@@ -658,8 +884,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     setThreadLive(false); // the card is parked on the reader: nothing is running
 
     followAnsweredQuestion('q1');
-    el.scrollTop = 900;   // and they scroll away before the agent picks it up
-    onScroll();
+    readerScrollsTo(el, 900, onScroll); // and they scroll away before the agent picks it up
 
     expect(followingLiveEdge.value).toBe(false);
     el.writes = 0;
@@ -691,8 +916,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     followAnsweredQuestion('q1');
     setThreadLive(false); // the lagging projection, re-rendered after the submit
 
-    el.scrollTop = 900;
-    onScroll();
+    readerScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(false);
   });
@@ -718,8 +942,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
       followContinuedThread(); // the POST then fails, so no status ever changes
       clock += 30_000;         // long past the claim
 
-      el.scrollTop = 900;      // the reader browses the still-idle thread
-      onScroll();
+      readerScrollsTo(el, 900, onScroll); // the reader browses the still-idle thread
 
       expect(followingLiveEdge.value).toBe(true);
     } finally {
@@ -770,8 +993,7 @@ describe('the toggle remembers the last press as a seed', () => {
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
 
-    el.scrollTop = 900;
-    onScroll();
+    readerScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(false); // the ride ended here
     expect(followLiveEdgeSeed.value).toBe(true); // the preference did not
@@ -829,21 +1051,24 @@ describe('a reveal inside the transcript never retires the follow', () => {
     expect(followingLiveEdge.value).toBe(true);
   });
 
-  it('rides the reveal GENTLY, as a tween rather than a teleport', () => {
-    // The growth branch would put an armed reader back on the live edge a frame
-    // later, but as one instant write. Right for streaming, where a round adds a
-    // line; wrong here, where one click can add the height of the transcript.
+  it('puts an armed reader ON the live edge at once, not over a tween', () => {
+    // A tween was tried here and is what the reader reported: the reveal grows
+    // every turn above them too, so they were left a screenful short of the
+    // live edge and the transcript then scrolled itself down. This write lands
+    // in the same frame the caller unfreezes, before the paint the mutation
+    // causes, and it keeps the newest content, which is what a riding reader is
+    // looking at, exactly where it already was. See `honourAnchoredMutation`.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
 
     armAndReveal(el, 500, 1500);
-    const writesBefore = el.writes;
-    expect(el.scrollTop).toBe(3000); // still short of the new edge at 4500
+    expect(el.scrollTop).toBe(4500); // the new live edge, with no frame in between
+    const writesOnLanding = el.writes;
 
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(4500);
-    expect(el.writes - writesBefore).toBeGreaterThan(1); // eased, not jumped
+    expect(el.writes).toBe(writesOnLanding); // and nothing eased in behind it
   });
 
   it('moves an UNARMED reader zero pixels, whatever the reveal did', () => {
@@ -870,11 +1095,10 @@ describe('a reveal inside the transcript never retires the follow', () => {
     const { onScroll } = makeScrollObservers(el);
     setActiveScrollElement(el);
 
-    armAndReveal(el, 500, 1500);
-    vi.advanceTimersByTime(1500); // the glide lands them on the live edge
+    armAndReveal(el, 500, 1500);  // which lands them on the live edge
+    vi.advanceTimersByTime(1500);
 
-    el.scrollTop = 900;           // and then they flick up
-    onScroll();
+    readerScrollsTo(el, 900, onScroll); // and then they flick up
 
     expect(followingLiveEdge.value).toBe(false);
   });
@@ -934,8 +1158,7 @@ describe('coming back to a thread resumes the follow it was left with', () => {
     setActiveScrollElement(el);
 
     resumeFollowingBottom(el);
-    el.scrollTop = 8000;
-    onScroll();
+    readerScrollsTo(el, 8000, onScroll);
 
     el.scrollHeight = 26000;
     onResize();
@@ -1239,8 +1462,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     onResize();
     vi.advanceTimersByTime(1500);
 
-    el.scrollTop = 1800; // the reader goes back to read something
-    onScroll();
+    readerScrollsTo(el, 1800, onScroll); // the reader goes back to read something
     const parked = el.scrollTop;
     el.writes = 0;
 
@@ -1270,8 +1492,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     vi.advanceTimersByTime(60);
     expect(el.scrollTop).toBeGreaterThan(500);
 
-    el.scrollTop = 800; // the reader takes over mid-glide
-    onScroll();
+    readerScrollsTo(el, 800, onScroll); // the reader takes over mid-glide
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(800);
@@ -1287,8 +1508,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     setActiveScrollElement(el);
 
     followSentMessage();
-    el.scrollTop = 900; // the reader scrolls on while the row is still rendering
-    onScroll();
+    readerScrollsTo(el, 900, onScroll); // the reader scrolls on while the row is still rendering
     el.writes = 0;
 
     el.addUserMessage({ top: 2900, height: 120 });
@@ -1642,8 +1862,7 @@ describe('answering a question card lands on the same status line', () => {
     vi.advanceTimersByTime(60);
     expect(el.scrollTop).toBeGreaterThan(500);
 
-    el.scrollTop = 1200; // the reader takes over mid-glide
-    onScroll();
+    readerScrollsTo(el, 1200, onScroll); // the reader takes over mid-glide
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(1200);
 
@@ -1795,8 +2014,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     vi.advanceTimersByTime(60);
     expect(el.scrollTop).toBeGreaterThan(2500);
 
-    el.scrollTop = 1000; // the reader takes over mid-glide
-    onScroll();
+    readerScrollsTo(el, 1000, onScroll); // the reader takes over mid-glide
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(1000);
 
@@ -2206,8 +2424,7 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
     vi.advanceTimersByTime(60);
     expect(el.scrollTop).toBeGreaterThan(500);
 
-    el.scrollTop = 700; // the reader takes over mid-glide
-    onScroll();
+    readerScrollsTo(el, 700, onScroll); // the reader takes over mid-glide
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(700);

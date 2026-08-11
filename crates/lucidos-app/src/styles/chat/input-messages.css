@@ -1186,6 +1186,33 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
 }
 
+/* The LAST turn drops the bottom half of that rhythm, because the rhythm is
+   what separates a turn from the NEXT one and there is no next one. Below the
+   last turn sits the transcript's own bottom padding
+   (--prompt-fade + --nav-focus-reach, which reserves the composer dissolve and
+   the focus marker's reach), and the feed rhythm stacked on top of that read as
+   a hole under the running step: the reply's live edge floated well clear of
+   the composer it was about to be answered in.
+
+   Both panel kinds, because either can be the turn's last child: a turn whose
+   response has not started yet ends on its initiator panel. An ERROR turn ends
+   on neither (`.exchange-error` follows the panels), so it keeps the rhythm,
+   which is right: the error box carries no feed padding of its own.
+
+   `:not(.nav-focus-stuck)` yields to the PANEL-level navigation focus marker,
+   which washes the panel box edge to edge and normalizes all four sides to
+   var(--turn-body-inset) (chat/response.css). At (0,5,0) this rule out-ranks
+   that (0,2,0) one, so without the exclusion a deep link landing on the last
+   turn would paint the wash flush against its last line while the other three
+   sides kept their inset, which is the exact asymmetry the marker rule exists
+   to remove, and its margin hand-back would stop netting to zero. The
+   WHOLE-TURN marker needs no such yield: its own rule already zeroes the last
+   panel's padding-bottom, so the two agree. */
+.thread-content > .chat-exchange:last-child > .initiator-panel:last-child:not(.nav-focus-stuck),
+.thread-content > .chat-exchange:last-child > .response-panel:last-child:not(.nav-focus-stuck) {
+    padding-bottom: 0;
+}
+
 /* `flex-start` plus a row unit on every field, exactly as `.response-header`
    (chat/response.css), which is where the reasoning lives: the fields are all
    one --turn-header-line tall and centre their own content, so a one-row header
@@ -1197,7 +1224,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     align-items: flex-start;
     gap: 0.5rem;
     padding-left: var(--turn-body-inset);
-    margin-bottom: 0.7rem;
+    /* Shared with `.response-header` (chat/response.css), where the reasoning
+       for the value lives: it is one measurement and must move with it. */
+    margin-bottom: 0.5rem;
     min-height: var(--turn-header-line);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);

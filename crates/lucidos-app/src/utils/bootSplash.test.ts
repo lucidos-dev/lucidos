@@ -664,6 +664,38 @@ describe('index.html inline boot splash', () => {
     expect(splashCss).not.toMatch(/\d\s*rem/);
   });
 
+  // The gateway splash carries this stylesheet and NOTHING else: it renders
+  // when no engine is reachable, so it cannot link the bundle css the app shell
+  // gets. Any type property the shell sets from `body` and this block does not
+  // therefore differs BETWEEN the two surfaces, on a seam the user crosses
+  // mid-boot. Smoothing is the one that shipped that way: the gateway status
+  // rendered at the macOS default (subpixel-antialiased, visibly heavier) and
+  // the app document's grayscale, so the line changed weight on the same frame
+  // its text changed. Read the shell's own rule rather than restating its
+  // values, so editing base.css cannot silently reopen it.
+  it('smooths the splash type exactly as the app shell does', () => {
+    const baseCss = readFileSync(resolve(__dirname, '../styles/global/base.css'), 'utf-8');
+    const shell = /^body \{([^}]*)\}/m.exec(baseCss)?.[1];
+    expect(shell, 'the body rule in styles/global/base.css').toBeTruthy();
+    const splash = /\.boot-splash \{([\s\S]*?)\n {6}\}/.exec(html)?.[1];
+    expect(splash, 'the .boot-splash rule in index.html').toBeTruthy();
+
+    const declared = (css: string, prop: string) =>
+      new RegExp(`(?:^|;|\\*/)\\s*${prop}:\\s*([^;]+);`, 'm').exec(css)?.[1].trim();
+
+    // Every smoothing/rendering property the shell declares must be declared
+    // here too, with the same value. Discovered from the shell rather than
+    // listed, so a fourth one added there fails this test instead of quietly
+    // applying to the app and not to the splash.
+    const smoothing = [
+      ...shell!.matchAll(/(-webkit-font-smoothing|-moz-osx-font-smoothing|text-rendering):/g),
+    ].map((m) => m[1]);
+    expect(smoothing.length, 'base.css body still declares font smoothing').toBeGreaterThan(0);
+    for (const prop of smoothing) {
+      expect(declared(splash!, prop), prop).toBe(declared(shell!, prop));
+    }
+  });
+
   // Three inline scripts in this document derive the per-workspace key prefix by
   // hand (the FOUC theme/font/scale reader, the quiet-cover flag, the boot
   // watchdog's retry marker) because each runs before the app's storage override

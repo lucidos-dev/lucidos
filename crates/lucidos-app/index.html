@@ -378,6 +378,22 @@
         font-size: 15px;
         line-height: 1.4;
         letter-spacing: 0.01em;
+        /* Smoothing belongs to "type set once here" as much as the size does,
+           and it is the one property that made the two surfaces disagree. The
+           app shell antialiases every glyph from `body` in
+           styles/global/base.css, which is BUNDLE css: the gateway splash
+           cannot load it (there is no engine yet to serve it, which is why that
+           page lifts only this marker-fenced block), so its status rendered at
+           the macOS default, subpixel-antialiased. That reads visibly heavier
+           than grayscale, so the line appeared to un-bold at the seam, on the
+           same frame its text changed from a boot phase to "Opening your
+           workspace…". Declared here rather than left to inherit, so it also
+           holds before the bundle stylesheet applies. Keep in step with the
+           `body` rule in base.css: a guard in src/utils/bootSplash.test.ts
+           reads both files and fails if the two ever disagree. */
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
         /* Decorative during normal boot: the app shell loads + is interactive
            behind it, so the splash does not intercept pointer events. The
            guarded terminal-recovery state deliberately enables a tap below. */

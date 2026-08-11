@@ -1040,11 +1040,32 @@ function foldEvent(
       // lands (`reanchorResolvedDivider`), which is what keeps the continuation
       // rendering last. An ALREADY-resolved divider gets no exception — see
       // `dividerStillAwaitsUser`.
+      //
+      // An unabsorbed `UserPromptInjected` is the SAME wake, reached from the
+      // third direction, and it belongs here for the same reason: an event
+      // wait does not hold its thread's turn (ADR 0049), so a detached wait
+      // can resolve while an unrelated turn is running, and the engine then
+      // injects the wake into that live loop (`WakeFromEvent`, the sibling of
+      // `WakeFromChild` under `InjectedPromptKind::is_engine_wake`) rather than
+      // opening a second turn. Every event after it therefore keeps the
+      // ORIGINAL turn's req_id, so without the advance the whole wake (its tool
+      // calls, its reply, its terminator) routes back into the exchange sitting
+      // ABOVE the card, leaving the card itself stranded last with nothing
+      // under it. Real thread bec39316: the release turn's "Stopped. Here is
+      // exactly where the release stands" rendered above the wake that caused
+      // it. The same advance is right for the other unabsorbed shapes, which
+      // are all mid-flight injections into a turn that keeps its id: a queued
+      // message whose `MessageReceived` partner never arrived, and a human
+      // correction landing on a `ContinuationStarted` resume.
+      //
+      // An IDLE wake is unaffected: there the engine starts a fresh turn
+      // anchored on the injection itself, so its events find this exchange by
+      // its own id and the moved redirect is never consulted.
       const advancesRedirect =
         event.type === 'UserQuestionAsked'
         || event.type === 'CommandPermissionRequested'
         || event.type === 'McpPermissionRequested'
-        || (event.type === 'ChildThreadCompleted'
+        || ((event.type === 'ChildThreadCompleted' || event.type === 'UserPromptInjected')
           && !!previousCurrent
           && !dividerStillAwaitsUser(previousCurrent));
       if (advancesRedirect && previousCurrent) {

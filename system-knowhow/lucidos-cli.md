@@ -399,8 +399,11 @@ two things: one of the consecutive subscriptions the loop cap below allows, and
 a second clock, since
 a child that outlives `--timeout-secs` wakes this thread with a pointless expiry
 and then wakes it again when it actually finishes. Await a `ChildThreadCompleted`
-only for a completion that is **not** your own child's, a grandchild's for
-instance, named with `--condition '{"child_thread_id": "<uuid>"}'`.
+only for a completion that is **not** your own child's, named with
+`--condition '{"child_thread_id": "<uuid>"}'`. Matching is workspace-wide, so
+that is any thread's child and not only a descendant of yours: a coding-agent
+session another thread spawned is a first-class thing to watch, and the wait
+fires when its completion lands on that thread.
 
 A **rendezvous, not a stream**. The first match resolves the subscription and
 consumes it. "Continue when the next X happens" is this; "react to every X,

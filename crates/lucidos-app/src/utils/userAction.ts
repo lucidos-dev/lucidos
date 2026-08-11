@@ -5,7 +5,16 @@
  *  (`components/shared/focusMarker.ts`), and a notification deep-link that gave
  *  up waiting for its target suppresses its fallback scroll on it
  *  (`components/chat/scrollState.ts`), so a user who scrolled away to read
- *  history is never yanked by a late correction. */
+ *  history is never yanked by a late correction.
+ *
+ *  **"Did the user SCROLL" is a narrower question and has its own answer**, in
+ *  `scrollState`'s `readerGestureActive`. It cannot use this set, because
+ *  `pointerdown` is in it: a press is how the reader answers a question card or
+ *  grants a permission, and both must leave a *standing follow* armed. It also
+ *  needs the element the gesture landed on, where these consumers only need
+ *  that one happened, and a freshness window (`USER_SCROLL_WINDOW_MS`,
+ *  `utils/scrollActivity.ts`) where these are one-shot callbacks. What it does
+ *  keep is the property below, which is what makes any of these reliable. */
 
 /** The input events that count as a user action. `wheel` / `touchmove` cover
  *  scrolling, `pointerdown` covers clicks, taps and a scrollbar drag, `keydown`

@@ -13,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isNavigationScroll } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isNavigationScroll, followingLiveEdge } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -315,6 +315,125 @@ export function renderExchanges(
 // and walking up from the anchor cannot pick the wrong element even while a
 // layout swap is committing.
 
+/** Where `el`'s top sits inside the transcript's scrollable content, measured to
+ *  the SUBPIXEL. This is `offsetTop`, in doubles.
+ *
+ *  `offsetTop` cannot be used for the correction, and that is the whole reason
+ *  this exists. The platform ROUNDS it to a whole CSS pixel, so a correction
+ *  derived from two of them is wrong by the difference of the two roundings,
+ *  which is under a pixel but is NOT zero and flips sign between the toggle's
+ *  two states. The reader sees the transcript twitch one way on the press and
+ *  the other way on the press back (reported 2026-08-11 as "a slight jump up and
+ *  down as i toggle the show last answer"), and every line of text re-lands on a
+ *  different device-pixel row, which is what made it read as the spacing
+ *  changing rather than as a scroll.
+ *
+ *  It bites whenever the layout above the anchor changes by a fractional number
+ *  of pixels, which is the ordinary case at any root font size that is not a
+ *  whole number of pixels: the mobile default is 112.5% and every rem-authored
+ *  height under it is a fraction. It cannot be seen on a transcript that does
+ *  not overflow, because there is no scroll offset to be wrong about.
+ *
+ *  Measured against the CONTAINER's own rect rather than the offset parent, so
+ *  it answers the same question `offsetTop` does (a distance from the top of the
+ *  scrolled content) while surviving two things `offsetTop` has no opinion
+ *  about: the container's box moving between the two reads, and the browser
+ *  clamping `scrollTop` mid-mutation when the content shrinks. Both rects are
+ *  taken in the same call, so any transform on the container or above it cancels
+ *  out; nothing between a `.chat-exchange` and the transcript is transformed. */
+function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
+  return el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+}
+
+/** The correction to write, snapped to a whole pixel because that is all a
+ *  scroll offset can hold.
+ *
+ *  Layout is fractional and the scroll offset is not: hand the container a
+ *  fractional `scrollTop` and it quantises anyway, so a residual under one pixel
+ *  is the floor for any anchor correction and no arithmetic removes it. What the
+ *  rounding removes is the part that is ours. The two engines quantise
+ *  DIFFERENTLY, and one of them is much worse than the other: Chromium rounds a
+ *  fractional write to the nearest pixel, so it lands within half a pixel, while
+ *  WebKit TRUNCATES, so handing it x.8 loses the whole 0.8. Rounding here makes
+ *  both engines land within half a pixel of the same place, instead of iOS
+ *  taking up to twice the error of the desktop for the same press.
+ *
+ *  `scrollTop` being a double on the way IN and OUT is what makes this look
+ *  unnecessary, and it is the reason to keep the measurement above: writing the
+ *  fraction and letting each engine quantise was tried and measured worse, on
+ *  this transcript at a 105% root. WebKit stored 2377 for a written 2377.8 and
+ *  the reader moved 0.8px; Chromium stored 2499 for 2498.8. Neither kept the
+ *  fraction, at either device pixel ratio. Rounding first took the worst press
+ *  in that run from 0.75px to 0.39px. Re-open this only with a measurement
+ *  showing an engine that stores what it was handed.
+ *
+ *  It also makes the clamp deficit below measurable: an integer target minus the
+ *  integer the container settled at is the clamp and nothing else, where a
+ *  fractional target would have left a sub-pixel remainder on every reveal for
+ *  the debt's own slack to absorb. */
+function reachableScrollTop(target: number): number {
+  return Math.round(target);
+}
+
+/* --- The correction the clamp ate, carried to the next reveal ---------------
+ *
+ * A reveal that SHRINKS the transcript can leave the anchor unreachable: with
+ * less content below it than the viewport is tall, no offset puts it back where
+ * it was, so the browser clamps and the turn slides. Measured in Chromium on a
+ * seeded 6-turn thread: the reader sat at 2124 with a 573 viewport, the answer
+ * only view took the transcript from 2737 to 1915, the correction wanted 1439
+ * and the maximum offset was 1342, so the turn moved 97px.
+ *
+ * That much is geometry. What is not is the ROUND TRIP: the reverse toggle
+ * restores its own delta from wherever the clamp left the reader, so it lands
+ * 97px short of where they started, and every pair of taps drifts again. The
+ * clamp was forced on us and never chosen by the reader, so the deficit is
+ * remembered and paid back by the next anchored mutation on the same container.
+ * With it, toggling twice returns the reader exactly where they were.
+ *
+ * It is dropped the moment the reader scrolls: `debtAt` records where our write
+ * actually landed, and a container sitting anywhere else has been moved by
+ * somebody whose position is now the one that counts. `debtHeight` is the other
+ * half of that test, and it is what keeps the debt inside ONE thread: the
+ * transcript element is REUSED across threads, so an offset restored by
+ * `useScrollMemory` on the way into another thread could land on the remembered
+ * one by coincidence and collect a debt it never earned. Same element, same
+ * offset AND same content height is a coincidence not worth engineering
+ * further against. One container's worth, because a reveal is transcript-wide
+ * and there is one transcript. */
+let anchorDebtEl: HTMLElement | null = null;
+let anchorDebt = 0;
+let anchorDebtAt = -1;
+let anchorDebtHeight = -1;
+
+/** What a previous reveal still owes this container, or 0. */
+function carriedAnchorDebt(container: HTMLElement): number {
+  if (anchorDebtEl !== container || container.scrollHeight !== anchorDebtHeight) return 0;
+  // 1px of slack for a browser re-rounding a fractional offset, matching
+  // `isWhereWeHeldIt` in scrollState.ts.
+  return Math.abs(container.scrollTop - anchorDebtAt) <= 1 ? anchorDebt : 0;
+}
+
+function clearAnchorDebt(): void {
+  anchorDebtEl = null;
+  anchorDebt = 0;
+  anchorDebtAt = -1;
+  anchorDebtHeight = -1;
+}
+
+/** Record what the clamp ate, and the state it left the container in. A debt
+ *  inside the same 1px of slack is no debt at all. */
+function rememberAnchorDebt(container: HTMLElement, debt: number): void {
+  if (Math.abs(debt) <= 1) {
+    clearAnchorDebt();
+    return;
+  }
+  anchorDebtEl = container;
+  anchorDebt = debt;
+  anchorDebtAt = container.scrollTop;
+  anchorDebtHeight = container.scrollHeight;
+}
+
 /** Keep `anchor` visually pinned while `fn` mutates the DOM. */
 export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
   const container = anchor?.closest('.thread-content') as HTMLElement | null;
@@ -327,8 +446,11 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   }
 
   const el = anchor as HTMLElement;
-  const offsetBefore = el.offsetTop;
+  const offsetBefore = contentOffsetTop(container, el);
   const scrollBefore = container.scrollTop;
+  // Read BEFORE the mutation, while the container is still where the last
+  // correction left it: after `fn` a shrink may have clamped it somewhere else.
+  const carried = carriedAnchorDebt(container);
   const overflowBefore = container.style.overflow;
   let restored = false;
 
@@ -340,8 +462,35 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     restored = true;
     observer.disconnect();
 
-    const delta = el.offsetTop - offsetBefore;
-    container.scrollTop = scrollBefore + delta;
+    // A reader RIDING the live edge has asked for the opposite of an anchor
+    // correction: hold me on the newest content, not on the content I was
+    // looking at. Correcting them anyway and then letting
+    // `honourAnchoredMutation` bring them back down is why toggling full
+    // response / steps on a live thread moved the transcript UP and then DOWN
+    // again for one tap. The freeze has kept the container at `scrollBefore`
+    // through the mutation, so skipping the correction leaves the live-edge
+    // write below as the tap's ONE motion.
+    const riding = followingLiveEdge.value;
+    // A mutation that took the anchor OUT of the DOM leaves nothing to hold the
+    // reader on, and a detached element does not say so: it measures as a zero
+    // rect, so the correction would come out as "the turn moved to the top of
+    // the thread" and move the reader somewhere meaningless. Leave them where
+    // the freeze kept them. The next-frame re-check already stands down on this
+    // same test, and a zero delta keeps it from being scheduled at all.
+    const anchored = el.isConnected;
+    const delta = anchored ? contentOffsetTop(container, el) - offsetBefore : 0;
+    // `carried` repays what a previous reveal's clamp ate; what THIS one cannot
+    // reach is recorded for the next. A riding reader owes and is owed nothing:
+    // the live edge is always reachable, and they are about to be put on it. Nor
+    // does a reader whose anchor left the DOM, since declining to correct is
+    // declining to know what the clamp would have eaten.
+    const wanted = reachableScrollTop(scrollBefore + carried + delta);
+    if (riding || !anchored) {
+      clearAnchorDebt();
+    } else {
+      container.scrollTop = wanted;
+      rememberAnchorDebt(container, wanted - container.scrollTop);
+    }
     container.style.overflow = overflowBefore;
 
     // The overflow freeze + large DOM shrink (hiding steps drops every tool-call
@@ -352,21 +501,29 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
 
     // Tell the transcript that THIS correction was ours, so it cannot read as the
     // reader scrolling away and retire their standing follow (only a scroll may
-    // do that), and glide them back to the live edge if they were riding it.
-    // After the unfreeze and the repaint nudge, so the glide it may start is not
-    // fighting either. See `honourAnchoredMutation`.
+    // do that), and land them on the live edge if they were riding it. After the
+    // unfreeze and the repaint nudge, so the write it may make is not fighting
+    // either, and still inside this frame, so the reader never sees the position
+    // the mutation left them at. See `honourAnchoredMutation`.
     honourAnchoredMutation(container);
 
     // iOS may adjust after unfreeze, so re-check in the next frame. Skipped while
-    // the app is driving this container's scroll: `honourAnchoredMutation` may
-    // have started a glide, and re-asserting the pre-glide offset against it is a
-    // frame of jitter for a correction the tween makes moot anyway.
-    if (delta !== 0) {
+    // the app is driving this container's scroll: a tween may be in flight, and
+    // re-asserting a pre-tween offset against it is a frame of jitter for a
+    // correction the tween makes moot anyway. Skipped for a RIDING reader for the
+    // stronger version of the same reason: there was no correction to re-assert,
+    // and asserting one would drag them back up off the live edge
+    // `honourAnchoredMutation` just put them on.
+    if (delta !== 0 && !riding) {
       requestAnimationFrame(() => {
         if (!el.isConnected || isNavigationScroll(container)) return;
-        const target = scrollBefore + (el.offsetTop - offsetBefore);
+        const target = reachableScrollTop(scrollBefore + carried + (contentOffsetTop(container, el) - offsetBefore));
         if (Math.abs(container.scrollTop - target) > 1) {
           container.scrollTop = target;
+          // Re-assert the debt against where this write actually landed. Without
+          // it, a target the clamp cannot reach would be re-written every frame
+          // AND recorded against a stale position.
+          rememberAnchorDebt(container, target - container.scrollTop);
           honourAnchoredMutation(container);
         }
       });
@@ -379,7 +536,7 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   fn();
 
   // Synchronous check (if DOM changed synchronously)
-  if (!restored && el.offsetTop !== offsetBefore) restore();
+  if (!restored && contentOffsetTop(container, el) !== offsetBefore) restore();
 
   // After Preact's Promise microtask render
   queueMicrotask(() => queueMicrotask(restore));
@@ -422,7 +579,11 @@ export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready:
 
     if (!el) return;
 
-    const { onScroll, onResize } = makeScrollObservers(el);
+    // `detachGestures` unwires the reader-gesture listeners the observers came
+    // with, which is what tells `onScroll` a scroll was the READER's rather
+    // than the platform's. Removed with the `scroll` listener below, so a
+    // recycled transcript never leaves a detached element feeding the signal.
+    const { onScroll, onResize, detachGestures } = makeScrollObservers(el);
 
     el.addEventListener('scroll', onScroll, { passive: true });
     const ro = new ResizeObserver(onResize);
@@ -450,6 +611,7 @@ export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready:
       el,
       cleanup: () => {
         el.removeEventListener('scroll', onScroll);
+        detachGestures();
         ro.disconnect();
         mo.disconnect();
         // Only clear if we're still the active element (another instance
@@ -554,7 +716,13 @@ export function CreateThreadView() {
             <ScrollControls
               showUp={isNotAtTop}
               showDown={isUp}
-              onScrollUp={() => areaRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+              // `scrollToTop`, not a raw `scrollTo` on the ref: the up chevron
+              // is a navigation, and the module that owns navigations is what
+              // ends the ride, supersedes a deep-link claim and settles the
+              // chevron signal. The down chevron next to it always went through
+              // the module; this one was inlined, which is why the ride outlived
+              // it.
+              onScrollUp={scrollToTop}
               onScrollDown={scrollToBottom}
             />
           )}

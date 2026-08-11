@@ -31,6 +31,11 @@ export function mockScrollEl(opts: { scrollTop?: number; scrollHeight?: number; 
   return el as any;
 }
 
+/** The transcript's own viewport position. Arbitrary and non-zero on purpose:
+ *  `withScrollAnchor` measures the anchor RELATIVE to this box, so a helper that
+ *  pinned it at 0 would let a missing subtraction pass. */
+const CONTAINER_VIEWPORT_TOP = 120;
+
 export function mockContainer(opts: {
   scrollTop?: number;
   scrollHeight?: number;
@@ -48,25 +53,44 @@ export function mockContainer(opts: {
     }),
     closest: vi.fn(() => null),
     contains: vi.fn(() => false),
+    getBoundingClientRect: () => ({
+      top: CONTAINER_VIEWPORT_TOP,
+      bottom: CONTAINER_VIEWPORT_TOP + el.clientHeight,
+      height: el.clientHeight,
+      left: 0, right: 400, width: 400,
+    }),
   };
   return el;
 }
 
-export function mockAnchorInContainer(container: ReturnType<typeof mockContainer>, offsetTop = 200) {
+/** A turn inside `container`, `offsetTop` from the top of its scrolled content.
+ *
+ *  It answers `getBoundingClientRect` as the real thing does, derived from that
+ *  offset and the container's current `scrollTop`, because `withScrollAnchor`
+ *  measures through rects rather than `offsetTop` (see `contentOffsetTop`: the
+ *  platform rounds `offsetTop` to a whole pixel, and a correction built from two
+ *  rounded reads twitches the transcript by the difference). Keeping `offsetTop`
+ *  on the double as the way a test MOVES the turn keeps every case readable, and
+ *  the rect stays derived from it so the two can never disagree. */
+function anchorIn(container: ReturnType<typeof mockContainer>, read: () => number) {
   return {
-    offsetTop,
+    get offsetTop() { return read(); },
     closest: vi.fn(() => container),
     isConnected: true,
+    getBoundingClientRect: () => {
+      const top = container.getBoundingClientRect().top + read() - container.scrollTop;
+      return { top, bottom: top, height: 0, left: 0, right: 400, width: 400 };
+    },
   };
+}
+
+export function mockAnchorInContainer(container: ReturnType<typeof mockContainer>, offsetTop = 200) {
+  return anchorIn(container, () => offsetTop);
 }
 
 export function mockDynamicAnchor(container: ReturnType<typeof mockContainer>, initialOffset: number) {
   let offset = initialOffset;
-  return {
-    get offsetTop() { return offset; },
-    set _offset(v: number) { offset = v; },
-    closest: vi.fn(() => container),
-    isConnected: true,
+  return Object.assign(anchorIn(container, () => offset), {
     _setOffset(v: number) { offset = v; },
-  };
+  });
 }

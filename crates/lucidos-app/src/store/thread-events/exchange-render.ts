@@ -64,6 +64,88 @@ function resolvePendingSteps(
   }
 }
 
+/** Is anything on this turn still running? Asked of `Step[]` here; the inline
+ *  projection asks the same question of its mixed array through
+ *  `lastPendingStepIndex`. */
+const anyStepPending = (steps: StepLike[]) => steps.some(s => s.outcome === 'pending');
+
+/** Does a LIVE coding-agent turn owe the reader a `Thinking` row right now?
+ *
+ *  The Lucidos Agent arm never needs one: the engine emits `ThoughtStreamed`
+ *  before every LLM call, so a `Thinking` row opens there and the call that
+ *  pass produces renames it (`nameThinkingRow`). A coding agent emits nothing
+ *  of the sort between a `CodingAgentToolResult` and the next
+ *  `CodingAgentToolCalled`, so the transcript was a column of finished checks
+ *  with nothing live in it and the only thing saying work was happening was the
+ *  "Working" label in the response header (reported 2026-08-11).
+ *
+ *  Nothing new is recorded for this: a tool result landed, no terminator has
+ *  arrived, and nothing is running, which means the model holds control. That
+ *  IS a `Thinking` row. The next `CodingAgentToolCalled` consumes it by taking
+ *  the index it occupied, the same in-place morph the rename produces, since
+ *  step rows are keyed by index in `ChatExchange`.
+ *
+ *  DERIVED at the end of each projection rather than pushed from the
+ *  `CodingAgentToolResult` / `CodingAgentTextStreamed` arms, and the difference
+ *  is load-bearing. The engine flushes coding-agent text at every renderable
+ *  boundary (`should_flush`: a paragraph break, a closed code fence, a
+ *  heading, a rule), so a multi-paragraph answer arrives as SEVERAL visible
+ *  `CodingAgentTextStreamed` events. A row pushed between them would defeat
+ *  `mergeAdjacentTextEvents`, whose whole job is to let a markdown document
+ *  split across flushes render as one document, so a code block spanning two
+ *  flushes would render as two broken ones. Appended last, the row cannot land
+ *  between two text events; derived only while the turn is live, it leaves
+ *  every finished transcript exactly as it was.
+ *
+ *  Three of the conditions are the branch this is called from, in both
+ *  projections (no terminator, thread not quiescent, the turn not handed to a
+ *  later exchange), so they are stated once each there rather than re-tested
+ *  here. The other three are here:
+ *
+ *  - It is a coding-agent turn, because only one of those has the gap. The chat
+ *    arm would gain a duplicate of the row `ThoughtStreamed` already gives it,
+ *    and a stepless queued follow-up would sprout one and read as working.
+ *    Wider than `hasCCContent` by ONE event, `SessionStarted`, and that window
+ *    is where the reader first looks: a follow-up that resumes the subprocess
+ *    emits no `CodingAgentPromptSent` at all, so for the 15 to 20 seconds
+ *    before the first tool call the turn holds only `SessionStarted` and two
+ *    `CodingAgentSettingsChanged`, none of which draws a row. The header
+ *    already says "Working" there, because `exchangeStatus` reads raw steps,
+ *    so the transcript was empty under a working turn (reported 2026-08-11,
+ *    seen on a live thread as a 20 second gap). `SessionStarted` is the honest
+ *    signal for it: it is coding-agent-only, it is a step of the turn that
+ *    caused it, and it is the same event that flips that header, so reading it
+ *    here is what keeps the two in agreement.
+ *  - `isLast`, i.e. the ACTIVE exchange. Coding-agent events are not request-id
+ *    routed: they fold chronologically into the last exchange, so the live
+ *    coding-agent turn IS that one. An older exchange stranded terminator-less
+ *    (the user sent a follow-up mid-turn, so the rest of the work landed in a
+ *    newer exchange) is not live, and a row there would shimmer half a screen
+ *    above the one that is.
+ *  - Not a *switch teardown* boundary. That one is closed by construction
+ *    whatever the thread projection says, because the engine went down with it,
+ *    and it settles at `paused` / `waiting` rather than anything quiescent.
+ *    What lands under it is the dying subprocess's drain (a rejected
+ *    `CodingAgentToolResult` and a `"\n\n"` flush), which is coding-agent
+ *    content by type and not work by any reading. Same exemption and same
+ *    predicate as `isSwitchTeardownBoundary` in `exchangeStatus`: without it
+ *    the boundary acquires a renderable body and reads "Working" while nothing
+ *    is running, the 2026-08-06 report `hasRenderableResponseContent` exists
+ *    for. */
+function needsLiveThinkingRow(opts: {
+  exchange: Exchange;
+  isLast: boolean;
+  hasCCContent: boolean;
+  anyPending: boolean;
+}): boolean {
+  const { exchange, isLast, hasCCContent, anyPending } = opts;
+  if (!isLast || anyPending) return false;
+  if (abortPromisesAutoResume(exchange.userEvent)) return false;
+  // The `SessionStarted` scan runs only in the start window, where
+  // `hasCCContent` is false and everything cheaper has already passed.
+  return hasCCContent || exchange.steps.some(({ event }) => event.type === 'SessionStarted');
+}
+
 /** A step row that has not named itself yet: the model is thinking and has not
  *  said what it is about to do. Exported because the renderer needs the same
  *  answer the projection does (`InlineStep` shows the reasoning ticker only
@@ -225,15 +307,18 @@ function bindSnapshotToStep<T>(
 }
 
 /** Build Step[] from exchange events (tool calls with outcome tracking).
- *  @param _isLast — kept for caller compatibility; spinners are no longer resolved
- *  on `!isLast` alone. A non-last exchange can still be the one the agentic loop
- *  is actively processing (chat mid-flight injection — the parent's
+ *  @param isLast: whether this is the ACTIVE exchange, the one at the bottom of
+ *  the transcript (`queuedFollowupRun.activeIndex`). It does NOT resolve
+ *  spinners: a non-last exchange can still be the one the agentic loop is
+ *  actively processing (chat mid-flight injection, where the parent's
  *  request_event_id keeps attracting events even after the follow-up MR lands),
- *  so resolution waits for either an in-exchange completion event or `threadIdle`.
+ *  so resolution waits for either an in-exchange completion event or
+ *  `threadIdle`. It gates only the derived live row, whose live-ness claim is
+ *  about the coding-agent turn at the bottom: see `needsLiveThinkingRow`.
  *  @param threadIdle — true when CC is not producing output (see
  *  `isThreadQuiescent` in store.ts). Combined with the in-exchange completion
  *  flag to finalize pending steps. */
-export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = false): Step[] {
+export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = false): Step[] {
   const steps: Step[] = [];
   let terminal: TerminalKind = null;
   let legacyAcc: LegacyContextEvents = {};
@@ -396,19 +481,30 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
     }
   }
   // See `exchangeResponseEvents` for the outcome split and for why a handed-off
-  // exchange finalizes only its Thinking markers.
+  // exchange finalizes only its Thinking markers. The last branch is the live
+  // turn, the only one that can owe a row: see `needsLiveThinkingRow`.
   if (terminal !== null || threadIdle) resolvePendingSteps(steps, pendingOutcomeFor(terminal));
   else if (exchange.continuationMoved) resolvePendingSteps(steps, 'success', isThinking);
+  else if (needsLiveThinkingRow({
+    exchange,
+    isLast,
+    hasCCContent: exchangeHasCCContent(exchange),
+    anyPending: anyStepPending(steps),
+  })) {
+    steps.push({ description: 'Thinking', outcome: 'pending' });
+  }
   return steps;
 }
 
 /** Index of the last pending step matching `pred`, or -1. The lookup half of
- *  `resolveLastPendingResponseStep`, for the one caller that replaces a step
- *  rather than resolving it. */
-function lastPendingStepIndex(events: ResponseEvent[], pred: (s: StepLike) => boolean): number {
+ *  `resolveLastPendingResponseStep`, for the callers that replace a step rather
+ *  than resolving it, or that only need to know whether one exists (`pred`
+ *  omitted, i.e. "is anything still running", which is `anyStepPending` for the
+ *  other projection's shape). */
+function lastPendingStepIndex(events: ResponseEvent[], pred?: (s: StepLike) => boolean): number {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.type === 'step' && e.outcome === 'pending' && pred(e)) return i;
+    if (e.type === 'step' && e.outcome === 'pending' && (!pred || pred(e))) return i;
   }
   return -1;
 }
@@ -463,14 +559,14 @@ function failureEchoPredicate(exchange: Exchange): (text: string | undefined) =>
 }
 
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
- *  @param _isLast — kept for caller compatibility; no longer drives spinner resolution
- *  on its own. See `threadIdle`.
+ *  @param isLast: the ACTIVE exchange, as in `exchangeSteps`. It does not drive
+ *  spinner resolution (see `threadIdle`), only the derived live row.
  *  @param threadIdle — true when CC is not producing output (see
  *  `isThreadQuiescent` in store.ts). Combined with the in-exchange completion
  *  flag to finalize pending steps. A non-last exchange can still be the one
  *  the engine is actively processing (chat mid-flight injection), so
  *  resolution must not trigger purely on `!isLast`. */
-export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threadIdle = false): ResponseEvent[] {
+export function exchangeResponseEvents(exchange: Exchange, isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
   const isFailureEcho = failureEchoPredicate(exchange);
@@ -910,6 +1006,16 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
     ) {
       events.push({ type: 'empty' });
     }
+  } else if (needsLiveThinkingRow({
+    exchange,
+    isLast,
+    hasCCContent,
+    anyPending: lastPendingStepIndex(events) >= 0,
+  })) {
+    // The turn is live and nothing is running, so the model holds control.
+    // Mirror of the last branch in `exchangeSteps`; see `needsLiveThinkingRow`
+    // for why the row is derived here rather than pushed from the text arm.
+    pushStep({ type: 'step', description: 'Thinking', outcome: 'pending' });
   }
   return mergeAdjacentTextEvents(events);
 }
@@ -950,8 +1056,10 @@ export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
  *  error. */
 export function stepStatus(outcome: StepOutcome): { label: string; icon: string; className: StepOutcome } {
   switch (outcome) {
-    // In-progress rows show no leading icon: the shimmering description is the
-    // "live" affordance (see `.inline-step.pending .step-icon` in steps.css).
+    // In-progress rows show no leading mark: the shimmering description is the
+    // "live" affordance. The empty icon still gets a slot, because the slot is
+    // a fixed-width column (`.inline-step .step-icon`, steps.css), so the
+    // running row's text sits on the same column as the finished rows above it.
     case 'pending': return { label: 'In progress', icon: '', className: 'pending' };
     case 'success': return { label: 'Completed', icon: '✓', className: 'success' };
     case 'error': return { label: 'Failed', icon: '⚠', className: 'error' };

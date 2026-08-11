@@ -14,6 +14,14 @@ function chatExchange(steps: Exchange['steps']): Exchange {
   };
 }
 
+function ccExchange(steps: Exchange['steps']): Exchange {
+  return {
+    userEvent: { type: 'MessageReceived', text: 'fix the projection', created: TS, channel: 'claude_code', _eventId: 'msg-1' } as any,
+    userSeq: 1,
+    steps,
+  };
+}
+
 let seq = 1;
 const ev = (event: Record<string, unknown>) => ({ seq: ++seq, event: { created: TS, ...event } as any });
 
@@ -75,6 +83,34 @@ describe('exactly-one-shimmer invariant while working', () => {
   // with steps globally expanded and a pending step in the data. (Regression:
   // hasVisibleLiveStep ignored the collapse and suppressed the label shimmer,
   // leaving the working turn with no shimmer at all.)
+  // The gap a coding-agent turn used to have: between a `CodingAgentToolResult`
+  // and the next `CodingAgentToolCalled` nothing was pending, so the transcript
+  // showed a column of finished checks and the ONLY thing saying work was
+  // happening was the header label (reported 2026-08-11: "the running state in
+  // between reflects in Working label above which is not good"). The derived
+  // live row (`needsLiveThinkingRow`) puts it back in the transcript, and the
+  // invariant then resolves the same way as for the native arm.
+  const ccGap = ccExchange([
+    ev({ type: 'SessionStarted', session_id: 's1' }),
+    ev({ type: 'CodingAgentPromptSent', text: 'fix the projection' }),
+    ev({ type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'a.rs' }, tool_use_id: 'tu-A' }),
+    ev({ type: 'CodingAgentToolResult', name: 'Read', result: 'ok', tool_use_id: 'tu-A' }),
+  ]);
+
+  it('coding-agent gap between tool calls shimmers the step row, not the label', () => {
+    const s = shimmerState(ccGap, /*showSteps*/ true);
+    expect(s.statusClass).toBe('working');
+    expect(s.stepShimmers).toBe(true);
+    expect(s.labelShimmers).toBe(false);
+  });
+
+  it('coding-agent gap with steps hidden shimmers the label alone', () => {
+    const s = shimmerState(ccGap, /*showSteps*/ false);
+    expect(s.statusClass).toBe('working');
+    expect(s.stepShimmers).toBe(false);
+    expect(s.labelShimmers).toBe(true);
+  });
+
   it('collapsed panel with a pending step still shimmers the Working label', () => {
     const working = chatExchange([
       ev({ type: 'ThoughtStreamed' }),

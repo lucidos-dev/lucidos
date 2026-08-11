@@ -120,7 +120,14 @@ describe('Flow: Interrupted exchanges', () => {
     // …but exchangeResponseEvents emits nothing (SessionStarted alone produces
     // no section_break — hasCCContent is false), so the response panel body
     // would be empty. The visible-noise placeholder must be hidden.
-    expect(exchangeResponseEvents(exchanges[0])).toEqual([]);
+    //
+    // `isLast` is passed, matching the status call above and what ChatExchange
+    // does for a middle exchange. It is load-bearing rather than tidiness: the
+    // ACTIVE exchange of a live coding-agent turn derives a `Thinking` row from
+    // a bare `SessionStarted` (that window is a 20 second empty "Working" panel
+    // otherwise, see `needsLiveThinkingRow`), and this exchange is precisely the
+    // one the turn has moved on from.
+    expect(exchangeResponseEvents(exchanges[0], /* isLast */ false)).toEqual([]);
     expect(exchangeResponseText(exchanges[0])).toBe('');
   });
 

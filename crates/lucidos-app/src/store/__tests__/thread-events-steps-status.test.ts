@@ -246,18 +246,24 @@ describe('step completion — no eternal spinners', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(1);
 
+    // Three tool rows, each resolved by its own result, then the live row a
+    // coding-agent turn carries while the model holds control: nothing is
+    // running and no terminator has arrived, so the turn is still going. See
+    // `needsLiveThinkingRow` and `thread-events/coding-agent-live-row.test.ts`.
     const respEvents = exchangeResponseEvents(exchanges[0]);
     const respSteps = respEvents.filter(e => e.type === 'step');
-    expect(respSteps).toHaveLength(3);
-    for (const step of respSteps) {
+    expect(respSteps).toHaveLength(4);
+    for (const step of respSteps.slice(0, 3)) {
       expect((step as { outcome: StepOutcome }).outcome).toBe('success');
     }
+    expect(respSteps[3]).toMatchObject({ description: 'Thinking', outcome: 'pending' });
 
     const steps = exchangeSteps(exchanges[0]);
-    expect(steps).toHaveLength(3);
-    for (const step of steps) {
+    expect(steps).toHaveLength(4);
+    for (const step of steps.slice(0, 3)) {
       expect(step.outcome).toBe('success');
     }
+    expect(steps[3]).toMatchObject({ description: 'Thinking', outcome: 'pending' });
   });
 
   it('parallel CC reads with same description: result pairs by tool_use_id, not visual order', () => {
@@ -304,9 +310,11 @@ describe('step completion — no eternal spinners', () => {
     ]);
 
     const exchanges = groupIntoExchanges(events);
-    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { outcome: StepOutcome }[];
-    expect(respSteps).toHaveLength(2);
-    for (const step of respSteps) expect(step.outcome).toBe('success');
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { description: string; outcome: StepOutcome }[];
+    // Both tool rows resolved, plus the still-running turn's live row.
+    expect(respSteps).toHaveLength(3);
+    for (const step of respSteps.slice(0, 2)) expect(step.outcome).toBe('success');
+    expect(respSteps[2]).toMatchObject({ description: 'Thinking', outcome: 'pending' });
   });
 
   it('parallel engine tool results resolve individual pending steps', () => {

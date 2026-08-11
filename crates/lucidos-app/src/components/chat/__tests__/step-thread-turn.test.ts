@@ -14,6 +14,10 @@ import {
   stepThreadTurn,
   setActiveScrollElement,
   awayFromBottom,
+  followingLiveEdge,
+  setFollowLiveEdge,
+  setThreadLive,
+  stopFollowingBottom,
 } from '../scrollState';
 
 // ---------------------------------------------------------------------------
@@ -122,5 +126,92 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
     stepThreadTurn(1);
 
     expect(awayFromBottom.value).toBe(false);
+  });
+});
+
+/**
+ * **Turn stepping ends a standing follow, and says so itself.**
+ *
+ * A scroll only speaks for the reader when a gesture is behind it (see
+ * scrollState's "Was this scroll the reader's own GESTURE?"), and a keyboard
+ * chord is not one: `stepThreadTurn`'s write used to retire the ride only
+ * because it landed somewhere the position test did not recognise, which was
+ * always an accident rather than a reading of intent.
+ *
+ * It reuses the chevron's own landing verdict, so the two cannot disagree: a
+ * step that parks the reader mid-thread ends the ride, and one that lands on
+ * the last turn does not, because the clamped live edge is where the ride was
+ * taking them anyway.
+ */
+describe('stepThreadTurn and the standing follow', () => {
+  let restoreMatchMedia: () => void;
+  let restoreGCS: () => void;
+
+  beforeEach(() => {
+    awayFromBottom.value = false;
+    stopFollowingBottom();
+    setThreadLive(true);
+    const origMM = globalThis.matchMedia;
+    (globalThis as any).matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
+    restoreMatchMedia = () => { (globalThis as any).matchMedia = origMM; };
+    const origGCS = (globalThis as any).getComputedStyle;
+    (globalThis as any).getComputedStyle = () => ({ scrollMarginTop: '8px', display: 'block' });
+    restoreGCS = () => { (globalThis as any).getComputedStyle = origGCS; };
+  });
+
+  afterEach(() => {
+    stopFollowingBottom();
+    setActiveScrollElement(null);
+    restoreMatchMedia();
+    restoreGCS();
+  });
+
+  /** An armed reader on a transcript long enough to step around in. Arming
+   *  takes them to the live edge, which is where a riding reader is by
+   *  definition, so the step that has anywhere to go is BACKWARDS. */
+  function ridingLongThread() {
+    const { el, turns } = makeContainer({ scrollTop: 0, scrollHeight: 2000, clientHeight: 500 });
+    turns.push(makeTurn(0, el), makeTurn(800, el), makeTurn(1600, el));
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    expect(followingLiveEdge.value).toBe(true);
+    return el;
+  }
+
+  it('ends the ride on a step that parks the reader mid-thread', () => {
+    ridingLongThread();
+
+    stepThreadTurn(-1);
+
+    expect(awayFromBottom.value).toBe(true);   // parked, content still below
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('keeps the ride on a step that lands at the live edge', () => {
+    // The clamped last turn is where the ride was taking them, so nothing was
+    // taken away and the toggle stays lit.
+    const { el, turns } = makeContainer({ scrollTop: 700, scrollHeight: 2000, clientHeight: 500 });
+    turns.push(makeTurn(0, el), makeTurn(700, el), makeTurn(1520, el));
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    expect(followingLiveEdge.value).toBe(true);
+
+    stepThreadTurn(1);
+
+    expect(awayFromBottom.value).toBe(false);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('keeps the ride when the thread is IDLE, whatever the step does', () => {
+    // Same rule as the scroll disarm: stepping back through a thread nothing is
+    // writing to is browsing, and the reader's next submit should still carry
+    // them to the live edge.
+    ridingLongThread();
+    setThreadLive(false);
+
+    stepThreadTurn(-1);
+
+    expect(awayFromBottom.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(true);
   });
 });
