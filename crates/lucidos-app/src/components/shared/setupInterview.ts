@@ -20,7 +20,7 @@ import { showConfirm } from '../../store/store';
 export async function confirmAndStartSetupInterview(): Promise<void> {
   const ok = await showConfirm(
     'I will ask a few questions about what you want help with, at work or outside '
-    + 'it, then build the apps and automations that fit, here in your workspace. '
+    + 'it, then we build the apps and automations that fit, here in your workspace. '
     + 'Nothing gets built until you say yes to what I propose.'
     // Blank line: `DialogMessage` renders this as its own paragraph.
     + '\n\n'

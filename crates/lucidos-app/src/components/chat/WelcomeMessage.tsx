@@ -96,9 +96,9 @@ export function SetupInterviewWelcome() {
       </button>
       <p class="welcome-setup-interview-hint">
         A few questions about what you want help with, at work or outside it:
-        personal admin, training, learning, whatever fits. Then I build the apps
-        and automations to match, right here in your workspace. You can start
-        this again any time
+        personal admin, training, learning, whatever fits. Then we build the
+        apps and automations to match, right here in your workspace. You can
+        start this again any time
         {onMobile ? ' ' : <> from the <span aria-hidden="true">?</span> button, or </>}
         by just asking me to set you up.
       </p>

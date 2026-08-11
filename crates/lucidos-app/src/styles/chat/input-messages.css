@@ -274,23 +274,39 @@
  * `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
  * announced its state to a screen reader and to nobody else.
  *
- * Deliberately the same paint as `.icon-btn.filter-active` (host-components.css)
- * rather than a blanket `.icon-btn.active`: a blanket rule would also frame
- * `.pin-thread-btn.active`, whose own rule takes the accent and NO frame on
- * purpose, its icon being a filled silhouette that carries the state by itself.
- * Scoped to this row, the two toggles that mean it get it and nothing else
- * does. */
-.prompt-actions-row .icon-btn.header-icon.active {
+ * They take DIFFERENT on-state paints, so each is selected by its own
+ * `data-role` rather than by a shared `.active` (which would have to be a
+ * negation to tell them apart, and would read as a rule about the follow toggle
+ * while styling the other one). A third toggle in this row therefore has to opt
+ * into one of the two shapes below; it inherits neither by accident.
+ *
+ * WIP PREVIEW: framed, the same paint as `.icon-btn.filter-active`
+ * (host-components.css). Not a blanket `.icon-btn.active`, which would also
+ * frame `.pin-thread-btn.active`, whose own rule takes the accent and NO frame
+ * on purpose. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"] {
     color: var(--accent);
     background: var(--bg-tertiary);
     border-radius: 0.375rem;
 }
 
 @media (hover: hover) {
-    .prompt-actions-row .icon-btn.header-icon.active:hover {
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"]:hover {
         background: var(--bg-quaternary);
         color: var(--accent);
     }
+}
+
+/* FOLLOW: the `.pin-thread-btn.active` shape instead, accent only and no frame.
+ * Following the live edge is a standing mode that is on for most of a thread's
+ * life, and a filled box held down that long at the end of a row of otherwise
+ * unframed icons reads as a button jammed in rather than as a mode. The accent
+ * alone carries the state, and the ordinary `.icon-btn:hover` background still
+ * applies transiently, like every icon-btn. No hover override is needed to keep
+ * the accent: this selector (0,5,0) already outranks `.icon-btn:hover` (0,2,0),
+ * so the color holds under the pointer. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="follow-live-edge"] {
+    color: var(--accent);
 }
 
 .prompt-actions-right {

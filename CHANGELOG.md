@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.26.2 — 2026-08-11
+
+### Changed
+
+- The setup interview says "we build" rather than "I build", in the welcome hint, the header tooltip and the confirm dialog.
+
+### Fixed
+
+- A workspace restored from a backup starts in the background like a created one, so its triggers, scheduled tasks and push keep working after login without opening it.
+- The follow-the-live-edge toggle in the prompt bar shows its on-state in accent alone, with no frame around the icon.
 ## v0.26.1 — 2026-08-10
 
 ### Fixed

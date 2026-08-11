@@ -45,7 +45,7 @@ export function threadHeaderActions(): HeaderActionSpec[] {
     actions.push({
       key: 'setup-interview',
       label: 'Get the most out of Lucidos',
-      tooltip: 'Get the most out of Lucidos: a few questions, then I build what fits',
+      tooltip: 'Get the most out of Lucidos: a few questions, then we build what fits',
       icon: () => <HelpIcon />,
       onClick: () => { void confirmAndStartSetupInterview(); },
       extraClass: 'setup-interview-btn',

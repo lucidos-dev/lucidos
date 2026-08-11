@@ -52,8 +52,9 @@ pub struct Workspace {
     /// `true` → the engine is **auto-started** when the gateway (re)starts (the
     /// always-on posture: a packaged install's login-launched gateway brings up
     /// its auto-start workspaces, so triggers, scheduled tasks and push keep
-    /// working without anyone opening a window). This is the default for a
-    /// workspace created through the picker. `false` (what the dev launcher
+    /// working without anyone opening a window). This is the default every
+    /// gateway-provisioned workspace is born with, see
+    /// [`Workspace::gateway_provisioned`]. `false` (what the dev launcher
     /// seeds, and what the picker toggle can set) → the workspace is **listed**
     /// in the picker but its engine is started only on an explicit open/launch
     /// (lazy).
@@ -70,6 +71,36 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// A workspace the gateway provisions for itself under
+    /// `<app-data>/workspaces/<id>`: the entry shape both creation paths share,
+    /// picker **create** and **restore from backup**.
+    ///
+    /// Both go through here so the two can never disagree on the [`autostart`]
+    /// default again. They did until 2026-08-11: create said `true` and restore
+    /// said `false`, so a restored backup sat dark after every login, running no
+    /// triggers, scheduled tasks or push until somebody found the picker toggle.
+    /// Restoring a backup is at least as strong a statement that you want the
+    /// workspace running as creating one from scratch is, and the restored
+    /// workspace is exactly the one whose triggers and scheduled tasks were
+    /// already set up.
+    ///
+    /// Not for a workspace the gateway merely *registers*: the dev launcher
+    /// seeds an absolute `dir` outside app-data and wants autostart off (see
+    /// `scripts/lib/workspace.sh`), and it writes the registry itself rather
+    /// than calling this.
+    ///
+    /// [`autostart`]: Workspace::autostart
+    pub fn gateway_provisioned(id: String, name: String, port: u16) -> Self {
+        Self {
+            dir: format!("workspaces/{id}"),
+            id,
+            name,
+            port,
+            database_url: None,
+            autostart: true,
+        }
+    }
+
     /// Resolve [`Workspace::dir`] to an absolute path: absolute dirs are used
     /// verbatim; relative dirs join `app_data`.
     pub fn resolve_dir(&self, app_data: &Path) -> PathBuf {
@@ -520,6 +551,30 @@ mod tests {
     }
 
     // ── The autostart default and its one-time migration ─────────────────────
+
+    /// The default a freshly provisioned entry carries. Asserted on the shared
+    /// constructor rather than per call site, because the constructor is what
+    /// makes create and restore agree: a second creation path that hand-rolls
+    /// the literal is the bug this replaced (see
+    /// [`Workspace::gateway_provisioned`]).
+    #[test]
+    fn a_gateway_provisioned_workspace_runs_in_the_background() {
+        let ws = Workspace::gateway_provisioned("myws".into(), "My Workspace 💼".into(), 5001);
+        assert!(
+            ws.autostart,
+            "a workspace the user created or restored is one they want running, \
+             so it auto-starts and keeps its triggers, scheduled tasks and push alive",
+        );
+        assert_eq!(ws.id, "myws");
+        assert_eq!(ws.name, "My Workspace 💼");
+        assert_eq!(ws.port, 5001);
+        // App-data relative: the gateway owns the directory it provisions.
+        assert_eq!(ws.dir, "workspaces/myws");
+        assert!(
+            ws.database_url.is_none(),
+            "the shared cluster's database is derived from the id (ADR 0014)",
+        );
+    }
 
     /// A pre-versioning document: no `version`, entries written with the old
     /// `autostart: false` default.

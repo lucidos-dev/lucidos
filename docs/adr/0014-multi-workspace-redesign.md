@@ -103,6 +103,15 @@ contradicting §10). The corrected model:
   declares `{"quit": true}` there before it signals, so the one teardown that
   means stay down records nothing. See `crates/lucidos-gateway/src/next_boot.rs`
   and `docs/plans/2026-08-03-a-restart-brings-the-workspaces-back.md`.)*
+  *(Updated 2026-08-11: **restore from backup** was missed by that change and
+  kept writing `autostart: false`, so a restored workspace ran nothing at login
+  until somebody found the picker toggle, which is the same broken promise for
+  the user most likely to be depending on it: one whose triggers and scheduled
+  tasks were already set up on the machine the backup came from. Both paths that
+  create a registry entry now build it through `Workspace::gateway_provisioned`,
+  the single place the default lives, so the two cannot diverge again. Distinct
+  from the next-boot "restore" above, which is about bringing stopped engines
+  back.)*
 - A document navigation to a registered-but-stopped workspace (`/<slug>/`)
   **lazy-starts** it and serves the existing boot-window page (§11) — so the
   picker's "Open" and a direct URL both work on a stopped workspace. API/SSE/

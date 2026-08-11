@@ -215,7 +215,8 @@ pub fn failed_page(message: &str) -> Response {
 }
 
 /// The boot-splash ESCAPE page, served once a workspace has been stuck in its boot
-/// window past the gateway's budget ([`crate::server::BOOT_ESCAPE_BUDGET`]). An
+/// window past the gateway's budget (`server::BOOT_ESCAPE_BUDGET`, private to
+/// that module, so this is a plain reference rather than a doc link). An
 /// alive-but-unreachable engine (misconfigured bind, network partition) is never
 /// marked `Unhealthy`, so without this the splash would meta-refresh forever with
 /// no way out. It keeps a SLOWER (10s) refresh so a late-but-real recovery still

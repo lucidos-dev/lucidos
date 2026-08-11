@@ -868,12 +868,14 @@ impl GatewayState {
     /// provisioning so a provisioning failure leaves a recoverable `Unhealthy`
     /// workspace (retry / delete from the picker) rather than vanishing.
     ///
-    /// New workspaces are created with `autostart = true`: a workspace someone
-    /// bothered to create is one they want running, and the always-on service
-    /// only keeps its promise (triggers, scheduled tasks, coding-agent sessions,
-    /// push) for a workspace whose engine is up. The picker toggle turns it off
-    /// per workspace. This is the sole creation path: there is no auto-created
-    /// bootstrap `default`, and first run shows the picker.
+    /// New workspaces are created with `autostart = true` (via
+    /// [`Workspace::gateway_provisioned`], shared with restore): a workspace
+    /// someone bothered to create is one they want running, and the always-on
+    /// service only keeps its promise (triggers, scheduled tasks, coding-agent
+    /// sessions, push) for a workspace whose engine is up. The picker toggle
+    /// turns it off per workspace. This is the sole *create* path: there is no
+    /// auto-created bootstrap `default`, and first run shows the picker.
+    /// ([`Self::restore_workspace`] is the other way an entry is born.)
     ///
     /// Refuses a display name another workspace already carries: two rows the
     /// user cannot tell apart is not a state worth creating (see
@@ -896,14 +898,7 @@ impl GatewayState {
             let port = reg
                 .allocate_port()
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            let ws = Workspace {
-                id: id.clone(),
-                name: name.to_string(),
-                dir: format!("workspaces/{id}"),
-                port,
-                database_url: None,
-                autostart: true,
-            };
+            let ws = Workspace::gateway_provisioned(id, name.to_string(), port);
             reg.add(ws.clone())
                 .map_err(|e| ApiError::internal(e.to_string()))?;
             reg.save(&self.inner.registry_path)
@@ -995,6 +990,11 @@ impl GatewayState {
     /// dir + database, so a failure before then leaves nothing registered and the
     /// cleanup removes only what this attempt created (the provisioned Postgres +
     /// the fresh dir) — never a pre-existing workspace.
+    ///
+    /// The entry it commits is a [`Workspace::gateway_provisioned`] one, exactly
+    /// like [`Self::create_workspace`]'s, so a restored workspace auto-starts and
+    /// its triggers, scheduled tasks and push resume at the next login without
+    /// anyone opening it.
     pub async fn restore_workspace(
         &self,
         archive_tmp: PathBuf,
@@ -1071,14 +1071,7 @@ impl GatewayState {
             (slug, port)
         };
 
-        let ws = Workspace {
-            id: id.clone(),
-            name: name.clone(),
-            dir: format!("workspaces/{id}"),
-            port,
-            database_url: None,
-            autostart: false,
-        };
+        let ws = Workspace::gateway_provisioned(id.clone(), name.clone(), port);
         let me = self.clone();
         let (id_done, name_done) = (id.clone(), name.clone());
         tokio::spawn(async move {
