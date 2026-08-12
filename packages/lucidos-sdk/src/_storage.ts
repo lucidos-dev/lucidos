@@ -44,6 +44,17 @@ export function wsLocalGet(key: string): string | null {
   }
 }
 
+/** Remove a per-workspace localStorage value (namespaced). Best-effort: used by
+ *  the boot script's `?style-reset` escape hatch, which must work even when the
+ *  UI it is rescuing does not. */
+export function wsLocalRemove(key: string): void {
+  try {
+    localStorage.removeItem(nsKey(key));
+  } catch {
+    /* a storage-less realm has nothing to clear */
+  }
+}
+
 /** Read a per-workspace sessionStorage value (namespaced). Null if unavailable. */
 export function wsSessionGet(key: string): string | null {
   try {

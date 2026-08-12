@@ -40,7 +40,10 @@ const REPO_ROOT = resolve(here, '../../../../..');
 
 /** Stylesheets the engine embeds and serves, relative to the repo root. Add a
  *  new one here in the same change that adds the `include_str!`. */
-const ENGINE_SERVED_CSS = ['crates/lucidos-engine/src/api/sdk_iframe.css'] as const;
+const ENGINE_SERVED_CSS = [
+  'crates/lucidos-engine/src/api/sdk_iframe.css',
+  'crates/lucidos-engine/src/api/sdk_fonts_fira_code.css',
+] as const;
 
 describe('engine-served stylesheets', () => {
   for (const relPath of ENGINE_SERVED_CSS) {

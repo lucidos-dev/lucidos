@@ -315,7 +315,10 @@ keeps a retry after a partial publish from adding a second commit for one tag).
 Offline-tested by
 `scripts/lib/release_tree_test.sh` (strip coverage, self-exclusion, guard
 fail-closed on both arms, commit determinism with and without a parent, the
-full ancestry-guard matrix, both pure push/history comparators, every preflight
+full ancestry-guard matrix, both pure push/history comparators including both
+of the count check's subtrahends, the recorded-exception verifier against a
+stand-in mirror in all three of its stale directions (tagged, off-history,
+abbreviated), every preflight
 refusal, an end-to-end rehearsal against a throwaway bare repo, and the wiring
 that keeps the promotion a promotion).
 
@@ -357,12 +360,13 @@ Four things hold it together, all in `scripts/lib/release_tree.sh`:
   `--force-with-lease=refs/heads/main:<parent>`, which puts the precondition on
   the SERVER at update time where the confirmation prompt cannot race it.
   `create` is the empty-mirror bootstrap; `refuse` means a release landed since.
-- **`release_mirror_history_is_complete <commits> <tags>`** is the precondition,
+- **`release_mirror_history_is_complete <commits> <tags> <in-flight> <recorded>`**
+  is the precondition,
   and it is permanent rather than a one-time step. It refuses in BOTH
   directions: fewer commits than release tags means the history is missing
   releases (the pre-repair state: 1 against 36, with the refusal naming
   `scripts/rebuild-mirror-history.sh`), more means something reached `main` that
-  no release published, which nothing in the pipeline can do. Once true it
+  no release published and that nothing accounts for. Once true it
   self-maintains, since every release adds exactly one commit and one tag.
   The count is necessary but **not sufficient**, so
   `release_mirror_tags_are_on_main` runs after it: a tag rewritten onto an
@@ -406,14 +410,54 @@ tag; if the tag push fails, `main` legitimately carries one commit no tag names.
 Ordered the other way round, the retry whose only remaining job is to push that
 tag hits "more commits than releases" and is refused for the state it exists to
 repair, with no in-workflow escape and every later release refused too. That
-deadlock is worse than the stray-hand-push it was guarding against. So
-`release_mirror_history_is_complete <commits> <tags> <in-flight>` takes the
-count as a **required** argument (0 defaults to the deadlock; 1 would
+deadlock is worse than the stray-hand-push it was guarding against. So the check
+takes the count as a **required** argument (0 defaults to the deadlock; 1 would
 blanket-excuse a stray commit), Phase A always passes 0 because it pushes to
 `rc/<version>` and never to `main`, and the one-shot passes 1 only once it has
 proven `main` is its own untagged commit. Tree equality is the proof, and it is
 sound because a release commit always bumps `RELEASE`, `CHANGELOG.md` and
 `install.sh`, so two consecutive releases can never share a published tree.
+
+**A run that NEVER comes back is the second exception, and it is recorded rather
+than assumed (2026-08-11).** The in-flight count covers the two-push window only
+for the run that returns to finish the tag; nothing covered one that died in
+between and was superseded. One did: the first v0.26.3 Phase A pushed its
+stripped commit to `main` and died in `notarize` (notarytool `abortedUpload` /
+`connectTimeout`), a later run parented a fresh candidate on the leftover as
+designed and published it, and the mirror was left at 49 commits against 48
+tags, refusing every release. The leftover cannot be dropped, because it is the
+PARENT of the published v0.26.3 commit and removing it changes that commit's SHA
+and breaks every clone, so the COUNT learns about it instead:
+`RELEASE_MIRROR_HISTORY_EXCEPTIONS` in `release_tree.sh` records the SHA, the
+date and the reason, one line per commit. **An entry is never trusted.**
+`release_mirror_history_exception_count` re-asks the live mirror both halves on
+every run (still an ancestor of `main`, named by no `v*` tag) and only a verified
+entry is subtracted, because a bare recorded number would be an unconditional -1
+that silently absorbs a DIFFERENT stray commit once the recorded one stops being
+what its entry describes. **A stale entry refuses**, naming it, rather than being
+skipped: an entry that stops verifying means either the commit was tagged after
+all (the list is hiding a real release) or the mirror was rewritten underneath a
+published one, and quietly dropping it would downgrade a corrupted mirror to a
+merely stricter count.
+
+**The SHA must be the full 40 hex, and that is correctness rather than tidiness.**
+git resolves short object names, so an abbreviation satisfies the ancestry half
+on its own, while the tag half compares against 40-char `ls-remote` output and
+can never match. An abbreviated entry would therefore verify forever with its
+"still untagged" half never actually running, and would go on subtracting the
+commit even after a tag landed on it. The shape is refused up front rather than
+expanded, since expanding it here would make the recorded list mean whatever the
+local object store happens to resolve it to.
+
+The two subtrahends stay independent and compose: in-flight is a commit whose tag
+is still coming, an exception is one whose tag is never coming. The list lives in
+`release_tree.sh` because that file is already withheld from the mirror, so it
+introduces no new exclude entry and no new leak surface, and nothing in the
+pipeline writes to it: adding an entry is a human decision, and the list is meant
+to stay at one, because a second means Phase A dropped another commit on `main`
+and that is a bug to fix at the source. Registered in `docs/temporary-measures.md`
+(a mirror rebuild would re-derive a chain with no untagged commits, which is the
+removal condition).
 
 **The one-time repair still has to run once, by a human.** Chaining onto a
 one-commit `main` only ever yields a two-commit `main`, so

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.26.5 — 2026-08-12
+
+### Added
+
+- **What's New, under Settings > System.** Browse the release notes for every version of Lucidos, reachable from the version row and from an update offer.
+
+### Changed
+
+- Fira Code is the default UI font and System the default theme on a fresh install.
+- Fira Code ships inside Lucidos and is served locally, so it renders offline and no request goes to Google.
+- Sending a message lands it at the top of the viewport, so your message and the reply that follows start at the top of the reading area.
+- The Lucidos menu says why the mark is dim, naming the workspace that lost its connection.
+- A thread can hold up to 25 live event waits.
+- The context viewer's rows share one chevron, one box and one right edge, and focus outranks hover on them.
+
+### Fixed
+
+- A wait or a trigger can scope to a single thread. A `thread_id` condition matches any thread event, so `CodingAgentIdled` can name one coding-agent session instead of every session in the workspace.
+- The transcript ends where its content ends, with no empty space below the last turn.
+- A deep link holds the position it lands on, including in a thread that is still working.
+- A queued follow-up is revealed where it sits rather than chased to the live edge.
+- A stored preference value that collides with a JavaScript built-in name no longer breaks the font or the UI scale at startup.
+- Fira Code renders in every browser, and an upgrade picks up the new font bytes instead of a cached copy.
+- A coding-agent turn counts its token usage once per message, so usage and cost totals stop inflating.
+- An event matching more than one of a wait's subscriptions wakes it once.
+- An update offer shows the release notes without the version heading repeated inside them.
+- A step's mark and its text sit together, with the gap between them closed.
 ## v0.26.4 — 2026-08-11
 
 ### Fixed

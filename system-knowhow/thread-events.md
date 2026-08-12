@@ -51,6 +51,8 @@ The blocklist contains exactly the per-token streaming variants — many fires p
 
 Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable**: they fire once per discrete action, scoped with per-entry `condition:` filters (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). A condition reads TOP-LEVEL payload fields only, with operators `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` and a bare value meaning `$eq`. There is no regex operator and no nested path, and an unsupported one never matches, so a filter on the command text inside `args` silently never fires.
 
+**`thread_id` is available on every event in this file, and on none of their payloads.** The engine supplies it at matching time from the thread the event belongs to, so `condition: { thread_id: "<uuid>" }` scopes a subscription to one thread whatever the event type: one coding-agent session reaching a turn boundary (`CodingAgentIdled`), one thread's next response (`ResponseGenerated`), one thread's next tool call. It is a matching-time field only, so it never appears in a payload you read back with `query_events`, where the event row's own thread column carries it instead. A **domain event** (`emit_event`) belongs to no thread and therefore has no `thread_id` to filter on.
+
 That means right now (each example below is one entry inside a trigger's `on` list, see `system-knowhow/triggers.md` for the full subscription shape):
 
 - `event_type: UserQuestionAsked`: works. The typical use is "push me when an interactive question is raised so I can answer from my phone." Pair `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` so the tap deep-links straight to the question, see `triggers.md` for the worked example.
@@ -382,8 +384,11 @@ the same turn rather than discovering later:
 
 - `timeout_secs` is **required** and capped at **24 hours**. There is no
   unbounded wait. For anything longer, the right shape is a trigger.
-- A thread may hold **5 live waits** at once, and may not register the same
-  `on:` list twice (one event would then wake it twice).
+- A thread may hold **25 live waits** at once, and may not register the same
+  `on:` list twice (one event would then wake it twice). The limit is on how
+  many separate wakes can be outstanding, not on how much you can watch: one
+  wait's `on:` list is uncapped, so watching a dozen things in one subscription
+  (any entry wakes you) costs one of the 25.
 - A thread may subscribe **10 times in a row** with no message from the user in
   between. That bounds a thread that wakes itself, two threads ping-ponging,
   and a model simply stuck. An agent- or engine-authored message does not reset

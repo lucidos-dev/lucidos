@@ -92,8 +92,8 @@ the same code as the LLM tool so caps and refusals cannot drift between agents.
 
 **Kept.** The subscription itself, unchanged: the `{event_type, condition}`
 shape shared with triggers, the one-shot `LiveWaits::take` gate, the watermark
-plus catch-up scan that closes the restart gap, the 24 h ceiling, the five live
-waits per thread, the duplicate-subscription refusal, the ten-in-a-row loop cap,
+plus catch-up scan that closes the restart gap, the 24 h ceiling, the live-waits
+per-thread cap, the duplicate-subscription refusal, the ten-in-a-row loop cap,
 and expiry-wakes-rather-than-drops.
 
 **Given up.** The seamless mid-thought resume. A delivery is now always a new

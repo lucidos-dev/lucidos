@@ -11,6 +11,12 @@ mod support;
 #[path = "api_support/health_test.rs"]
 mod health_test;
 
+#[path = "api_support/changelog_test.rs"]
+mod changelog_test;
+
+#[path = "api_support/fonts_test.rs"]
+mod fonts_test;
+
 #[path = "api_support/workspace_label_test.rs"]
 mod workspace_label_test;
 

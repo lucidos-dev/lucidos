@@ -1,4 +1,5 @@
-import { showToast, removeToast, latestTauriAppVersion, appUpdateCheckError, appUpdateProgress } from '../store';
+import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateProgress } from '../store';
+import { openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
 import { formatBytes } from '../../utils/formatBytes';
@@ -8,6 +9,7 @@ import {
   cancelAppUpdate,
   listen,
   APP_UPDATE_PROGRESS_EVENT,
+  type AppUpdateOffer,
   type AppUpdateProgress,
   type AppUpdateRunning,
 } from '../../utils/tauri';
@@ -131,6 +133,20 @@ function offerAppUpdate(version: string): void {
       label: 'Update & restart',
       onClick: () => { void installAppUpdate(); },
     },
+    // "What is in it?" is the question an update offer raises, and answering it
+    // is not the same click as taking the update. Rendered only when the
+    // manifest actually carried notes, so the control never opens onto nothing.
+    // Reads the signal at call time rather than taking a parameter, because the
+    // cancel path re-offers with only a version in hand and the notes it should
+    // show are the same ones.
+    ...(latestTauriAppNotes.value
+      ? {
+          secondaryAction: {
+            label: "What's new",
+            onClick: () => { openSettingsSubview('whats-new'); },
+          },
+        }
+      : {}),
   });
 }
 
@@ -234,9 +250,9 @@ export async function checkForAppUpdate(): Promise<void> {
   // Stamped after the guards, never before: a call that returned without asking
   // the release host anything must not make the resume throttle think it did.
   lastCheckStartedAt = Date.now();
-  let version: string | null;
+  let offer: AppUpdateOffer | null;
   try {
-    version = await checkAppUpdate();
+    offer = await checkAppUpdate();
   } catch (e) {
     // Recorded for Settings → System; the next poll retries.
     appUpdateCheckError.value = String(e);
@@ -249,15 +265,21 @@ export async function checkForAppUpdate(): Promise<void> {
   // repo checkout, so every packaged install reports `'unknown'` (which
   // connection.ts now discards). Clear only what we ourselves set — see
   // {@link updaterOwnsLatestVersion}.
-  if (version) {
-    latestTauriAppVersion.value = version;
+  //
+  // The notes travel WITH the version, written and cleared on the same branches,
+  // so the two can never end up describing different releases: a stale note
+  // beside a fresh version would tell the user what a different update contains.
+  if (offer) {
+    latestTauriAppVersion.value = offer.version;
+    latestTauriAppNotes.value = offer.notes;
     updaterOwnsLatestVersion = true;
   } else if (updaterOwnsLatestVersion) {
     latestTauriAppVersion.value = null;
+    latestTauriAppNotes.value = null;
     updaterOwnsLatestVersion = false;
   }
-  if (!version) return;
-  offerAppUpdate(version);
+  if (!offer) return;
+  offerAppUpdate(offer.version);
 }
 
 /** Re-check for a packaged update because the user came BACK to the client

@@ -14,12 +14,14 @@
 //!
 //! The other half of the shared contract is the **subscribability gate**
 //! ([`is_subscribable`]): the per-token streaming firehose is dropped before
-//! either matcher sees it.
+//! either matcher sees it. The third is [`matchable_payload`], which decides
+//! what a `condition` is evaluated against.
 
 pub mod condition;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::engine::thread_events::ThreadEvent;
 
@@ -91,6 +93,65 @@ impl EventSubscription {
             condition,
         })
     }
+}
+
+// ── The matchable payload ───────────────────────────────────────────
+
+/// The key [`matchable_payload`] injects. The same spelling the `threads` list
+/// returns, so a subscriber scopes a wait with a value it already holds.
+pub const THREAD_ID_KEY: &str = "thread_id";
+
+/// The **matchable payload**: what a `condition` is evaluated against.
+///
+/// An event's own serialized fields, plus the id of the thread it belongs to.
+/// Every consumer that offers a payload to [`EventSubscription::matches`] builds
+/// its view here, so the live dispatcher, the catch-up scan, the arming lookback
+/// and trigger dispatch cannot disagree about what a condition can name.
+///
+/// **Why the thread id is not a field on the events themselves.** It already has
+/// two canonical homes and neither is the payload: the carrier
+/// (`BusEvent::Thread { thread_id, event }`, so every thread event has exactly
+/// one by construction) and the `events.thread_id` column, which
+/// `20260314120000_strip_thread_id_from_payloads.sql` deliberately made the
+/// source of truth by removing the key from stored payloads. Persisting it per
+/// event would duplicate that column into every row forever and would still
+/// leave the next event type unscopable. Injecting it here costs nothing on
+/// disk, and makes every thread event scopable at once.
+///
+/// `thread_id` is `None` for a row that belongs to no thread (a system frame, a
+/// workspace domain event), and such an event is deliberately NOT thread-
+/// scopable: the live bus could sometimes supply an originating thread where the
+/// stored row has a NULL column, and a condition that matched live but not on
+/// replay is the exact asymmetry this function exists to prevent.
+///
+/// Insert-if-absent, never overwrite: an event that declares its own
+/// `thread_id` keeps its value, and so does a user-authored domain payload.
+pub fn matchable_payload(payload: Value, thread_id: Option<Uuid>) -> Value {
+    let Some(thread_id) = thread_id else {
+        return payload;
+    };
+    let mut payload = payload;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry(THREAD_ID_KEY)
+            .or_insert_with(|| Value::String(thread_id.to_string()));
+    }
+    payload
+}
+
+/// [`matchable_payload`] for a live `BusEvent::Thread`, which is the form both
+/// live consumers need: the event-wait dispatcher and the trigger matcher.
+///
+/// They call this rather than composing the two steps themselves, so the view
+/// they match against is the same object by construction rather than by two
+/// call sites happening to agree. `EventMeta::NONE` because the meta a
+/// particular emit stamped is not part of it: the live paths never see the meta
+/// at all ([`crate::engine::event_bus::EmittedEvent`] does not carry it), so a
+/// meta field would be conditionable on replay only.
+pub fn matchable_thread_payload(event: &ThreadEvent, thread_id: Uuid) -> Value {
+    matchable_payload(
+        event.to_payload(&crate::engine::thread_events::EventMeta::NONE),
+        Some(thread_id),
+    )
 }
 
 // ── The shared subscribability gate ─────────────────────────────────

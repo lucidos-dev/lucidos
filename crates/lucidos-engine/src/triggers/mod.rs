@@ -125,6 +125,63 @@ mod tests {
         }
     }
 
+    /// The trigger half of thread scoping. A `condition` naming `thread_id`
+    /// works here for the same reason it works for an *event wait*: the
+    /// scheduler offers the matcher a *matchable payload*, built by the same
+    /// function the wait dispatcher calls, so one `on_event:` filter cannot
+    /// mean two different things depending on which subscriber reads it.
+    ///
+    /// Built through `matchable_thread_payload` rather than a hand-written
+    /// `json!` carrying a `thread_id`, because a literal would pass even if the
+    /// scheduler stopped injecting: no `ThreadEvent` declares the field.
+    #[test]
+    fn a_trigger_can_scope_on_event_to_one_thread() {
+        use crate::core::event_subscription::matchable_thread_payload;
+
+        let watched = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let idle = crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
+            has_changes: true,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        };
+
+        let mut configs = HashMap::new();
+        configs.insert(
+            "scoped".into(),
+            make_event_trigger(
+                "scoped",
+                vec![sub(
+                    "CodingAgentIdled",
+                    Some(serde_json::json!({"thread_id": watched.to_string()})),
+                )],
+            ),
+        );
+
+        let hit = find_matching_event_triggers(
+            &configs,
+            "CodingAgentIdled",
+            &matchable_thread_payload(&idle, watched),
+        );
+        assert_eq!(hit.len(), 1, "the watched thread's idle must fire it");
+
+        let miss = find_matching_event_triggers(
+            &configs,
+            "CodingAgentIdled",
+            &matchable_thread_payload(&idle, other),
+        );
+        assert!(
+            miss.is_empty(),
+            "another session's idle must not, or the filter is decorative"
+        );
+    }
+
     #[test]
     fn matches_event_trigger_by_type() {
         let mut configs = HashMap::new();

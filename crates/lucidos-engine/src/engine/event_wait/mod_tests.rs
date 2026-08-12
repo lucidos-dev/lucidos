@@ -406,6 +406,32 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
         "a wait watching something else must NOT suppress the fan-in"
     );
 
+    // And the gate has to ask through `waits_matching_row`, not against the
+    // stored column: a `thread_id` condition matches the *matchable payload*
+    // only, so asking the raw way reports this parent as un-subscribed and the
+    // callback runs beside the wake its own wait is about to deliver.
+    let scoped = wait_with(
+        parent_id,
+        vec![sub(
+            "ChildThreadCompleted",
+            Some(json!({"thread_id": parent_id.to_string()})),
+        )],
+        0,
+    );
+    assert!(
+        waits_matching(std::slice::from_ref(&scoped), &row.event_type, &row.payload).is_empty(),
+        "precondition: the stored column carries no thread_id, which is why the \
+         raw question is the wrong one: {:?}",
+        row.payload
+    );
+    assert_eq!(
+        waits_matching_row(std::slice::from_ref(&scoped), &row).len(),
+        1,
+        "the gate must see the thread-scoped wait and stand the fan-in down, or \
+         the parent gets two turns for one completion: {:?}",
+        row.payload
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -480,6 +506,159 @@ async fn a_wait_matches_a_child_completion_belonging_to_another_thread() {
         "a cross-thread ChildThreadCompleted must resolve the wait whose \
          child_thread_id it carries, and only that one: {:?}",
         row.payload
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The `CodingAgentIdled` every path in the test below matches against. Built
+/// once so the live view and the seeded row cannot drift apart.
+fn an_idle() -> ThreadEvent {
+    ThreadEvent::CodingAgentIdled {
+        has_changes: true,
+        is_external_repo: false,
+        requires_restart: false,
+        cc_session_id: None,
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        reason: None,
+        worktree_path: None,
+        worktree_head_sha: None,
+        bg_bash_pending: false,
+    }
+}
+
+/// One coding-agent turn boundary on `thread_id`, and the row it persisted.
+///
+/// A `SessionStarted` first, not the chat `seed_thread`: the lifecycle guard
+/// refuses `CodingAgentIdled` on a chat thread, which is the same refusal
+/// production would raise.
+async fn seed_coding_agent_idle(
+    bus: &EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> crate::core::EventRow {
+    seed_thread_event(
+        bus,
+        thread_id,
+        ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: format!("session-{}", thread_id.simple()),
+            branch: format!("claude-code/{}", thread_id.simple()),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+        },
+    )
+    .await;
+    let idle_id = seed_thread_event(bus, thread_id, an_idle()).await;
+    crate::core::store::EventStore::new(pool.clone())
+        .get_event_by_id(idle_id)
+        .await
+        .unwrap()
+        .expect("the idle row")
+}
+
+/// **"Wait until the coding agent on THAT thread finishes."** The request that
+/// failed five times in one day, pinned on every path that can answer it.
+///
+/// `CodingAgentIdled` declares no thread id and never will: the id lives on the
+/// carrier and in the `events.thread_id` column, and the *matchable payload* is
+/// what puts it in front of a `condition`. So the same subscription has to
+/// resolve identically whether the event arrives live, is found by the catch-up
+/// scan after a restart, or is reported by the arming lookback, and it must do
+/// that without anything new being written to the row.
+#[tokio::test]
+async fn a_wait_scopes_to_one_coding_agent_session_on_every_path() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let watched = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let before = max_sequence(&pool).await;
+
+    // The other agent finishes FIRST, so a scoped wait has to step over it. An
+    // unscoped one would have woken here and reported the wrong session.
+    let other_row = seed_coding_agent_idle(&bus, &pool, other).await;
+    let watched_row = seed_coding_agent_idle(&bus, &pool, watched).await;
+
+    let scoped = |thread: Uuid| {
+        sub(
+            "CodingAgentIdled",
+            Some(json!({ "thread_id": thread.to_string() })),
+        )
+    };
+
+    // 1. LIVE. The view the dispatcher builds, through the function it calls.
+    let live_watched =
+        crate::core::event_subscription::matchable_thread_payload(&an_idle(), watched);
+    let waiter = Uuid::new_v4();
+    let wait = wait_with(waiter, vec![scoped(watched)], before);
+    let wait_id = wait.wait_id;
+    assert_eq!(
+        waits_matching(&[wait], "CodingAgentIdled", &live_watched),
+        vec![(wait_id, 0)],
+        "a live idle must resolve the wait scoped to its thread: {live_watched:?}"
+    );
+    let wrong = wait_with(waiter, vec![scoped(other)], before);
+    assert!(
+        waits_matching(&[wrong], "CodingAgentIdled", &live_watched).is_empty(),
+        "and must not resolve one scoped to a different session"
+    );
+
+    // 2. CATCH-UP. Same subscription, arriving from the row instead of the bus,
+    // and the earlier idle on the other thread must be stepped over rather than
+    // being the first hit.
+    let scanning = wait_with(waiter, vec![scoped(watched)], before);
+    let hit = catch_up_from_watermark(&pool, &scanning)
+        .await
+        .unwrap()
+        .expect("the scan finds the watched thread's idle");
+    assert_eq!(
+        hit.0, watched_row.id,
+        "the scan must return the watched thread's idle, not {}'s",
+        other_row.id
+    );
+    assert_eq!(hit.3, 0, "matched by the only entry in the list");
+    assert_eq!(
+        hit.2["thread_id"],
+        json!(watched.to_string()),
+        "and the payload it hands the wake carries the thread it matched on"
+    );
+
+    // 3. ARMING LOOKBACK. The report a model gets for a match that landed just
+    // before it armed, scoped the same way and carrying the same view.
+    let after = max_sequence(&pool).await;
+    let report = arming_lookback_matches(
+        &pool,
+        &[scoped(watched)],
+        after,
+        ARMING_LOOKBACK_SECS,
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.matches.len(),
+        1,
+        "exactly the watched thread's idle is reported: {:?}",
+        report.matches
+    );
+    assert_eq!(
+        report.matches[0].payload["thread_id"],
+        json!(watched.to_string()),
+        "the reported payload names the thread, which is what lets the model \
+         scope the wait it arms next"
+    );
+
+    // 4. NOTHING NEW IS PERSISTED. The id is a view, not a column duplicated
+    // into every row: `20260314120000_strip_thread_id_from_payloads.sql` stands.
+    assert!(
+        watched_row.payload.get("thread_id").is_none(),
+        "the stored payload must stay lean: {:?}",
+        watched_row.payload
     );
 
     pool.close().await;

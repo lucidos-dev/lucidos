@@ -42,8 +42,8 @@ import {
  *  of the chevron's ask (it arms a standing follow, growth honours it, and only
  *  the reader's own scroll retires it) and, against it, the ONE-SHOT reaction
  *  every SUBMIT gets: a glide to the live edge for a reader already riding it,
- *  and otherwise a landing that rests the turn's agent status line on the bottom
- *  of the viewport. A submit arms nothing. A send and an answer used to, and the
+ *  and otherwise a landing that rests the turn they acted on with its TOP on the
+ *  landing line. A submit arms nothing. A send and an answer used to, and the
  *  blocks below that read "arms nothing" are where that inverted.
  *
  *  Its mirror is `scroll-resize-never-follows.test.ts`, which pins the other
@@ -52,9 +52,24 @@ import {
  *  not a request, and that distinction is the whole point of both files. */
 
 /** How tall the agent status line is in this fake: one row of a turn header. The
- *  landing aims at its BOTTOM edge, so every expected offset in this file is the
- *  reader's own panel bottom plus this. */
+ *  landing does not aim at it, so no expected offset in this file is derived from
+ *  it; what it stands for is the row that has to end up IN VIEW under the landed
+ *  turn, and the marker of a turn the agent has taken. */
 const STATUS_LINE_HEIGHT = 28;
+
+/** The landing line: how far below the transcript's top a landed turn's top comes
+ *  to rest. `turnLandingClearancePx` reads `.chat-exchange`'s computed
+ *  `scroll-margin-top` and falls back to this when there is no layout to ask,
+ *  which is every test here except the one that mocks `getComputedStyle`. So an
+ *  expected offset in this file is a turn's top minus this. */
+/*  Every landing expectation here is a turn top minus that clearance, and it is
+ *  only REACHABLE when the container can scroll that far, which in the app means
+ *  a turn with a screenful of real transcript under it: a reply that has streamed
+ *  past a screenful, or any turn that is not the last. Nothing is reserved to
+ *  make it reachable. The fake has no layout, so its `scrollHeight` is set by
+ *  hand and stands for whichever of the two cases a test is about: leave headroom
+ *  past the turn for the line, and don't for the reveal branch. */
+const LANDING_CLEARANCE = 8;
 
 /** A `.thread-content` stand-in that clamps `scrollTop` the way a browser does,
  *  counts writes (so a jump that happens to land where the reader already was
@@ -84,9 +99,21 @@ function makeEl(opts: {
   const questionCards: any[] = [];
   const permissionCards: any[] = [];
   const turns: any[] = [];
+  /** An inline style declaration the module is free to write to, kept so a test
+   *  can assert that it does not: nothing here publishes a custom property onto
+   *  the transcript any more, and the TAIL ROOM that used to is the thing the
+   *  guard below exists to keep out. */
+  const styleProps = new Map<string, string>();
   const el: any = {
     parentElement: null,
     children: [],
+    style: {
+      setProperty: (name: string, value: string) => { styleProps.set(name, value); },
+      getPropertyValue: (name: string) => styleProps.get(name) ?? '',
+    },
+    /** The transcript's last element child. The turns array is in DOM order, so
+     *  its tail is the newest turn. */
+    get lastElementChild() { return turns[turns.length - 1] ?? null; },
     clientWidth: 800,
     clientHeight: opts.clientHeight ?? 500,
     scrollHeight: opts.scrollHeight,
@@ -116,14 +143,22 @@ function makeEl(opts: {
      *  matters for a brand-new thread, whose transcript holds no turn when the
      *  send is made and one a render later.
      *
+     *  The turn is given the ROW's own rect, because that is the geometry the
+     *  landing measures and the DOM's answer for it: a turn renders as
+     *  `[initiator panel, response panel?]`, so the exchange's top IS its user
+     *  message row's top. A turn parked at 0 while its row sat further down would
+     *  let a landing that aims at the wrong element pass.
+     *
      *  And the turn arrives WITH its agent status line, because that is what the
      *  app does: the optimistic row and the "Requesting" response panel under it
      *  are one commit. `status: false` is the turn that never gets one, which is
      *  the queued follow-up (its "Queued" tag lives in its own bubble) and the
      *  frame before the response panel mounts; `mountStatusLine` covers the
-     *  second half of that. */
+     *  second half of that. The landing does not aim at the status line, so this
+     *  is fixture realism rather than a target: what it pins is that the row the
+     *  landing puts on the line has the status line in view underneath it. */
     addUserMessage(p: { top: number; height: number; visible?: boolean; status?: boolean }) {
-      const turn = makeTurn();
+      const turn = makeTurn(p.top, p.height);
       const panel: any = {
         parentElement: null,
         isConnected: true,
@@ -203,7 +238,7 @@ function makeEl(opts: {
   /** One `.chat-exchange`, with the slot its agent status line mounts into. It
    *  carries a rect and a `closest` of its own because Continue's landing anchors
    *  on the EXCHANGE rather than on a panel inside it: `lastTurn` measures it to
-   *  reject an invisible one, and `turnStatusLine` walks `closest` from it (which
+   *  reject an invisible one, and `landOnOwnTurn` walks `closest` from it (which
    *  answers with the element itself, as the DOM's does). */
   function makeTurn(top = 0, height = 100) {
     const turn: any = {
@@ -211,6 +246,7 @@ function makeEl(opts: {
       isConnected: true,
       statusLine: null,
       closest: (sel: string) => (sel === '.chat-exchange' ? turn : null),
+      matches: (sel: string) => sel === '.chat-exchange',
       querySelector: (sel: string) => (sel === '.response-header' ? turn.statusLine : null),
       getBoundingClientRect: () => ({
         width: 800, height, top: top - el.scrollTop, bottom: top + height - el.scrollTop, left: 0, right: 800,
@@ -854,7 +890,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(2500);       // 3000 - 500, the live edge
-    expect(el.scrollTop).not.toBe(2228);   // and NOT the landing on the card
+    expect(el.scrollTop).not.toBe(2392);   // and NOT the landing on the card
   });
 
   it('a submit after a LIVE scroll gets the landing instead', () => {
@@ -864,7 +900,7 @@ describe('scrolling an IDLE thread keeps the follow', () => {
     followAnsweredQuestion('q1');
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228);       // the card's status line
+    expect(el.scrollTop).toBe(2392);       // the card's turn top, minus the clearance
   });
 
   it('a SUBMIT makes the thread live, so scrolling away after it still disarms', () => {
@@ -1318,7 +1354,87 @@ describe('coming back to a thread resumes the follow it was left with', () => {
   });
 });
 
-describe('sending a message lands on the turn\'s agent status line', () => {
+describe('resuming IN PLACE, when a deep link owns the position', () => {
+  /** A deep link owns where the reader is looking on the open it caused; it does
+   *  not own what the thread asked for. The two answers coexist, so the resume
+   *  has a second placement that arms and writes nothing. Which OPENS take it is
+   *  `hooks/useScrollMemory.ts`'s question, pinned there; what this pins is the
+   *  placement itself. */
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  it('arms without moving the reader a pixel, and rides the next growth', () => {
+    // The whole point: the reader stays on the event the link took them to, and
+    // the toggle is lit, so the thread waking up carries them as it always did.
+    const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setThreadLive(false); // the thread the link landed on is parked on a question
+    el.writes = 0;
+
+    resumeFollowingBottom(el, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(6000);
+
+    // Idle growth (markdown settling, the card mounting) still moves nobody.
+    el.scrollHeight = 21000;
+    onResize();
+    expect(el.scrollTop).toBe(6000);
+
+    // The thread wakes: the same armed request picks them back up.
+    setThreadLive(true);
+    expect(el.scrollTop).toBe(20500);
+  });
+
+  it('declines while the agent is LIVE, because the landing just ended the ride', () => {
+    // A link into a streaming thread is a request to be at ONE place, and
+    // `scrollToSelectorAndPulse` retires the follow for exactly that reason. This
+    // runs afterwards, so arming here would undo the decision.
+    const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
+    setActiveScrollElement(el);
+    setThreadLive(true);
+
+    resumeFollowingBottom(el, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(el.scrollTop).toBe(6000);
+  });
+
+  it('leaves an ALREADY ARMED follow and its held stamp alone', () => {
+    // A link into the thread the reader is already in retires nothing, so there
+    // is no request to resume. Re-arming would clear the stamp `isFollowScroll`
+    // reads, which is what decides whether this thread's reading position is
+    // recorded as the live edge or as an offset.
+    const el = makeEl({ scrollTop: 100, scrollHeight: 20000 });
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    expect(isFollowScroll(el)).toBe(true);
+    setThreadLive(false);
+
+    resumeFollowingBottom(el, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(isFollowScroll(el)).toBe(true);
+  });
+
+  it('takes no stamp of its own, so the landing is recorded as an offset', () => {
+    // The reader is wherever the LINK put them, which is not a position the
+    // follow wrote. Recording it as the live edge would send them to the bottom
+    // on re-entry instead of back to the event they went to.
+    const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
+    setActiveScrollElement(el);
+    setThreadLive(false);
+
+    resumeFollowingBottom(el, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(isFollowScroll(el)).toBe(false);
+  });
+});
+
+describe('sending a message lands the turn at the top of the viewport', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
@@ -1343,19 +1459,19 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     expect(el.scrollTop).toBe(parked);
 
     el.addUserMessage({ top: 2900, height: 120 }); // the row and its status line
-    el.scrollHeight = 3400;                        // render below the old fold
+    el.scrollHeight = 3400;                        // with a screenful under it
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548); // 3048 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2892); // 2900 (the row's top) - the clearance
     expect(el.scrollTop).toBeGreaterThan(parked);
   });
 
-  it('still writes nothing when that turn lands fully in view', () => {
-    // The other half, and where the deleted at-the-live-edge branch was RIGHT:
-    // a reader whose new status line renders above the fold has nowhere to go.
-    // Reached by measuring the target rather than by predicting it, which is the
-    // difference that makes the case above work.
+  it('still writes nothing when that turn is already ON the landing line', () => {
+    // The other half, and where the deleted at-the-live-edge branch was RIGHT: a
+    // reader whose new turn already sits at the top of the viewport has nowhere
+    // to go. Reached by measuring the target rather than by predicting it, which
+    // is the difference that makes the case above work.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1363,7 +1479,9 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     el.writes = 0;
 
     followSentMessage();
-    el.addUserMessage({ top: 2510, height: 20 }); // a one-line message, in view
+    // Exactly on the line: parked at 2500, so a row at 2508 is `LANDING_CLEARANCE`
+    // below the container top, which is where the landing would put it.
+    el.addUserMessage({ top: parked + LANDING_CLEARANCE, height: 20 });
     el.scrollHeight = 3000;
     onResize();
     vi.advanceTimersByTime(1500);
@@ -1411,13 +1529,12 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     expect(el.scrollTop).toBe(500);
   });
 
-  it('glides to the turn\'s agent status line, not to the end of the message', () => {
-    // What a send actually asks. The reader wrote the message a second ago and
-    // does not need to be shown it; what they are waiting for is whether the
-    // agent took it, and that is the Requesting / Working row underneath. The
-    // landing used to stop on the message's own bottom edge, which parked the
-    // status line one row below the fold with nothing on screen saying anything
-    // had happened.
+  it('glides so the message is the TOP thing in the viewport', () => {
+    // What a send actually asks, and what the whole screen under the message is
+    // for: the agent status line one row down says the turn was taken, and the
+    // reply then streams into the space rather than into the fold. The landing
+    // used to rest that status line on the container's BOTTOM edge, which
+    // answered the first half and spent the entire viewport doing it.
     //
     // Anchored on an ELEMENT either way. A scrollHeight target would land at 2900
     // here, which is past the whole turn and hides the very thing they wrote.
@@ -1434,24 +1551,23 @@ describe('sending a message lands on the turn\'s agent status line', () => {
 
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548);                      // 3048 (status line bottom) - 500
-    expect(el.scrollTop).not.toBe(2520);                  // NOT 3020, the message's own bottom
-    expect(el.scrollTop).toBeLessThan(2900);              // NOT the transcript bottom either
-    expect(2900).toBeGreaterThanOrEqual(el.scrollTop);    // the message is fully visible
-    expect(3048).toBeLessThanOrEqual(el.scrollTop + el.clientHeight); // and so is the status line
+    expect(el.scrollTop).toBe(2892);                      // 2900 (the row's top) - the clearance
+    expect(el.scrollTop).not.toBe(2548);                  // NOT the old status-line-on-the-bottom answer
+    expect(2900 - el.scrollTop).toBe(LANDING_CLEARANCE);  // the row is the top thing on screen
+    expect(3048).toBeLessThanOrEqual(el.scrollTop + el.clientHeight); // the status line is in view under it
   });
 
-  it('WAITS for the response panel rather than settling on the message', () => {
-    // The reported bug, 2026-08-10: "it scrolls to weird place or to end of
-    // message, but not to agent response header". The optimistic row can arrive
-    // a commit before the response panel under it, and the landing used to
-    // resolve on the row. `landOnOwnTurn` asks its do-not-scroll-backwards test
-    // once, at the moment it is called, so anchored on the message it either
-    // declined outright or aimed one row short and settled there when the header
-    // arrived after the tween had finished.
+  it('lands as soon as the ROW renders, without waiting for the response panel', () => {
+    // The landing used to hold until the turn's status line was in the DOM,
+    // because that row WAS the target and the response panel can mount a commit
+    // or two after the row it belongs to, so a landing aimed while it was missing
+    // stopped one row short (reported 2026-08-10: "it scrolls to weird place or
+    // to end of message, but not to agent response header").
     //
-    // So the landing does not start until the status line is in the DOM. The
-    // round that has the row but not the header must move NOBODY.
+    // The target is the turn's own TOP now, which is fixed the instant the row
+    // renders, so there is nothing left to wait for and the wait is gone. The
+    // status line arrives into the viewport underneath, wherever in the sequence
+    // it turns up.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1462,48 +1578,101 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     el.scrollHeight = 3400;
     onResize();
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(500);  // nothing to aim at yet, so nobody moves
-    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(2892); // landed on the row alone
 
-    el.mountStatusLine(sent);        // the response panel renders, which grows
-    onResize();                      // the transcript, so a real RO round fires
+    el.mountStatusLine(sent);        // the response panel follows a commit later
+    onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548); // 3048 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2892); // and does not move the reader again
+    expect(3048).toBeLessThanOrEqual(el.scrollTop + el.clientHeight);
   });
 
-  it('moves NOBODY for a turn that never gets a status line', () => {
-    // A queued follow-up shows its "Queued" tag in its own bubble and renders no
-    // response panel at all. There is no status line to aim at, and the reader's
-    // own message is not a substitute for one: what a submit asks is whether the
-    // agent took it, and a queued turn's honest answer is "not yet". The landing
-    // lapses on its deadline and writes nothing, which is what that deadline was
-    // documented to be for all along.
+  it('a QUEUED follow-up is only REVEALED, never chased to the live edge', () => {
+    // Fire a second message while the first reply is still running and it lands
+    // as the newest turn, with nothing under it but the transcript's own bottom
+    // padding, so the landing line is out of reach.
+    //
+    // So the ask changes rather than being clamped. Asking for the line anyway
+    // and letting the browser cut it short is a decision by accident: it drags
+    // the reader to the live edge for a turn that cannot get to the top, taking
+    // them off the reply they are watching to gain nothing. The modest ask is to
+    // SHOW the turn, which here stops short of the live edge by the trailing room
+    // the transcript reserves for the prompt dissolve.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
 
     followSentMessage();
 
-    el.addUserMessage({ top: 2900, height: 120, status: false });
-    el.scrollHeight = 3400;
+    el.addUserMessage({ top: 2900, height: 120, status: false }); // the queued bubble
+    // Its own bottom is 3020: no room reserved under a queued turn, just the
+    // transcript's own bottom padding past it.
+    el.scrollHeight = 3080;
     onResize();
     vi.advanceTimersByTime(1500);
-    el.scrollHeight = 4000; // the reply streams in under the queued row
+
+    expect(el.scrollTop).toBe(2520);                    // 3020 (the bubble's bottom) - the viewport
+    expect(el.scrollTop).toBeLessThan(2892);            // short of the landing line, out of reach
+    expect(el.scrollTop).toBeLessThan(el.scrollHeight - el.clientHeight); // and short of the live edge
+    expect(3020).toBe(el.scrollTop + el.clientHeight);  // the bubble is fully on screen
+    expect(el.scrollTop).toBeLessThan(2900);            // with the running reply above it
+  });
+
+  it('still lands on the line when the container falls a rounded pixel short', () => {
+    // At the BOUNDARY, where a turn is within a rounding error of a screenful,
+    // the two sides of "can the container reach the line" are effectively the
+    // same number and `scrollHeight` is an integer while the turn's own top is
+    // fractional. An exact test would flip there for reasons no reader can see,
+    // and flipping is not a small difference: the other branch lands the turn a
+    // whole padding-bottom lower. `LANDING_REACH_SLACK_PX` is what absorbs it.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    el.addUserMessage({ top: 2900, height: 470 });
+    // One pixel SHORT of what the landing needs: the line is 2892 and this puts
+    // the furthest the container goes at 2891.
+    el.scrollHeight = 3391;
     onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2891);         // the line, as far as the container allows
+    expect(el.scrollTop).toBeGreaterThan(2870); // and NOT the reveal branch's answer
+  });
+
+  it('moves NOBODY for a queued follow-up that is already on screen', () => {
+    // The point of asking to REVEAL rather than to land: with the first message
+    // resting on the landing line and its reply still filling less than a screen,
+    // the queued bubble renders in the room that is left and is visible where the
+    // reader already is. Nothing is owed, so nothing is written, and the message
+    // they sent FIRST stays where its own landing put it, at the top.
+    const el = makeEl({ scrollTop: 2000, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    el.writes = 0;
+
+    // Viewport 2000..2500, and the bubble lands inside it.
+    el.addUserMessage({ top: 2300, height: 120, status: false });
+    el.scrollHeight = 2480;
+    onResize();
+    vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(500);
+    expect(el.scrollTop).toBe(2000);
   });
 
   it('a lapsed landing does not block the NEXT submit', () => {
     // The deadline is wall-clock, and the growth branch is the only thing that
-    // was checking it, so a landing whose turn never renders a status line sat
-    // on `_pendingLanding` for as long as nothing grew. A queued follow-up is
-    // exactly that turn, and the reader's next submit then returned early
-    // without installing its own resolver: it never landed. Found by the Codex
-    // reviewer while hardening this change, and reachable BECAUSE the landing
-    // now waits for a status line.
+    // was checking it, so a landing whose turn never becomes addressable sat on
+    // `_pendingLanding` for as long as nothing grew. The reader's next submit
+    // then returned early without installing its own resolver: it never landed.
+    // Found by the Codex reviewer, 2026-08-10. The turn that never answers is the
+    // second and subsequent queued follow-up, which folds into a CLOSED
+    // disclosure group and so has no box at all.
     // The second submit is a CARD, which resolves at submit time and glides
     // immediately: it never reaches the growth branch, so a stale pending
     // landing is the only thing that can stop it. That is what makes this the
@@ -1525,21 +1694,21 @@ describe('sending a message lands on the turn\'s agent status line', () => {
       followAnsweredQuestion('q1');
       vi.advanceTimersByTime(1500);
 
-      expect(el.scrollTop).toBe(2228); // 2728 (the card's status line) - 500
+      expect(el.scrollTop).toBe(2392); // 2400 (the card's turn top) - the clearance
     } finally {
       nowSpy.mockRestore();
     }
   });
 
-  it('stops short of the prompt dissolve, by the clearance the row asks for', () => {
-    // The container's bottom edge is not clear space: the prompt dissolve paints
-    // a bg-coloured band over it, so a status line rested flush against that edge
-    // is as invisible as one below the fold. The row names the room it needs as
-    // `scroll-margin-bottom` (chat/response.css) and the landing reads the
-    // resolved px, which is what this stands in for.
-    const styles = vi.fn((el: any) => ({
-      scrollMarginBottom: el.getBoundingClientRect().height === STATUS_LINE_HEIGHT ? '24px' : '0px',
-    }));
+  it('stops clear of the chrome at the top, by the clearance the turn asks for', () => {
+    // The transcript's top edge is not clear space: the desktop fade band and the
+    // floating up-chevron sit over it, and on mobile the app header and the
+    // sticky thread-title row do. A turn landed flush against that edge would be
+    // half under them. The turn names the room it needs as `scroll-margin-top`
+    // (chat/response.css), which is the SAME line a deep link and ⌘↑/⌘↓ turn
+    // stepping come to rest on, and the landing reads the resolved px, which is
+    // what this stands in for.
+    const styles = vi.fn(() => ({ scrollMarginTop: '24px' }));
     (globalThis as any).getComputedStyle = styles;
     try {
       const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
@@ -1552,7 +1721,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
       onResize();
       vi.advanceTimersByTime(1500);
 
-      expect(el.scrollTop).toBe(2572); // 2548, plus the 24px the row asked for
+      expect(el.scrollTop).toBe(2876); // 2900 (the row's top) - the 24px it asked for
     } finally {
       delete (globalThis as any).getComputedStyle;
     }
@@ -1574,14 +1743,14 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     el.scrollHeight = 6000; // the reply starts streaming while the glide runs
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548);
+    expect(el.scrollTop).toBe(2892);
   });
 
-  it('then holds still, so the reply grows in UNDER the status line it landed', () => {
+  it('then holds still, so the reply grows in UNDER the turn it landed', () => {
     // THE INVERSION. The landing used to be the first half of a ride: it put the
     // reader on their own turn and the follow then dragged them down through the
-    // reply. The landing is the whole reaction now, so the status line stays
-    // exactly where the glide left it and the answer arrives beneath it.
+    // reply. The landing is the whole reaction now, so the turn stays exactly
+    // where the glide left it and the answer arrives beneath it.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1591,7 +1760,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     el.scrollHeight = 3400;
     onResize();
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(2548);
+    expect(el.scrollTop).toBe(2892);
     el.writes = 0;
 
     for (const height of [5000, 9000]) {
@@ -1600,7 +1769,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     }
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(2548);
+    expect(el.scrollTop).toBe(2892);
   });
 
   it('leaves a reader who scrolls away after the landing entirely alone', () => {
@@ -1672,11 +1841,12 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     expect(el.scrollTop).toBe(900);
   });
 
-  it('holds the glide on its last measured target when the message leaves the layout', () => {
+  it('holds the glide on its last measured target when the turn leaves the layout', () => {
     // Nothing cancels a tween when the reader opens another thread mid-glide, and
-    // a detached node reports an all-zero rect. Subtracting the container's
-    // BOTTOM edge from that would make the target a whole viewport negative and
-    // scroll the thread to its top, over whatever else had just positioned it.
+    // a detached node reports an all-zero rect. Measured against the container's
+    // own top that reads as a target ABOVE where the reader is, so the glide
+    // would turn round and haul the newly-opened thread backwards, over whatever
+    // else had just positioned it.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1689,12 +1859,12 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     vi.advanceTimersByTime(60);
     const midGlide = el.scrollTop;
     expect(midGlide).toBeGreaterThan(500);
-    sent.isConnected = false; // the reader opens another thread
+    sent.turn.isConnected = false; // the reader opens another thread
 
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBeGreaterThanOrEqual(midGlide);
-    expect(el.scrollTop).toBeLessThanOrEqual(2548);
+    expect(el.scrollTop).toBeLessThanOrEqual(2892);
   });
 
   it('LAPSES and moves nobody when the message has no box to land on', () => {
@@ -1702,8 +1872,8 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     // disclosure group, so the message the reader just sent has no rect. Past the
     // deadline that landing used to fall back to the live edge, because the send
     // had armed a follow that had to be honoured; with no arming there is nothing
-    // to honour, and such a turn has no response panel and so no status line to
-    // show them anyway. So the landing lapses and the reader is not moved.
+    // to honour, and a turn with no box is not something to show them anyway.
+    // So the landing lapses and the reader is not moved.
     const nowSpy = vi.spyOn(performance, 'now');
     let clock = 1_000_000;
     nowSpy.mockImplementation(() => clock);
@@ -1757,7 +1927,7 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548); // the landing still happened
+    expect(el.scrollTop).toBe(2892); // the landing still happened
   });
 
   it('a second call for the same send is a no-op refresh, not a second landing', () => {
@@ -1776,11 +1946,11 @@ describe('sending a message lands on the turn\'s agent status line', () => {
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2548);
+    expect(el.scrollTop).toBe(2892);
   });
 });
 
-describe('a send moves nobody only when the status line is already in view', () => {
+describe('a send moves nobody only when the turn is already at the landing line', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
@@ -1793,20 +1963,24 @@ describe('a send moves nobody only when the status line is already in view', () 
    *  (`hasSomewhereToLand`). Both asked about the transcript AS IT STANDS in
    *  order to predict where a turn that had not rendered would sit, and both got
    *  the ordinary case wrong: a reader who sends from the bottom is at the live
-   *  edge when asked and one commit later has the new status line below the fold.
+   *  edge when asked and one commit later has the new turn below the fold.
    *  Reported twice on 2026-08-10.
    *
    *  Now there is ONE test and it is a measurement: `landOnOwnTurn` writes
    *  nothing when its target is at or behind the current position, asked per
-   *  frame against the status line itself. Every case below reaches "moves
-   *  nobody" through it rather than by being recognised in advance. */
+   *  frame against the turn itself. Every case below reaches "moves nobody"
+   *  through it rather than by being recognised in advance. */
 
-  it('leaves the reader alone for the whole first reply in a brand-new thread', () => {
+  it('leaves the reader alone when their turn renders AT the top already', () => {
     // The reported bug, in the order the two call sites actually fire for one
     // send. `PromptInput.submit` runs first, from the compose view, where there
     // is no transcript to resolve at all. `addPendingMessage` runs second, by
     // which time the promoted thread has mounted an EMPTY one: it calls before
     // writing `threadMap`, precisely so the optimistic row has not rendered.
+    //
+    // A brand-new thread's first turn IS the top of the transcript, so there is
+    // nowhere to take anybody, and the whole first reply then streams in below
+    // without moving them either.
     followSentMessage();
 
     const el = makeEl({ scrollTop: 0, scrollHeight: 400, turns: 0 });
@@ -1815,7 +1989,7 @@ describe('a send moves nobody only when the status line is already in view', () 
     followSentMessage();
     el.writes = 0;
 
-    el.addUserMessage({ top: 40, height: 120 }); // the optimistic row renders
+    el.addUserMessage({ top: 0, height: 120 }); // the optimistic row, at the top
     el.scrollHeight = 600;
     onResize();
     for (const height of [900, 3000, 9000]) {   // and the reply streams in
@@ -1829,26 +2003,26 @@ describe('a send moves nobody only when the status line is already in view', () 
     expect(awayFromBottom.value).toBe(true); // and the chevron is their way down
   });
 
-  it('lands the FIRST turn of a brand-new thread when its status line is below the fold', () => {
+  it('lands the FIRST turn of a brand-new thread when there is content above it', () => {
     // The compose view renders the welcome message inside the same
     // `.thread-content`, and on a short viewport it has real scroll room. That
     // used to be answered with a pre-emptive "this transcript holds no turn, so
     // there is nowhere to take anybody", which is the same mistake as the
     // at-the-live-edge branch: it predicts where a turn that has not rendered
-    // will sit. The first turn of a brand-new thread lands below the fold here
-    // exactly like any other, and the reader is owed the same sight of the agent
-    // taking it.
+    // will sit. The first turn of a brand-new thread renders below that welcome
+    // content exactly like any other turn renders below the conversation above
+    // it, and is owed the same landing.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000, turns: 0 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
 
     followSentMessage();
     el.addUserMessage({ top: 3100, height: 120 }); // the optimistic row and its
-    el.scrollHeight = 3400;                        // Requesting row render
+    el.scrollHeight = 3700;                        // Requesting row, with room past it
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2748); // 3248 (status line bottom) - 500
+    expect(el.scrollTop).toBe(3092); // 3100 (the row's top) - the clearance
 
     // And it arms nothing on the way, so the reply that follows moves nobody.
     el.writes = 0;
@@ -1892,7 +2066,7 @@ describe('a send moves nobody only when the status line is already in view', () 
   });
 });
 
-describe('answering a question card lands on the same status line', () => {
+describe('answering a question card lands the same way', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
@@ -1939,12 +2113,12 @@ describe('answering a question card lands on the same status line', () => {
     expect(el.scrollTop).toBe(parked);
   });
 
-  it('glides to the status line under the answered card, not to the card\'s own bottom', () => {
+  it('glides so the answered card is the top thing in the viewport', () => {
     // The same landing a send gets, for the same reason: the reader knows what
-    // they just answered, and what they are owed is the agent picking it up
-    // again. The card's PANEL is the fallback anchor, exactly as a send falls
-    // back to its message panel; a scrollHeight target would land at 2500 here,
-    // past the whole turn, and hide the thing they just answered.
+    // they just answered, and what they are owed is the whole screen under it
+    // for the agent picking it up again. Anchored on the card's TURN, exactly as
+    // a send is anchored on its message's turn; a scrollHeight target would land
+    // at 2500 here, past the whole turn, and hide the thing they just answered.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1955,7 +2129,7 @@ describe('answering a question card lands on the same status line', () => {
 
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228);           // 2728 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2392);           // 2400 (the turn top) - the clearance
     expect(el.scrollTop).not.toBe(2200);       // NOT 2700, the card's own bottom
     expect(el.scrollTop).toBeLessThan(2500);   // NOT the transcript bottom either
   });
@@ -1980,7 +2154,7 @@ describe('answering a question card lands on the same status line', () => {
     el.answerQuestionCard(live);
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228); // still lands on the card, not stranded
+    expect(el.scrollTop).toBe(2392); // still lands on the card, not stranded
     expect(el.scrollTop).toBeGreaterThan(midGlide);
   });
 
@@ -1994,14 +2168,14 @@ describe('answering a question card lands on the same status line', () => {
 
     followAnsweredQuestion('q1');
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
     el.writes = 0;
 
     el.scrollHeight = 5000;
     onResize();
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
   });
 
   it('stops the glide the moment the reader scrolls, rather than dragging them back', () => {
@@ -2048,7 +2222,85 @@ describe('answering a question card lands on the same status line', () => {
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
+  });
+});
+
+describe('nothing is reserved under the newest turn', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** THE TAIL ROOM IS GONE, removed 2026-08-12, and this is what stops it coming
+   *  back by accident. It was one viewport of `min-height` under the last turn,
+   *  measured here and applied in chat/response.css, so a submit could land that
+   *  turn's top on the landing line.
+   *
+   *  Three reports in two days, each a different reader meeting the same
+   *  screenful of air. A rider was carried INTO it, because the room extends the
+   *  scrollable range past where the content ends, so the bottom the follow
+   *  writes them to stopped being "the newest content at the bottom of the
+   *  screen" and became "the newest turn at the top, over reserved air": two
+   *  messages fired at a live coding-agent thread, and the second took the first
+   *  and its whole running reply off screen. Withholding the room from a rider
+   *  fixed that and bought worse, a layout that reads the follow flag, so every
+   *  failure to re-arm showed a screenful of blank as its symptom. And it arrived
+   *  MID-TURN either way, since a queued follow-up grows no reply and only
+   *  qualified once the agent picked it up, growing the transcript by a screen in
+   *  one step under a reader riding it.
+   *
+   *  What the landing does instead is measure: see the reveal branch in
+   *  `landOnOwnTurn`, covered by the queued-follow-up tests above. */
+  const LAYOUT = { paddingBottom: '56px', scrollMarginTop: '72px' };
+
+  function withLayout(run: () => void) {
+    (globalThis as any).getComputedStyle = () => LAYOUT;
+    try { run(); } finally { delete (globalThis as any).getComputedStyle; }
+  }
+
+  const roomOn = (el: any) => el.style.getPropertyValue('--transcript-tail-room');
+
+  it('publishes no room, on a resize or on either edge of the follow', () => {
+    withLayout(() => {
+      const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+      const { onResize } = makeScrollObservers(el);
+      setActiveScrollElement(el);
+      el.addUserMessage({ top: 2900, height: 120 });
+
+      // The three moments that used to write the property, and the two edges are
+      // named because they were once a rule of their own: the toggle changes no
+      // element's size, so the room had to be republished from the arm and the
+      // retire by hand.
+      onResize();
+      expect(roomOn(el)).toBe('');
+      setFollowLiveEdge(true);
+      expect(roomOn(el)).toBe('');
+      setFollowLiveEdge(false);
+      expect(roomOn(el)).toBe('');
+
+      resumeFollowingBottom(el);
+      expect(roomOn(el)).toBe('');
+    });
+  });
+
+  it('leaves a rider on the bottom of the CONTENT through a reply', () => {
+    withLayout(() => {
+      const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+      const { onResize } = makeScrollObservers(el);
+      setActiveScrollElement(el);
+      el.addUserMessage({ top: 2900, height: 120 });
+      // Armed FROM the live edge, so the toggle writes no scroll and starts no
+      // tween: the growth branch stands down while one owns the scroll, and the
+      // point here is the growth rounds.
+      atBottom(el);
+      setFollowLiveEdge(true);
+
+      for (const height of [3400, 5000, 9000]) {
+        el.scrollHeight = height;
+        onResize();
+      }
+
+      expect(el.scrollTop).toBe(9000 - 500);
+    });
   });
 });
 
@@ -2212,13 +2464,13 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     followSentMessage();
     el.addUserMessage({ top: 2900, height: 120 });
     el.scrollHeight = 3400;
-    onResize();                    // the send's landing glide starts, for 2548
+    onResize();                    // the send's landing glide starts, for 2892
     vi.advanceTimersByTime(60);
 
     followAnsweredQuestion('q1');  // and the reader answers the card mid-glide
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228); // the CARD's status line, not the send's
+    expect(el.scrollTop).toBe(2392); // the CARD's turn, not the send's
   });
 
   it('a glide that already LANDED does not suppress the next submit', () => {
@@ -2302,7 +2554,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     // itself "the one submit that ARMS NOTHING" and moved a reader who was
     // following nothing zero pixels, so deciding a card resumed the agent below
     // the fold with nothing on screen saying so. It is a submit like the others
-    // now: the reader gets the status line of the turn they decided.
+    // now: the turn they decided goes to the top, with the resumed reply under it.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2311,13 +2563,13 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     followResolvedPermission('p1');
     expect(el.scrollTop).toBe(500); // a glide, not a jump
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(2228); // 2728 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2392); // 2400 (the turn top) - the clearance
 
     el.writes = 0;
     el.scrollHeight = 4000;
     onResize();
     expect(el.writes).toBe(0);       // and it armed nothing on the way
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
   });
 
   it('lands on the card the reader DECIDED, never on a later turn', () => {
@@ -2334,7 +2586,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     followResolvedPermission('p1');
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228);            // p1's status line
+    expect(el.scrollTop).toBe(2392);            // p1's turn top
     expect(el.scrollTop).not.toBe(4228);        // NOT p2's
     expect(el.scrollTop).toBeLessThan(5500);    // NOT the live edge
   });
@@ -2364,7 +2616,7 @@ describe('Continue after an abort is a submit too', () => {
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228); // 2728 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2392); // 2400 (the turn top) - the clearance
   });
 
   it('arms nothing, so the resumed reply grows in under it', () => {
@@ -2376,7 +2628,7 @@ describe('Continue after an abort is a submit too', () => {
     el.addContinuationTurn({ top: 2400, height: 300 });
     onResize();
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
     el.writes = 0;
 
     for (const height of [5000, 9000]) {
@@ -2385,7 +2637,7 @@ describe('Continue after an abort is a submit too', () => {
     }
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(2228);
+    expect(el.scrollTop).toBe(2392);
   });
 
   it('LAPSES and moves nobody when the continuation never renders', () => {
@@ -2436,9 +2688,9 @@ describe('Continue after an abort is a submit too', () => {
  *  its turn is, when it renders, what it falls back to); this is the matrix.
  *
  *  The geometry is shared on purpose: whichever surface it is, the turn the
- *  reader acted on spans 2400..2700 and its status line 2700..2728, so every
- *  landing in the table lands on 2228. A surface that answered differently would
- *  be doing something the others are not. */
+ *  reader acted on spans 2400..2700, so every landing in the table lands on 2392,
+ *  its top minus the clearance. A surface that answered differently would be
+ *  doing something the others are not. */
 const SUBMIT_SURFACES: Array<{
   name: string;
   /** Render what must be on screen BEFORE the submit, at `top`. The two deferred
@@ -2492,20 +2744,20 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
     return { el, ...observers };
   }
 
-  it('branch 1, the status line is already in view: writes nothing', () => {
-    // A thread that fits on screen, with the turn INSIDE it, which is the only
-    // way a short transcript can actually be laid out. The landing measures its
-    // target, finds it behind the reader, and writes nothing. There is no
-    // pre-emptive "this thread is too short" test any more, and there must not
+  it('branch 1, the turn is already at the landing line: writes nothing', () => {
+    // A thread that fits on screen, with the turn at the top of it, which is the
+    // only way a short transcript can actually be laid out. The landing measures
+    // its target, finds it at or behind the reader, and writes nothing. There is
+    // no pre-emptive "this thread is too short" test any more, and there must not
     // be: the same test asked one commit earlier is what left a reader who sent
     // from the bottom of a long thread staring at their own message.
     const el = makeEl({ scrollTop: 0, scrollHeight: 400 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    arrange(el, 40);
+    arrange(el, 0);
     el.writes = 0;
 
-    submit(el, onResize, 40);
+    submit(el, onResize, 0);
     vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);
@@ -2549,7 +2801,7 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
     submit(el, onResize);
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2228); // 2728 (status line bottom) - 500
+    expect(el.scrollTop).toBe(2392); // 2400 (the turn top) - the clearance
   });
 
   it('arms nothing: growth after the submit moves the reader 0px', () => {

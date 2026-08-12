@@ -9,6 +9,7 @@ pub mod cc_permission;
 pub mod cc_question_wait;
 pub(crate) mod cc_settings;
 mod change_ops;
+pub mod changelog;
 mod chat;
 pub(crate) mod claude_code;
 pub(crate) mod command_guard;

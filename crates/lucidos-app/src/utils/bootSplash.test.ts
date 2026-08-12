@@ -221,6 +221,12 @@ describe('bootSplash controller', () => {
 
 describe('index.html inline boot splash', () => {
   const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf-8');
+  /** The shell's half of the shared appearance boot script, which owns the
+   *  `<html>` canvas paint. The Vite plugin inlines its BUILD into the document
+   *  above, so the source is where the rule is readable. */
+  const bootHostSrc = readFileSync(
+    resolve(__dirname, '../../../../packages/lucidos-sdk/src/boot/host.ts'), 'utf-8',
+  );
 
   /** The two independent marks a retry leaves: sessionStorage, and the URL
    *  param. Either one must spend the single attempt, so a browser that refuses
@@ -355,9 +361,13 @@ describe('index.html inline boot splash', () => {
     // colour + fixed attachment) on <html> behind it. The body must carry the
     // same paint: its light-theme inline background otherwise owns the uncovered
     // strip and shows white despite the root paint.
-    expect(html).toMatch(
-      /d\.style\.background\s*=\s*['"]#145eb9 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
+    // The <html> half lives in the shared boot script's host entry now (the
+    // shell's own piece of it, kept out of the contract every app iframe runs);
+    // the <body> half is still this document's.
+    expect(bootHostSrc).toMatch(
+      /SPLASH_BACKGROUND\s*=\s*\n?\s*['"]#145eb9 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
     );
+    expect(bootHostSrc).toMatch(/documentElement\.style\.background = SPLASH_BACKGROUND/);
     expect(html).toMatch(
       /<body style="background:#145eb9 radial-gradient\([^";]*\) no-repeat fixed">/,
     );
@@ -733,12 +743,16 @@ describe('index.html inline boot splash', () => {
   // case that splits them: `basePath.ts` takes its pathname, a naive slash-strip
   // does not. Count the guard instead of trusting three prose comments.
   it('normalizes an absolute base href in every hand-rolled key derivation', () => {
+    // TWO, not three. The appearance boot script used to carry a third copy and
+    // now goes through the SDK's `_storage.ts`, which derives the slug once for
+    // the shell and every app iframe. These two remain because they run in this
+    // document before any module, for the picker and the boot splash.
     const guards = html.match(/if\s*\(.*?\/\^https\?:\\\/\\\/\/i\.test\(/g) ?? [];
-    expect(guards.length, 'one absolute-base guard per wsKey derivation').toBe(3);
-    expect(html.match(/function wsKey\(/g)?.length).toBe(3);
-    // And each strips THEN compares, so a slash-less `~` is null everywhere
-    // rather than a `ws:~:` namespace in two copies and null in the third.
-    expect(html.match(/\(seg === '' \|\| seg === '~'\) \? null : seg/g)?.length).toBe(3);
+    expect(guards.length, 'one absolute-base guard per wsKey derivation').toBe(2);
+    expect(html.match(/function wsKey\(/g)?.length).toBe(2);
+    // And each strips THEN compares, so a slash-less `~` is null in both rather
+    // than a `ws:~:` namespace in one and null in the other.
+    expect(html.match(/\(seg === '' \|\| seg === '~'\) \? null : seg/g)?.length).toBe(2);
   });
 
   it('keeps the markers the gateway splash lifts this stylesheet and mark out by', () => {

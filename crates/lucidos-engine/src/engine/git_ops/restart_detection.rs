@@ -27,9 +27,23 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // time (crates/lucidos-gateway/src/proxy.rs). Without the restart the
         // gateway keeps serving the previous splash while the app has the new
         // one, which is exactly the drift sharing the file removes.
+        // The changelog is one of these too, and it is the one that looks like a
+        // doc: `crate::engine::changelog` include_str!s it and serves it to the
+        // What's New panel, so an edit that skipped the restart would leave the
+        // panel showing the previous text with nothing saying why. The `.md`
+        // exclusion above gates only the Rust-source and SDK-bundle arms, so
+        // naming it here is enough.
+        // The font is the odd one: it lives in the APP crate (the host's
+        // @font-face resolves it through Vite), which would otherwise read as a
+        // frontend-only change, but the engine include_bytes!s that same file to
+        // serve app iframes. One copy in the tree, two consumers, and only one
+        // of them picks up an edit without a rebuild.
         let is_engine_bundled_asset = f == "crates/lucidos-engine/src/api/sdk_iframe.css"
             || f == "crates/lucidos-engine/src/api/sdk_iframe_audio.js"
-            || f == "crates/lucidos-app/index.html";
+            || f == "crates/lucidos-engine/src/api/sdk_fonts_fira_code.css"
+            || f == "crates/lucidos-app/src/assets/fonts/FiraCode-VF.woff2"
+            || f == "crates/lucidos-app/index.html"
+            || f == "CHANGELOG.md";
         (is_rust_source && !is_test_or_doc)
             || is_migration
             || is_sdk_bundle_source

@@ -57,6 +57,7 @@ use super::{
     is_awaitable_event, rebuild_live_waits, waits_matching, CancelWaitOutcome, EventWake,
     EventWakeRequest, LiveWait, ResolutionEmitError, DEADLINE_SWEEP_INTERVAL,
 };
+use crate::core::event_subscription::matchable_thread_payload;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
 use crate::engine::thread_events::{ActorMode, EventMeta, EventWaitCancelCause};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
@@ -214,21 +215,31 @@ impl LucidosEngine {
             return;
         }
         let (event_type, payload) = match &emitted.typed {
-            BusEvent::Thread { event, .. } => {
+            BusEvent::Thread {
+                thread_id, event, ..
+            } => {
                 if !is_awaitable_event(event) {
                     return;
                 }
-                // `EventMeta::NONE` so the matcher sees the same payload shape
-                // the trigger matcher does (I8). The catch-up scan reads the
-                // persisted `payload` column instead, which additionally
-                // carries whatever meta the emit stamped; a `condition` on a
-                // meta field would therefore match one path and not the other,
-                // so conditions belong on the event's own fields.
+                // The *matchable payload*, which is the same object the
+                // trigger matcher builds (I8) and the same view the catch-up
+                // scan reconstructs from the row. The meta a particular emit
+                // stamped is deliberately not in it: the persisted column
+                // carries it and this path cannot, so a `condition` on a meta
+                // field would match one path and not the other. `thread_id` is
+                // the one attribute both paths CAN supply authoritatively, the
+                // carrier here and the `events.thread_id` column there, which
+                // is why it is the one cross-cutting field a condition may
+                // name.
                 (
                     event.event_type().to_string(),
-                    event.to_payload(&EventMeta::NONE),
+                    matchable_thread_payload(event, *thread_id),
                 )
             }
+            // A domain event belongs to no thread (`SystemEvent::DomainEvent`
+            // carries none, and its row's `thread_id` column is NULL), so it
+            // gets no injected id here either. Supplying one on this path alone
+            // is precisely the live-versus-replay split described above.
             BusEvent::System(SystemEvent::DomainEvent {
                 event_type,
                 payload,

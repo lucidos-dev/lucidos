@@ -22,11 +22,16 @@ function declarationValue(block: string, property: string): string | undefined {
 }
 
 /**
- * The gap under a header, and NOT the `scroll-margin-bottom` that shares its
- * tail. `declarationValue` matches anywhere in the block, so on
- * `.response-header` (which declares both) it answers whichever comes first in
- * source order: correct today, and quietly wrong the day the two swap places.
- * The leading boundary is what tells the longhand apart from the shorthand.
+ * The gap under a header, and NOT any `*-margin-bottom` that shares its tail.
+ * `declarationValue` matches anywhere in the block, so a header declaring both
+ * answers whichever comes first in source order: correct on the day it is
+ * written, and quietly wrong the day the two swap places. The leading boundary
+ * is what tells the longhand apart.
+ *
+ * `.response-header` was the header that declared both, until its
+ * `scroll-margin-bottom` went with the landing that read it (a submit lands its
+ * turn's TOP now, see `landOnOwnTurn`). The boundary stays: it costs nothing and
+ * it is what makes re-adding such a property safe rather than silently wrong.
  */
 function gapBelow(block: string): string | undefined {
   return block.match(/(?:^|[;{\s])margin-bottom\s*:\s*([^;]+)/)?.[1].trim();

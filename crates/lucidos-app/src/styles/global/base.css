@@ -1,3 +1,35 @@
+/* Fira Code, the DEFAULT UI font: vendored, never fetched from a CDN.
+   Inter / JetBrains Mono / IBM Plex Mono are still loaded on demand from Google
+   Fonts (GOOGLE_FONT_URLS in store/actions/preferences.ts), and that is fine for
+   an OPT-IN font. The default is different in kind: a Lucidos workspace is a
+   self-contained local install, so its ordinary appearance must not depend on a
+   third-party origin being reachable. Fetched from the CDN, an offline or
+   air-gapped workspace would render its whole UI in the browser's generic
+   `monospace`, and every boot would announce itself to Google.
+
+   One variable file covers the 300-700 range the four static weights used to ask
+   the CDN for. The `url()` is relative so Vite hashes it into `assets/`, which
+   is also the prefix the service worker's SHELL_CACHE covers, so a warm client
+   keeps the font offline. App iframes are outside this bundle and get the same
+   bytes from the engine instead: `crates/lucidos-engine/src/api/sdk_fonts.rs`
+   `include_bytes!`s THIS file, so there is one copy in the tree.
+
+   `format('woff2')`, NOT `format('woff2-variations')`. The `-variations` form
+   is a non-standard Safari-10-era string that CSS Fonts 4 replaced with
+   `tech(variations)`, and a UA that does not recognise a format() value SKIPS
+   the source outright, so the whole face would silently fail to load. Plain
+   `woff2` is what every browser with variable-font support reads.
+
+   Provenance: Fira Code 6.2 (github.com/tonsky/FiraCode), SIL Open Font License
+   1.1, license text in the same directory. */
+@font-face {
+    font-family: 'Fira Code';
+    src: url('../../assets/fonts/FiraCode-VF.woff2') format('woff2');
+    font-weight: 300 700;
+    font-style: normal;
+    font-display: swap;
+}
+
 * {
     margin: 0;
     padding: 0;
@@ -14,6 +46,12 @@ html {
 :root {
     /* Font stacks */
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    /* NOT the default UI font, which is Fira Code. This is the pre-JS floor,
+       and it is deliberately the local system stack: the inline FOUC script in
+       index.html overwrites --font-ui on <html> before this sheet is even
+       parsed, so this value only paints if that script somehow did not run, and
+       at that instant no web font can be assumed decoded either. The default
+       itself is `fira-code` in currentFontFamily() and its three mirrors. */
     --font-ui: var(--font-mono);
     /* Neutral system sans-serif — the gateway workspace picker opts out of the
        app's monospace --font-ui for a calmer, brand-neutral surface. Native

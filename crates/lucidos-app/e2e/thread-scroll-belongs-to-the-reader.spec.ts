@@ -2,15 +2,20 @@ import { test, expect } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
 
 /** The transcript's scroll position belongs to the reader: the app moves it only
- *  when the reader asks, and two of those asks are STANDING rather than one-shot.
- *  Sending a message and pressing the down chevron each arm a follow that rides
- *  the live edge until the reader scrolls away.
+ *  when the reader asks, and exactly ONE of those asks is STANDING rather than
+ *  one-shot. The FOLLOW TOGGLE in the prompt row means "take me to the live edge
+ *  and keep me there", and rides until the reader scrolls away. Nothing else
+ *  arms it: not the down chevron, which navigates and no more, and not a SUBMIT,
+ *  which gets a one-shot landing and is over when it is done.
  *
- *  A send arms it only when there is somewhere to be taken, which is why this
- *  spec opens on a BRAND-NEW thread and asserts the opposite there. The first
- *  message is the whole of what is on screen, so the reader can see it without
- *  moving and the send asks for nothing; riding would only drag them down
- *  through a first reply they have not read, which is what it used to do.
+ *  What the transcript reserves under its newest turn (nothing) has its own spec
+ *  (`transcript-ends-where-its-content-ends-desktop.spec.ts`), because that is
+ *  real layout and no fake container can answer it. What this one uses a submit
+ *  for is the contrast: after a send the reader is left exactly where the landing
+ *  put them, and the reply then grows past the fold without taking them with it.
+ *
+ *  It opens on a BRAND-NEW thread, whose first message is the whole of what is on
+ *  screen, so there is nowhere to land and the send moves nobody at all.
  *
  *  This file was `thread-open-lands-at-end-desktop.spec.ts` and asserted a
  *  time-boxed pin: a reply landed the reader on the newest turn, and a late grow
@@ -26,6 +31,12 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  accompanying render, which is exactly the case no layout effect covers, and
  *  where both a stale re-pin and a follow that failed to follow would show.
  *
+ *  Every grow here lands on an IDLE thread, which is the state a spec is in once
+ *  `waitForResponse` returns, and an idle thread carries nobody: growth there is
+ *  the transcript finishing its own rendering. So the follow's CARRYING is
+ *  asserted the only deterministic way a spec can, on the settled end state of a
+ *  reply sent while the toggle is on.
+ *
  *  Desktop only. The same rule runs on mobile, but the mobile header's own
  *  scroll compensation is a second writer over the same offset and the
  *  assertion would be about it rather than about the resize rule. */
@@ -34,7 +45,7 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await assertHealthy(page);
   });
 
-  test('a new thread rides nothing, a later send rides the live edge, and a scroll up retires it', async ({ page }) => {
+  test('a send rides nothing, the toggle rides, and taking it back moves nobody', async ({ page }) => {
     test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
 
     // A short viewport so a modest transcript overflows: with no scroll capacity
@@ -65,43 +76,65 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBeLessThan(50);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
 
-    // A send into that same thread DOES ask: the reader is above the fold now,
-    // and what they write lands below it. So this one arms the follow, the
-    // landing glide takes them to their own message, and the reply that streams
-    // in below then carries them the rest of the way, leaving nothing for the
-    // chevron to offer.
+    // A send into that same thread DOES move them, once: the reader is above the
+    // fold now, and what they write lands below it, so the landing takes them to
+    // their own turn. It ARMS nothing, though, so the reply that streams in
+    // afterwards leaves them exactly there and the chevron is their way down.
     await sendMessage(page, 'List the numbers from 1 to 20, one per line, and nothing else.');
+    await waitForResponse(page);
+    const landed = await tc.evaluate(el => el.scrollTop);
+    expect(landed).toBeGreaterThan(50);
+    await expect.poll(atBottom).toBe(false);
+    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
+    // Not merely short of the bottom: unmoved since the landing, across
+    // everything that arrived after it.
+    await growLastTurn();
+    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(landed);
+
+    // THE ONE STANDING ASK. The toggle takes them to the live edge, and unlike
+    // the chevron it stays pressed, which is the visible difference between a
+    // journey and a mode. One button cannot be go-there, stay-here and
+    // stop-staying at once, which is why these are two controls.
+    const toggle = page.locator('button[data-role="follow-live-edge"]:visible').first();
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(atBottom).toBe(true);
+    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
+
+    // And it CARRIES, which the send deliberately did not: the whole of this
+    // reply arrives with the reader riding it, and they end on the live edge
+    // rather than a screen above it. Asserted on the settled end state, because
+    // that is what discriminates: a follow that armed but never wrote would
+    // leave them where the submit's glide put them, a reply behind.
+    await sendMessage(page, 'List the numbers from 1 to 30, one per line, and nothing else.');
     await waitForResponse(page);
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
 
-    // A real wheel gesture retires it. Everything after this point is the
-    // unarmed reader, who owns their position absolutely.
-    await tc.hover();
-    await page.mouse.wheel(0, -600);
-    await expect.poll(atBottom).toBe(false);
-    const chevron = page.locator('button.scroll-to-bottom.visible');
-    await expect(chevron).toHaveCount(1);
-
     // Past the old pin window (500ms) with room to spare, so the grow below lands
     // in the world the bug lived in: no suppression left, no render, no gesture.
-    // It must not drag the reader after it.
+    // The thread is IDLE now, and an idle thread carries NOBODY, armed or not:
+    // growth here is the transcript finishing its own rendering rather than the
+    // agent producing anything to be carried toward. The ride is kept, though,
+    // and picks them back up the moment the thread runs again.
     await page.waitForTimeout(1500);
-    const before = await tc.evaluate(el => el.scrollTop);
+    const riding = await tc.evaluate(el => el.scrollTop);
     await growLastTurn();
-    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(before);
+    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
+    await expect.poll(atBottom).toBe(false);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 
-    // The chevron reaches the TRUE bottom of the grown content, and arms the
-    // follow again on landing.
+    // Taking the ride back writes NO scroll: turning the follow off means "leave
+    // me where I am reading", not "put me back where I was".
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
+
+    // The chevron reaches the TRUE bottom of the grown content, and arms nothing.
     await page.locator('button.scroll-to-bottom.visible').click();
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
-
-    // So this second grow, identical to the one above, carries them. Same
-    // resize, opposite answer, and the only difference is that the reader asked.
-    await growLastTurn();
-    await expect.poll(atBottom).toBe(true);
-    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBeGreaterThan(before);
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
   });
 });

@@ -66,6 +66,8 @@ vi.mock('./_fetch', () => ({
     navigate(path, init.body ? JSON.parse(init.body) : undefined);
     return Promise.resolve();
   },
+  // `ui.ts` builds the locally-served Fira Code stylesheet URL with this.
+  apiUrl: (suffix: string) => `/api/v1${suffix}`,
 }));
 
 describe('ui.openExternal', () => {

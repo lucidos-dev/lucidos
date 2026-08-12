@@ -41,6 +41,12 @@ if (typeof globalThis.document === 'undefined') {
       removeAttribute: () => {},
       hasAttribute: () => false,
     },
+    // Loading a web font appends a <link> here, and that is now on the DEFAULT
+    // path: Fira Code is the default UI font, so `applyPreferences()` and
+    // `applyFontFamily()` reach this on a run with no preferences set at all.
+    // Without the stub they throw "Cannot read properties of undefined", in a
+    // test that was only ever about the theme or the device id.
+    head: { appendChild: () => {} },
   };
 }
 // There is no layout engine here, so nothing can be measured. Store modules

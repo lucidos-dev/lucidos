@@ -662,7 +662,8 @@ pub(super) fn is_stale_resume_signal(i: StaleResumeInputs) -> bool {
 /// the inactivity watchdog fired ten minutes later. A `Usage` event separates
 /// them structurally, because it is emitted per real API call and only for one
 /// (the parser drops all-zero usage frames, which is exactly what a
-/// `<synthetic>` message carries), so zero of them proves the backend never
+/// `<synthetic>` message carries, and dedups CC's per-content-block repeats of
+/// one assistant message on its `message.id`), so zero of them proves the backend never
 /// asked the model anything and therefore cannot be answering us. It stays out
 /// of the struct because [`is_stale_resume_signal`] must keep reading exactly
 /// the eight fields it reads today: a dead `--resume` starts a FRESH

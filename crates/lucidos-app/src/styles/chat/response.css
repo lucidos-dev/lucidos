@@ -38,17 +38,12 @@
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-wrap: wrap;
-    /* Room to leave under this row when a send or an answer lands on it
-       (`landOnOwnTurn` in scrollState.ts rests the agent status line on the
-       transcript's bottom edge). That edge is UNDER the prompt dissolve,
-       .prompt-area::before in panels/content.css, a bg-coloured band that would
-       swallow the row the landing exists to show, so the clearance is the same
-       --prompt-fade + --nav-focus-reach the transcript's own bottom padding
-       reserves for it. Declared here, as the mirror of .chat-exchange's
-       scroll-margin-top below: the landing reads the RESOLVED px off this
-       property, so the number stays beside the fade that makes it necessary
-       instead of drifting as a literal in TypeScript. */
-    scroll-margin-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach));
+    /* This row used to carry a `scroll-margin-bottom`, the clearance a submit's
+       landing left under it when the landing rested it on the transcript's
+       bottom edge (over the prompt dissolve, which would otherwise have painted
+       over the very row the landing existed to show). A submit brings its turn
+       UP now, as far as the transcript reaches, so nothing rests here and the
+       clearance had no reader left. See `landOnOwnTurn` in scrollState.ts. */
 }
 
 .response-executor-icon {
@@ -459,6 +454,24 @@
 .chat-exchange:last-child {
     margin-bottom: 0;
 }
+
+/* NOTHING IS RESERVED UNDER THE NEWEST TURN, and the absence is deliberate
+   enough to be worth a note here, because this is where a reader looking for it
+   will come.
+
+   Between 2026-08-11 and 2026-08-12 a TAIL ROOM was: one viewport of
+   `min-height`, measured in scrollState.ts and applied to the last turn, so a
+   SUBMIT could land that turn's top on the landing line declared above. It was
+   reserved AIR, and air below the last turn misreports how much thread there is.
+   A reader riding the live edge was carried into it and lost the running reply
+   off the top of the screen; withholding it from a rider made the layout depend
+   on the follow flag, so any failure to re-arm showed a screenful of blank; and
+   it arrived mid-turn in one step either way, because a queued follow-up grows
+   no reply and only qualified once the agent picked it up.
+
+   The landing measures instead of reserving: it asks for the line only when the
+   turn genuinely has a screenful under it, and otherwise asks to SHOW the turn.
+   See `landOnOwnTurn` in components/chat/scrollState.ts. */
 
 /* scrollToEventAndPulse lands the event at the scroll-container top, which would
    sit behind the fixed/sticky chrome stacked there ("covered a bit"). The scroll

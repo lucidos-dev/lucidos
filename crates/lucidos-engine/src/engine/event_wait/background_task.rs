@@ -157,7 +157,7 @@ impl LucidosEngine {
             })
             .ok();
 
-        let plan = plan_wait(&running, &live, consecutive);
+        let plan = plan_wait(&running, &live, consecutive, thread_id);
         let uncovered = match &plan {
             ArmingPlan::Arm(tasks) => tasks,
             ArmingPlan::NothingUncovered => return 0,
@@ -242,10 +242,15 @@ pub(super) fn plan_wait<'a>(
     running: &'a [RunningTaskHandle],
     live: &[super::LiveWait],
     consecutive: Option<i64>,
+    thread_id: Uuid,
 ) -> ArmingPlan<'a> {
     let uncovered: Vec<&RunningTaskHandle> = running
         .iter()
-        .filter(|h| !live.iter().any(|w| wait_covers_task(&w.on, &h.task_id)))
+        .filter(|h| {
+            !live
+                .iter()
+                .any(|w| wait_covers_task(&w.on, &h.task_id, thread_id))
+        })
         .collect();
     if uncovered.is_empty() {
         return ArmingPlan::NothingUncovered;
@@ -279,13 +284,16 @@ pub(super) fn plan_wait<'a>(
 
 /// Whether a live wait would already wake on this task's completion.
 ///
-/// Runs the dispatcher's own predicate against the payload the event will
-/// carry, so "covered" means the wait genuinely fires rather than merely
-/// looking similar. An unconditioned `BackgroundBashCompleted` entry therefore
+/// Runs the dispatcher's own predicate against the *matchable payload* the
+/// event will carry, the thread id included, so "covered" means the wait
+/// genuinely fires rather than merely looking similar. An unconditioned `BackgroundBashCompleted` entry therefore
 /// counts as covering every task, which is correct: it will wake on the first
 /// of them.
-fn wait_covers_task(on: &[EventSubscription], task_id: &str) -> bool {
-    let payload = serde_json::json!({ "task_id": task_id });
+fn wait_covers_task(on: &[EventSubscription], task_id: &str, thread_id: Uuid) -> bool {
+    let payload = crate::core::event_subscription::matchable_payload(
+        serde_json::json!({ "task_id": task_id }),
+        Some(thread_id),
+    );
     EventSubscription::any_matches(on, BACKGROUND_BASH_COMPLETED, &payload)
 }
 

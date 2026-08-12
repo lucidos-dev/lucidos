@@ -1,6 +1,11 @@
-import { requestVoid } from './_fetch';
+import { apiUrl, requestVoid } from './_fetch';
 import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
+import {
+  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, THEME_BG,
+  fontFeaturesFor, parseUiScale, resolveFontKey, resolveTheme, resolveThemePreference,
+  type FontFamily,
+} from './appearance';
 import { preferences as prefsModule } from './preferences';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
@@ -12,41 +17,19 @@ import type { NavigateTarget, NavigateUi } from './notifications';
  *  and discoverable from the SDK, in lockstep with the engine `navigate_ui` tool. */
 export type NavigateParams = Omit<NavigateUi, 'target'>;
 
-const FONT_FAMILIES: Record<string, string> = {
-  monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
-  system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-  inter: "'Inter', system-ui, sans-serif",
-  'jetbrains-mono': "'JetBrains Mono', monospace",
-  'ibm-plex-mono': "'IBM Plex Mono', monospace",
-  'fira-code': "'Fira Code', monospace",
-};
-
-const GOOGLE_FONT_URLS: Record<string, string> = {
-  inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
-  'jetbrains-mono': 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap',
-  'ibm-plex-mono': 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap',
-  'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
-};
-
-// Programming ligatures: OFF for text, ON for code, gated to fonts that ship
-// them (Fira Code). Every other font resolves BOTH to `normal`, leaving its
-// rendering unchanged. Mirrors FONT_FEATURES in the host shell
-// (crates/lucidos-app/src/store/actions/preferences.ts) and the FOUC scripts
-// (index.html, crates/lucidos-engine/src/api/sdk_prefs.rs). The engine-served
-// api/sdk_iframe.css is the only consumer: `html, input, textarea, select,
-// button` take the text value, `code, pre, kbd, samp` the code one.
-//
-// The off value is the ZEROS, never `normal`: `liga` and `calt` are default-ON
-// in CSS, so `normal` means "the font's defaults" and renders identically to
-// `1`, leaving Fira Code's `calt` free to re-space a typed `...` into what reads
-// as two dots (tonsky/FiraCode#1561). Form controls are named explicitly
-// because the UA stylesheet's `font` shorthand resets this property on them, so
-// a `<textarea>` never inherits it. See preferences.ts for the full why.
-type FontFeaturePair = { text: string; code: string };
-const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
-const FONT_FEATURES: Record<string, FontFeaturePair> = {
-  'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' },
-};
+/** The stylesheet to load for a font key, or `undefined` for a font already on
+ *  the device.
+ *
+ *  Fira Code resolves to the LOCAL engine, never to Google, because it is the
+ *  default: a workspace is a self-contained local install, so its ordinary
+ *  appearance must not depend on a third-party origin being reachable
+ *  (`crates/lucidos-engine/src/api/sdk_fonts.rs` carries the full reasoning).
+ *  Resolved per call rather than held in a map, because `apiUrl` reads a base
+ *  URL that `configure({ baseUrl })` can still change. */
+export function webFontUrl(fontKey: FontFamily): string | undefined {
+  if (fontKey === DEFAULT_FONT_FAMILY) return apiUrl('/fonts/fira-code.css');
+  return GOOGLE_FONT_URLS[fontKey];
+}
 
 const loadedFonts = new Set<string>();
 let watchingPrefs = false;
@@ -64,40 +47,6 @@ export function isIOSAgent(
   if (!nav) return false;
   return /iPad|iPhone|iPod/.test(nav.userAgent) ||
     (nav.platform === 'MacIntel' && (nav.maxTouchPoints ?? 0) > 1);
-}
-
-type ThemePref = 'light' | 'dark' | 'system';
-const VALID_THEMES: readonly ThemePref[] = ['light', 'dark', 'system'];
-
-/**
- * Resolve which theme preference applies, mirroring the host shell's
- * `currentPreference()` (crates/lucidos-app/src/store/actions/preferences.ts)
- * and the synchronous `sdk-prefs.js` FOUC script. Precedence:
- *   1. the server-provided value, when present and valid;
- *   2. else the `lucidos-theme` localStorage value `sdk-prefs.js` read;
- *   3. else the `data-theme` attribute `sdk-prefs.js` already applied;
- *   4. else the hard default `'dark'` (matching `sdk-prefs.js`).
- *
- * Load-bearing invariant: a MISSING server theme must NEVER clobber the value
- * the synchronous client resolver already settled on. The previous
- * `prefs['theme'] || 'dark'` violated this — a device with no server-scoped
- * theme (e.g. an iPhone PWA that only stored `ui-scale`) flipped every app
- * iframe to dark even when localStorage said light.
- *
- * `getAttr` is a thunk so the DOM is read only as a last resort — keeping the
- * common path side-effect-free and the function unit-testable without a DOM.
- * Returns a raw preference; the caller resolves `system` via matchMedia.
- */
-export function resolveThemePreference(
-  server: string | undefined,
-  local: string | null,
-  getAttr: () => string | null,
-): ThemePref {
-  const valid = VALID_THEMES as readonly string[];
-  if (server && valid.includes(server)) return server as ThemePref;
-  if (local && valid.includes(local)) return local as ThemePref;
-  const attr = getAttr();
-  return attr === 'light' || attr === 'dark' ? attr : 'dark';
 }
 
 let confirmCounter = 0;
@@ -363,56 +312,50 @@ export const ui = {
   async applyPreferences(): Promise<void> {
     const prefs = await prefsModule.get();
 
-    // Theme — prefer the value the synchronous sdk-prefs.js resolver already
-    // applied (server → localStorage → data-theme) over a hard default, so a
-    // missing server-scoped theme can't flip the iframe to dark. Then resolve
-    // "system" via matchMedia.
-    let theme: string = resolveThemePreference(
-      prefs['theme'],
-      wsLocalGet('lucidos-theme'),
-      () => document.documentElement.getAttribute('data-theme'),
+    // Theme: prefer the value the synchronous sdk-prefs.js resolver already
+    // applied (server, then localStorage, then data-theme) over a hard default,
+    // so a missing server-scoped theme can't flip the iframe to dark. Then
+    // resolve "system" against the OS.
+    const theme = resolveTheme(
+      resolveThemePreference(
+        prefs['theme'],
+        wsLocalGet('lucidos-theme'),
+        () => document.documentElement.getAttribute('data-theme'),
+      ),
+      window.matchMedia('(prefers-color-scheme: light)').matches,
     );
-    if (theme === 'system') {
-      theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-    }
-    const bg = theme === 'light' ? '#ffffff' : '#07172e';
+    const bg = THEME_BG[theme];
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.style.setProperty('--bg-primary', bg);
-    // Mirrors sdk-prefs.js — keeps <html> covered before/after the iframe's
+    // Mirrors sdk-prefs.js: keeps <html> covered before/after the iframe's
     // stylesheet applies its bg rule (iOS WKWebView underlying white).
     document.documentElement.style.background = bg;
 
-    // Font — load Google Fonts on demand, map to CSS value. Fall back to the
+    // Font: load the web font on demand, map to CSS value. Fall back to the
     // `lucidos-font-family` localStorage value sdk-prefs.js read before the
     // hard default, so a missing server value doesn't reset the client font.
-    const fontKey = prefs['font-family'] || wsLocalGet('lucidos-font-family') || 'monospace';
-    const googleUrl = GOOGLE_FONT_URLS[fontKey];
-    if (googleUrl && !loadedFonts.has(fontKey)) {
+    const fontKey = resolveFontKey(prefs['font-family'] || wsLocalGet('lucidos-font-family'));
+    const fontUrl = webFontUrl(fontKey);
+    if (fontUrl && !loadedFonts.has(fontKey)) {
       loadedFonts.add(fontKey);
       const link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = googleUrl;
+      link.href = fontUrl;
       document.head.appendChild(link);
     }
-    const fontValue = FONT_FAMILIES[fontKey] || FONT_FAMILIES['monospace'];
-    document.documentElement.style.setProperty('--font-ui', fontValue);
-    const features = FONT_FEATURES[fontKey] || FONT_FEATURES_DEFAULT;
+    document.documentElement.style.setProperty('--font-ui', FONT_FAMILY_VALUES[fontKey]);
+    const features = fontFeaturesFor(fontKey);
     document.documentElement.style.setProperty('--font-features-text', features.text);
     document.documentElement.style.setProperty('--font-features-code', features.code);
 
-    // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
     // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
     // so a missing server value doesn't drop the client-applied scale.
-    const rawScale = prefs['ui-scale'] || prefs['text-size'] || prefs['font-size']
-      || wsLocalGet('lucidos-ui-scale');
-    if (rawScale) {
-      const legacy: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
-      let n = legacy[rawScale];
-      if (n === undefined) n = parseFloat(rawScale);
-      if (!isNaN(n)) {
-        const snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
-        document.documentElement.style.setProperty('--user-ui-scale', `${snapped}%`);
-      }
+    const scale = parseUiScale(
+      prefs['ui-scale'] || prefs['text-size'] || prefs['font-size']
+      || wsLocalGet('lucidos-ui-scale'),
+    );
+    if (scale !== null) {
+      document.documentElement.style.setProperty('--user-ui-scale', `${scale}%`);
     }
 
     // The live style remote's custom property overrides. LAST, because the

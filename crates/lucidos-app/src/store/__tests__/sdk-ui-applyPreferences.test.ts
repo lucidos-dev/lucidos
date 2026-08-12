@@ -113,16 +113,10 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
       removeProperty: (k: string) => { delete inlineProps[k]; },
       background: '',
     };
-    // fira-code is a Google font, so applyPreferences appends a <link>; the
-    // test-setup document stub has no `head`.
-    const realHead = (document as any).head;
-    (document as any).head = { appendChild: () => {} };
-
     try {
       await lucidos.ui.applyPreferences();
     } finally {
       (document as any).documentElement.style = realStyle;
-      (document as any).head = realHead;
     }
 
     expect(inlineProps['--font-features-text']).toBe('"liga" 0, "calt" 0');
@@ -131,8 +125,15 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   });
 
   it('resolves both properties to normal for a font that ships no ligatures', async () => {
-    // beforeEach's mock returns no font-family, so the SDK falls back to
-    // monospace: both must clear rather than leave a stale value behind.
+    // A NAMED non-Fira font, not the absent-preference path: Fira Code is the
+    // default now, so "no font-family" is a ligature font and would test the
+    // opposite of what this case is for. Both properties must clear rather than
+    // leave a stale value behind from a previous font.
+    globalThis.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ preferences: { theme: 'light', 'font-family': 'inter' } }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )) as unknown as typeof globalThis.fetch;
+
     const inlineProps: Record<string, string> = {};
     const realStyle = (document as any).documentElement.style;
     (document as any).documentElement.style = {
@@ -255,12 +256,15 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
     expect(cap.attrs['data-theme']).toBe('light');
   });
 
-  it('ignores an invalid localStorage theme and falls back to the default', async () => {
+  it('ignores an invalid localStorage theme and falls back to the OS', async () => {
     localStorage.setItem('lucidos-theme', 'chartreuse');
     mockPrefs({});
 
     const cap = await applyWithCapture();
 
+    // The default is `system`, which the SDK resolves through matchMedia. The
+    // test env's matchMedia answers `matches: false` for every query, so
+    // `prefers-color-scheme: light` is false and this lands on dark.
     expect(cap.attrs['data-theme']).toBe('dark');
   });
 

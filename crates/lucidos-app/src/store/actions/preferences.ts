@@ -16,74 +16,33 @@ import {
   serializeStyleOverrides, styleResetRequested,
 } from '../../utils/styleOverrides';
 
-export type Theme = 'light' | 'dark' | 'system';
-export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono' | 'fira-code';
+import {
+  DEFAULT_FONT_FAMILY, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, THEMES, THEME_BG,
+  UI_SCALE_DEFAULT, clampUiScale, fontFeaturesFor, parseUiScale, resolveTheme,
+  type FontFamily, type ThemePref,
+} from '@lucidos/appearance';
+
+/** Re-exported so the components that already import these from the store keep
+ *  one import site. The definitions live in the appearance contract, which is
+ *  the single source the two FOUC scripts and the SDK read as well. */
+export type { FontFamily } from '@lucidos/appearance';
+export type Theme = ThemePref;
+export {
+  UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP, UI_SCALE_DEFAULT, clampUiScale,
+} from '@lucidos/appearance';
+
 export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' | 'gpt-image-2';
 
-export const UI_SCALE_MIN = 75;
-export const UI_SCALE_MAX = 200;
-// 12.5% keeps the root font-size on integer pixels (16 × 0.125 = 2px per
-// step), so every `rem` resolves to an integer and 1px borders don't
-// anti-alias at varying widths across the layout. Inline duplicates exist
-// in FOUC scripts — grep for `Math.round(n / 12.5) * 12.5`.
-export const UI_SCALE_STEP = 12.5;
-export const UI_SCALE_DEFAULT = 100;
-
-const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
-  monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
-  system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-  inter: "'Inter', system-ui, sans-serif",
-  'jetbrains-mono': "'JetBrains Mono', monospace",
-  'ibm-plex-mono': "'IBM Plex Mono', monospace",
-  'fira-code': "'Fira Code', monospace",
-};
-
-const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
-  inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
-  'jetbrains-mono': 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap',
-  'ibm-plex-mono': 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap',
-  'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
-};
-
-// Programming ligatures belong to CODE, never to prose. Fira Code's `calt`
-// deliberately re-spaces dot runs (`..` and `...` are separate contextual rules
-// so the font can tighten range operators), so a typed `...` comes out kerned
-// tight enough to read as two dots: tonsky/FiraCode#1561, open upstream with no
-// per-sequence switch. `...` is ordinary prose punctuation and Lucidos is
-// chat-first, so the feature is turned OFF for text and back ON for code.
+// The ligature pair, the font stacks and the two defaults live in
+// `@lucidos/appearance` (`packages/lucidos-sdk/src/appearance.ts`), which is the
+// single source every surface reads: this store, the two FOUC scripts, and the
+// SDK. Its comments carry the reasoning, including the two counter-intuitive
+// facts that make a careless edit here a silent no-op (`normal` does NOT mean
+// "ligatures off", and a <textarea> does not inherit `font-feature-settings`).
 //
-// Two values per font, published as custom properties and consumed by CSS
-// (`html, input, textarea, select, button` for the text one; `code, pre, kbd,
-// samp, .diff-line-content` for the code one) in styles/global/base.css and its
-// mirror in the engine-served api/sdk_iframe.css. Mirrored in the FOUC scripts
-// (index.html, api/sdk_prefs.rs) and the SDK (packages/lucidos-sdk/src/ui.ts).
-//
-// Two things about this are counter-intuitive, and getting either wrong makes
-// the change a silent no-op. Both were established by pixel comparison in
-// headless Chromium, because the computed property value does not show either:
-//
-//  1. **`normal` does NOT mean "ligatures off".** `liga` and `calt` are
-//     default-ON features in CSS, so `normal` means "the font's defaults",
-//     which for Fira Code is ligatures on. Rendering `...` under `normal` is
-//     byte-identical to rendering it under `"liga" 1, "calt" 1`. Turning the
-//     feature off REQUIRES writing the zeros. Never spell the off value
-//     `normal`, and never think that dropping the declaration disables it.
-//  2. **A <textarea> does not inherit `font-feature-settings`.** The UA
-//     stylesheet applies the `font` shorthand to form controls, and that
-//     shorthand resets this property to its initial value. So the text rule has
-//     to name the controls explicitly; inheriting from <html> reaches prose but
-//     stops at the composer, which is the surface the bug was reported against.
-//     Same reason the app already sets `font-family` on inputs by hand.
-//
-// Every non-Fira font resolves BOTH to `normal`, leaving its rendering exactly
-// as it is today. That matters beyond minimal blast radius: an unconditional
-// `"liga" 0` would also kill the `fi`/`fl` ligatures a proportional text font
-// like Inter legitimately wants.
-type FontFeaturePair = { text: string; code: string };
-const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
-const FONT_FEATURES: Partial<Record<FontFamily, FontFeaturePair>> = {
-  'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' },
-};
+// What stays here is the half that is genuinely this module's: reading the
+// preference signal, writing the properties onto <html>, and re-asserting the
+// style-remote overrides afterwards.
 
 const loadedFonts = new Set<string>();
 
@@ -297,11 +256,6 @@ export async function savePreference(
 
 // --- UI scale ---
 
-export function clampUiScale(scale: number): number {
-  const snapped = Math.round(scale / UI_SCALE_STEP) * UI_SCALE_STEP;
-  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, snapped));
-}
-
 export function applyUiScale(scale: number): void {
   const clamped = clampUiScale(scale);
   localStorage.setItem('lucidos-ui-scale', String(clamped));
@@ -333,13 +287,10 @@ export function applyUiScale(scale: number): void {
 export function currentUiScale(): number {
   if (preferences.value.status !== 'loaded') return UI_SCALE_DEFAULT;
   const raw = preferences.value.data['ui-scale'] || preferences.value.data['text-size'] || preferences.value.data['font-size'];
-  if (!raw) return UI_SCALE_DEFAULT;
-  // Migrate old enum values. `medium` was 113 (pre-12.5%-grid); snap to 112.5.
-  const legacyMap: Record<string, number> = { small: 100, medium: 112.5, large: 125 };
-  if (raw in legacyMap) return legacyMap[raw];
-  // parseFloat so fractional snapped values like "112.5" round-trip.
-  const parsed = parseFloat(raw);
-  return isNaN(parsed) ? UI_SCALE_DEFAULT : clampUiScale(parsed);
+  // `parseUiScale` answers null for nothing usable, which for a SETTING means
+  // the default. The FOUC scripts want that null instead, so they can leave
+  // --user-ui-scale unset and let the stylesheet's own fallback answer.
+  return parseUiScale(raw) ?? UI_SCALE_DEFAULT;
 }
 
 export function setUiScale(scale: number): Promise<void> {
@@ -349,16 +300,12 @@ export function setUiScale(scale: number): Promise<void> {
 
 // --- Theme ---
 
-function resolveTheme(theme: Theme): 'light' | 'dark' {
-  if (theme === 'system') {
-    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  }
-  return theme;
-}
-
 export function applyTheme(theme: Theme): void {
-  const resolved = resolveTheme(theme);
-  const bg = resolved === 'light' ? '#ffffff' : '#07172e';
+  const resolved = resolveTheme(
+    theme,
+    window.matchMedia('(prefers-color-scheme: light)').matches,
+  );
+  const bg = THEME_BG[resolved];
   // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
   // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
   type ThemeLogEvt = (label: string, info: unknown) => void;
@@ -429,11 +376,20 @@ function onSystemThemeChange(): void {
   applyTheme('system');
 }
 
+/** The device's theme, defaulting to `system` (follow the OS light/dark
+ *  setting). A device that has explicitly picked light or dark keeps its pick:
+ *  this is only what applies when nothing is stored, which is also why changing
+ *  it reaches existing devices that never opened Settings.
+ *
+ *  The default is mirrored in the FOUC script (index.html), the iframe FOUC
+ *  script (api/sdk_prefs.rs), the SDK (`resolveThemePreference`) and the
+ *  preference catalog. They paint at different moments of one page load, so a
+ *  disagreement between them is a visible flash. */
 export function currentTheme(): Theme {
   // localStorage fallback matches the FOUC prevention script in index.html.
   // Covers: backend missing the preference (device_id change, save failure),
   // and the loading window before the API responds.
-  return currentPreference('theme', ['light', 'dark', 'system'], 'dark', 'lucidos-theme');
+  return currentPreference('theme', THEMES, DEFAULT_THEME, 'lucidos-theme');
 }
 
 export function setTheme(theme: Theme): Promise<void> {
@@ -455,17 +411,27 @@ function ensureFontLoaded(font: FontFamily): void {
 export function applyFontFamily(font: FontFamily): void {
   ensureFontLoaded(font);
   localStorage.setItem('lucidos-font-family', font);
-  const value = FONT_FAMILY_VALUES[font] || FONT_FAMILY_VALUES.monospace;
-  document.documentElement.style.setProperty('--font-ui', value);
-  const features = FONT_FEATURES[font] || FONT_FEATURES_DEFAULT;
+  document.documentElement.style.setProperty('--font-ui', FONT_FAMILY_VALUES[font]);
+  const features = fontFeaturesFor(font);
   document.documentElement.style.setProperty('--font-features-text', features.text);
   document.documentElement.style.setProperty('--font-features-code', features.code);
   // This just wrote --font-ui and the two feature properties inline.
   reapplyStyleOverrides();
 }
 
+/** The device's UI font. The default and the valid set come from the appearance
+ *  contract, so this and the boot scripts cannot disagree.
+ *
+ *  Deliberately NOT backed by localStorage the way the theme is: `applyFontFamily`
+ *  writes `lucidos-font-family` on every load for the FOUC script to read, so a
+ *  cached value here would just be the previous default echoed back and would
+ *  outlive a change to it. */
 export function currentFontFamily(): FontFamily {
-  return currentPreference('font-family', Object.keys(FONT_FAMILY_VALUES) as FontFamily[], 'monospace');
+  return currentPreference(
+    'font-family',
+    Object.keys(FONT_FAMILY_VALUES) as FontFamily[],
+    DEFAULT_FONT_FAMILY,
+  );
 }
 
 export function setFontFamily(font: FontFamily): Promise<void> {

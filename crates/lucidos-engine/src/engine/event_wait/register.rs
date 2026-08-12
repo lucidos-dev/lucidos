@@ -12,9 +12,9 @@
 //! * **The consecutive-subscription cap** (S8): 10 registrations with no human
 //!   message in between. Catches a thread awaiting an event kind its own wake
 //!   emits, two threads ping-ponging, and a model simply stuck.
-//! * **The live-wait cap** (S6b): 5 simultaneous waits per thread, so a
-//!   subscribe / wake / subscribe cycle cannot accumulate watchers without
-//!   bound.
+//! * **The live-wait cap** (S6b): 25 simultaneous waits per thread. It bounds
+//!   how many separate wakes one burst of events can start on one thread, not
+//!   what a sleeping subscription costs, which is nothing.
 //! * **The duplicate refusal** (S6b): the same `on` list twice on one thread.
 //!   One event would then produce two wakes.
 
@@ -36,10 +36,40 @@ pub(crate) const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 /// persist, the fan-out just stops.
 pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 
-/// How many waits one thread may hold at once (S6b). All of them are ordinary
-/// background subscriptions: none holds the thread's turn, so this bounds how
-/// many watchers one thread can accumulate, nothing more.
-pub(crate) const MAX_LIVE_WAITS_PER_THREAD: usize = 5;
+/// How many waits one thread may hold at once (S6b).
+///
+/// **It bounds outstanding WAKES, not accumulated watchers.** A sleeping wait
+/// is not a running anything: it costs one entry in the live cache, one
+/// `EventWaitStarted` row, and one name compare plus a condition eval per
+/// emitted event. What the number actually limits is how many separate turns
+/// one burst of events can start on a single thread, because every wait that
+/// fires opens one.
+///
+/// It is NOT the guard against a runaway thread.
+/// [`MAX_CONSECUTIVE_SUBSCRIPTIONS`] is, and that one bounds a *loop*: a thread
+/// waking itself spends a turn per iteration with no human in it. This cap adds
+/// exactly one thing that one does not. The consecutive counter resets on a
+/// human message, so the standing set a thread carries ACROSS many messages is
+/// bounded here and nowhere else.
+///
+/// Raised from 5 on 2026-08-12. Five was sized for a shape that no longer
+/// exists: it arrived with the *attached wait*, where "at most one of them is
+/// attached; the rest are background subscriptions that survived an
+/// interruption", so the number bounded how many leftovers could pile up behind
+/// the one holding the turn. ADR 0049 retired attachment and every wait became
+/// an ordinary background subscription, which left the number without its
+/// reason.
+///
+/// It was also refusing the case the mechanism exists for. "Wait until the
+/// running coding agents finish" wants one wait per live session, so six
+/// running agents hit the limit, and the workaround (one wait whose `on` names
+/// every session) is only available because that list is itself uncapped. Which
+/// is the other reason five was wrong: it never bounded what a thread WATCHES,
+/// since one wait can name twenty event/condition pairs. Nor is it the lever on
+/// matching cost, which is workspace-wide: the dispatcher matches every live
+/// wait in the workspace against every event, and nothing bounds how many
+/// threads there are.
+pub(crate) const MAX_LIVE_WAITS_PER_THREAD: usize = 25;
 
 /// How far back registration looks for a match that landed while the model was
 /// still working towards this call (the **arming lookback**, see

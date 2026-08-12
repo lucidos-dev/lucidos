@@ -138,6 +138,8 @@ These are NOT prefixed `CodingAgent*` because the same machinery serves any agen
 
 All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated and will be missing from the wire when at their zero value (`false` for bools, `None` for `Option`s). Read defensively: `payload.has_changes ?? false`, `payload.worktree_path ?? null`.
 
+**A `condition` on this event can also name `thread_id`, which is NOT in the payload above.** The engine supplies it from the thread the event belongs to, for every thread event, so `{ "thread_id": "<uuid>" }` scopes a wait or a trigger to one coding-agent session. It is a matching-time field only: it is not written to the event row (the `events.thread_id` column is where the thread is stored), so a consumer reading a persisted payload will not find it there.
+
 | Field | Type | When present |
 |---|---|---|
 | `has_changes` | `bool` | `true` iff the coding-agent branch has a non-empty net diff against its **diff base** — the SAME base the Diff button renders against (`default_diff_base`: `origin/<default>` when the local default branch has diverged, otherwise the local default) — **after** filtering out runtime-only paths (`.lucidos/**` etc. — see `branch_changed_files` + `files_require_restart`). Sharing the base is deliberate: the gate that shows the Diff button and the algorithm that computes the diff are one (`branch_changed_files`), so the button can never light up on an empty diff. Carries forward from a prior idle if the live turn produced no new commits but the branch still has prior work. Drives the `coding_agent_has_diff` projection column (the WaitingBanner Diff button). During a live turn, the worktree post-commit hook can update the same column earlier through `CodingAgentDiffChanged`; `coding_agent_proposed` is still set exclusively by the aggregate `ChangeProposed` (non-empty `change_id`), which only follows when the coding-agent turn ended `Generated` and `may_touch_change_state_at_idle` permits. Aborts / cancels / mid-turn deaths never create an Apply proposal — see the "Changes" section of `thread-events.md`. |
@@ -422,7 +424,7 @@ on:
       cc_session_id: "abc123-…"
 ```
 
-Conditions are pure payload filters — they only look at the event's payload fields. `cc_session_id` is on `UserQuestionAsked`'s payload (see shape above), so this works. There is no conditional access to thread metadata, app id, etc. from the condition.
+Conditions are pure payload filters: they look at the event's own payload fields, plus `thread_id`, which the engine supplies for every thread event. `cc_session_id` is on `UserQuestionAsked`'s payload (see shape above), so this works, and `{ "thread_id": "<uuid>" }` works on any thread event. Nothing else about the thread is reachable from a condition (no title, no app id, no status), and a **domain event** has no `thread_id` either, since it belongs to no thread.
 
 ### Notify when a coding-agent session finishes / produced changes
 
@@ -436,6 +438,17 @@ run:
 ```
 
 Adding `is_external_repo: { $ne: true }` scopes to the engine repo; `requires_restart: true` scopes to changes that need an Apply & Restart, etc. — same condition language across all per-payload fields.
+
+### Wait for one named coding-agent session to finish
+
+```yaml
+on:
+  - event_type: CodingAgentIdled
+    condition:
+      thread_id: "<uuid>"
+```
+
+The same entry shape works as an `await_event` subscription, which is how a chat thread waits for a coding-agent session it did not spawn: list the running ones (`threads` list, `status: ["running"]`), then subscribe per session. Two things to know before relying on it. `CodingAgentIdled` is a **turn boundary**, not a session terminator, so a session that gets a follow-up emits another one later; and a subscription is spent by the first match, so waiting on several sessions means re-listing on each wake and subscribing again while any are still running.
 
 ### Notify when a coding agent errors
 

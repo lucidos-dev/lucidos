@@ -93,7 +93,9 @@ enum Command {
     /// NOT for a thread you spawned as your own child: that one already wakes
     /// this thread with its result when it finishes, so a wait on its
     /// `ChildThreadCompleted` buys nothing. Await a completion only for a thread
-    /// that is not your own child, named with a `child_thread_id` condition.
+    /// that is not your own child, named with a `child_thread_id` condition. A
+    /// session nobody spawned emits no completion at all: watch
+    /// `CodingAgentIdled` with a `thread_id` condition instead.
     ///
     /// A rendezvous, not a stream: the first match consumes it. For a standing
     /// rule that fires every time, create a trigger instead.
@@ -505,8 +507,9 @@ pub(crate) struct AwaitEventArgs {
     /// Optional payload filter as a JSON object, applied to every `--on` name.
     /// Field-to-value for equality, or an operator object (`{"$gt": 0}`,
     /// `{"$in": [...]}`). Filter on the event's OWN payload fields, the ones
-    /// `lucidos events query` prints; the thread an event belongs to is not one
-    /// of them.
+    /// `lucidos events query` prints, plus `thread_id`: the engine supplies
+    /// that one for every thread event, so `{"thread_id": "<uuid>"}` scopes the
+    /// wait to one thread.
     #[arg(long)]
     pub(crate) condition: Option<String>,
     /// How long to wait before giving up, in seconds (1 to 86400). Required:

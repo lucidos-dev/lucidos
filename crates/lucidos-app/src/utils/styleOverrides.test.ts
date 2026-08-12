@@ -1,6 +1,5 @@
 /**
- * The live style remote's validator, and the guard that its three other realms
- * still agree with it.
+ * The live style remote's validator.
  *
  * The map is written by a preference, which means any app can set it through
  * `lucidos.preferences.set` and the chat agent can set it over HTTP. It ends up
@@ -9,20 +8,11 @@
  * the file, not padding.
  */
 import { describe, it, expect } from 'vitest';
-// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync } from 'node:fs';
-// @ts-expect-error: same
-import { fileURLToPath } from 'node:url';
-// @ts-expect-error: same
-import { dirname, resolve } from 'node:path';
 import {
   isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
   serializeStyleOverrides, styleResetRequested,
   MAX_STYLE_OVERRIDES, MAX_STYLE_VALUE_LENGTH,
 } from './styleOverrides';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(here, '../../../..');
 
 describe('override names', () => {
   it('accepts a custom property', () => {
@@ -142,47 +132,12 @@ describe('styleResetRequested', () => {
   });
 });
 
-describe('the other realms mirror this validator', () => {
-  // Four realms apply this map and none can import another's copy: the app
-  // module here, the index.html boot script (runs before any module), the
-  // engine-served sdk-prefs.js (iframe first paint), and the SDK (a separate
-  // package, iframe live updates). A rule relaxed in one realm is a hole in all
-  // of them, so the literals are pinned here. The Rust side pins its own in
-  // `api/sdk_prefs.rs`.
-  const NAME_RE_SRC = '/^--[a-z][a-z0-9-]*$/';
-  const VALUE_RE_SRC = String.raw`/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i`;
-
-  const realms: Array<[string, string]> = [
-    ['index.html boot script', resolve(REPO_ROOT, 'crates/lucidos-app/index.html')],
-    ['engine sdk-prefs.js', resolve(REPO_ROOT, 'crates/lucidos-engine/src/api/sdk_prefs.rs')],
-    ['SDK ui.ts', resolve(REPO_ROOT, 'packages/lucidos-sdk/src/ui.ts')],
-  ];
-
-  for (const [label, path] of realms) {
-    it(`${label} uses the same name and value rules`, () => {
-      const src = readFileSync(path, 'utf8');
-      expect(src, `${label}: name rule`).toContain(NAME_RE_SRC);
-      expect(src, `${label}: banned-value rule`).toContain(VALUE_RE_SRC);
-      expect(src, `${label}: entry cap`).toContain('200');
-      expect(src, `${label}: value length cap`).toContain('120');
-    });
-  }
-
-  it('the boot script applies overrides after theme, font and scale', () => {
-    // Order is load-bearing: the remote may override --bg-primary, --font-ui
-    // and --user-ui-scale, and inline properties are last-write-wins.
-    const src = readFileSync(resolve(REPO_ROOT, 'crates/lucidos-app/index.html'), 'utf8');
-    const overrides = src.indexOf('lucidos-style-overrides');
-    expect(overrides).toBeGreaterThan(-1);
-    for (const earlier of ['lucidos-theme', 'lucidos-font-family', 'lucidos-ui-scale']) {
-      expect(src.indexOf(earlier), earlier).toBeLessThan(overrides);
-    }
-  });
-
-  it('the boot script scopes its storage key per workspace', () => {
-    // The gateway serves every workspace from one origin (ADR 0014), so an
-    // unscoped key would bleed one workspace's tuning into another's.
-    const src = readFileSync(resolve(REPO_ROOT, 'crates/lucidos-app/index.html'), 'utf8');
-    expect(src).toContain("wsKey('lucidos-style-overrides')");
-  });
-});
+// The "other realms mirror this validator" guard is GONE, and its absence is
+// the point. Four realms used to apply this map from four hand-copied copies of
+// the rules, so the literals had to be pinned against each other. They now come
+// from one place: `@lucidos/appearance` defines them, this module re-exports
+// them for app code, and both FOUC scripts are built from a boot source that
+// imports the same functions. `appearanceBoot.test.ts` drives the boot script's
+// application for real against a fake document, including the two behaviours
+// this block used to infer from source order: that the overrides are applied
+// LAST, and that the storage key is workspace-scoped.

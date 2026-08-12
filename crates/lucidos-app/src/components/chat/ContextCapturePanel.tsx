@@ -7,6 +7,7 @@ import { sectionTokenScale, headlineTokens, type TokenScale } from './sectionTok
 import { fetchContextCapture, type ContextCapturePayload } from '../../api/threads';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { mergeContextCaptureSections, needsLazyFetch } from './loadStrippedSections';
+import { ChevronRightIcon } from '../shared/icons';
 
 // The body of the context viewer: what the model was actually sent for one LLM
 // call. Lives in its own module because it is reached from the step row's
@@ -19,18 +20,38 @@ function formatChars(n: number): string {
   return `${n}`;
 }
 
+/** The one disclosure marker for all three tiers of the tree: a single chevron
+ *  in a fixed box, turned a quarter turn when the row is open.
+ *
+ *  It replaces three glyph pairs at three sizes (▼/▶ on the role and section
+ *  rows, ▾/▸ on the inner ones). Those had different advance widths, so no two
+ *  tiers put their label on the same column and each row's label shifted
+ *  sideways as it was toggled. A rotated icon keeps one footprint in both
+ *  states, and the box is sized in CSS so every tier's chevron is the same. */
+function ContextChevron({ open }: { open: boolean }) {
+  return (
+    <span class="context-chevron" data-open={open ? 'true' : 'false'} aria-hidden="true">
+      <ChevronRightIcon />
+    </span>
+  );
+}
+
 /** `tokens` is the scale from `sectionTokenScale`: a share of the capture's
  *  headline total, threaded down from `ContextSectionsArea` so every row in
- *  the tree divides the same measured (or same estimated) pie. */
+ *  the tree divides the same measured (or same estimated) pie.
+ *
+ *  The measurement reads as bare numbers rather than "N chars · ≈N tokens":
+ *  the role header above every section states the units once, and repeating
+ *  them on each of a few dozen rows is what made the tree read as a wall. */
 function ContextSectionRow({ section, tokens }: { section: ContextSection; tokens: TokenScale }) {
   const [open, setOpen] = useState(false);
   return (
     <div class="context-section" data-role="section-row">
-      <button class="context-header context-section-header" onClick={() => setOpen(!open)}>
-        <span>{open ? '▼' : '▶'}</span>
+      <button class="context-section-header" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <ContextChevron open={open} />
         <span class="context-section-name">{section.name}</span>
         <span class="context-section-chars">
-          {formatChars(section.char_count)} chars · ≈{formatTokens(tokens(section.char_count))} tokens
+          {formatChars(section.char_count)} · ≈{formatTokens(tokens(section.char_count))}
         </span>
       </button>
       {open && section.content !== undefined && (
@@ -50,8 +71,8 @@ function ContextInnerGroup({ group, tokens }: { group: InnerGroup; tokens: Token
   const totalChars = group.sections.reduce((a, s) => a + s.char_count, 0);
   return (
     <div class="context-inner-group">
-      <button class="context-inner-header" onClick={() => setOpen(!open)}>
-        <span>{open ? '▾' : '▸'}</span>
+      <button class="context-inner-header" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <ContextChevron open={open} />
         <span class="context-inner-label">{group.name}</span>
         <span class="context-inner-chars">
           {formatChars(totalChars)} · ≈{formatTokens(tokens(totalChars))}
@@ -62,6 +83,11 @@ function ContextInnerGroup({ group, tokens }: { group: InnerGroup; tokens: Token
   );
 }
 
+/** The role rows are the only ones that name the units, once per block, for
+ *  every compact number under them. The words sit in their own spans (with
+ *  their leading space inside) because a narrow modal cannot afford them: they
+ *  are what pushed a role label into four wrapped lines on a phone, and CSS
+ *  drops them there (see `.context-unit`). */
 function ContextRoleGroup({ role, tokens }: { role: RoleGroup; tokens: TokenScale }) {
   const [open, setOpen] = useState(true);
   const totalChars = role.innerGroups
@@ -69,11 +95,11 @@ function ContextRoleGroup({ role, tokens }: { role: RoleGroup; tokens: TokenScal
     .reduce((a, s) => a + s.char_count, 0);
   return (
     <div class="context-role">
-      <button class="context-role-header" onClick={() => setOpen(!open)}>
-        <span>{open ? '▼' : '▶'}</span>
+      <button class="context-role-header" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <ContextChevron open={open} />
         <span class="context-role-label">{role.label}</span>
         <span class="context-role-chars">
-          {formatChars(totalChars)} chars · ≈{formatTokens(tokens(totalChars))} tokens
+          {formatChars(totalChars)}<span class="context-unit"> chars</span> · ≈{formatTokens(tokens(totalChars))}<span class="context-unit"> tokens</span>
         </span>
       </button>
       {open && role.innerGroups.map(ig => (

@@ -84,6 +84,7 @@ vi.mock('./devices', () => ({
 
 vi.mock('../../utils/platform', () => ({
   isTauri: vi.fn(() => false),
+  isIOS: () => false,
 }));
 
 vi.mock('../../utils/tauri', () => ({

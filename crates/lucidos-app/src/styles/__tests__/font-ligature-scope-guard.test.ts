@@ -10,7 +10,7 @@
  *
  * The mechanism is a two-part contract, and BOTH halves have to hold:
  *
- *  1. Four set-points publish two custom properties, `--font-features-text`
+ *  1. Something publishes two custom properties, `--font-features-text`
  *     (explicitly OFF for Fira Code) and `--font-features-code` (explicitly ON).
  *     A custom property inherits as a *value* and renders nothing until a rule
  *     applies it, so publishing is inert and CSS alone decides scope.
@@ -18,33 +18,29 @@
  *     `html, input, textarea, select, button`, the code value on the code
  *     elements.
  *
- * FOUR WAYS TO BREAK IT, and this guard exists for all four. The first two are
- * not hypothetical: they shipped together on 2026-08-07 as a change that read
- * correctly, passed its tests, and did nothing at all.
+ * **This file now guards only half (2).** Half (1) used to be four hand-copied
+ * set-points, which is what most of this guard was for; they are one function
+ * in `@lucidos/appearance` now, and `appearance.test.ts` owns its rules
+ * (including that the OFF value is the explicit zeros, never `normal`).
+ * `appearanceBoot.test.ts` drives what actually reaches `<html>`.
  *
- *  a. Spelling the OFF value `normal`. `liga` and `calt` are default-ON features
- *     in CSS, so `normal` means "the font's defaults" and renders BYTE-IDENTICALLY
- *     to `"liga" 1, "calt" 1`. Merely removing the enabling declaration is a
- *     no-op. Only the explicit zeros disable them.
- *  b. Leaving form controls out of the text rule. A `<textarea>` does not inherit
+ * What is left is the CSS side, which no amount of deduplication reaches,
+ * and its two failure modes are the subtle ones:
+ *
+ *  a. Leaving form controls out of the text rule. A `<textarea>` does not inherit
  *     `font-feature-settings`, because the UA stylesheet's `font` shorthand
  *     resets it. `html` alone fixes prose and leaves the composer, which is the
  *     surface the bug was actually reported against, untouched.
- *  c. A set-point regressing to bare `font-feature-settings` on the document
- *     element, which puts scope back in JS where the stylesheets cannot see it.
- *  d. A consumer applying the CODE value at `:root`/`html`/`body`/`*`, which
+ *  b. A consumer applying the CODE value at `:root`/`html`/`body`/`*`, which
  *     re-inherits the ligatures to everything through the stylesheet instead.
  *
- * Note what (a) and (b) have in common: `getComputedStyle(el).fontFeatureSettings`
- * looks right in both. They were settled by pixel comparison in headless
- * Chromium against the real webfont. Do not "verify" a change here by reading
- * the computed value.
+ * Plus the `font:` shorthand sweep below, which is the same trap a third way:
+ * the shorthand silently resets the property to `normal`, re-enabling on 15
+ * sites what their own authors were trying to inherit.
  *
- * The set-points cannot share code: two are inline FOUC scripts (one in
- * `index.html`, one an `include_str!`d Rust string literal served as
- * `sdk-prefs.js`) that run before any bundle loads, one is the host store, one
- * is the SDK an app iframe imports. Duplication is forced, so the guard is the
- * thing keeping them in lockstep.
+ * All of these look RIGHT in `getComputedStyle(el).fontFeatureSettings`. They
+ * were settled by pixel comparison in headless Chromium against the real
+ * webfont. Do not "verify" a change here by reading the computed value.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -61,14 +57,6 @@ const REPO_ROOT = resolve(here, '../../../../..');
 function read(relPath: string): string {
   return readFileSync(resolve(REPO_ROOT, relPath), 'utf8');
 }
-
-/** Every place that writes the ligature value onto the document element. */
-const SET_POINTS = [
-  'crates/lucidos-app/src/store/actions/preferences.ts',
-  'crates/lucidos-app/index.html',
-  'crates/lucidos-engine/src/api/sdk_prefs.rs',
-  'packages/lucidos-sdk/src/ui.ts',
-] as const;
 
 /** Every place allowed to turn the published value into rendering. */
 const CONSUMERS = [
@@ -132,49 +120,6 @@ describe('a `font` shorthand does not silently re-enable ligatures', () => {
 });
 
 describe('Fira Code ligatures stay scoped to code surfaces', () => {
-  for (const relPath of SET_POINTS) {
-    it(`publishes the custom property, not the inherited one: ${relPath}`, () => {
-      const src = read(relPath);
-
-      for (const prop of ['--font-features-text', '--font-features-code']) {
-        expect(
-          src.includes(prop),
-          `${relPath} is one of the ${SET_POINTS.length} set-points that publish the ligature `
-          + `values; it must write ${prop} so the stylesheets decide where the `
-          + 'feature applies.',
-        ).toBe(true);
-      }
-
-      // Failure (a): the OFF value must be the explicit zeros. `normal` is "the
-      // font's defaults", and liga/calt are default-ON, so an off value spelled
-      // `normal` renders byte-identically to `1` and the whole change is inert.
-      // (`normal` is still correct for the non-Fira FALLBACK, which does want
-      // the defaults; this asserts the Fira value specifically.)
-      expect(
-        /["']liga["']\s+0\s*,\s*["']calt["']\s+0/.test(src),
-        `${relPath} does not publish an explicit "liga" 0, "calt" 0 as the text value. `
-        + '`normal` does NOT disable ligatures: liga and calt are default-ON in CSS, '
-        + 'so `normal` renders identically to `1` and a typed "..." still collapses.',
-      ).toBe(true);
-
-      // Both spellings of the same mistake. `setProperty('font-feature-settings',
-      // …)` is how all four set-points write today, quoted '...' in the TS/JS
-      // ones and "..." inside the Rust string literal; matching the property
-      // name plus its closing quote keeps the check off prose and comments that
-      // merely mention it. `style.fontFeatureSettings = …` is the IDL spelling,
-      // equally available and equally global, so a guard that only knew the
-      // first would wave the regression through in a different disguise.
-      const bareProperty = /setProperty\(\s*['"]font-feature-settings['"]|\.fontFeatureSettings\s*=/;
-      expect(
-        bareProperty.test(src),
-        `${relPath} sets font-feature-settings directly on the document element. That `
-        + "property is inherited, so it ligatures prose too, and Fira Code's calt "
-        + 'collapses a typed "..." into what reads as two dots. Publish '
-        + '--font-features-code instead and let the code-surface rule consume it.',
-      ).toBe(false);
-    });
-  }
-
   for (const relPath of CONSUMERS) {
     it(`consumes the custom property on code surfaces: ${relPath}`, () => {
       const src = read(relPath);

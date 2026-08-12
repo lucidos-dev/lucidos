@@ -349,18 +349,50 @@ impl AppUpdateRun {
     }
 }
 
-/// Check GitHub Releases for a newer signed build. Returns the new version string
-/// when an update is available, else `None`. The packaged workspace UI polls this
-/// (gated on running in the Tauri client) to drive the in-app update toast.
+/// A newer signed build, and what is in it.
+///
+/// The notes are the whole reason this is a struct rather than the bare version
+/// string it used to be. They are the ONLY way a client can say what a pending
+/// update contains: the offered version postdates the binary doing the offering,
+/// so it is by construction absent from the changelog baked into it (see
+/// `lucidos-engine`'s `engine::changelog`). Showing the installed changelog on an
+/// update offer would show the notes for the version already running, which is
+/// worse than showing none, because it looks like it worked.
+#[derive(Clone, Serialize)]
+pub struct AppUpdateOffer {
+    version: String,
+    /// The release's notes as raw markdown, or `None` when the manifest carries
+    /// none. `latest.json`'s `notes` is written from this repo's own
+    /// `CHANGELOG.md` section for that release (`scripts/lib/release_notes.sh`),
+    /// so in practice it is present and is the same prose the What's New panel
+    /// shows for every earlier release. Optional because nothing structurally
+    /// guarantees it for a hand-cut or older release, and a missing note must
+    /// degrade to "no notes shown" rather than to an empty panel.
+    notes: Option<String>,
+}
+
+/// Check GitHub Releases for a newer signed build. Returns the offer when one is
+/// available, else `None`. The packaged workspace UI polls this (gated on running
+/// in the Tauri client) to drive the in-app update toast.
 /// No-op (`None`) in development.
 #[tauri::command]
-pub async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
+pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateOffer>, String> {
     if tauri::is_dev() {
         return Ok(None);
     }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(update.map(|u| u.version.clone()))
+    Ok(update.map(|u| AppUpdateOffer {
+        version: u.version.clone(),
+        // Blank is absent. An empty-string body would otherwise render as an
+        // affordance that opens onto nothing.
+        notes: u
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string),
+    }))
 }
 
 /// Resolve the available update and stream it into memory, announcing `checking`,

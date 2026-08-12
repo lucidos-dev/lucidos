@@ -403,7 +403,10 @@ only for a completion that is **not** your own child's, named with
 `--condition '{"child_thread_id": "<uuid>"}'`. Matching is workspace-wide, so
 that is any thread's child and not only a descendant of yours: a coding-agent
 session another thread spawned is a first-class thing to watch, and the wait
-fires when its completion lands on that thread.
+fires when its completion lands on that thread. A session **nobody** spawned
+(the user started it themselves) has no `ChildThreadCompleted` at all, since
+only the parent/child fan-in emits one. Watch its turn boundary instead:
+`--on CodingAgentIdled --condition '{"thread_id": "<uuid>"}'`.
 
 A **rendezvous, not a stream**. The first match resolves the subscription and
 consumes it. "Continue when the next X happens" is this; "react to every X,
@@ -424,8 +427,13 @@ yourself a few minutes ago.
 - `--condition` is a JSON object filtering the event's OWN payload fields (the
   ones `lucidos events query` prints), applied to every `--on` name. Equality by
   default, or an operator object: `{"$eq":v}`, `{"$ne":v}`, `{"$lt":n}`,
-  `{"$lte":n}`, `{"$gt":n}`, `{"$gte":n}`, `{"$in":[…]}`. The thread an event
-  belongs to is not a payload field, so it cannot be filtered on.
+  `{"$lte":n}`, `{"$gt":n}`, `{"$gte":n}`, `{"$in":[…]}`. One field beyond the
+  payload is always filterable on a thread event: `thread_id`, supplied by the
+  engine from the thread the event belongs to, so
+  `--condition '{"thread_id":"<uuid>"}'` scopes the wait to one thread. It will
+  not appear in what `lucidos events query` prints (the event row carries the
+  thread in its own column), and a **domain event** belongs to no thread and so
+  has none to filter on.
 - `--timeout-secs` is required and capped at 86400 (24 h). There is no unbounded
   subscription. Waking early with a timeout costs one turn; waking too late
   costs the user the whole wait.
@@ -435,7 +443,7 @@ yourself a few minutes ago.
 
 Refusals arrive as a `400` carrying the reason, and are worth reading rather
 than retrying: a per-token streaming event (`TextStreamed` and friends) or an
-`EventWait*` type is refused outright, a thread may hold at most 5 live
+`EventWait*` type is refused outright, a thread may hold at most 25 live
 subscriptions, the same `--on` list twice on one thread is refused (it would
 wake you twice for one event), and 10 subscriptions in a row with no message
 from the user is the loop cap.

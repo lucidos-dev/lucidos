@@ -1,12 +1,57 @@
 //! CC stream-output line parser, split out of claude_code.rs.
 use super::*;
+use std::collections::HashSet;
+
+/// The little parse state that spans lines of ONE Claude Code stdout stream.
+/// The driver task owns an instance per spawned process and passes it to every
+/// [`parse_line`] call, so the state is per session by construction: two
+/// concurrent coding-agent sessions cannot suppress each other's events. Same
+/// shape as the Codex side's `TurnTracker` / `AppServerTracker`.
+#[derive(Debug, Default)]
+pub struct CcStreamState {
+    /// Assistant message ids a `Usage` event has already been emitted for in
+    /// the turn now in flight. See the dedup comment in the `"assistant"` arm
+    /// of [`parse_line`], and [`CcStreamState::end_turn`] for the lifetime.
+    usage_reported_message_ids: HashSet<String>,
+}
+
+impl CcStreamState {
+    /// Claim the one `Usage` event this assistant message is entitled to.
+    /// `true` means the caller may emit: nothing has reported this id yet, and
+    /// the claim is now recorded so the message's remaining frames get `false`.
+    /// It mutates on purpose, which is why it is not named as a question.
+    ///
+    /// Every id claimed this turn is remembered, not just the most recent few.
+    /// A parallel sub-agent's frames ride the PARENT's stream (the same reason
+    /// its error banner has to be filtered out below), so any number of
+    /// messages can interleave, and forgetting one would let its next frame
+    /// report the same call twice.
+    ///
+    /// A frame with no `message.id` always wins the claim and records nothing.
+    /// With no key there is no telling a repeat from a fresh call, and
+    /// under-counting spend is worse than over-counting it.
+    fn claim_usage_report(&mut self, message_id: Option<&str>) -> bool {
+        let Some(id) = message_id else { return true };
+        self.usage_reported_message_ids.insert(id.to_string())
+    }
+
+    /// Release the turn's claims at its terminal `result`. An id belongs to one
+    /// API response, so no id from a closed turn can be claimed again and
+    /// nothing is lost by forgetting them. What it buys is the bound: the set
+    /// holds one turn's messages rather than a whole session's, which matters
+    /// on a session that stays up for days. A straggler frame arriving after
+    /// the terminal re-reports its usage, which is the safe direction.
+    fn end_turn(&mut self) {
+        self.usage_reported_message_ids.clear();
+    }
+}
 
 /// Parse a single JSON line from Claude Code's stream output.
 /// Returns all recognized events from the line. An assistant message with
 /// multiple content blocks (text + tool_use) produces multiple events.
-/// Never produces `AgentEvent::Exited` — that variant is emitted by the
+/// Never produces `AgentEvent::Exited`: that variant is emitted by the
 /// driver task on process exit.
-pub fn parse_line(line: &str) -> Vec<AgentEvent> {
+pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -120,9 +165,24 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                     }
                 }
             }
-            // CC mirrors Anthropic's `usage` block on each assistant
-            // message (one per LLM API call). Surfaced as a separate
-            // `Usage` event so the consumer can emit `ContextCaptured`.
+            // CC mirrors Anthropic's `usage` block on each assistant frame, and
+            // surfacing it as a separate `Usage` event is how the consumer gets
+            // to emit `ContextCaptured`. But a frame is NOT an API call: CC
+            // splits one assistant message into one frame per content block
+            // (thinking, text, each tool_use), and every one of them carries the
+            // same `message.id` and the same cumulative usage. Reporting each
+            // frame therefore reported one call 2 to 4 times, which made
+            // `ContextCaptured` 1.73x the real call count in the dev workspace
+            // (521,038 rows for 300,499 calls, measured 2026-08-11, against
+            // 1.00x for Codex and the chat path). The all-zero skip below does
+            // not catch it: a repeat carries the same NON-zero numbers as the
+            // frame that already reported them.
+            //
+            // So the message id is the dedup key, and it is the exact one
+            // rather than a heuristic: an id is unique per API response, so a
+            // second sighting of one is always a re-report and never a second
+            // call. Only the `Usage` event is suppressed. The frame's own
+            // content block is a distinct text / tool_use and still emits above.
             if let Some(usage) = message.and_then(|m| m.get("usage")) {
                 let model = message
                     .and_then(|m| m.get("model"))
@@ -159,11 +219,16 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 // Skip empty-usage frames (CC sometimes emits a continuation
                 // assistant message with zeroed usage — no real API call
                 // happened, so a snapshot would be misleading).
-                if input_tokens > 0
+                let usage_is_from_a_real_call = input_tokens > 0
                     || output_tokens > 0
                     || cache_read_tokens > 0
-                    || cache_creation_tokens > 0
-                {
+                    || cache_creation_tokens > 0;
+                let message_id = message.and_then(|m| m.get("id")).and_then(|v| v.as_str());
+                // The two guards are orthogonal, and the `&&` order keeps them
+                // that way: an all-zero frame short-circuits before it can claim
+                // the id, so a later real frame carrying the same id is still
+                // reported.
+                if usage_is_from_a_real_call && state.claim_usage_report(message_id) {
                     events.push(AgentEvent::Usage {
                         model,
                         input_tokens,
@@ -303,6 +368,8 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             } else {
                 None
             };
+            // The turn is over, so the message ids it reported usage for can go.
+            state.end_turn();
             vec![AgentEvent::Result {
                 text,
                 duration_ms: duration,

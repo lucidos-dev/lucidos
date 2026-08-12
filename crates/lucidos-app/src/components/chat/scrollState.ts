@@ -45,18 +45,27 @@ import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMa
  *  A SUBMIT ARMS NOTHING. It is one ask with one reaction, whichever of the four
  *  shapes it takes: a reader who is already riding the live edge is taken there,
  *  because that is the chevron's standing ask being served; everyone else gets a
- *  one-shot LANDING that rests the turn's agent status line on the bottom of the
- *  viewport, so they see the agent take what they just submitted with the reply
- *  growing in underneath. Neither outcome outlives the moment. This is a change
- *  from the earlier rule, where a send and an answer armed the follow: riding is
- *  the chevron's alone now.
+ *  one-shot LANDING that brings the turn they acted on as far up the viewport as
+ *  the transcript can actually reach, so what they submitted is on screen with
+ *  the agent status line under it. Neither outcome outlives the moment. This is a
+ *  change from the earlier rule, where a send and an answer armed the follow:
+ *  riding is the chevron's alone now.
+ *
+ *  THE LANDING LINE IS SHARED. A turn comes to rest in the same place whatever
+ *  put it there, a submit, ⌘↑/⌘↓ turn stepping or a deep link: `scroll-margin-top`
+ *  below the container's top edge, clear of the chrome stacked there. See
+ *  `turnLandingClearancePx`. It is reachable for any turn with a screenful of
+ *  content below it, which the NEWEST turn by definition has not got, so a submit
+ *  on one lands by the modest ask instead: show the turn. NOTHING IS RESERVED
+ *  UNDER IT to make the line reachable. A screenful of `min-height` was, until
+ *  2026-08-12, and it is gone: see `landOnOwnTurn` for what replaced it and why.
  *
  *  A SUBMIT WRITES NOTHING ONLY WHEN THERE IS NOWHERE TO GO, and that is decided
- *  by measuring the landing rather than by predicting it: if the status line is
- *  already resting at or above the bottom edge, the target is behind the reader
- *  and nothing is written. A thread that fits on screen answers that way by
- *  construction. Two earlier branches tried to reach the same conclusion BEFORE
- *  the turn rendered, and both got the ordinary case wrong; see `followSubmit`.
+ *  by measuring the landing rather than by predicting it: if the turn is already
+ *  resting at or above the landing line, the target is behind the reader and
+ *  nothing is written. Two earlier branches tried to reach the same conclusion
+ *  BEFORE the turn rendered, and both got the ordinary case wrong; see
+ *  `followSubmit`.
  *
  *  Four things retire a standing follow, and all four are the reader: their own
  *  scroll GESTURE, a chevron or turn-nav press, opening another thread, and a
@@ -379,12 +388,21 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
  *  nothing following. So the request is WRITTEN DOWN per thread, as one of the
  *  two forms a reading position takes (`hooks/useScrollMemory.ts`), and
  *  `resumeFollowingBottom` re-arms it on re-entry. That is the same request
- *  resumed, not a second arming point: only a chevron request can ever be
- *  recorded, since only the chevron arms, so the resume can only ever replay one
+ *  resumed, not a second arming point: only a TOGGLE request can ever be
+ *  recorded, since only the toggle arms, so the resume can only ever replay one
  *  the reader made in this thread. A reader who merely parked at the bottom
  *  saves the offset instead and comes back to it following nothing.
  *  `isFollowScroll` and `onFollowArmed` are the two things the recording side
  *  needs; both are below.
+ *
+ *  The resume has TWO PLACEMENTS, and the second exists because one open is not
+ *  this hook's to position: a DEEP LINK. Ordinarily the resume writes today's
+ *  live edge and rides from there. On a deep-linked open it writes nothing and
+ *  arms where the reader already is, because the link owns the POSITION and the
+ *  record owns the REQUEST, and those are two different answers that both hold.
+ *  Without it the retire above had no matching resume on exactly that open, so a
+ *  notification tap into a thread the reader was riding landed them on the event
+ *  with the toggle dark. See `FollowResumeFrom`.
  *
  *  The condition for following is this flag AND the agent being live, and
  *  nothing else. There is no proximity term (the retired 80px stickiness window)
@@ -401,7 +419,10 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
  *  reader off the event they asked for. On an IDLE thread it retires nothing, in
  *  step with every other retirement: there is no next token, and the reader who
  *  followed a link into a finished thread has not asked to stop riding the ones
- *  that come later. */
+ *  that come later. Nothing about the link's own OPEN retires it either, which
+ *  needed the in-place resume above to be true rather than merely intended: the
+ *  link cost the reader the ride through the thread switch it rode in on, not
+ *  through anything the landing did. */
 const _followingBottom = signal(false);
 
 /** Is the standing follow armed? Read by the follow toggle, which RENDERS it.
@@ -454,24 +475,27 @@ function recordFollowSeed(on: boolean): void {
 }
 
 /** Apply the seed to `el`: arm the follow if that is what the reader last chose,
- *  and report whether it did (the caller has to know, because arming writes the
- *  live edge and its own no-position reset would undo it).
+ *  and report whether the SEED SPOKE. The caller has to know, because a
+ *  `live-edge` resume writes the live edge and its own no-position reset would
+ *  undo it; an `in-place` one writes nothing, and the caller that asks for that
+ *  has no reset of its own to skip.
  *
  *  Named for what it DOES rather than for when it is right to call, because it
  *  checks only the seed. WHERE the seed may speak is the caller's to decide and
- *  is the load-bearing half: `attachScrollMemory` calls it in the one branch with
- *  no *reading position* at all, and only for the transcript. A thread the reader
- *  HAS parked in must keep deciding for itself, and the content pane and the
- *  thread drawer must never arm the transcript's follow.
+ *  is the load-bearing half: `attachScrollMemory` calls it in the two branches
+ *  with no *reading position* at all (the ordinary open, and the one a deep link
+ *  owns), and only for the transcript. A thread the reader HAS parked in must
+ *  keep deciding for itself, and the content pane and the thread drawer must
+ *  never arm the transcript's follow.
  *
  *  Deliberately routed through `resumeFollowingBottom` rather than arming
- *  directly: it is the same act (write the live edge THIS thread has now, then
- *  arm), the write is what stops the reader being left at the outgoing thread's
- *  offset in the shared container, and reusing it keeps the arming entry points at
- *  two. */
-export function applyFollowSeed(el: HTMLElement): boolean {
+ *  directly: it is the same act (arm this thread's request, writing the live edge
+ *  or not per `from`), the write is what stops the reader being left at the
+ *  outgoing thread's offset in the shared container, and reusing it keeps the
+ *  arming entry points at two. */
+export function applyFollowSeed(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): boolean {
   if (!_followSeed.value) return false;
-  resumeFollowingBottom(el);
+  resumeFollowingBottom(el, from);
   return true;
 }
 
@@ -700,9 +724,9 @@ let _pendingLanding: { resolveTurn: TurnResolver; at: number } | null = null;
  *  Lapsing moves nobody, and does NOT fall back to the live edge. It used to,
  *  because the send had armed a standing follow that had to be honoured somehow;
  *  with no arming there is nothing to honour, and the case the deadline covers
- *  is precisely a turn with no response panel, so there is no agent status line
- *  to show the reader even if they were taken there. Without the deadline a
- *  pending landing would sit forever and hold the growth branch inert. */
+ *  is precisely a turn with no box, so there is nothing to show the reader even
+ *  if they were taken there. Without the deadline a pending landing would sit
+ *  forever and hold the growth branch inert. */
 const LANDING_DEADLINE_MS = 1000;
 
 /** The ONE at-the-live-edge threshold. 2px of slack absorbs subpixel rounding
@@ -816,25 +840,63 @@ function armFollowOn(el: HTMLElement | null) {
   if (!wasArmed) for (const listener of _followArmedListeners) listener();
 }
 
+/** Where a resumed standing follow starts from, i.e. whether resuming it also
+ *  MOVES the reader.
+ *
+ *  `live-edge` is the ordinary re-entry, and the write is required rather than
+ *  tidy: `.thread-content` is one element reused across threads, so on arrival it
+ *  holds the OUTGOING thread's offset, and arming alone would leave the reader
+ *  there until the next growth round.
+ *
+ *  `in-place` writes nothing, because something else owns where the reader is
+ *  looking on this open, and there is exactly one such thing: a DEEP LINK. The
+ *  link owns the POSITION and the record owns the REQUEST, so both answers hold
+ *  and the reader gets the event they tapped AND the ride they never asked to
+ *  end. Only `standDownForDeepLink` asks for it. */
+export type FollowResumeFrom = 'live-edge' | 'in-place';
+
 /** Resume a standing follow the reader armed in this thread BEFORE they left it:
- *  write the live edge and arm, so the growth branch carries them from there.
+ *  arm, then write the live edge, so the growth branch carries them from there.
  *
  *  Called only by `attachScrollMemory`, on a thread whose recorded reading
- *  position is the live edge. The write is required and not merely tidy:
- *  `.thread-content` is one element reused across threads, so on arrival it holds
- *  the OUTGOING thread's offset, and arming alone would leave the reader there
- *  until the next growth round. It goes through `markHeldScroll` like every
- *  other follow write, so the mobile header stands down for it and the render
- *  window does not read it as the reader asking for older turns.
+ *  position is the live edge (or, through `applyFollowSeed`, on one with no
+ *  record at all). The write goes through `markHeldScroll` like every other
+ *  follow write, so the mobile header stands down for it and the render window
+ *  does not read it as the reader asking for older turns.
  *
  *  Nothing waits for content here, unlike the offset restore's observer retries.
  *  An offset can only be honoured once the transcript is tall enough to hold it,
  *  whereas the live edge is wherever the content currently ends: the write lands
  *  on today's bottom and the armed follow rides every later arrival to the real
  *  one. */
-export function resumeFollowingBottom(el: HTMLElement): void {
-  markHeldScroll(el, liveEdgeTop(el));
+export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): void {
+  if (from === 'in-place') {
+    // Two guards, and both are about what resuming may NOT undo.
+    //
+    // ALREADY ARMED means the reader never lost the request: a link into the
+    // thread they are already in re-attaches nothing and `focusThread` retires
+    // nothing, so there is no request to resume. Arming again would clear the
+    // held stamp `isFollowScroll` reads, which silently switches what this
+    // landing records from the live edge to an offset.
+    if (_followingBottom.value) return;
+    // LIVE means the landing has just ended the ride ON PURPOSE
+    // (`scrollToSelectorAndPulse`), because a link into a streaming thread is a
+    // request to be at ONE place and the next token would carry the reader off
+    // it. This runs afterwards, so resuming would undo that decision. The
+    // question is the same one every other retirement asks, and it is fresh
+    // here: `ChatExchange` publishes the incoming thread's liveness from a
+    // child effect, which Preact flushes before this attachment's.
+    if (threadIsLive()) return;
+    // No stamp: the reader is wherever the LINK put them, which is not a
+    // position the follow wrote and must not be recorded as the live edge. The
+    // landing is an ordinary offset, exactly as it is for a same-thread link
+    // (see `currentPosition` in `hooks/useScrollMemory.ts`). The first growth
+    // round after the thread wakes stamps it properly.
+    armFollowOn(null);
+    return;
+  }
   armFollowOn(el);
+  markHeldScroll(el, liveEdgeTop(el));
 }
 
 /** Is the scroll event being handled the FOLLOW's own write rather than the
@@ -1283,56 +1345,83 @@ function cardTurn(el: HTMLElement, bodySelector: string, attr: string, value: st
   return null;
 }
 
-/** The AGENT STATUS LINE of the turn `panel` belongs to: the `.response-header`
- *  of that turn's response panel, the row carrying the executor's name and the
- *  live Requesting / Working label (see `ResponsePanel` in
- *  `chat-exchange-parts`).
+/** Fallback clearance when the computed `scroll-margin-top` is unavailable (the
+ *  DOM-free unit environment, or an element with no layout): ~0.5rem, the base
+ *  `--deep-link-focus-gap`. */
+const TURN_LANDING_FALLBACK_GAP_PX = 8;
+
+/** Slack on "can the container reach the landing line": a turn that falls a few
+ *  fractional pixels short of tall enough takes the line anyway, and the browser
+ *  clamps it those few pixels lower.
  *
- *  It is what a submit's landing actually aims at. The reader's own panel is
- *  where the landing used to stop, and stopping there answers the wrong
- *  question: they can already recall what they just wrote, and what they are
- *  looking for is whether the agent picked it up. One row lower is the whole
- *  difference between a transcript that says "sent" and one that says nothing.
+ *  It matters only at the boundary, where a turn is within a rounding error of a
+ *  screenful. `scrollHeight` and `clientHeight` are integers while the turn's own
+ *  top is fractional, so an exact test flips there for reasons no reader can see,
+ *  and flipping is not a small difference in outcome: the other branch lands the
+ *  turn a whole `padding-bottom` lower. Everywhere else the two answers are a
+ *  viewport apart and 4px decides nothing. */
+const LANDING_REACH_SLACK_PX = 4;
+
+/** THE LANDING LINE: how far below the transcript's top edge a turn comes to
+ *  rest when the app navigates to it, read off `.chat-exchange`'s computed
+ *  `scroll-margin-top` (chat/response.css).
  *
- *  Scoped through the enclosing `.chat-exchange`, never taken as the last header
- *  in the transcript, because a turn with NO response panel is ordinary rather
- *  than exotic: a queued follow-up carries its "Queued" tag in its own bubble and
- *  renders no panel at all. The last header would then belong to an earlier turn,
- *  ABOVE the reader's message, and the landing would go backwards.
+ *  ONE number for every navigation that puts a turn at the top, which is now all
+ *  three of them: a deep link (which gets it from `scroll-margin-top` directly,
+ *  through `smoothScrollToElement`), ⌘↑/⌘↓ turn stepping, and a SUBMIT's landing.
+ *  They must agree or the same turn would come to rest in three different places
+ *  depending on what put it there.
  *
- *  Null while the response panel has not mounted yet and for a turn that never
- *  gets one; the landing falls back to the panel in both cases. Never a header
- *  with no box either: a collapsed pane or a detached node reports an all-zero
- *  rect, and subtracting the container's bottom edge from that would haul the
- *  transcript to its top, which is the trap `landOnOwnTurn`'s own guard covers
- *  for the panel. */
-function turnStatusLine(panel: HTMLElement): HTMLElement | null {
-  if (typeof panel.closest !== 'function') return null;
-  const turn = panel.closest(TURN_SELECTOR) as HTMLElement | null;
-  const header = turn?.querySelector?.('.response-header') as HTMLElement | null;
-  return header && isElementVisible(header) ? header : null;
+ *  It has to be read rather than written here because what it clears is a stack
+ *  of chrome that differs per breakpoint and is described in CSS: the desktop
+ *  top-fade band and the floating up-chevron, the mobile app header and sticky
+ *  thread-title row, plus the focus highlight's own bloom. Keeping the number
+ *  beside the things it measures is the same reasoning that keeps the deep-link
+ *  clearance in CSS, and it is why this is not a constant.
+ *
+ *  Read off the TURN, since that is where the rule is declared; a caller holding
+ *  an inner panel resolves its `.chat-exchange` first. */
+function turnLandingClearancePx(turn: HTMLElement): number {
+  if (typeof getComputedStyle !== 'function') return TURN_LANDING_FALLBACK_GAP_PX;
+  const px = parseFloat(getComputedStyle(turn).scrollMarginTop);
+  return Number.isFinite(px) && px > 0 ? px : TURN_LANDING_FALLBACK_GAP_PX;
 }
 
-/** Room to leave UNDER a landing, read as the anchor's resolved
- *  `scroll-margin-bottom`.
+/* ── THE TRANSCRIPT RESERVES NOTHING UNDER ITS NEWEST TURN ───────────────────
+ *  It did between 2026-08-11 and 2026-08-12: one viewport of `min-height`, the
+ *  TAIL ROOM, measured here and applied in chat/response.css, so that the newest
+ *  turn could be scrolled all the way up to the landing line and the reply would
+ *  grow into the room rather than past the fold.
  *
- *  The transcript's bottom edge is not clear space: the prompt dissolve
- *  (`.prompt-area::before`, panels/content.css) paints a background-coloured
- *  band over it, so a row rested flush against that edge is exactly as invisible
- *  as one below the fold. The status line names its own clearance in
- *  chat/response.css and this reads it, which is the mirror of
- *  `turnNavClearancePx` reading `scroll-margin-top` for the fade at the other
- *  end, and the same reason for keeping the number in CSS: the band's height is
- *  a token, and a literal here would drift from it.
+ *  It was reserved AIR, and air below the last turn is a lie about how much
+ *  thread there is. Three reports in two days, each a different reader meeting
+ *  the same screenful:
  *
- *  Zero for an anchor that declares none (every anchor but the status line: the
- *  reader's own message panel keeps landing flush, as it always has) and zero
- *  where there is no layout to ask. */
-function landingClearancePx(anchor: HTMLElement): number {
-  if (typeof getComputedStyle !== 'function') return 0;
-  const px = parseFloat(getComputedStyle(anchor).scrollMarginBottom);
-  return Number.isFinite(px) && px > 0 ? px : 0;
-}
+ *   - A rider was carried into it. The room extends the scrollable range past
+ *     where the content ends, so the live edge stopped being "the newest content
+ *     at the bottom of the screen" and became "the newest turn at the top, with
+ *     air under it", taking the running reply off the screen.
+ *   - Withholding it from a rider fixed that and bought a worse one: the air's
+ *     absence then depended on the follow being ARMED, so any path that failed to
+ *     re-arm showed a screenful of blank as its symptom. A layout that reads the
+ *     follow flag makes every arming bug a visible one.
+ *   - And it appeared MID-TURN either way, because the room is withheld from a
+ *     queued follow-up (which grows no reply) until the agent picks it up. The
+ *     transcript then grew by a screen in one step under a reader who was riding
+ *     it.
+ *
+ *  So the reservation is gone and nothing replaced it. What the landing does
+ *  without it is not a clamp by accident: `landOnOwnTurn` asks for the line only
+ *  when the turn can actually reach it, and otherwise asks the modest question,
+ *  SHOW THE TURN. A submit therefore brings the reader's own message as far up
+ *  the screen as the real content allows, which for a long reply is the landing
+ *  line itself and for a fresh turn is the bottom of the screen with the status
+ *  line under it. The reply then grows the transcript for real, and a rider rides
+ *  actual content.
+ *
+ *  Nothing here reads the follow flag any more, which is the property worth
+ *  keeping: the transcript's height is a function of its content and nothing
+ *  else. */
 
 /** Put the container ON the live edge in one held write, and reconcile the
  *  chevron behind it: the write can land where the container already was, and
@@ -1402,16 +1491,14 @@ function glideToLiveEdge(el: HTMLElement): void {
  *   - **Already riding the live edge**: glide to the live edge. Riding it is a
  *     STANDING request to be kept at the bottom, so a submit made while it is
  *     armed asks for the bottom and not for a look at the turn they acted on.
- *   - **Everyone else**: glide to the turn's AGENT STATUS LINE, landing that row
- *     on the bottom of the viewport, so they see the agent take what they
- *     submitted with the thing they submitted sitting just above it and the
- *     answer growing in underneath. The status line and not the turn's own bottom
- *     edge, because "did it go through" is the question a submit asks and the
- *     Requesting / Working row is where it is answered. Anchored on an ELEMENT
- *     either way, never computed from `scrollHeight`: the transcript grows
- *     between the submit and the landing and a `scrollHeight` target then lands
- *     PAST the turn and hides the very thing they acted on. See `landOnOwnTurn`
- *     and `turnStatusLine`.
+ *   - **Everyone else**: glide so the turn they acted on comes as far up the
+ *     viewport as the transcript can reach, which is its TOP on the landing line
+ *     when there is a screenful under it and simply "the whole turn on screen"
+ *     when there is not. Anchored on an ELEMENT, never computed from
+ *     `scrollHeight`: the
+ *     transcript grows between the submit and the landing, and a `scrollHeight`
+ *     target then lands PAST the turn and hides the very thing they acted on.
+ *     See `landOnOwnTurn`.
  *
  *  TWO, not four. It shipped with two more branches that declined to move
  *  anybody, and both were the same mistake: they asked a question about the
@@ -1434,10 +1521,10 @@ function glideToLiveEdge(el: HTMLElement): void {
  *  What both were reaching for survives as ONE test, in the right place and
  *  against the right thing: `landOnOwnTurn` writes nothing when its target is at
  *  or behind the current position. That is physics rather than policy, since the
- *  status line is already in view and there is nowhere to go, and it subsumes
- *  both: a thread too short to scroll cannot produce a target ahead of the
- *  reader, and neither can one whose status line is already resting above the
- *  bottom edge. Asked per frame, against the real anchor, after the turn exists.
+ *  turn is already at or above the landing line and there is nowhere to go, and
+ *  it subsumes both: a thread too short to scroll cannot produce a target ahead
+ *  of the reader, and neither can a turn the reader is already looking at the top
+ *  of. Asked per frame, against the real turn, after that turn exists.
  *
  *  The landing takes a POSITION STAMP before it does anything, because the two
  *  deferred submits move nobody for a frame or more and the reader's flick in
@@ -1471,33 +1558,30 @@ function followSubmit(resolveTurn: TurnResolver): void {
     // is the live edge itself, which is exactly where the growth is about to
     // take them anyway, so a rider already on it needs no write and gets no
     // redundant tween (on iOS that would cancel a momentum scroll). The LANDING
-    // cannot ask the same question, because its target is a status line that does
-    // not exist yet and will render BELOW where the reader is standing.
+    // cannot ask the same question, because its target is a turn that does not
+    // exist yet and will render BELOW where the reader is standing.
     if (!isAtLiveEdge(el)) glideToLiveEdge(el);
     return;
   }
   // A landing already PENDING keeps the floor, unless it has LAPSED. The two
   // checks are the same rule from opposite sides: the growth branch expires it
   // when a round happens to run, and this expires it when one never does. A
-  // queued follow-up is exactly that case, and it is the common one now that the
-  // landing waits for a status line the queued turn will never render: the turn
-  // resolves, nothing else grows the transcript, and the stale pending landing
-  // sat on `_pendingLanding` forever. The reader's NEXT submit then returned on
-  // the line below without installing its own resolver, so it never landed.
-  // Found by the Codex reviewer, 2026-08-10.
+  // queued follow-up is exactly that case: it folds into a closed disclosure
+  // group, so it never becomes addressable, nothing else grows the transcript,
+  // and the stale pending landing sat on `_pendingLanding` forever. The reader's
+  // NEXT submit then returned on the line below without installing its own
+  // resolver, so it never landed. Found by the Codex reviewer, 2026-08-10.
   dropLapsedLanding();
   if (_pendingLanding) return;
   holdPosition(el);
-  // The turn AND its status line, or the landing waits. Resolving on the panel
-  // alone is what put the reader on the end of their own message: the response
-  // panel can mount a commit or two after the row, and `landOnOwnTurn` asks its
-  // do-not-scroll-backwards test once, at the moment it is called. Asked against
-  // the panel it either declines (nothing happens) or aims one row short and
-  // settles there if the header arrives after the tween has finished. Waiting
-  // costs nothing the deferral did not already cost, and hands the deadline the
-  // case it was written for: a turn that never gets a response panel at all.
+  // The turn, and nothing else. This used to wait for the turn's STATUS LINE as
+  // well, because that row was the target and the response panel can mount a
+  // commit or two after the row it belongs to, so a landing aimed while it was
+  // missing stopped one row short. The target is the turn's own TOP now, which is
+  // fixed the instant the turn renders and cannot be improved on by waiting, and
+  // the status line arrives into the viewport underneath it whenever it arrives.
   const panel = resolveTurn(el);
-  if (panel && turnStatusLine(panel)) { landOnOwnTurn(el, panel); return; }
+  if (panel) { landOnOwnTurn(el, panel); return; }
   _pendingLanding = { resolveTurn, at: nowMs() };
 }
 
@@ -1574,82 +1658,93 @@ export function followContinuedThread(): void {
   followSubmit(awaitsNewTurn(lastTurn));
 }
 
-/** Glide so the turn's AGENT STATUS LINE rests on the container's bottom edge,
- *  marking every frame as a held scroll. `panel` is the turn the reader acted
- *  on: their optimistic message row for a send, the answered card's initiator
- *  panel for an answer, the decided card's for a permission, the whole
- *  continuation exchange for Continue. The line is `turnStatusLine(panel)`, and
- *  the panel itself is the fallback for a turn that has no response panel to
- *  carry one.
+/** Glide so the turn the reader acted on comes as far UP the viewport as the
+ *  transcript can actually take it, marking every frame as a held scroll. `panel`
+ *  is what the submit resolved: their optimistic message row for a send, the
+ *  answered card's initiator panel for an answer, the decided card's for a
+ *  permission, the whole continuation exchange for Continue. The thing landed is
+ *  that panel's `.chat-exchange`, whose top is the panel's top in every one of
+ *  those cases (a turn renders as `[initiator panel, response panel?]`, so the
+ *  panel a submit resolves is the turn's first child) and which is where the
+ *  landing line is declared.
  *
- *  Landing the STATUS LINE rather than the panel is the point of the whole
- *  glide. A reader who submits from up the transcript is asking "did that go
- *  through, and is it working on it", and the answer is the Requesting / Working
- *  row under what they submitted, not that thing itself, which they produced a
- *  second ago and can see the top of anyway.
+ *  UPWARD is the reason. A reader who submits is asking "did that go through, and
+ *  what does it say", and both are answered by the screen below their message: the
+ *  agent status line says the turn was taken, and the reply then streams into
+ *  whatever is under it. The landing used to rest that STATUS LINE on the
+ *  container's bottom edge instead, which answered the first question and spent
+ *  the entire screen doing it.
  *
  *  It is emphatically NOT the response panel's bottom, which would be the
  *  live-edge chase this landing exists instead of: the panel grows with every
  *  token, so anchoring there would drag the reader down through an answer they
- *  have not read and hide the thing they just submitted, which is exactly what
- *  `followSubmit`'s fourth bullet forbids. The status line is a fixed row at the
- *  TOP of that growth, so it holds still while the reply arrives beneath it.
+ *  have not read. The turn's top is a fixed line ABOVE all of that growth, so it
+ *  holds still while the reply arrives beneath it.
  *
- *  It rests ABOVE the container's bottom edge by whatever clearance the anchor
- *  asks for (`landingClearancePx`), because that edge is under the prompt
- *  dissolve and a row landed flush against it is painted over.
+ *  HOW FAR up is decided by measuring, not by wishing, and that is the whole of
+ *  what `targetOf` does. The landing LINE is reachable only for a turn with a
+ *  screenful under it, and the newest turn does not have one: nothing is reserved
+ *  below it (see "THE TRANSCRIPT RESERVES NOTHING UNDER ITS NEWEST TURN"). So the
+ *  ask becomes the modest one, SHOW the turn, rather than asking for the line and
+ *  letting the browser clamp. A clamp is a decision by accident: it drags the
+ *  reader to the live edge for a turn that cannot reach the top anyway. Combined
+ *  with the do-not-scroll-backwards guard, the modest ask also means a queued
+ *  follow-up already on screen moves nobody, leaving the message they sent first
+ *  where its own landing put it. A long reply's turn grows past a screenful as it
+ *  streams and reaches the line on its own, with no reservation to help it.
  *
- *  The target is re-read per frame by `animateScroll`, so a reply streaming
- *  under it during the glide is tracked rather than overshot. Reduced motion
+ *  The target is re-read per frame by `animateScroll`, so content settling above
+ *  the turn during the glide is tracked rather than overshot. Reduced motion
  *  writes it once, as everywhere else in this module. A target at or behind the
- *  current position writes nothing: the turn is already fully in view through
- *  its status line, and a submit has no business scrolling the reader backwards
- *  to prove it.
+ *  current position writes nothing: the turn is already at or above the line, and
+ *  a submit has no business scrolling the reader backwards to prove it.
  *
- *  A panel that LEAVES the layout mid-glide (the reader opens another thread, a
+ *  A turn that LEAVES the layout mid-glide (the reader opens another thread, a
  *  second queued follow-up reparents this one into its disclosure group) holds
- *  the tween on the last target it measured while the panel was still there, so
+ *  the tween on the last target it measured while the turn was still there, so
  *  the glide finishes where it was heading. Nothing else cancels a tween on a
- *  thread switch, and a detached node reports an all-zero rect, so without the
- *  guard the subtraction of the container's bottom edge would make the target a
- *  whole viewport NEGATIVE and haul the newly-opened thread to its top. The
- *  floor is the same belt for a rect that is merely surprising. */
+ *  thread switch, and a detached node reports an all-zero rect, which would make
+ *  the target the container's own negative offset and haul the newly-opened
+ *  thread to its top. The floor is the same belt for a rect that is merely
+ *  surprising. */
 function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
   let lastTarget = -1;
-  /** The row the glide rests on the container's bottom edge, and the room to
-   *  leave under it: the status line once it is in the DOM, the reader's own
-   *  panel until then and for a turn that never gets one.
-   *
-   *  Re-asked each frame only while the answer is still the panel, because the
-   *  response panel can mount a frame or two after the row the landing was
-   *  scheduled on, and a target fixed at call time would stop one row short of
-   *  the thing the reader is waiting for. Held once found, so a settled glide
-   *  costs the one rect read per frame every other tween does rather than a
-   *  `closest` + a visibility walk, and it is what keeps the CLEARANCE to a
-   *  single `getComputedStyle` instead of one per frame. Dropped again if the
-   *  node ever leaves the layout. */
-  let anchor: HTMLElement = panel;
-  let clearance = landingClearancePx(panel);
-  const anchorOf = (): HTMLElement => {
-    if (anchor !== panel && anchor.isConnected !== false) return anchor;
-    // Only on a CHANGE of anchor, which is what keeps the fallback cheap: a turn
-    // that never gets a status line re-asks for one every frame and must not pay
-    // a `getComputedStyle` for the same panel each time it hears no.
-    const next = turnStatusLine(panel) ?? panel;
-    if (next !== anchor) {
-      anchor = next;
-      clearance = landingClearancePx(next);
-    }
-    return anchor;
-  };
+  // The turn, and the room to leave above it. Both are resolved ONCE: a turn
+  // does not become a different element while the glide runs (the panel inside
+  // it can, which is why an answered question card's landing holds the panel and
+  // not its body), and the clearance is a breakpoint-level constant, so re-asking
+  // either per frame would buy nothing and cost a `closest` plus a
+  // `getComputedStyle` on every one.
+  const turn = (panel.closest?.(TURN_SELECTOR) as HTMLElement | null) ?? panel;
+  const clearance = turnLandingClearancePx(turn);
   const targetOf = (c: HTMLElement) => {
-    const on = anchorOf();
-    if (panel.isConnected === false
+    if (turn.isConnected === false
       || typeof c.getBoundingClientRect !== 'function'
-      || typeof on.getBoundingClientRect !== 'function') {
+      || typeof turn.getBoundingClientRect !== 'function') {
       return lastTarget >= 0 ? lastTarget : c.scrollTop;
     }
-    lastTarget = Math.max(0, c.scrollTop + clearance + (on.getBoundingClientRect().bottom - c.getBoundingClientRect().bottom));
+    const rect = turn.getBoundingClientRect();
+    const origin = c.getBoundingClientRect().top - c.scrollTop;
+    // The landing line, and the least the container can scroll to show the whole
+    // turn. They are the two answers to "where should this rest", and WHICH ONE
+    // applies is decided by whether the line is reachable at all.
+    const line = rect.top - origin - clearance;
+    const reveal = rect.bottom - origin - c.clientHeight;
+    const furthest = Math.max(0, c.scrollHeight - c.clientHeight);
+    // Reachable means this turn has a screenful of real transcript under it, so
+    // the line is a position the container can hold: rest on it. A turn deep in
+    // a long thread answers this way, and so does a reply that has streamed past
+    // a screenful of its own.
+    //
+    // Unreachable is the NEWEST turn, which is most submits, since the transcript
+    // reserves nothing below it. Asking for the line anyway would let the browser
+    // clamp, and a clamp is a decision by accident: it drags the reader to the
+    // live edge for a turn that cannot get there, taking them off whatever they
+    // were watching to gain nothing. So the ask becomes the modest one instead,
+    // show the turn, and the do-not-scroll-backwards guard below then does the
+    // rest: a queued message already on screen moves nobody at all, and the
+    // message they sent FIRST stays where its own landing put it.
+    lastTarget = Math.max(0, line <= furthest + LANDING_REACH_SLACK_PX ? line : Math.min(line, reveal));
     return lastTarget;
   };
   if (targetOf(el) <= el.scrollTop) return;
@@ -1689,11 +1784,8 @@ function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
 function honourGrowth(el: HTMLElement): void {
   if (_scrollAnimRaf !== null) return;
   if (_pendingLanding) {
-    // Both, for the reason `followSubmit` gives: the status line is the anchor,
-    // so a landing started before it exists asks its own guard the wrong
-    // question.
     const panel = _pendingLanding.resolveTurn(el);
-    if (panel && turnStatusLine(panel)) {
+    if (panel) {
       _pendingLanding = null;
       landOnOwnTurn(el, panel);
       return;
@@ -2458,23 +2550,6 @@ const TURN_SELECTOR = '.chat-exchange';
  *  larger clearance must not widen the "skip" band, or short adjacent turns become
  *  unreachable by stepping. */
 const TURN_NAV_THRESHOLD_SLACK_PX = 4;
-/** Fallback clearance when the computed `scroll-margin-top` is unavailable (jsdom /
- *  no layout) — ~0.5rem, the base `--deep-link-focus-gap`. */
-const TURN_NAV_FALLBACK_GAP_PX = 8;
-
-/** Room to leave above a turn landed by keyboard turn-nav — the SAME clearance the
- *  deep-link / notification navigation gets for free from `.chat-exchange`'s CSS
- *  `scroll-margin-top` (the top fade band + header stack + focus-highlight gap; see
- *  chat/response.css). Turn-nav animates to an explicit scroll position rather than
- *  via `scrollIntoView`, so `scroll-margin-top` doesn't apply automatically — it
- *  reads the computed value here so both navigation paths share one source of
- *  truth for "make room on top". Falls back to a small gap when the computed style
- *  is unavailable. */
-function turnNavClearancePx(turn: HTMLElement): number {
-  if (typeof getComputedStyle !== 'function') return TURN_NAV_FALLBACK_GAP_PX;
-  const px = parseFloat(getComputedStyle(turn).scrollMarginTop);
-  return Number.isFinite(px) && px > 0 ? px : TURN_NAV_FALLBACK_GAP_PX;
-}
 
 /** Pure pick of the turn to jump to. `tops` are each turn's top in the container's
  *  scroll coordinate space (ascending, DOM order); `scrollTop` is the current
@@ -2551,9 +2626,10 @@ export function stepThreadTurn(direction: 1 | -1): void {
 
   const turns = Array.from(el.querySelectorAll<HTMLElement>(TURN_SELECTOR)).filter(isElementVisible);
   if (turns.length === 0) return;
-  // Reuse the deep-link navigation's clearance (.chat-exchange scroll-margin-top);
-  // all turns share the same CSS rule, so read it off the first one.
-  const gap = turnNavClearancePx(turns[0]);
+  // The shared landing line (.chat-exchange scroll-margin-top), the same one a
+  // deep link and a submit's landing come to rest on; all turns share the CSS
+  // rule, so read it off the first one.
+  const gap = turnLandingClearancePx(turns[0]);
   const containerTop = el.getBoundingClientRect().top;
   const tops = turns.map((t) => t.getBoundingClientRect().top - containerTop + el.scrollTop);
   // A landed turn's top rests on the landing line at `scrollTop + gap`, so "next"

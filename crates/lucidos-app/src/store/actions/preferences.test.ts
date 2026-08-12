@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -57,10 +57,10 @@ describe('currentTheme — localStorage fallback', () => {
     expect(currentTheme()).toBe('light');
   });
 
-  it('returns dark as final fallback when nothing is set', () => {
+  it('follows the OS as final fallback when nothing is set', () => {
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('dark');
+    expect(currentTheme()).toBe('system');
   });
 
   it('returns system from localStorage when backend has no theme', () => {
@@ -88,7 +88,24 @@ describe('currentTheme — localStorage fallback', () => {
     localStorage.setItem('lucidos-theme', 'purple');
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('dark');
+    expect(currentTheme()).toBe('system');
+  });
+
+  // The defaults apply where nothing is stored, which is most existing devices:
+  // no first run seeds either row, so a device that never opened Settings picks
+  // them up. A device that DID pick keeps its pick, and the two cases above
+  // ('returns backend theme…', 'skips invalid backend value…') pin that half.
+  it('defaults an untouched device to system theme and Fira Code', () => {
+    preferences.value = { status: 'loaded', data: {} };
+
+    expect(currentTheme()).toBe('system');
+    expect(currentFontFamily()).toBe('fira-code');
+  });
+
+  it('a stored font pick survives the default', () => {
+    preferences.value = { status: 'loaded', data: { 'font-family': 'ibm-plex-mono' } };
+
+    expect(currentFontFamily()).toBe('ibm-plex-mono');
   });
 });
 

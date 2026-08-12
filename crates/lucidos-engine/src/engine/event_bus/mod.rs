@@ -529,6 +529,20 @@ impl EventBus {
         // Broadcast on the bus so subscribers observe the replay. Only emit
         // when the insert actually happened — re-runs (ON CONFLICT skip) must
         // not double-fire downstream consumers.
+        //
+        // **A system frame, even for a row that carries a `thread_id`.** That
+        // is deliberate: a backfilled historical event is not a thing that just
+        // happened on a thread, and broadcasting it as `BusEvent::Thread` would
+        // put it through the trigger matcher, the thread projections and the
+        // parent-callback fan-in as though it had. It does mean this is the one
+        // place where the *matchable payload* differs between the live frame
+        // and the row (`core::event_subscription`, ADR 0062): a `thread_id`
+        // condition cannot match this broadcast, while the catch-up scan and
+        // the arming lookback reading the row it just wrote will inject one.
+        // The direction is the safe one, since such a wait resolves from the
+        // scan a moment later rather than never, and the scan is what covers
+        // this path anyway: a backfill runs at startup, where the wait cache is
+        // still being rebuilt.
         if let Some(seq_val) = seq {
             let _ = self.event_tx.send(EmittedEvent {
                 event_id,

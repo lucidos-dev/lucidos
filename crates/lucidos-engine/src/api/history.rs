@@ -450,6 +450,23 @@ pub(super) async fn engine_version_status(
     Json(state.engine.version_status().await)
 }
 
+/// `GET /api/v1/engine/changelog`: every published release's notes, newest
+/// first, for the *What's New* panel (Settings > System).
+///
+/// Takes no state and touches no disk. The text is baked into this binary (see
+/// `crate::engine::changelog`), so the answer is the same offline, on a packaged
+/// install with no checkout, and while the database is down.
+///
+/// Deliberately does NOT restate which release is running. `/health` already
+/// carries `release`, the frontend already holds it, and one source of truth for
+/// that value is what keeps the panel's "you are running this" mark from
+/// disagreeing with the Versions section two tabs away.
+pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "releases": crate::engine::changelog::changelog_releases(),
+    }))
+}
+
 /// `POST /api/v1/engine/rebuild` — manually kick off the dev background engine
 /// rebuild (the escape hatch behind the frontend "Rebuild & Switch" affordance),
 /// so a wedged workspace (source behind HEAD with a stale binary — e.g. after a
@@ -1011,6 +1028,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/restart", post(restart_engine))
         .route("/engine/version-status", get(engine_version_status))
+        .route("/engine/changelog", get(engine_changelog))
         .route("/engine/rebuild", post(engine_rebuild))
         .route("/workspaces", get(list_workspaces))
         .route("/events", get(global_events))

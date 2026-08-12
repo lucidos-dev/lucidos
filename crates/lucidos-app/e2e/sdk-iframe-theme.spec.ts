@@ -107,14 +107,18 @@ waitForLucidos();
     expect(res.headers()['content-type']).toContain('application/javascript');
 
     const js = await res.text();
-    // IIFE prologue, with optional whitespace before the brace.
-    expect(js).toMatch(/^\(function\(\)\s*\{/);
-    // Storage keys are workspace-scoped via wsKey() (mirrors workspaceStorage.ts
-    // + sdk/_storage.ts); the engine-side guard in sdk_prefs.rs forbids any raw,
-    // unscoped access, so the served script always wraps the key in wsKey().
-    expect(js).toContain('localStorage.getItem(wsKey("lucidos-theme"))');
-    expect(js).toContain('localStorage.getItem(wsKey("lucidos-font-family"))');
-    expect(js).toContain('localStorage.getItem(wsKey("lucidos-ui-scale"))');
+    // The served script is BUILT from packages/lucidos-sdk/src/boot/, the same
+    // source the app shell inlines into its own <head>, so the two documents
+    // cannot drift. It is bundled to a self-contained IIFE with no imports.
+    expect(js).toContain('GENERATED from packages/lucidos-sdk/src/boot/');
+    expect(js).toContain('(() => {');
+    // Storage keys are workspace-scoped through the SDK's _storage helper
+    // (mirrors workspaceStorage.ts); the engine-side guard in sdk_prefs.rs
+    // forbids any raw, unscoped access.
+    expect(js).toContain('wsLocalGet("lucidos-theme")');
+    expect(js).toContain('wsLocalGet("lucidos-font-family")');
+    expect(js).toContain('wsLocalGet("lucidos-ui-scale")');
+    expect(js).not.toContain('localStorage.getItem("lucidos-theme")');
     // `system` defers to matchMedia at execution time so light-OS browsers
     // don't FOUC dark-then-light.
     expect(js).toContain('matchMedia("(prefers-color-scheme: light)")');

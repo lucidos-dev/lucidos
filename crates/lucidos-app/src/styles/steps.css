@@ -50,7 +50,15 @@
 .inline-step .step-main {
     display: flex;
     align-items: baseline;
-    gap: 0.375rem;
+    /* Tighter than the row's own gap, because the two breaks this spends width
+       on are not the same relationship. The mark and the description are ONE
+       thing (a check and the word it marks), and a field's worth of air after
+       the check reads as the mark drifting off its row, which is the complaint
+       this and the slot below answer together. The other break it spends,
+       description to detail, loses nothing by it: the detail prefixes itself
+       with a dash and a non-breaking space (see `.step-detail::before`), so the
+       separator there is the dash, not the gap. */
+    gap: 0.25rem;
     flex: 1 1 auto;
     min-width: 0;
     background: none;
@@ -112,15 +120,16 @@
    it, which is why this is a plain `width` rather than a `min-width` that would
    let the description move.
 
-   Three quarters of an em, down from the full one it was: the slot was wider
-   than the marks standing in it. `--font-ui` is a monospace stack, whose
-   advance is well under an em, so the leftover inside the box sat between the
-   mark and the text it belongs to and read as part of the gap after the slot.
-   The visible distance from a check to its description was the slack plus the
-   0.375rem `.step-main` gap, not the gap, and the mark read as adrift from its
-   own row rather than attached to it. Only the icon's side of the row moves:
-   the gap itself is shared with the description-to-detail break, which was
-   never the loose one.
+   Six tenths of an em, and that number is `--font-ui`'s own advance rather than
+   a taste: the stack is monospace (`--font-mono`), where the common faces all
+   step at 0.6em, so the box is now exactly the glyph and carries NO slack at
+   all. It was a full em first and then three quarters, and both left leftover
+   INSIDE the box which sat between the mark and the text it belongs to, adding
+   to the gap after the slot rather than to the mark. So the visible distance
+   from a check to its description was the slack plus the gap, and the mark read
+   as adrift from its own row instead of attached to it. Emptying the box was
+   half the fix; the other half is the tightened `.step-main` gap above, since
+   with no slack left the gap IS the whole of that distance.
 
    Nothing here assumes every mark fits. Where the face lacks one (the warning
    sign and the slashed circle are the likely two) the browser substitutes per
@@ -130,7 +139,7 @@
    the number does not change that. */
 .inline-step .step-icon {
     flex-shrink: 0;
-    width: 0.75em;
+    width: 0.6em;
 }
 
 .inline-step.success .step-icon {
@@ -280,129 +289,230 @@
     color: var(--accent-notable);
 }
 
-/* Context section viewer — used inside StepDetailModal's Context tab to
- * render the assembled LLM prompt as collapsible labeled sections. */
+/* Context section viewer: the tree inside the context viewer modal
+ * (`ContextViewerModal`), rendering what one LLM call was sent as three tiers
+ * of collapsible rows. Outer = API role (system / prior_message / user), inner
+ * = curated tier inside the user role, then the sections themselves.
+ *
+ * Every row of every tier is the same box: a chevron column, a label, a number
+ * column, one shared right edge. Depth is carried ONLY by `--context-depth`,
+ * which each tier redeclares and the shared row rule reads. That is what keeps
+ * a child indented past the header it hangs under: the indent used to live on
+ * the containers' margins while the row buttons carried no inset of their own,
+ * so a section sat half a step LEFT of the role header that owned it. */
 .context-sections {
+    /* One chevron box for all three tiers, and one step down the tree. */
+    --context-chevron-size: 0.75rem;
+    --context-row-inset: var(--space-sm);
+    --context-indent: 1rem;
     display: flex;
     flex-direction: column;
     gap: 0.125rem;
 }
 
-/* Two-layer grouping: outer = API role (system / prior_message / user),
- * inner = curated tier inside the user role. Indentation hierarchy:
- * role (0) → inner group (1rem) → section (2rem). */
 .context-role {
-    margin-bottom: 0.75rem;
+    --context-depth: 0;
+    margin-bottom: var(--space-md);
 }
 
-.context-role-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.375rem 0.5rem;
-    font-weight: 600;
-    background: var(--bg-tertiary);
-    border-radius: 0.25rem;
-    width: 100%;
-    text-align: left;
-    border: 0;
-    cursor: pointer;
-    color: var(--text-primary);
-    font-family: var(--font-ui);
-}
-
-.context-role-label {
-    flex: 1;
-}
-
-.context-role-chars {
-    margin-left: auto;
-    font-weight: 400;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
+/* The last block ends the tree, and the usage footer's own rule is what
+   separates it from what follows. */
+.context-role:last-child {
+    margin-bottom: 0;
 }
 
 .context-inner-group {
-    margin: 0.25rem 0 0.25rem 1rem;
+    --context-depth: 1;
 }
 
-.context-inner-header {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    padding: 0.25rem 0.375rem;
-    font-weight: 500;
-    color: var(--text-secondary);
-    width: 100%;
-    text-align: left;
-    border: 0;
-    cursor: pointer;
-    background: transparent;
-    font-family: var(--font-ui);
-    font-size: var(--font-size-md);
-}
-
-.context-inner-label {
-    flex: 1;
-}
-
-.context-inner-chars {
-    margin-left: auto;
-    font-weight: 400;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
+/* A section directly under a role (a role whose tier has no inner group) takes
+   the column an inner header would have taken; one nested under an inner group
+   goes a step deeper. */
+.context-section {
+    --context-depth: 1;
 }
 
 .context-inner-group .context-section {
-    margin-left: 1rem;
+    --context-depth: 2;
 }
 
-.context-header {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-family: var(--font-mono, monospace);
+.context-role-header,
+.context-inner-header,
+.context-section-header {
     display: flex;
+    align-items: center;
+    gap: var(--space-sm);
     width: 100%;
+    padding: var(--space-xs) var(--context-row-inset) var(--space-xs)
+        calc(var(--context-row-inset) + var(--context-depth) * var(--context-indent));
+    border: 0;
+    border-radius: 0.25rem;
+    background: transparent;
     text-align: left;
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 
-@media (hover: hover) {
-    .context-header:hover {
-        color: var(--text-primary);
-    }
+/* The tier heads keep a tinted bar so the tree reads as blocks rather than one
+   long ladder of rows. That is also why their hover is a ring instead of a
+   background: they already sit on --bg-tertiary, which is the hover colour. */
+.context-role-header {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: var(--font-size-md);
+    padding-top: 0.375rem;
+    padding-bottom: 0.375rem;
+}
+
+.context-inner-header {
+    font-weight: 500;
+    font-size: var(--font-size-md);
 }
 
 .context-section-header {
     font-size: var(--font-size-sm);
-    padding: 0.25rem 0;
-    align-items: center;
-    gap: 0.375rem;
 }
 
-.context-section-name {
-    flex: 1;
+@media (hover: hover) {
+    /* A hairline drawn INSIDE the bar, because the wash every other row uses
+       is unavailable here: the bar already wears --bg-tertiary, and --bg-hover
+       sits on the other side of it (darker in the dark theme, lighter in the
+       light one), so a role head would move the wrong way in one of them. An
+       outline rather than a border keeps the row's box the size it was, and a
+       px width because a hairline is snapped to a whole unit before layout. */
+    .context-role-header:hover {
+        outline: 1px solid var(--border-color);
+        outline-offset: -1px;
+    }
+
+    /* The rows that sit on the panel's own --bg-secondary take the shared
+       hover wash, which keeps a hovered row distinct from a role head. */
+    .context-inner-header:hover,
+    .context-section-header:hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+
+    .context-inner-header:hover .context-chevron,
+    .context-section-header:hover .context-chevron {
+        color: var(--text-secondary);
+    }
 }
 
-.context-section-chars {
+/* AFTER the hover block on purpose: a role head's hover draws an outline too,
+   and at equal specificity the later rule wins, so a focused row under a
+   resting pointer would otherwise keep the hairline and lose its ring. The
+   band is drawn INSET because the row runs edge to edge inside a scrolling
+   panel and an outward ring would be clipped there; the transparent outline is
+   the forced-colors fallback, at a matching negative offset for the same
+   reason (see `.list-row-add-card:focus-visible`). */
+.context-role-header:focus-visible,
+.context-inner-header:focus-visible,
+.context-section-header:focus-visible {
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
+}
+
+.context-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    width: var(--context-chevron-size);
+    height: var(--context-chevron-size);
     color: var(--text-muted);
-    font-size: var(--font-size-xs);
+    transition: transform var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 
+.context-chevron svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.context-chevron[data-open="true"] {
+    transform: rotate(90deg);
+}
+
+/* Wraps rather than ellipsises: a section name is the only identity a row has,
+   and `min-width: 0` is what stops a long one from pushing the number column
+   past the shared right edge. */
+.context-role-label,
+.context-inner-label,
+.context-section-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* One number column for all three tiers, in one size, tabular so the digits
+   line up down the tree. Only the role rows name the units (see
+   `ContextRoleGroup`). */
+.context-role-chars,
+.context-inner-chars,
+.context-section-chars {
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-weight: 400;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* The spelled-out units on a role row (see `ContextRoleGroup`). They cost
+   about fourteen characters, which the modal has to spare only at its 40rem
+   cap: below the mobile breakpoint it is 90vw, and the words pushed the role
+   labels into three and four wrapped lines. The rows are compact everywhere
+   under there, which is what the tree already is. */
+@media (max-width: 768px) {
+    .context-unit {
+        display: none;
+    }
+}
+
+/* Hangs one step past the row that opened it, so the body reads as that row's
+   content rather than as the next sibling row. */
 .context-section-content {
     font-family: var(--font-mono, monospace);
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     background: var(--bg-tertiary);
-    padding: 0.5rem;
+    border: 1px solid var(--border-color);
+    padding: var(--space-sm);
     border-radius: 0.25rem;
-    margin: 0.25rem 0 0.5rem 1rem;
+    margin: var(--space-xs) var(--context-row-inset) var(--space-sm)
+        calc(var(--context-row-inset) + (var(--context-depth) + 1) * var(--context-indent));
     max-height: 18.75rem;
     overflow-y: auto;
+    overscroll-behavior: contain;
     white-space: pre-wrap;
     word-break: break-word;
-    line-height: 1.4;
+    line-height: 1.5;
+}
+
+.context-section-content.empty {
+    font-style: italic;
+}
+
+/* The lazy sections fetch's two non-loaded states (`ContextSectionsArea`).
+   They render INSTEAD of `.context-sections`, so they cannot read that block's
+   own custom properties; the inset they stand on is spelled with the shared
+   spacing token, matching what a row inside the tree resolves to. */
+.context-sections-loading,
+.context-sections-error {
+    padding: var(--space-xs) var(--space-sm);
+    font-size: var(--font-size-sm);
+}
+
+.context-sections-loading {
+    color: var(--text-muted);
+}
+
+.context-sections-error {
+    color: var(--accent-red);
 }
 
 /* Top-aligned so the modal stays put as section rows expand/collapse —
@@ -415,31 +525,40 @@
 .step-detail-modal {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    border-radius: 0.75rem;
     box-shadow: var(--shadow-lg);
-    padding: 1rem;
+    padding: var(--space-xl) var(--space-lg) var(--space-lg);
     width: min(40rem, 90vw);
     max-height: 90vh;
     overflow-y: auto;
+    /* The panel is the scroller, so a flick that reaches its end must not
+       chain out to whatever is behind the scrim. */
+    overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: var(--space-md);
     color: var(--text-primary);
     font-family: var(--font-ui);
 }
 
+/* The eyebrow row. It rides tight above the description it labels, so the pair
+   reads as one heading rather than two stacked lines: the negative margin is
+   the panel's own --space-md column gap pulled back to --space-xs, and it is
+   the only place in this modal that overrides that gap. */
 .step-detail-header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 1rem;
-    font-size: var(--font-size-sm);
+    gap: var(--space-lg);
+    font-size: var(--font-size-xs);
+    margin-bottom: calc(var(--space-xs) - var(--space-md));
 }
 
 .step-detail-status {
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.08em;
     font-weight: 600;
+    color: var(--text-muted);
 }
 
 .step-detail-status.success {
@@ -536,38 +655,49 @@
 .step-detail-context {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-md);
 }
 
+/* The one line that says which call this was: model chip, producer, tool
+   count. Deliberately NOT a flex row, so the ` · ` glue between the spans
+   stays ordinary text rather than becoming a gap around each separator. */
 .step-detail-context-meta {
     color: var(--text-muted);
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
+    line-height: 1.6;
 }
 
 .step-detail-context-meta code {
     color: var(--text-secondary);
     background: var(--bg-tertiary);
-    padding: 0.0625rem 0.25rem;
-    border-radius: 0.1875rem;
-    font-size: var(--font-size-xs);
+    border: 1px solid var(--border-color);
+    padding: 0.0625rem 0.375rem;
+    border-radius: 0.25rem;
+    font-size: inherit;
 }
 
-/* ContextCaptured panel — budget bar (shared .progress-bar), sections, usage. */
+/* ContextCaptured panel: budget bar (shared .progress-bar), sections, usage. */
 .context-budget {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-xs);
 }
 
 .context-budget-row {
     display: flex;
+    align-items: baseline;
     justify-content: space-between;
+    gap: var(--space-sm);
     font-size: var(--font-size-sm);
-    color: var(--text-secondary);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
 }
 
+/* The headline number is the one figure the panel exists to report, so it is
+   the only thing here allowed to outsize the body text. */
 .context-budget-row strong {
     color: var(--text-primary);
+    font-size: var(--font-size-lg);
 }
 
 .context-budget-trimmed {
@@ -577,13 +707,17 @@
     font-size: var(--font-size-xs);
 }
 
+/* A footer under the tree rather than one more row in it, so the ruled edge is
+   what separates them, not a bigger gap. */
 .context-usage {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.75rem;
-    font-size: var(--font-size-sm);
+    gap: var(--space-xs) var(--space-md);
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
-    padding-top: 0.5rem;
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border-color);
+    font-variant-numeric: tabular-nums;
 }
 
 .context-usage strong {

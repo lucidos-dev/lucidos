@@ -99,6 +99,36 @@ Each entry carries its own `condition`, scoped to *that* event:
 
 The `sleep_score` filter does NOT apply to `EmailReceived` — its payload doesn't have that field at all. Per-entry conditions mean different event payload shapes never constrain each other.
 
+### Aggregating events: cron, per event, or a projection
+
+"If an event exists, prefer it" is about how you learn something happened. It does not settle how to maintain an **aggregation**: a rollup, a running total, a per-period summary, a counter, anything whose value is current state derived from N events. Both shapes are legitimate, and each costs something the other does not.
+
+- An **event subscription** buys freshness, and costs one run per event.
+- A **cron** buys a bounded, predictable cost, and costs staleness of up to one interval.
+
+Which of those matters more is your call, and it turns on the consumer: what it does with the number, and how wrong the number is allowed to be between updates. What follows is how to answer that for your own case, not a verdict.
+
+**Often the answer is a projection rather than either trigger shape.** When an event type is firing a lot and something needs to consume it, folding each event into a maintained read model and pointing consumers at that model tends to beat having every consumer re-aggregate raw events. The projection is the artifact: a stored value plus the cursor recording how far it has consumed. What advances it (a cron recompute, an O(1) per-event increment, a reader that merges the tail itself) then becomes a separate and much smaller question. The shape worth thinking twice about is a trigger per event on a busy event class, because **a trigger fire is a thread, not a callback**: each one goes through thread-queue admission and spawns a real process, and that fixed cost does not shrink as the fires get denser.
+
+Two questions worth measuring before picking:
+
+- **Does the per-fire work actually shrink as the fires get denser?** Split the measured per-run cost into fixed overhead (process start, connection), the part proportional to NEW rows, and the part proportional to the WINDOW recomputed. Only the middle term shrinks. If a run is dominated by the window term, firing more often multiplies a near-constant, and nothing about the code makes that visible until it is measured.
+- **Can you keep up at the PEAK rate, not the average?** Multiply peak rate by per-fire cost. Above one unit of work per unit of wall clock the fires cannot drain, and event fires are never coalesced the way cron fires are: with `max_concurrent_per_trigger` at 1 they queue strictly FIFO, the backlog runs into `max_queued_per_trigger` (25), and `overflow` drops the oldest waiting fires. Averages hide this, and a projection that breaks at the peak stays broken. See `system-knowhow/thread-queue.md`.
+
+One consideration that is not about cost: **a whole-window recompute is idempotent and self-healing.** Rerun it and nothing changes; miss a run and the next one repairs the gap. An incremental per-event append is neither: a rerun double-counts, and a missed fire is silent drift with nothing to detect it. That is a reason to lean toward recompute, or to pair an incremental path with a reconciling recompute underneath, rather than a reason to rule incremental out.
+
+**The one hard rule here, and the exception to the surrounding guidance: a trigger must not subscribe to an event class its own run emits.** That is a feedback loop, not a tradeoff. The concrete case is an *intent* trigger on any LLM-activity event: its own model call emits the event it subscribes to. Only the script flavour is even arguable on that class of event.
+
+Shapes worth knowing, roughly in the order they tend to fit:
+
+1. **A cron for the projection, with the consumer merging the recent tail itself.** It queries the event store for rows above the projection's stored cursor and folds them on top, so the reader is current without the projection being current. This is what the Token Cost dashboard does.
+2. **O(1) per-event work with no database round trip**, when the projection has to be current between runs. Read the row out of `TRIGGER_EVENT_PAYLOAD`, which the engine already hands the script, increment, write. A cron underneath as a reconciling rebuild buys back the self-healing above.
+3. **The plain event trigger**, when the event is low-volume or user-initiated. The hybrid shape is this one plus a floor: a cron, plus `on: SomethingRequested` for a Refresh button.
+
+A rate to read as a smell rather than a threshold: an event firing more than roughly once a minute sustained is worth measuring before you subscribe a trigger to it. The number settles nothing by itself, it is just where the two questions above start coming back with different answers. `system-knowhow/thread-events.md` § "Volume classes" labels each engine event, and `lucidos events count` gives a workspace's actual rate.
+
+**Worked example**, offered as an illustration of running that measurement rather than as the source of any threshold (a live workspace, August 2026). `ContextCaptured`, one row per model API call, ran 7,500 to 17,600 rows a day, peaking at 2,415 in one hour and 238 in a single minute. Its rollup script took 3.4 seconds per run. Everything below is that 3.4 seconds multiplied out. Per event it is 7 to 17 hours of query time a day (7,500 and 17,600 runs) to maintain a projection that costs about 82 seconds a day as an hourly cron (24 runs), and at the peak minute it would need just over 13 minutes of work (238 runs) to service 60 seconds of events. The split is what made the choice obvious: process start 29 ms and psql connect 25 ms, both negligible, with the whole 3.4 seconds sitting in one SQL query whose window function scans each touched thread's full history, which does not get cheaper when you fire more often.
+
 ## Writing cron expressions
 
 Six fields, `second minute hour day-of-month month day-of-week`, in the user's local timezone. Two rules decide what a trigger actually fires on, and they pull in opposite directions:
@@ -170,6 +200,8 @@ A day-of-month that the month is never long enough to contain is syntactically v
 Set `condition` on a trigger subscription when the event is high-volume and you only care about a slice. Example: subscribe to `EmailReceived` but only fire on emails from a specific sender. Without a condition, the trigger fires for every email and the LLM has to filter inside the run, which is wasteful and slow.
 
 Don't use `condition` for logic that depends on external state (e.g. "only if this app's data file says X"). Conditions are pure payload filters. Stateful checks belong inside the run.
+
+**One field is always available on a thread event: `thread_id`.** It is not in any event's payload (the engine supplies it from the thread the event belongs to), and it scopes a subscription to a single thread: `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `emit_event`) belongs to no thread and has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names has to be a real top-level field of that event's own payload.
 
 ## Notification discipline
 
@@ -558,6 +590,7 @@ in `list_triggers`.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
 - **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
+- **Picking a trigger per event to maintain an aggregate without measuring first.** A trigger fire is a thread, not a callback, and a rollup's cost is usually dominated by the window it recomputes rather than by the rows that just arrived. Weigh it against a projection. See § "Aggregating events: cron, per event, or a projection".
 - **Assuming day-of-month and day-of-week are ORed.** They are ANDed, so `0 0 9 1 * Mon` is "the 1st when it falls on a Monday", not "the 1st and every Monday". Vixie cron behaves the other way, which is where the assumption comes from. See § "Writing cron expressions".
 - **A cron that can never fire.** `0 0 9 31 2 *` is valid syntax and a dead trigger. The engine rejects these now, but the surer habit is to read the next-3 fire times it reports on every create and update: they catch the whole class, including the expressions that fire far more rarely than the user meant.
 - **Parallel triggers for one workflow that reacts to several events.** Use one trigger with multiple `on` entries; never duplicate the intent across siblings — editing one and forgetting the other silently drifts behaviour.

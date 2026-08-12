@@ -21,7 +21,12 @@
  *    content pane put them in the same two places, and the threads pane's mark
  *    takes that same span's trailing edge, so all three rows agree on where
  *    that column is.
- * 5. A transparent centred span restores pointer events to its members, and
+ * 5. The menu's connection notice reads as a notice: a raised surface with no
+ *    frame and nothing that promises a tap, and a dot on the sentence's first
+ *    line. Whether it is SHOWN at all is a property of the component and is
+ *    pinned in `components/layout/__tests__/connection-notice.test.ts`; this is
+ *    the half only the stylesheet can answer.
+ * 6. A transparent centred span restores pointer events to its members, and
  *    STANDS DOWN while an overlay owns the screen. Two hosts carry that pair now
  *    (the mobile cluster here, the desktop brand span in panels/shell.css), and
  *    the gate is the half that gets forgotten: the inert-behind contract only
@@ -100,6 +105,61 @@ describe('the unfolded workspace list scrolls instead of overflowing the panel',
     // the header than a desktop window does.
     const cap = decl(block(markCss, ':root {'), '--brand-menu-ws-list-max-height');
     expect(cap).toContain('vh');
+  });
+});
+
+/** The notice the panel leads with while the mark is dim. Its PRESENCE is a
+ *  property of `connectionNoticeRow` and is pinned in
+ *  `components/layout/__tests__/connection-notice.test.ts`; what only the
+ *  stylesheet can say is that it reads as a notice rather than as a row, and
+ *  that its dot is drawn at all. */
+describe('the connection notice is a raised statement, not a row', () => {
+  const notice = block(markCss, '.brand-menu-notice {');
+
+  it('lifts on the shared surface, with no frame and no stripe', () => {
+    expect(decl(notice, 'background')).toBe('var(--bg-tertiary)');
+    // A coloured left edge on a callout is banned outright
+    // (.claude/rules/frontend-css.md), and a full border would make the panel
+    // read as two panels, which is what the separator below it already avoids.
+    for (const frame of ['border', 'border-left', 'box-shadow', 'outline']) {
+      expect(decl(notice, frame), `a ${frame} turns the notice into a card`).toBeNull();
+    }
+    // Concentric with the panel's own corners, like every row in it.
+    expect(decl(notice, 'border-radius')).toBe('var(--brand-menu-item-radius)');
+  });
+
+  it('takes nothing that would promise a tap', () => {
+    const targeting = rulesTargeting(markCss, 'brand-menu-notice');
+    for (const rule of targeting) {
+      expect(rule.props.get('cursor'), `${rule.selector} offers a pointer`).toBeUndefined();
+      expect(rule.selector, 'a hover state would make it look like a control')
+        .not.toContain(':hover');
+    }
+  });
+
+  it('lands its dot on the first line, derived rather than nudged', () => {
+    // The text wraps in a fixed-width panel, so centring the dot against the
+    // whole box floats it into the middle of a sentence. Both quantities the
+    // offset is made of have to be the ones actually in force, or the dot
+    // drifts off the line the moment either is retuned.
+    expect(decl(notice, 'align-items')).toBe('flex-start');
+    const dot = block(markCss, '.brand-menu-notice .status-dot {');
+    const offset = decl(dot, 'margin-top') ?? '';
+    expect(offset).toContain('var(--brand-menu-row-line-height)');
+    expect(offset).toContain('var(--brand-menu-notice-dot)');
+    expect(decl(notice, 'line-height')).toBe('var(--brand-menu-row-line-height)');
+    expect(decl(dot, 'width')).toBe('var(--brand-menu-notice-dot)');
+  });
+
+  it('gets its colour from the shared dot scale, for every state it can show', () => {
+    // The notice names the state in its class list and lets `.status-dot`
+    // colour it, so the two must actually meet: a state with no step in that
+    // scale draws the muted fallback and says nothing.
+    const dotStates = rulesTargeting(shellCss, 'status-dot')
+      .flatMap(r => [...r.selector.matchAll(/\.status-dot\.([\w-]+)/g)].map(m => m[1]));
+    for (const state of ['connecting', 'disconnected']) {
+      expect(dotStates, `.status-dot.${state} has no colour of its own`).toContain(state);
+    }
   });
 });
 

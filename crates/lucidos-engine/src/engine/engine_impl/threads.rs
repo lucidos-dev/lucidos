@@ -426,12 +426,14 @@ impl LucidosEngine {
     ) -> bool {
         // Probe 1, the live cache. Scoped to a wait that actually MATCHES this
         // event: a thread may hold several, and one watching something else
-        // says nothing about this completion.
+        // says nothing about this completion. Asked through `waits_matching_row`
+        // so the question is put against the same *matchable payload* the
+        // dispatcher will match, and not the stored column: a wait scoped with a
+        // `thread_id` condition matches only the former, and the two answering
+        // differently is a duplicate turn.
         if !self.live_waits.is_empty().await {
             let live = self.live_waits.for_thread(parent_thread_id).await;
-            if !crate::engine::event_wait::waits_matching(&live, &row.event_type, &row.payload)
-                .is_empty()
-            {
+            if !crate::engine::event_wait::waits_matching_row(&live, row).is_empty() {
                 return true;
             }
         }

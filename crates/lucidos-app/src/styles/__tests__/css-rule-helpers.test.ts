@@ -78,6 +78,24 @@ describe('rulesTargeting picks the rules that style the element itself', () => {
     expect(selectorsMatching(':is(.a, .b) .child { a: 1; }', 'a')).toEqual([]);
   });
 
+  it('reads a :has() argument as a condition, never as the subject', () => {
+    // `:has()` is the one functional pseudo-class whose argument describes
+    // something OTHER than the element being styled, so a class named there must
+    // not answer for it. The regression: the transcript's tail room was reserved
+    // on `.chat-exchange:last-child:has(.response-header)`, and its `min-height`
+    // was read as the response header's own, failing an unrelated scan that
+    // pins what floors that header.
+    expect(selectorsMatching('.owner:has(.t) { a: 1; }', 't')).toEqual([]);
+    expect(selectorsMatching('.owner:has(.t) { a: 1; }', 'owner')).toEqual(['.owner:has(.t)']);
+    // Still the subject when it is genuinely the subject as well.
+    expect(selectorsMatching('.t:has(.child) { a: 1; }', 't')).toEqual(['.t:has(.child)']);
+    // A nested paren closes with its own owner, so the rest of the compound survives.
+    expect(selectorsMatching('.owner:has(:is(.a, .t)).state { a: 1; }', 't')).toEqual([]);
+    expect(selectorsMatching('.owner:has(:is(.a, .t)).state { a: 1; }', 'state')).toEqual(['.owner:has(:is(.a, .t)).state']);
+    // And a descendant combinator INSIDE the argument is not one of the subject's.
+    expect(selectorsMatching('.owner:has(.a .t) .child { a: 1; }', 'child')).toEqual(['.owner:has(.a .t) .child']);
+  });
+
   it('leaves combinators inside a functional pseudo-class alone', () => {
     // The `>` belongs to the :is() argument, so the subject is still `.t`.
     expect(selectorsMatching('.t:is(.a > .b) { a: 1; }', 't')).toEqual(['.t:is(.a > .b)']);

@@ -77,9 +77,9 @@ intuitive guess still resolves to the user's font instead of silently dropping t
 hardcoded fallback) — but `--font-ui` is the name to write.
 
 **`--font-features-text` and `--font-features-code` carry programming ligatures,
-and only code gets them.** When the user picked Fira Code they resolve to
-`"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`; for every other font both are
-`normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
+and only code gets them.** Fira Code is the default UI font, so unless the user
+picked another one they resolve to `"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`;
+for every other font both are `normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
 textarea, select, button` and the code one on `code, pre, kbd, samp`, so a code
 block in your app ligatures `=>` and `!=` while your prose and your form fields
 render literally.
@@ -343,8 +343,9 @@ Emit domain events, and query the workspace's event store.
 **`query` reads the whole store, not just what your app emitted.** Workspace
 domain events (`HabitCompleted`) and the engine's own thread / system events
 (`ChildThreadCompleted`, `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`)
-are rows in one `events` table and come back from one call, filtered only by
-`event_type` / time. There is no second stream to reach for. See
+are rows in one `events` table and come back from one call, filtered by
+`event_type`, time, `thread_id`, or a paging cursor. There is no second stream
+to reach for. See
 `system-knowhow/thread-events.md` § "One table, two enums" for what the
 `ThreadEvent` / `SystemEvent` distinction actually is.
 
@@ -358,9 +359,12 @@ lucidos.events.query(params?: EventQuery): Promise<LucidosEvent[]>
 ```ts
 interface EventQuery {
   event_type?: string;
-  since?: string;    // ISO 8601
-  until?: string;    // ISO 8601
-  limit?: number;    // default 100
+  since?: string;             // ISO 8601
+  until?: string;             // ISO 8601
+  limit?: number;             // default 100, clamped to 1..1000
+  before_event_id?: string;   // walk backward from this event, exclusive
+  after_event_id?: string;    // tail-follow forward from this event, exclusive
+  thread_id?: string;         // restrict to one thread
 }
 
 interface LucidosEvent {
@@ -420,6 +424,33 @@ for (const e of completions) {
     e.payload.status,                 // success | failure | no_changes | canceled
     e.payload.summary
   );
+}
+```
+
+### Paging with `before_event_id` / `after_event_id`
+
+Rows come back **newest first** (`created DESC, id DESC`) and `limit` is clamped to 1000, so anything longer than one page needs a cursor rather than a bigger `limit`. Pass the id of the oldest row you received as `before_event_id` to get the next page backwards; pass the newest id you already stored as `after_event_id` to tail-follow what has arrived since. Both cursors are exclusive, and both are ids from `LucidosEvent.id` (not `sequence`).
+
+The two are mutually exclusive: set both and the engine answers 400, since "strictly older than X AND strictly newer than Y" has no coherent paging meaning. A cursor id matching no event is a 404, never a silently unfiltered page. `after_event_id` still returns newest-first, so a tail longer than `limit` gives you the most recent slice, not the rows immediately after the cursor.
+
+```js
+// Walk backwards from newest until we reach an event we already have.
+async function eventsNewerThan(knownId) {
+  const collected = [];
+  let before;
+  for (;;) {
+    const page = await lucidos.events.query({
+      event_type: 'HabitCompleted',
+      limit: 1000,
+      before_event_id: before,   // omitted on the first call: start at newest
+    });
+    if (page.length === 0) return collected;
+    for (const e of page) {
+      if (e.id === knownId) return collected;   // caught up
+      collected.push(e);
+    }
+    before = page[page.length - 1].id;          // oldest row of this page
+  }
 }
 ```
 

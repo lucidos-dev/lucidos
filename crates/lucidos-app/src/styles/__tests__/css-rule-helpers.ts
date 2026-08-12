@@ -94,12 +94,43 @@ function flattenCombinators(selector: string): string {
 }
 
 /**
+ * `:has(…)` arguments removed, parens balanced by depth so a nested one goes
+ * with its owner.
+ *
+ * Every other functional pseudo-class matches its argument against the SUBJECT
+ * (`:is(.a, .b)`, `:where(…)`, `:not(…)` all still describe the element the
+ * rule styles), so their contents must stay. `:has()` is the one that matches
+ * against something ELSE: `.turn:has(.header)` styles the turn precisely
+ * BECAUSE it contains a header, and styles the header not at all. Left in, a
+ * class named there reads as the subject, and a scan asking "what styles
+ * `.header`" answers with a rule that never touches it. That is not
+ * hypothetical: the transcript's tail room was reserved on
+ * `.chat-exchange:last-child:has(.response-header)`, and its `min-height` was
+ * read as the response header's own. (That rule is gone, the room with it, but
+ * the trap it sprang is a property of `:has()` and stays.)
+ */
+function stripHas(selector: string): string {
+  let out = '';
+  for (let i = 0; i < selector.length; i++) {
+    if (!selector.startsWith(':has(', i)) { out += selector[i]; continue; }
+    let depth = 0;
+    for (i += 4; i < selector.length; i++) {
+      if (selector[i] === '(') depth++;
+      else if (selector[i] === ')' && --depth === 0) break;
+    }
+  }
+  return out;
+}
+
+/**
  * Every rule that styles the ELEMENT carrying `className`, in source order.
  *
  * The subject of a selector is its last compound, so this keeps
  * `.a .target`, `.target.state` and a bare `.target` (all of which style the
- * element) and drops `.target .child` (which styles a descendant) and
- * `.target::-webkit-scrollbar` (which styles a pseudo-element, not the box).
+ * element) and drops `.target .child` (which styles a descendant),
+ * `.target::-webkit-scrollbar` (which styles a pseudo-element, not the box)
+ * and `.other:has(.target)` (which styles whatever CONTAINS the target; see
+ * `stripHas`).
  * That distinction is the whole point: a scan asserting "nothing re-enables X"
  * has to see the compound and descendant-combinator forms that outrank the
  * bare rule, and must not trip over rules aimed at children.
@@ -111,7 +142,7 @@ export function rulesTargeting(css: string, className: string): CssRule[] {
   const token = new RegExp(`\\.${className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`);
   return cssRules(css).filter(rule =>
     postcss.list.comma(rule.selector).some(one => {
-      const compounds = postcss.list.space(flattenCombinators(one));
+      const compounds = postcss.list.space(flattenCombinators(stripHas(one)));
       const subject = compounds[compounds.length - 1] ?? '';
       return !subject.includes('::') && token.test(subject);
     }),

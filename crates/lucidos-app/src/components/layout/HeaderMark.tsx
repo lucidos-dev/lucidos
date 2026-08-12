@@ -1,6 +1,8 @@
 import { useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty } from '../../store/store';
+import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
+import type { ConnectionStatus } from '../../store/types';
+import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
@@ -15,12 +17,16 @@ import { WorkspacesMenuRow } from './WorkspaceSwitcher';
 
 /** Readable spelling of the connection light, naming what it is connected TO.
  *
- *  The mark carries the state as colour and motion, which is not enough on its
- *  own: this is the whole of what a screen reader gets, since the menu no longer
- *  spells the state out in a header row. It is also the desktop hover tooltip,
- *  and there the workspace matters as much as the state: the name beside the
- *  mark hides itself when the pane is narrow, so this is what answers "connected
- *  to what?" at any width.
+ *  The mark carries the state as colour and motion, and this is its readable
+ *  half, read by three surfaces: the toggle's accessible name, the desktop hover
+ *  tooltip, and the sentence the menu's own notice leads with (see
+ *  `connectionNotice`, which sentence-cases exactly this). One table, so what a
+ *  screen reader is told and what the panel says cannot drift into two
+ *  different claims about one state.
+ *
+ *  On the tooltip the workspace matters as much as the state: the name beside
+ *  the mark hides itself when the pane is narrow, so this is what answers
+ *  "connected to what?" at any width.
  *
  *  Each state brings its own preposition rather than sharing one, because
  *  "disconnected to dev" is not English. With no workspace name yet (before
@@ -38,6 +44,81 @@ export function connectionPhrase(status: string, workspace: string | null): stri
   const phrase = CONNECTION_PHRASE[status];
   if (!phrase) return status;
   return workspace ? phrase(workspace) : status;
+}
+
+/** What the menu says while the mark is dimmed, and nothing at all while it is
+ *  lit.
+ *
+ *  A state with no line here renders no notice, and `connected` is the only one
+ *  the closed `ConnectionStatus` union leaves out. That is the whole condition,
+ *  and it is deliberately the same one the MARK recedes on:
+ *  `styles/header-mark.css` dims disconnected and breathes connecting, so a
+ *  dimmed glyph above a panel that mentions nothing is what this exists to end.
+ *
+ *  The condition is the STATE, not the host that opened the panel, and on one
+ *  host those differ. The mobile threads row's mark carries no `data-conn` at
+ *  all (see `BrandMenuButton`: a glyph dimming itself among a row of icons that
+ *  do not reads as disabled), so there is no light on that pane to explain, and
+ *  the notice is instead the only place the state appears. Keying this on the
+ *  host to "match" the mark would take it away exactly where it is worth most.
+ *
+ *  The disconnected line names no remedy, on purpose. Restart posts to the
+ *  engine we cannot reach, and Refresh reloads a client that is not the thing
+ *  that broke, so pointing at either row would be wrong in the ordinary case.
+ *  The 5s health poll in `store/actions/connection.ts` genuinely does recover on
+ *  its own, so that is what it promises instead. */
+const CONNECTION_DETAIL: Record<string, string> = {
+  connecting: 'Waiting for the workspace to answer.',
+  // Scoped to THIS WORKSPACE rather than the app, because a bare "nothing loads
+  // or sends" is refuted by the row directly under it: `connectionStatus` is
+  // driven solely by `/api/v1/health` against this workspace's engine, while the
+  // Workspaces row talks to the GATEWAY (`/~/api/v1/control/*`, a different
+  // process), so unfolding the list and switching away still work while this
+  // engine is unreachable. The narrower claim is both true and more useful,
+  // since switching is the one thing in the panel that still goes anywhere.
+  // Two lines in the panel's 17.5rem, and that is the ceiling worth spending:
+  // the notice pushes every row below it down, so a third line buys nothing the
+  // first two have not already said.
+  disconnected: 'Nothing in this workspace loads or sends. Still trying.',
+};
+
+export function connectionNotice(
+  status: ConnectionStatus,
+  workspace: string | null,
+): { title: string; detail: string } | null {
+  const detail = CONNECTION_DETAIL[status];
+  if (!detail) return null;
+  // Sentence-cased rather than a second string table: the preposition each
+  // state wants is already decided once, above.
+  const phrase = connectionPhrase(status, workspace);
+  return { title: phrase.charAt(0).toUpperCase() + phrase.slice(1), detail };
+}
+
+/** The notice at the head of the panel: a statement, not a row.
+ *
+ *  `role="none"` for the reason `.brand-menu-confirm-row` takes it: the panel is
+ *  a `role="menu"`, whose children are expected to be menuitems, groups and
+ *  separators, so an announced node here would be an orphan the keyboard roving
+ *  has to step past. Nothing is lost by it. The state is already in the
+ *  accessible name of the control that opened the panel (see `BrandMenuButton`'s
+ *  `label`), which is where a screen reader meets it first and without opening
+ *  anything; this notice is the half that a phone, which has no hover and no
+ *  tooltip, could not reach at all.
+ *
+ *  Pure, so `vnodeToText` can flatten it with no DOM: which element it becomes
+ *  and which classes it carries IS this surface's behaviour, the same way it is
+ *  for the workspace rows. */
+export function connectionNoticeRow(status: ConnectionStatus, workspace: string | null) {
+  const notice = connectionNotice(status, workspace);
+  if (!notice) return null;
+  return (
+    <div class={`brand-menu-notice brand-menu-notice-${status}`} role="none">
+      <span class={`status-dot ${status}`} aria-hidden="true" />
+      <span class="brand-menu-notice-text">
+        <b>{notice.title}</b>{' '}{notice.detail}
+      </span>
+    </div>
+  );
 }
 
 /**
@@ -80,6 +161,13 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
   const releaseDirty = lucidosReleaseDirty.value;
   const version = lucidosVersionLabel(release, releaseDirty);
   const versionTooltip = lucidosVersionTooltip(release, releaseDirty);
+  // Is there a release whose notes this client has not read? The dot is the
+  // visual half of that; the sentence below is the half a screen reader and a
+  // desktop hover get, because an unexplained dot says nothing on either
+  // surface. `hasUnreadWhatsNew` is false while the release is unknown, so
+  // `versionTooltip` is never undefined when this composes.
+  const unread = hasUnreadWhatsNew(release, whatsNewSeenRelease.value);
+  const versionLabel = unread ? `${versionTooltip} · new release notes` : versionTooltip;
   // Every menu action closes the menu first. `composeHandlers` focuses the
   // prompt from inside the touch gesture, which is the only way iOS raises the
   // keyboard, and it runs the action AFTER the focus for the same reason: a
@@ -151,12 +239,22 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
         panelRole="menu"
         panelProps={{ 'aria-label': 'Lucidos menu' }}
       >
-        {/* What you are running, and the way to the page that can move it
-            forward. It leads the menu because it is identity rather than an
-            action: the bar no longer says the word "Lucidos" anywhere, so this
-            is where the product names itself and admits its version. Settings >
-            System is the destination because that is where the engine and
-            client versions, and the update controls, already live. */}
+        {/* Why the mark is dim, in words, and nothing at all while it is lit.
+            It goes ABOVE the identity row because it is news of a different
+            kind: that row says what you are running and what is new in it, and
+            this says that right now you are not reaching it at all. Read from
+            inside the panel, so a drop while the menu is open writes the notice
+            in under the user's eyes rather than waiting for the next open. */}
+        {connectionNoticeRow(connectionStatus.value, visibleWorkspaceName.value)}
+
+        {/* What you are running, and the answer to the question a version
+            number raises. It leads the menu because it is identity rather than
+            an action: the bar no longer says the word "Lucidos" anywhere, so
+            this is where the product names itself and admits its version.
+            Settings > System > What's New is the destination because that is
+            what "0.26.3" means: the notes for the release, with every earlier
+            one under it. System's Overview, with the other three versions and
+            the update controls, is one tab along the subpanel switcher. */}
         <button
           type="button"
           class="brand-menu-item brand-menu-version"
@@ -164,13 +262,19 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
           // The pill's `*` is the whole of what says "this is not the published
           // release", and an asterisk read aloud, or hovered, says nothing. Both
           // surfaces get the sentence instead.
-          aria-label={versionTooltip}
-          data-tooltip={versionTooltip}
-          onClick={() => { onClose(); openSettingsSubview('system'); }}
+          aria-label={versionLabel}
+          data-tooltip={versionLabel}
+          onClick={() => { onClose(); openSettingsSubview('whats-new'); }}
         >
           <LucidosMarkIcon />
           Lucidos
           <span class="brand-menu-value">
+            {/* A release whose notes this client has not opened. Inside the
+                pill, on the version it is about, rather than floating beside
+                the row: it marks THAT number as new, and it goes away by being
+                acted on. `aria-hidden` because a bare dot names nothing said
+                aloud; the sentence in the row's label carries it instead. */}
+            {unread && <span class="brand-menu-unread-dot" aria-hidden="true" />}
             <span class="brand-menu-value-name">{version}</span>
           </span>
         </button>

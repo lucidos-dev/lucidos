@@ -276,6 +276,29 @@ export async function engineVersionStatus(): Promise<EngineVersionStatus> {
   return json(`${API}/engine/version-status`);
 }
 
+/** One published release, as the What's New panel shows it. Comes from the
+ *  changelog baked into the engine binary, so this is the history you HAVE:
+ *  the notes for a release the updater is OFFERING postdate that binary and
+ *  arrive with the update check instead (`AppUpdateOffer.notes`). */
+export interface ChangelogRelease {
+  /** No leading `v`, e.g. `0.26.3`. Matched against the `release` from /health
+   *  to mark the one you are running. */
+  version: string;
+  /** As written in the heading, or absent when the heading carries only a
+   *  version. */
+  date?: string | null;
+  /** The section body as raw markdown, heading excluded. Rendered client-side
+   *  (`utils/renderMarkdown.ts`). */
+  notes: string;
+}
+
+/** Every published release, newest first. See engine
+ *  `GET /api/v1/engine/changelog`. */
+export async function engineChangelog(): Promise<ChangelogRelease[]> {
+  const body = await json<{ releases: ChangelogRelease[] }>(`${API}/engine/changelog`);
+  return body.releases;
+}
+
 /** Manually kick off the dev background engine rebuild (escape hatch for a wedged
  *  workspace whose source is behind HEAD with a stale binary — e.g. after a failed
  *  background rebuild). No-op packaged. The resulting version-status `build_state`

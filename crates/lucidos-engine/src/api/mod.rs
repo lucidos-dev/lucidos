@@ -44,6 +44,7 @@ pub(crate) mod proxy_wasm_host;
 pub(crate) mod proxy_wasm_signer;
 mod repositories;
 mod sdk;
+mod sdk_fonts;
 mod sdk_prefs;
 mod search;
 mod settings;
@@ -1121,6 +1122,7 @@ pub fn create_router(
         .merge(search::router())
         .merge(repositories::router())
         .merge(sdk::router())
+        .merge(sdk_fonts::router())
         .merge(sdk_prefs::router())
         .merge(data_api::router())
         .merge(blobs::router())

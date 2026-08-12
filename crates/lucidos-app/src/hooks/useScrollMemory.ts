@@ -355,6 +355,33 @@ export function attachScrollMemory(
     // armed yet) and the whole point from the claim broadcast. Clears a rescue
     // already in flight too, which is what the re-arm below replaces.
     stopRestore();
+    // The link owns the POSITION on this open; it does not own the REQUEST.
+    // Standing down means "do not place the reader", and every branch below this
+    // one places them, so the *standing follow* this thread recorded used to be
+    // handed over with them: `focusThread` retires the flag on the way in, the
+    // resume that answers it lives in the positioning branch, and a deep-linked
+    // open is the one open that never reaches it. A notification tap into a
+    // thread the reader was riding therefore landed on the event with the toggle
+    // dark, which is the report this exists for. So the request is resumed here
+    // instead, `in-place` so nothing is written over the landing, and
+    // `resumeFollowingBottom` itself declines while the agent is LIVE, where the
+    // landing has just ended the ride on purpose.
+    //
+    // FIRST, before the early return below, because a link that has already
+    // landed is exactly the ordinary cross-thread tap and needs this most.
+    //
+    // The record is RE-READ rather than taken from the attach-time snapshot: a
+    // claim broadcast can arrive long after the reader's own scroll changed the
+    // answer, which is the same reason `readSaved` is re-readable at all.
+    // Gated on `followsLiveEdge` like every other live-edge branch, so the
+    // content pane and the thread drawer cannot arm the transcript's follow.
+    if (followsLiveEdge) {
+      const recorded = readSaved();
+      if (recorded?.kind === 'live-edge') resumeFollowingBottom(el, 'in-place');
+      // No record at all is the one case the *follow seed* speaks for, and a
+      // deep link does not change that this thread has none.
+      else if (recorded === null) applyFollowSeed(el, 'in-place');
+    }
     // A link that has ALREADY found its target is positioning the reader, so
     // there is no dead link to rescue and arming would only create one more way
     // to move them. ASKED rather than waited for, because the resolve broadcast
@@ -792,11 +819,14 @@ export function attachScrollMemory(
   const unsubscribeWake = followsLiveEdge
     ? onPageWake(() => {
         if (isCurrent && !isCurrent()) return;
-        // A notification tap can resume the app and resolve a deep-link in one
-        // breath. The deep-link owns the viewport, same as at attach time.
-        if (!openIsOurs()) return;
         if (readSaved()?.kind !== 'live-edge') return;
-        resumeFollowingBottom(el);
+        // A notification tap can resume the app and resolve a deep-link in one
+        // breath, which is the mobile shape of the whole report: the app comes
+        // back, the link lands on the event, and this fires. The deep-link owns
+        // the viewport, same as at attach time, so the resume writes nothing
+        // there and merely picks the request back up. It used to decline
+        // outright, which is right about the write and wrong about the request.
+        resumeFollowingBottom(el, openIsOurs() ? 'live-edge' : 'in-place');
       })
     : null;
 

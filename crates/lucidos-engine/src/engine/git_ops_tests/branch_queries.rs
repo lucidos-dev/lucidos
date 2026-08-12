@@ -893,6 +893,39 @@ fn files_require_restart_for_engine_bundled_iframe_assets() {
     ]));
 }
 
+/// The vendored default font is the sharpest case of "an engine-bundled asset
+/// is not always an engine FILE". `FiraCode-VF.woff2` lives in the app crate,
+/// because the host's `@font-face` resolves it through Vite, so by path alone it
+/// reads as a frontend-only change. But `api/sdk_fonts.rs` `include_bytes!`s that
+/// same file to serve app iframes, so a running engine serves the copy it was
+/// BUILT with. One copy in the tree, two consumers, and only one of them picks up
+/// an edit without a rebuild.
+#[test]
+fn files_require_restart_for_the_engine_bundled_font() {
+    assert!(files_require_restart(&[
+        "crates/lucidos-app/src/assets/fonts/FiraCode-VF.woff2".into()
+    ]));
+    assert!(files_require_restart(&[
+        "crates/lucidos-engine/src/api/sdk_fonts_fira_code.css".into()
+    ]));
+    // The license text beside the font is not served by anything.
+    assert!(!files_require_restart(&[
+        "crates/lucidos-app/src/assets/fonts/LICENSE-FiraCode.txt".into()
+    ]));
+}
+
+/// The changelog is the exception to "docs never restart". It is
+/// `include_str!`'d by `engine::changelog` and served to the What's New panel,
+/// so a running engine serves the copy it was BUILT with. Without the restart an
+/// Apply that adds a release would leave the panel on the previous text, with
+/// the button having promised nothing was needed. Other `.md` files are
+/// unaffected, which is exactly why this one has to be named.
+#[test]
+fn files_require_restart_for_the_engine_bundled_changelog() {
+    assert!(files_require_restart(&["CHANGELOG.md".into()]));
+    assert!(!files_require_restart(&["docs/glossary.md".into()]));
+}
+
 /// The app document is the exception to "frontend files never restart": the
 /// gateway `include_str!`s it and lifts the boot-splash stylesheet + mark out at
 /// compile time (crates/lucidos-gateway/src/proxy.rs), so a running gateway

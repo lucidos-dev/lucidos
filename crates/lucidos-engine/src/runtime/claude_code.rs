@@ -90,7 +90,7 @@ pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
 
 #[path = "claude_code_parse.rs"]
 mod parse;
-pub use parse::parse_line;
+pub use parse::{parse_line, CcStreamState};
 
 /// Render the menu of supported control commands for the frontend's `/model`
 /// picker. CC-specific — Codex and other agents have their own menus.
@@ -765,6 +765,10 @@ async fn driver_task(
     // recycled, so signalling the group would risk unrelated processes.
     let mut child_reaped = false;
     let mut line_buf = String::new();
+    // Parse state that spans lines of THIS stream, and only this one. Owned by
+    // the driver task, so it lives and dies with the subprocess and no other
+    // session can see it. Today it holds the per-message usage dedup.
+    let mut stream_state = CcStreamState::default();
     loop {
         tokio::select! {
             read_result = stdout_reader.read_line(&mut line_buf) => {
@@ -774,7 +778,7 @@ async fn driver_task(
                         break;
                     }
                     Ok(_) => {
-                        for ev in parse_line(&line_buf) {
+                        for ev in parse_line(&mut stream_state, &line_buf) {
                             if let AgentEvent::Init { session_id: ref sid, .. } = ev {
                                 session_id = Some(sid.clone());
                             }
@@ -862,7 +866,7 @@ async fn driver_task(
                 // read_line would append fresh bytes to it, corrupting
                 // parse_line. Forward any pre-captured line before draining.
                 if !line_buf.is_empty() {
-                    for ev in parse_line(&line_buf) {
+                    for ev in parse_line(&mut stream_state, &line_buf) {
                         let _ = events_tx.send(ev);
                     }
                     line_buf.clear();
@@ -878,7 +882,7 @@ async fn driver_task(
                     {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(_)) => {
-                            for ev in parse_line(&line_buf) {
+                            for ev in parse_line(&mut stream_state, &line_buf) {
                                 if events_tx.send(ev).is_err() {
                                     line_buf.clear();
                                     break;

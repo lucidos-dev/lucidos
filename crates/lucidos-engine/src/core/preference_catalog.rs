@@ -278,8 +278,8 @@ pub const CATALOG: &[PrefSpec] = &[
         label: "Theme",
         scope: PrefScope::Device,
         value: PrefValue::Enum(THEMES),
-        default: "dark",
-        description: "Color theme for THIS device. 'system' follows the OS setting. Device-scoped — it overrides the global value on the device that set it.",
+        default: "system",
+        description: "Color theme for THIS device. Defaults to 'system', which follows the OS light/dark setting; 'light' and 'dark' pin it. Device-scoped, so it overrides the global value on the device that set it.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -287,8 +287,8 @@ pub const CATALOG: &[PrefSpec] = &[
         label: "Font family",
         scope: PrefScope::Device,
         value: PrefValue::Enum(FONT_FAMILIES),
-        default: "monospace",
-        description: "UI font for THIS device. Device-scoped.",
+        default: "fira-code",
+        description: "UI font for THIS device. Device-scoped. The default 'fira-code' is served by this engine, so it needs no internet; 'inter', 'jetbrains-mono' and 'ibm-plex-mono' are fetched from Google Fonts on first use, and 'monospace' / 'system' use the device's own fonts.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -577,6 +577,78 @@ mod tests {
         let spec = lookup("timezone").unwrap();
         assert!(validate(spec, "Europe/Oslo").is_ok());
         assert!(validate(spec, "Not/AZone").is_err());
+    }
+
+    /// The appearance defaults, read back out of the client's own contract.
+    ///
+    /// Every client surface (the host store, the two boot scripts, the SDK)
+    /// resolves these from ONE module,
+    /// `packages/lucidos-sdk/src/appearance.ts`. This catalog is the only copy
+    /// left, and it exists because it is a different thing: the agent-facing
+    /// DESCRIPTION, in another language and another process, read out when a
+    /// user asks what a setting is. A stale value here is the agent confidently
+    /// describing a default the app does not have.
+    ///
+    /// So it is pinned against the source rather than hand-checked, the same
+    /// shape as `doc_lists_every_catalog_and_internal_key` below.
+    #[test]
+    fn appearance_defaults_match_the_client_contract() {
+        let contract = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/lucidos-sdk/src/appearance.ts"
+        ))
+        .expect("packages/lucidos-sdk/src/appearance.ts must exist");
+
+        let declared = |name: &str| -> String {
+            let at = contract
+                .find(&format!("export const {name}"))
+                .unwrap_or_else(|| panic!("{name} must be declared in appearance.ts"));
+            let line = contract[at..].lines().next().unwrap();
+            let value = line
+                .split('=')
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must be assigned a literal"));
+            value
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('\'')
+                .to_string()
+        };
+
+        assert_eq!(
+            lookup("theme").unwrap().default,
+            declared("DEFAULT_THEME"),
+            "the catalog's theme default has drifted from the client contract"
+        );
+        assert_eq!(
+            lookup("font-family").unwrap().default,
+            declared("DEFAULT_FONT_FAMILY"),
+            "the catalog's font default has drifted from the client contract"
+        );
+    }
+
+    /// A default the enum does not allow is a default nothing can ever hold: the
+    /// agent reports it, the user asks for it, and `set_preference` rejects the
+    /// value it was just told to use. A single typo is enough, and nothing else
+    /// would catch it. A parenthesised default is the catalog's way of writing
+    /// "no value", so those are exempt by construction.
+    #[test]
+    fn every_enum_default_is_an_allowed_value() {
+        for spec in CATALOG {
+            let PrefValue::Enum(allowed) = spec.value else {
+                continue;
+            };
+            if spec.default.starts_with('(') {
+                continue;
+            }
+            assert!(
+                allowed.contains(&spec.default),
+                "'{}' defaults to '{}', which is not in [{}]",
+                spec.key,
+                spec.default,
+                allowed.join(", ")
+            );
+        }
     }
 
     #[test]

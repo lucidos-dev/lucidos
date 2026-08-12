@@ -66,6 +66,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // System subpanels
+  { id: 'whats-new', label: "What's New", subview: 'whats-new', path: 'Settings → System', keywords: 'changelog release notes version history whats new updates changes released' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },
   { id: 'disk-usage', label: 'Disk Usage', subview: 'disk-usage', path: 'Settings → System', keywords: 'storage space disk usage data' },

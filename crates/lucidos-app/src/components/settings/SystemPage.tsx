@@ -7,6 +7,7 @@ import {
   engineStartedAt,
   engineVersion,
   latestEngineVersion,
+  latestTauriAppNotes,
   latestTauriAppVersion,
   lucidosRelease,
   lucidosReleaseDirty,
@@ -33,6 +34,7 @@ import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
+import { WhatsNewPage } from './WhatsNewPage';
 import { restartControlHome } from './restartControl';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
@@ -41,7 +43,7 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
+export type SystemPanel = 'overview' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -154,6 +156,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   function renderPanel() {
     switch (panel) {
+      case 'whats-new': return <WhatsNewPage />;
       case 'thread-queue': return <ThreadQueueView />;
       case 'backup': return <BackupSection />;
       case 'memory': return <MemoryInspector />;
@@ -288,6 +291,21 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
           ) : tauriHasUpdate && (
             <div class="system-notice">
               Lucidos {latestTauriVer} is available - update and restart to install
+              {/* What is in it, before deciding to take it. The notes come from
+                  the update manifest, so What's New shows THAT release above the
+                  installed history; rendered only when the manifest carried
+                  them, so the link never opens onto nothing. */}
+              {latestTauriAppNotes.value && (
+                <>
+                  {' '}
+                  <button
+                    class="accent-link"
+                    onClick={() => openSettingsSubview('whats-new')}
+                  >
+                    What's new
+                  </button>
+                </>
+              )}
             </div>
           )}
           {/* A check that FAILED must not look like "you are up to date". */}

@@ -498,9 +498,13 @@ describe('both desktop builds show one bar of the same height', () => {
     // while --desktop-bar-height is rem, so shrinking the bar walks the overlay
     // build's header toward zero and then negative. Scanned rather than
     // imported so this stays a dependency-free source test like its neighbours.
-    const prefs = readFileSync(resolve(stylesDir, '../store/actions/preferences.ts'), 'utf-8');
-    const minScale = Number(/UI_SCALE_MIN\s*=\s*([\d.]+)/.exec(prefs)?.[1]);
-    expect(minScale, 'UI_SCALE_MIN not found in preferences.ts').toBeGreaterThan(0);
+    // The scale bounds live in the shared appearance contract (the store only
+    // re-exports them), because the two FOUC scripts need them too.
+    const appearance = readFileSync(
+      resolve(stylesDir, '../../../../packages/lucidos-sdk/src/appearance.ts'), 'utf-8',
+    );
+    const minScale = Number(/UI_SCALE_MIN\s*=\s*([\d.]+)/.exec(appearance)?.[1]);
+    expect(minScale, 'UI_SCALE_MIN not found in appearance.ts').toBeGreaterThan(0);
 
     const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
     const barRem = Number(/^([\d.]+)rem$/.exec(root!.props.get('--desktop-bar-height')!)?.[1]);

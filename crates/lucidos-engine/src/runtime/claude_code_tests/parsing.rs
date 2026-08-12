@@ -1,9 +1,37 @@
 use super::*;
 
+/// Parse one line against a fresh stream, for the majority of tests below that
+/// judge a single frame in isolation. Anything about state that spans lines
+/// (the usage dedup) drives one `CcStreamState` across several calls instead.
+fn parse_one_line(line: &str) -> Vec<AgentEvent> {
+    parse_line(&mut CcStreamState::default(), line)
+}
+
+/// Build an assistant frame carrying `usage`, with an optional `message.id`.
+/// The dedup tests differ only in that id, so spelling the rest of the JSON out
+/// per test would bury the one thing under examination.
+fn assistant_usage_frame(message_id: Option<&str>, input: u64, output: u64) -> String {
+    let id_field = match message_id {
+        Some(id) => format!(r#""id":"{}","#, id),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"type":"assistant","message":{{{}"role":"assistant","model":"claude-opus-4-7","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{},"output_tokens":{},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
+        id_field, input, output
+    )
+}
+
+fn usage_count(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+        .count()
+}
+
 #[test]
 fn parse_system_init() {
     let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","tools":[]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Init {
@@ -23,7 +51,7 @@ fn parse_system_init() {
 #[test]
 fn parse_system_init_with_model() {
     let line = r#"{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-4-6","tools":[]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Init {
@@ -39,7 +67,7 @@ fn parse_system_init_with_model() {
 #[test]
 fn parse_system_init_with_slash_commands() {
     let line = r#"{"type":"system","subtype":"init","session_id":"s-1","slash_commands":["compact","clear","help","my-skill"]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Init {
@@ -57,7 +85,7 @@ fn parse_system_init_with_slash_commands() {
 #[test]
 fn parse_system_init_with_skills() {
     let line = r#"{"type":"system","subtype":"init","session_id":"s-1","slash_commands":["compact","clear","bugfix","superpowers:brainstorming"],"skills":["bugfix","superpowers:brainstorming"]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Init {
@@ -80,7 +108,7 @@ fn parse_system_init_with_skills() {
 #[test]
 fn parse_assistant_text() {
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello world"}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Message { role, text } => {
@@ -94,7 +122,7 @@ fn parse_assistant_text() {
 #[test]
 fn parse_assistant_tool_use() {
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/tmp/test.rs"}}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolUse { name, input, id } => {
@@ -110,7 +138,7 @@ fn parse_assistant_tool_use() {
 fn parse_assistant_tool_use_missing_id() {
     // Defensive: if CC ever emits a tool_use without id, parser must not panic.
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{}}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolUse { id, .. } => {
@@ -123,7 +151,7 @@ fn parse_assistant_tool_use_missing_id() {
 #[test]
 fn parse_assistant_mixed_content() {
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me read that."},{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/tmp/x"}}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 2);
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
     assert!(matches!(&events[1], AgentEvent::ToolUse { .. }));
@@ -135,7 +163,7 @@ fn parse_assistant_extracts_usage() {
     // parser must surface it as a separate `Usage` event so the
     // consumer can emit a real `ContextCaptured` with producer=CC.
     let line = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1234,"output_tokens":56,"cache_read_input_tokens":900,"cache_creation_input_tokens":100}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 2, "expected one Message and one Usage");
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
     match &events[1] {
@@ -161,7 +189,7 @@ fn parse_assistant_usage_skipped_when_all_zero() {
     // Continuation frames with zeroed usage shouldn't emit a misleading
     // snapshot — no real API call happened.
     let line = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(
         events.len(),
         1,
@@ -170,12 +198,183 @@ fn parse_assistant_usage_skipped_when_all_zero() {
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
 }
 
+/// The duplicate-`ContextCaptured` bug. CC splits one assistant message into
+/// one frame per content block (thinking, text, each tool_use), and every frame
+/// repeats the same `message.id` and the same cumulative usage, so one API call
+/// was reported 2 to 4 times (1.73x the real call count across 521,038 rows in
+/// the dev workspace, measured 2026-08-11). The repeats must collapse to a
+/// single `Usage`, and the frames' own content must still come through.
+#[test]
+fn parse_assistant_usage_reported_once_per_message_id() {
+    let mut state = CcStreamState::default();
+    let frame = assistant_usage_frame(Some("msg_repeat"), 208_908, 2);
+
+    let all: Vec<AgentEvent> = (0..3)
+        .flat_map(|_| parse_line(&mut state, &frame))
+        .collect();
+
+    assert_eq!(
+        usage_count(&all),
+        1,
+        "three frames of one assistant message are one API call, got {:?}",
+        all
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|e| matches!(e, AgentEvent::Message { .. }))
+            .count(),
+        3,
+        "only the Usage is deduped: each frame's own content block still emits"
+    );
+}
+
+/// Keyed on the id, NOT on the numbers. Two genuine API calls can report byte
+/// identical usage (a cache-warm retry of the same prompt), and dropping the
+/// second would under-report spend. Value equality is the heuristic the
+/// historical rollup had to use because it cannot see the id; the engine has
+/// the exact key.
+#[test]
+fn parse_assistant_usage_distinct_message_ids_both_report() {
+    let mut state = CcStreamState::default();
+    let first = parse_line(&mut state, &assistant_usage_frame(Some("msg_a"), 1000, 7));
+    let second = parse_line(&mut state, &assistant_usage_frame(Some("msg_b"), 1000, 7));
+
+    assert_eq!(usage_count(&first), 1);
+    assert_eq!(
+        usage_count(&second),
+        1,
+        "a different message id is a different API call however identical its usage"
+    );
+}
+
+/// A parallel sub-agent's frames ride the parent's stream, so two messages can
+/// interleave. Dedup must survive that: the id claimed by the first frame is
+/// still claimed when the second one arrives.
+#[test]
+fn parse_assistant_usage_dedupes_across_interleaved_messages() {
+    let mut state = CcStreamState::default();
+    let a = assistant_usage_frame(Some("msg_parent"), 5000, 11);
+    let b = assistant_usage_frame(Some("msg_subagent"), 900, 4);
+
+    let all: Vec<AgentEvent> = [&a, &b, &a, &b]
+        .iter()
+        .flat_map(|f| parse_line(&mut state, f))
+        .collect();
+
+    assert_eq!(
+        usage_count(&all),
+        2,
+        "two interleaved messages are two API calls, got {:?}",
+        all
+    );
+}
+
+/// The same, at the width a fleet of parallel sub-agents can reach. Every id
+/// claimed this turn is remembered, so no amount of interleaving between a
+/// message's frames lets the later one report its call a second time. A fixed
+/// window of recent ids would evict the first message and do exactly that.
+#[test]
+fn parse_assistant_usage_dedup_survives_wide_interleaving() {
+    let mut state = CcStreamState::default();
+    let frames: Vec<String> = (0..40)
+        .map(|i| assistant_usage_frame(Some(&format!("msg_{}", i)), 1000 + i, 5))
+        .collect();
+
+    let first_pass: Vec<AgentEvent> = frames
+        .iter()
+        .flat_map(|f| parse_line(&mut state, f))
+        .collect();
+    let second_pass: Vec<AgentEvent> = frames
+        .iter()
+        .flat_map(|f| parse_line(&mut state, f))
+        .collect();
+
+    assert_eq!(
+        usage_count(&first_pass),
+        40,
+        "40 distinct calls, 40 reports"
+    );
+    assert_eq!(
+        usage_count(&second_pass),
+        0,
+        "a second frame of each of those 40 messages is no new call at all"
+    );
+}
+
+/// The claimed ids are turn-scoped: a `result` frame releases them, which is
+/// what keeps the set the size of one turn rather than of a session that stays
+/// up for days. Nothing is lost, because CC never reuses a message id.
+#[test]
+fn parse_assistant_usage_claims_are_released_at_the_turn_terminal() {
+    let mut state = CcStreamState::default();
+    let frame = assistant_usage_frame(Some("msg_turn_1"), 7000, 21);
+
+    let before = parse_line(&mut state, &frame);
+    let repeat_within_turn = parse_line(&mut state, &frame);
+    parse_line(
+        &mut state,
+        r#"{"type":"result","result":"Done.","duration_ms":10}"#,
+    );
+    let after_terminal = parse_line(&mut state, &frame);
+
+    assert_eq!(usage_count(&before), 1);
+    assert_eq!(usage_count(&repeat_within_turn), 0);
+    assert_eq!(
+        usage_count(&after_terminal),
+        1,
+        "past the terminal the id is forgotten, and re-reporting a straggler is \
+         the safe direction"
+    );
+}
+
+/// Defensive: no `message.id` means no key, and with no key a repeat cannot be
+/// told from a fresh call. Emit, every time. Over-counting spend is the
+/// recoverable direction; silently dropping usage is not.
+#[test]
+fn parse_assistant_usage_without_message_id_always_reports() {
+    let mut state = CcStreamState::default();
+    let frame = assistant_usage_frame(None, 1234, 56);
+
+    let all: Vec<AgentEvent> = (0..2)
+        .flat_map(|_| parse_line(&mut state, &frame))
+        .collect();
+
+    assert_eq!(
+        usage_count(&all),
+        2,
+        "an id-less frame must never be suppressed, got {:?}",
+        all
+    );
+}
+
+/// The all-zero skip and the dedup are orthogonal, and an all-zero frame must
+/// not consume its id: CC stamps zeroed usage on synthetic continuation
+/// messages, and a real frame later carrying the same id still has to report.
+#[test]
+fn parse_assistant_all_zero_usage_does_not_consume_its_message_id() {
+    let mut state = CcStreamState::default();
+    let zeroed = parse_line(&mut state, &assistant_usage_frame(Some("msg_z"), 0, 0));
+    let real = parse_line(&mut state, &assistant_usage_frame(Some("msg_z"), 4321, 9));
+
+    assert_eq!(
+        usage_count(&zeroed),
+        0,
+        "the all-zero skip still holds, got {:?}",
+        zeroed
+    );
+    assert_eq!(
+        usage_count(&real),
+        1,
+        "a real call must report even when a zeroed frame claimed its id first"
+    );
+}
+
 #[test]
 fn parse_assistant_no_usage_block() {
     // Defensive: assistant frames without a usage block (e.g. older CC
     // format) must still parse text/tool_use without panicking.
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
 }
@@ -190,7 +389,7 @@ fn parse_assistant_no_usage_block() {
 fn parse_assistant_skips_cc_own_api_error_banner() {
     let line = r#"{"type":"assistant","is_api_error_message":true,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Stream idle timeout - no chunks received"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
     assert!(
-        parse_line(line).is_empty(),
+        parse_one_line(line).is_empty(),
         "CC's API-error banner must not become assistant text: the failure card already states it"
     );
 }
@@ -201,7 +400,7 @@ fn parse_assistant_skips_cc_own_api_error_banner() {
 #[test]
 fn parse_assistant_skips_subagent_api_error_banner() {
     let line = r#"{"type":"assistant","is_api_error_message":true,"parent_tool_use_id":"toolu_1","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Response stalled mid-stream. The response above may be incomplete."}]}}"#;
-    assert!(parse_line(line).is_empty());
+    assert!(parse_one_line(line).is_empty());
 }
 
 /// The flag is what disqualifies the text, not its wording. A turn where the
@@ -209,7 +408,7 @@ fn parse_assistant_skips_subagent_api_error_banner() {
 #[test]
 fn parse_assistant_keeps_text_that_merely_looks_like_an_api_error() {
     let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: Stream idle timeout - no chunks received"}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Message { text, .. } => {
@@ -224,7 +423,7 @@ fn parse_assistant_keeps_text_that_merely_looks_like_an_api_error() {
 #[test]
 fn parse_assistant_keeps_text_when_the_error_flag_is_false() {
     let line = r#"{"type":"assistant","is_api_error_message":false,"message":{"role":"assistant","content":[{"type":"text","text":"Reading the file."}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
 }
@@ -232,7 +431,7 @@ fn parse_assistant_keeps_text_when_the_error_flag_is_false() {
 #[test]
 fn parse_legacy_tool_result() {
     let line = r#"{"type":"tool_result","content":"file contents here","is_error":false,"tool_use_id":"toolu_legacy"}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolResult { output, status, id } => {
@@ -247,7 +446,7 @@ fn parse_legacy_tool_result() {
 #[test]
 fn parse_legacy_tool_result_error() {
     let line = r#"{"type":"tool_result","content":"not found","is_error":true}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolResult { output, status, id } => {
@@ -264,7 +463,7 @@ fn parse_legacy_tool_result_error() {
 #[test]
 fn parse_user_tool_result() {
     let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"result text","is_error":false}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolResult { output, status, id } => {
@@ -279,7 +478,7 @@ fn parse_user_tool_result() {
 #[test]
 fn parse_user_tool_result_error() {
     let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"permission denied","is_error":true}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::ToolResult { output, status, id } => {
@@ -294,7 +493,7 @@ fn parse_user_tool_result_error() {
 #[test]
 fn parse_user_multiple_tool_results() {
     let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"tu_2","content":"also ok","is_error":false}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 2);
     assert!(matches!(&events[0], AgentEvent::ToolResult { .. }));
     assert!(matches!(&events[1], AgentEvent::ToolResult { .. }));
@@ -305,7 +504,7 @@ fn parse_user_non_tool_result_ignored() {
     // A user message with text content (not tool_result) should produce no events
     let line =
         r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 0);
 }
 
@@ -314,7 +513,7 @@ fn parse_user_non_tool_result_ignored() {
 fn parse_control_response_ignored() {
     let line =
         r#"{"type":"control_response","request_id":"abc-123","response":{"subtype":"success"}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert!(events.is_empty());
 }
 
@@ -328,7 +527,7 @@ fn parse_control_response_ignored() {
 #[test]
 fn parse_stream_event_emits_liveness() {
     let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert!(
         matches!(&events[..], [AgentEvent::StreamActivity]),
         "stream_event must yield a single StreamActivity liveness ping, got {:?}",
@@ -343,7 +542,7 @@ fn parse_stream_event_emits_liveness() {
 #[test]
 fn parse_stream_event_extracts_thinking_delta_and_keeps_liveness() {
     let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason"}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[..] {
         [AgentEvent::Thought { text }, AgentEvent::StreamActivity] => {
             assert_eq!(text, "Let me reason");
@@ -359,7 +558,7 @@ fn parse_stream_event_extracts_thinking_delta_and_keeps_liveness() {
 #[test]
 fn parse_stream_event_thinking_delta_ignores_text_field() {
     let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"wrong field"}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert!(
         matches!(&events[..], [AgentEvent::StreamActivity]),
         "a thinking_delta with only a `text` field must yield liveness only, got {:?}",
@@ -372,7 +571,7 @@ fn parse_stream_event_thinking_delta_ignores_text_field() {
 #[test]
 fn parse_stream_event_empty_thinking_delta_is_liveness_only() {
     let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert!(
         matches!(&events[..], [AgentEvent::StreamActivity]),
         "empty thinking_delta must yield only StreamActivity, got {:?}",
@@ -383,7 +582,7 @@ fn parse_stream_event_empty_thinking_delta_is_liveness_only() {
 #[test]
 fn parse_result() {
     let line = r#"{"type":"result","result":"Done.","duration_ms":1234}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Result {
@@ -406,7 +605,7 @@ fn parse_result() {
 #[test]
 fn parse_result_error_during_execution_carries_error() {
     let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","duration_ms":2300,"errors":["Stream interrupted: connection reset"]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Result {
@@ -431,7 +630,7 @@ fn parse_result_error_during_execution_carries_error() {
 #[test]
 fn parse_result_error_max_turns_falls_back_to_subtype() {
     let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","duration_ms":42000}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert_eq!(
@@ -449,7 +648,7 @@ fn parse_result_error_max_turns_falls_back_to_subtype() {
 #[test]
 fn parse_result_joins_multiple_errors() {
     let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","duration_ms":100,"errors":["upstream 503","retry exhausted"]}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert_eq!(error.as_deref(), Some("upstream 503; retry exhausted"));
@@ -464,7 +663,7 @@ fn parse_result_joins_multiple_errors() {
 #[test]
 fn parse_result_success_with_subtype_has_no_error() {
     let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"All good.","duration_ms":1500}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { text, error, .. } => {
             assert_eq!(text, "All good.");
@@ -489,7 +688,7 @@ fn parse_result_success_with_subtype_has_no_error() {
 fn parse_result_is_error_with_success_subtype_yields_no_error() {
     let line =
         r#"{"type":"result","subtype":"success","is_error":true,"result":"","duration_ms":100}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert!(
@@ -512,7 +711,7 @@ fn parse_result_is_error_with_success_subtype_yields_no_error() {
 #[test]
 fn parse_result_is_error_with_success_subtype_and_text_yields_no_error() {
     let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"Done — changes committed.","duration_ms":100}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { text, error, .. } => {
             assert_eq!(text, "Done — changes committed.");
@@ -535,7 +734,7 @@ fn parse_result_is_error_with_success_subtype_and_text_yields_no_error() {
 #[test]
 fn parse_result_is_error_success_subtype_preserves_api_error_result_text() {
     let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: Stream idle timeout - partial response received","duration_ms":100}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert_eq!(
@@ -556,7 +755,7 @@ fn parse_result_is_error_success_subtype_preserves_api_error_result_text() {
 #[test]
 fn parse_result_is_error_success_subtype_ignores_incidental_api_error_mention() {
     let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"Fixed the api error handling in client.ts.","duration_ms":100}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert!(
@@ -576,7 +775,7 @@ fn parse_result_is_error_success_subtype_ignores_incidental_api_error_mention() 
 #[test]
 fn parse_result_is_error_with_no_subtype_and_no_errors_yields_no_error() {
     let line = r#"{"type":"result","is_error":true,"result":"","duration_ms":100}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {
             assert!(
@@ -592,20 +791,20 @@ fn parse_result_is_error_with_no_subtype_and_no_errors_yields_no_error() {
 
 #[test]
 fn parse_empty_line() {
-    assert!(parse_line("").is_empty());
-    assert!(parse_line("   ").is_empty());
-    assert!(parse_line("\n").is_empty());
+    assert!(parse_one_line("").is_empty());
+    assert!(parse_one_line("   ").is_empty());
+    assert!(parse_one_line("\n").is_empty());
 }
 
 #[test]
 fn parse_invalid_json() {
-    assert!(parse_line("not json at all").is_empty());
+    assert!(parse_one_line("not json at all").is_empty());
 }
 
 #[test]
 fn parse_unknown_type_logged() {
     let line = r#"{"type":"something_new","data":"test"}"#;
-    let events = parse_line(line);
+    let events = parse_one_line(line);
     assert!(events.is_empty());
 }
 
@@ -622,7 +821,12 @@ fn parse_full_cc_session() {
         r#"{"type":"result","result":"Here are the contents.","duration_ms":5000}"#,
     ];
 
-    let all_events: Vec<AgentEvent> = lines.iter().flat_map(|l| parse_line(l)).collect();
+    // One state for the whole sequence, as the driver task does it.
+    let mut state = CcStreamState::default();
+    let all_events: Vec<AgentEvent> = lines
+        .iter()
+        .flat_map(|l| parse_line(&mut state, l))
+        .collect();
 
     // system → Init
     assert!(
@@ -667,15 +871,15 @@ fn parse_line_ignores_hook_system_events() {
         r#"{"type":"system","subtype":"hook_progress","hook_id":"abc","session_id":"s1"}"#;
 
     assert!(
-        super::parse_line(hook_started).is_empty(),
+        parse_one_line(hook_started).is_empty(),
         "hook_started should not produce Init"
     );
     assert!(
-        super::parse_line(hook_response).is_empty(),
+        parse_one_line(hook_response).is_empty(),
         "hook_response should not produce Init"
     );
     assert!(
-        super::parse_line(hook_progress).is_empty(),
+        parse_one_line(hook_progress).is_empty(),
         "hook_progress should not produce Init"
     );
 }
@@ -683,7 +887,7 @@ fn parse_line_ignores_hook_system_events() {
 #[test]
 fn parse_line_extracts_init_from_system_init_event() {
     let init = r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus","slash_commands":["compact","commit","review"],"skills":["commit","review"]}"#;
-    let events = super::parse_line(init);
+    let events = parse_one_line(init);
     assert_eq!(events.len(), 1);
     match &events[0] {
         AgentEvent::Init {

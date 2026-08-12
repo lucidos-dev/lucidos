@@ -85,16 +85,14 @@ describe('the transcript fades leave the scroll gutter alone', () => {
     expect(decl(block(contentCss, '.prompt-area {'), 'box-shadow')).toBeNull();
   });
 
-  it('keeps the send landing clear of that dissolve, sized from the same token', () => {
-    // The one thing the app deliberately parks AT the transcript's bottom edge:
-    // `landOnOwnTurn` (components/chat/scrollState.ts) rests a turn's agent
-    // status line there on a send or an answer. That edge is under the band
-    // above, so the row names the room it needs and the landing reads the
-    // resolved px off this property. Written as the token rather than a literal
-    // for the same reason the band's own height is: the two have to move
-    // together, and a number copied into either place drifts.
-    const clearance = decl(block(responseCss, '.response-header {'), 'scroll-margin-bottom');
-    expect(clearance, '.response-header declares no landing clearance').not.toBeNull();
-    expect(clearance).toContain('var(--prompt-fade)');
+  it('parks nothing AT that dissolve: the send landing goes to the top instead', () => {
+    // `.response-header` used to declare a `scroll-margin-bottom`, because
+    // `landOnOwnTurn` (components/chat/scrollState.ts) rested a turn's agent
+    // status line on the transcript's bottom edge, which is under the band above
+    // and would have painted over the very row the landing existed to show.
+    // A submit lands its turn's TOP on the line at the other end now, so nothing
+    // is parked against the dissolve and the clearance has no reader. Pinned so
+    // it cannot come back without the landing that needs it.
+    expect(decl(block(responseCss, '.response-header {'), 'scroll-margin-bottom')).toBeNull();
   });
 });

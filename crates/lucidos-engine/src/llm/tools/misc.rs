@@ -59,6 +59,7 @@ const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "system",
     "appearance",
     "keyboard-shortcuts",
+    "whats-new",
     "thread-queue",
     "backup",
     "memory",
@@ -408,7 +409,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                                 },
                                 "condition": {
                                     "type": "object",
-                                    "description": "Optional filter on THIS entry. A value for equality, or an operator object (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`). Only the event's OWN payload fields, e.g. `{\"child_thread_id\": \"<uuid>\"}`; the thread it belongs to is not one."
+                                    "description": "Optional filter on THIS entry. A value for equality, or an operator object (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`). The event's OWN payload fields, plus `thread_id`, which scopes ANY thread event to one thread: `CodingAgentIdled` with `{\"thread_id\": \"<uuid>\"}` is one session finishing."
                                 }
                             },
                             "required": ["event_type"]

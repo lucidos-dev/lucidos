@@ -74,7 +74,7 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
     const origMM = globalThis.matchMedia;
     (globalThis as any).matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
     restoreMatchMedia = () => { (globalThis as any).matchMedia = origMM; };
-    // Deterministic clearance: turnNavClearancePx reads scroll-margin-top; pin it
+    // Deterministic clearance: turnLandingClearancePx reads scroll-margin-top; pin it
     // to 8px so the landing gap is stable across environments.
     const origGCS = (globalThis as any).getComputedStyle;
     (globalThis as any).getComputedStyle = () => ({ scrollMarginTop: '8px', display: 'block' });

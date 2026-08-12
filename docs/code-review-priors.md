@@ -1420,6 +1420,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`components/chat/CreateThreadView.tsx`,
   `e2e/turn-control-holds-the-reader-still.spec.ts`.)
 
+- **Multiplication inside `calc()`, custom properties included, is not an
+  unsupported-browser risk here** (2026-08-12, Codex). The context viewer's
+  indent ladder computes a row's inset as `calc(var(--context-row-inset) +
+  var(--context-depth) * var(--context-indent))` (`styles/steps.css`), where the
+  depth substitutes a bare number, and a reviewer flagged the whole declaration
+  as dropped on older WebKit, taking the tree's hierarchy with it. The premise
+  is wrong twice over. It is CSS Values 3, in Safari since well before any
+  macOS this app runs on, and Playwright's WebKit resolves the ladder to
+  8/24/24/40px exactly as Chromium does. More decisively, the app cannot run at
+  all on an engine that lacks it: EVERY `--duration-*` token is
+  `calc(<literal> * var(--duration-scale))` (`styles/global/base.css`, pinned by
+  `styles/__tests__/duration-scale-guard.test.ts`), so every transition in the
+  app would be dead, and the desktop split's divider is
+  `calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)))`
+  (`styles/panels/shell.css`), a unitless var times a parenthesized expression,
+  which is strictly more than the ladder asks for. Re-flag only with a named
+  engine, in the supported set, measured dropping one of these declarations.
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though

@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   listen: vi.fn(),
   showToast: vi.fn(),
   removeToast: vi.fn(),
+  openSettingsSubview: vi.fn(),
 }));
 
 // The persistent Settings → System surface reads these, so the tests assert on
@@ -17,11 +18,23 @@ const mocks = vi.hoisted(() => ({
 // graph) into a unit test.
 const storeSignals = vi.hoisted(() => ({
   latestTauriAppVersion: { value: null as string | null },
+  latestTauriAppNotes: { value: null as string | null },
   appUpdateCheckError: { value: null as string | null },
   appUpdateProgress: { value: null as AppUpdateProgress | null },
 }));
 
+/** What `check_app_update` resolves to. Notes default to absent, which is the
+ *  state every assertion below other than the What's-new ones describes. */
+function offer(version: string, notes: string | null = null) {
+  return { version, notes };
+}
+
 vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
+// The offer toast's secondary action navigates; the navigation itself belongs to
+// the menu action's own tests. Mocked rather than left real because pulling the
+// real module in would drag the whole store graph through this file's partial
+// `../store` mock.
+vi.mock('./menu', () => ({ openSettingsSubview: mocks.openSettingsSubview }));
 vi.mock('../../utils/tauri', () => ({
   checkAppUpdate: mocks.checkAppUpdate,
   installAppUpdateAndRestart: mocks.installAppUpdateAndRestart,
@@ -33,6 +46,7 @@ vi.mock('../store', () => ({
   showToast: mocks.showToast,
   removeToast: mocks.removeToast,
   latestTauriAppVersion: storeSignals.latestTauriAppVersion,
+  latestTauriAppNotes: storeSignals.latestTauriAppNotes,
   appUpdateCheckError: storeSignals.appUpdateCheckError,
   appUpdateProgress: storeSignals.appUpdateProgress,
 }));
@@ -77,12 +91,14 @@ beforeEach(() => {
   mocks.cancelAppUpdate.mockResolvedValue(undefined);
   mocks.showToast.mockReset();
   mocks.removeToast.mockReset();
+  mocks.openSettingsSubview.mockReset();
   mocks.listen.mockReset();
   mocks.listen.mockImplementation((_event: string, handler: (e: { payload: AppUpdateProgress }) => void) => {
     emitProgress = (frame) => handler({ payload: frame });
     return Promise.resolve(() => {});
   });
   storeSignals.latestTauriAppVersion.value = null;
+  storeSignals.latestTauriAppNotes.value = null;
   storeSignals.appUpdateCheckError.value = null;
   storeSignals.appUpdateProgress.value = null;
 });
@@ -331,7 +347,7 @@ describe('checkForAppUpdate', () => {
   });
 
   it('surfaces the in-app "Update & restart" toast when an update is available', async () => {
-    mocks.checkAppUpdate.mockResolvedValue('2026.6.25');
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
     await checkForAppUpdate();
     expect(mocks.showToast).toHaveBeenCalledTimes(1);
     const [message, type, opts] = mocks.showToast.mock.calls[0];
@@ -342,12 +358,54 @@ describe('checkForAppUpdate', () => {
   });
 
   it('clicking the toast action installs the update + restarts the stack', async () => {
-    mocks.checkAppUpdate.mockResolvedValue('2026.6.25');
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
     mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
     await checkForAppUpdate();
     const opts = mocks.showToast.mock.calls[0][2];
     opts.action.onClick();
     expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(1);
+  });
+
+  // "What is in it?" is the question an update offer raises, and the manifest's
+  // notes are the only thing that can answer it: the offered version postdates
+  // this binary, so it is absent from the changelog baked into it.
+  it("keeps the offered release's notes beside the version they describe", async () => {
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
+    await checkForAppUpdate();
+    expect(storeSignals.latestTauriAppVersion.value).toBe('2026.6.25');
+    expect(storeSignals.latestTauriAppNotes.value).toBe('### Added\n\n- a thing');
+  });
+
+  it('offers a way to read them, which lands on What\'s New', async () => {
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
+    await checkForAppUpdate();
+    const opts = mocks.showToast.mock.calls[0][2];
+    expect(opts.secondaryAction.label).toBe("What's new");
+    opts.secondaryAction.onClick();
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('whats-new');
+    // Reading is not taking: the primary action stays the only thing that
+    // installs anything.
+    expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  it('offers no way to read notes the manifest never carried', async () => {
+    // An affordance that opens onto nothing is worse than no affordance, and
+    // falling back to the installed changelog would show the notes for the
+    // version already running.
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
+    await checkForAppUpdate();
+    expect(mocks.showToast.mock.calls[0][2].secondaryAction).toBeUndefined();
+  });
+
+  it('drops the notes with the version when the update goes away', async () => {
+    // A stale note beside a fresh version would tell the user what a DIFFERENT
+    // update contains, so the two are written and cleared together.
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added'));
+    await checkForAppUpdate();
+    mocks.checkAppUpdate.mockResolvedValue(null);
+    await checkForAppUpdate();
+    expect(storeSignals.latestTauriAppVersion.value).toBe(null);
+    expect(storeSignals.latestTauriAppNotes.value).toBe(null);
   });
 
   it('swallows a failed check (best-effort) — no toast, retried next poll', async () => {
@@ -359,7 +417,7 @@ describe('checkForAppUpdate', () => {
   // The toast is transient; Settings → System is the surface that persists, so
   // the outcome has to be RECORDED, not just announced.
   it('records the available version for the persistent System surface', async () => {
-    mocks.checkAppUpdate.mockResolvedValue('0.16.0');
+    mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
     await checkForAppUpdate();
     expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
     expect(storeSignals.appUpdateCheckError.value).toBeNull();
@@ -387,7 +445,7 @@ describe('checkForAppUpdate', () => {
   });
 
   it('does clear the version it set once the update is gone', async () => {
-    mocks.checkAppUpdate.mockResolvedValue('0.16.0');
+    mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
     await checkForAppUpdate();
     expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
 
@@ -434,7 +492,7 @@ describe('recheckAppUpdateOnResume', () => {
   // went on reporting itself current all morning.
   it('surfaces a release published while the client sat idle', async () => {
     await justChecked();
-    mocks.checkAppUpdate.mockResolvedValue('0.18.2');
+    mocks.checkAppUpdate.mockResolvedValue(offer('0.18.2'));
     vi.advanceTimersByTime(RESUME_THROTTLE_MS);
     await recheckAppUpdateOnResume();
     expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);

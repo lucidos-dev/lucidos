@@ -20,6 +20,13 @@ fn sub(event_type: &str, condition: Option<serde_json::Value>) -> EventSubscript
     }
 }
 
+/// The thread the tasks and the waits belong to. Fixed rather than fresh per
+/// call, because the coverage probe now runs against the *matchable payload*
+/// the completion will carry, and that view names the owning thread.
+fn owner() -> Uuid {
+    Uuid::from_u128(0x0BACC0DE)
+}
+
 fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
     RunningTaskHandle {
         task_id: task_id.to_string(),
@@ -38,7 +45,7 @@ fn a_wait_the_model_armed_for_this_task_covers_it() {
         "BackgroundBashCompleted",
         Some(json!({"task_id": "abc"})),
     )];
-    assert!(wait_covers_task(&on, "abc"));
+    assert!(wait_covers_task(&on, "abc", owner()));
 }
 
 /// The mirror case, and the reason coverage is not just "does a
@@ -50,7 +57,7 @@ fn a_wait_for_a_different_task_does_not_cover_this_one() {
         "BackgroundBashCompleted",
         Some(json!({"task_id": "other"})),
     )];
-    assert!(!wait_covers_task(&on, "abc"));
+    assert!(!wait_covers_task(&on, "abc", owner()));
 }
 
 /// An unconditioned subscription wakes on the first background task to finish
@@ -59,8 +66,8 @@ fn a_wait_for_a_different_task_does_not_cover_this_one() {
 #[test]
 fn an_unconditioned_subscription_covers_every_task() {
     let on = vec![sub("BackgroundBashCompleted", None)];
-    assert!(wait_covers_task(&on, "abc"));
-    assert!(wait_covers_task(&on, "anything-else"));
+    assert!(wait_covers_task(&on, "abc", owner()));
+    assert!(wait_covers_task(&on, "anything-else", owner()));
 }
 
 /// A thread waiting on something else entirely is not watching its background
@@ -71,7 +78,7 @@ fn a_wait_on_another_event_type_covers_nothing() {
         sub("ChangeProposed", None),
         sub("CodingAgentIdled", Some(json!({"task_id": "abc"}))),
     ];
-    assert!(!wait_covers_task(&on, "abc"));
+    assert!(!wait_covers_task(&on, "abc", owner()));
 }
 
 /// The `on:` list is an OR, so one matching entry among several is coverage.
@@ -81,7 +88,7 @@ fn one_matching_entry_among_several_is_coverage() {
         sub("ChangeProposed", None),
         sub("BackgroundBashCompleted", Some(json!({"task_id": "abc"}))),
     ];
-    assert!(wait_covers_task(&on, "abc"));
+    assert!(wait_covers_task(&on, "abc", owner()));
 }
 
 // ── timeout ──────────────────────────────────────────────────────────
@@ -192,7 +199,7 @@ fn task(id: &str) -> RunningTaskHandle {
 #[test]
 fn an_unwatched_task_is_armed() {
     let running = [task("build")];
-    match plan_wait(&running, &[], Some(0)) {
+    match plan_wait(&running, &[], Some(0), owner()) {
         ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 1),
         other => panic!("expected Arm, got {other:?}"),
     }
@@ -208,7 +215,7 @@ fn a_task_the_model_is_already_watching_is_not_armed_again() {
         Some(json!({"task_id": "build"})),
     )])];
     assert_eq!(
-        plan_wait(&running, &live, Some(0)),
+        plan_wait(&running, &live, Some(0), owner()),
         ArmingPlan::NothingUncovered
     );
 }
@@ -222,7 +229,7 @@ fn only_the_uncovered_tasks_are_armed() {
         "BackgroundBashCompleted",
         Some(json!({"task_id": "watched"})),
     )])];
-    match plan_wait(&running, &live, Some(0)) {
+    match plan_wait(&running, &live, Some(0), owner()) {
         ArmingPlan::Arm(tasks) => {
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0].task_id, "unwatched");
@@ -236,7 +243,7 @@ fn only_the_uncovered_tasks_are_armed() {
 #[test]
 fn several_uncovered_tasks_go_into_one_wait() {
     let running = [task("a"), task("b"), task("c")];
-    match plan_wait(&running, &[], Some(0)) {
+    match plan_wait(&running, &[], Some(0), owner()) {
         ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 3),
         other => panic!("expected Arm, got {other:?}"),
     }
@@ -251,7 +258,7 @@ fn the_live_wait_cap_refuses_and_says_why() {
     let live: Vec<super::super::LiveWait> = (0..MAX_LIVE_WAITS_PER_THREAD)
         .map(|_| wait_over(vec![sub("ChangeProposed", None)]))
         .collect();
-    match plan_wait(&running, &live, Some(0)) {
+    match plan_wait(&running, &live, Some(0), owner()) {
         ArmingPlan::Refused(why) => assert!(why.contains("live subscriptions"), "{why}"),
         other => panic!("expected Refused, got {other:?}"),
     }
@@ -268,7 +275,8 @@ fn the_consecutive_cap_refuses_at_the_same_limit_the_model_gets() {
         plan_wait(
             &running,
             &[],
-            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS)
+            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            owner()
         ),
         ArmingPlan::Refused(_)
     ));
@@ -276,7 +284,8 @@ fn the_consecutive_cap_refuses_at_the_same_limit_the_model_gets() {
         plan_wait(
             &running,
             &[],
-            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS - 1)
+            Some(super::super::MAX_CONSECUTIVE_SUBSCRIPTIONS - 1),
+            owner()
         ),
         ArmingPlan::Arm(_)
     ));
@@ -288,7 +297,7 @@ fn the_consecutive_cap_refuses_at_the_same_limit_the_model_gets() {
 #[test]
 fn an_unreadable_subscription_count_refuses_rather_than_assuming_zero() {
     let running = [task("build")];
-    match plan_wait(&running, &[], None) {
+    match plan_wait(&running, &[], None, owner()) {
         ArmingPlan::Refused(why) => assert!(why.contains("could not be read"), "{why}"),
         other => panic!("an unknown count must refuse, got {other:?}"),
     }

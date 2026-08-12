@@ -102,7 +102,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::core::event_subscription::{is_subscribable, EventSubscription};
+use crate::core::event_subscription::{is_subscribable, matchable_payload, EventSubscription};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
 /// One live wait, as reconstructed from its `EventWaitStarted`.
@@ -242,6 +242,24 @@ pub fn waits_matching(waits: &[LiveWait], event_type: &str, payload: &Value) -> 
         .iter()
         .filter_map(|w| w.matched_index(event_type, payload).map(|i| (w.wait_id, i)))
         .collect()
+}
+
+/// [`waits_matching`] for a caller holding a persisted [`crate::core::EventRow`]
+/// rather than a live bus event.
+///
+/// It exists so such a caller cannot accidentally ask the question against the
+/// stored `payload` column, which is not what any dispatch path matches: the
+/// *matchable payload* adds the row's own thread, and a wait scoped with a
+/// `thread_id` condition matches only that view. The fan-in's dedupe gate asked
+/// with the raw column, so a parent that scoped its subscription to a thread
+/// looked un-subscribed to the gate and got woken twice for one completion,
+/// once by its wait and once by the callback the gate exists to stand down.
+pub fn waits_matching_row(waits: &[LiveWait], row: &crate::core::EventRow) -> Vec<(Uuid, usize)> {
+    waits_matching(
+        waits,
+        &row.event_type,
+        &matchable_payload(row.payload.clone(), row.thread_id),
+    )
 }
 
 /// Whether this bus event should be offered to the wait matcher at all.
@@ -416,8 +434,13 @@ pub async fn catch_up_from_watermark(
     }
     let mut after = wait.watermark;
     loop {
-        let rows: Vec<(Uuid, String, Value, i64)> = sqlx::query_as(
-            "SELECT id, event_type, payload, sequence FROM events \
+        // `thread_id` rather than `aggregate_id`, deliberately: the question
+        // here is "which thread does this row belong to, or none", across a
+        // result set that can include rows belonging to no thread, and that is
+        // exactly what the column holds (`CASE WHEN aggregate = 'thread'`).
+        // `aggregate_id::uuid` would fail to cast on a system row.
+        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64)> = sqlx::query_as(
+            "SELECT id, event_type, payload, thread_id, sequence FROM events \
              WHERE sequence > $1 AND event_type = ANY($2) \
              ORDER BY sequence LIMIT $3",
         )
@@ -428,10 +451,13 @@ pub async fn catch_up_from_watermark(
         .await?;
 
         let exhausted = (rows.len() as i64) < CATCH_UP_PAGE;
-        if let Some(&(_, _, _, last_seq)) = rows.last() {
+        if let Some(&(_, _, _, _, last_seq)) = rows.last() {
             after = last_seq;
         }
-        for (id, event_type, payload, _) in rows {
+        for (id, event_type, payload, thread_id, _) in rows {
+            // The same view the live dispatcher matched against, so a wait that
+            // would have woken live wakes on replay too.
+            let payload = matchable_payload(payload, thread_id);
             if let Some(idx) = wait.matched_index(&event_type, &payload) {
                 return Ok(Some((id, event_type, payload, idx)));
             }
@@ -573,8 +599,10 @@ pub async fn arming_lookback_matches(
         // `now()` on both sides of the window and of the age: the cutoff and
         // the elapsed time are the database's own arithmetic, so neither can be
         // thrown off by the engine host's clock. See the doc comment.
-        let rows: Vec<(Uuid, String, Value, i64, i64)> = sqlx::query_as(
-            "SELECT id, event_type, payload, \
+        // `thread_id` for the same reason as the catch-up scan above: it is the
+        // column that answers "which thread, or none" across mixed rows.
+        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64, i64)> = sqlx::query_as(
+            "SELECT id, event_type, payload, thread_id, \
                     EXTRACT(EPOCH FROM now() - created)::bigint, sequence \
              FROM events \
              WHERE sequence <= $1 \
@@ -590,10 +618,15 @@ pub async fn arming_lookback_matches(
         .await?;
 
         let exhausted = (rows.len() as i64) < CATCH_UP_PAGE;
-        if let Some(&(_, _, _, _, last_seq)) = rows.last() {
+        if let Some(&(_, _, _, _, _, last_seq)) = rows.last() {
             upper = last_seq - 1;
         }
-        for (id, event_type, payload, age_secs, _) in rows {
+        for (id, event_type, payload, thread_id, age_secs, _) in rows {
+            // Matched against the same view as every other path, and REPORTED
+            // as that view: the injected `thread_id` is how the model learns
+            // which thread the match it is being told about belongs to, which
+            // is what it needs to scope the wait it arms next.
+            let payload = matchable_payload(payload, thread_id);
             if !already_delivered.contains(&id)
                 && EventSubscription::any_matches(on, &event_type, &payload)
             {

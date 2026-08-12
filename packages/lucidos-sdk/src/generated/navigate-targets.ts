@@ -38,6 +38,7 @@ export const SETTINGS_VIEW_TARGETS = [
   'system',
   'appearance',
   'keyboard-shortcuts',
+  'whats-new',
   'thread-queue',
   'backup',
   'memory',

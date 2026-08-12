@@ -9,6 +9,7 @@ import {
 } from './useScrollMemory';
 import {
   clearPendingEventScroll,
+  followingLiveEdge,
   hasPendingEventScroll,
   isFollowScroll,
   setFollowLiveEdge,
@@ -1099,6 +1100,149 @@ describe('attachScrollMemory teardown', () => {
         vi.useRealTimers();
       }
     });
+
+    // ── The link owns the POSITION, not the REQUEST ────────────────────────
+    //
+    // A *standing follow* is one global flag that `focusThread` retires on every
+    // open, and the resume that answers it lives in the positioning branch this
+    // stand-down replaces. So a deep-linked open was the one open with a retire
+    // and no resume, and a notification tap into a thread the reader was riding
+    // landed them on the event with the toggle dark. It is resumed here instead,
+    // writing nothing, because both answers hold: the link decides where they
+    // look, the record decides whether they are riding.
+
+    /** Arrive at a thread the way a NOTIFICATION TAP does: `focusThread` retires
+     *  the global follow on the way in, the target renders and the link resolves
+     *  on the microtask checkpoint of that commit, and only then does Preact run
+     *  the effect that attaches this. `rectTop` is what makes the landing MOVE
+     *  the reader, which is the ordinary case and the one that used to record an
+     *  offset over the request. */
+    function tapNotificationInto(el: any, opts: { live?: boolean } = {}) {
+      const restoreDom = withFindableTarget(el, { rectTop: 1000, reducedMotion: true });
+      captureObservers();
+      stopFollowingBottom();          // what focusThread does on the way in
+      setThreadLive(!!opts.live);     // what ChatExchange publishes for the thread arrived at
+      scrollToEventAndPulse('e1');    // resolves before anything attaches
+      const detach = attachScrollMemory(el, 'k', {
+        live: transcript,
+        resetOnEmpty: true,
+        followsLiveEdge: true,
+      });
+      return () => { detach(); restoreDom(); };
+    }
+
+    it('resumes the ride the IDLE thread recorded, without moving the reader off the event', async () => {
+      // The report. The thread is parked on a question (or a permission card,
+      // which is the same state), so nothing will carry the reader anywhere and
+      // the ride costs them nothing: they get the event AND the lit toggle.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 20000);
+        const done = tapNotificationInto(el);
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          expect(el.scrollTop).toBe(5200); // the landing, and nothing written over it
+          // And the landing is still recorded as an OFFSET: the reader asked to
+          // be at one place, so coming back returns them to it. The in-place
+          // resume takes no held stamp precisely so this stays true.
+          await vi.advanceTimersByTimeAsync(200);
+          expect(isFollowScroll(el)).toBe(false);
+          expect(localStorage.getItem('k')).toBe('5200');
+        } finally {
+          done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('leaves the ride retired when the thread is LIVE', async () => {
+      // The other half, and the blind spot the landing's own retire exists for:
+      // a link into a streaming thread is a request to be at ONE place, and the
+      // next token would carry the reader off it.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 20000);
+        const done = tapNotificationInto(el, { live: true });
+
+        try {
+          expect(followingLiveEdge.value).toBe(false);
+          expect(el.scrollTop).toBe(5200);
+        } finally {
+          done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('lets the follow seed speak for a thread with no reading position', async () => {
+      // The seed answers the no-record case and only that one, and a deep link
+      // does not change that this thread has none. Without it, every first open
+      // reached by a link would cost a reader who rides everything their ride.
+      vi.useFakeTimers();
+      try {
+        setFollowLiveEdge(true); // the press that records the seed
+        stopFollowingBottom();
+        const el = makeEl(4200, 20000);
+        const done = tapNotificationInto(el);
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          expect(el.scrollTop).toBe(5200);
+        } finally {
+          done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('arms nothing for a thread with no reading position when the seed is off', async () => {
+      vi.useFakeTimers();
+      try {
+        setFollowLiveEdge(false);
+        const el = makeEl(4200, 20000);
+        const done = tapNotificationInto(el);
+
+        try {
+          expect(followingLiveEdge.value).toBe(false);
+          expect(el.scrollTop).toBe(5200);
+        } finally {
+          done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never arms a container that cannot ride a live edge', async () => {
+      // The content pane and the thread drawer share this hook and the follow is
+      // one global, so the gate has to hold on this path too: a deep link in the
+      // transcript must not arm a follow because a file preview was scrolled.
+      vi.useFakeTimers();
+      try {
+        setFollowLiveEdge(true); // the seed is on, and must not reach this container
+        stopFollowingBottom();
+        const el = makeEl(4200, 20000);
+        const restoreDom = withFindableTarget(el, { rectTop: 1000, reducedMotion: true });
+        captureObservers();
+        scrollToEventAndPulse('e1');
+        const detach = attachScrollMemory(el, 'k', { live: transcript, resetOnEmpty: true });
+
+        try {
+          expect(followingLiveEdge.value).toBe(false);
+        } finally {
+          detach();
+          restoreDom();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   // A deep-link owning the open, modelled the way the real one behaves: the
@@ -1759,9 +1903,13 @@ describe('attachScrollMemory teardown', () => {
       detach();
     });
 
-    it('defers to a deep-link that owns the open', () => {
+    it('defers to a deep-link that owns the open, and keeps the ride anyway', () => {
       // A push notification can resume the app and resolve a deep-link in one
-      // breath. The event the reader was sent to wins over the live edge.
+      // breath, which is the MOBILE shape of the whole report. The event the
+      // reader was sent to wins over the live edge, and the request survives:
+      // the link owns the position, not what this thread asked for. The wake
+      // used to decline outright, which is right about the write and wrong about
+      // the request.
       localStorage.setItem('k', LIVE_EDGE_VALUE);
       const el = makeEl(4200, 20000);
       const detach = attachScrollMemory(el, 'k', {
@@ -1770,11 +1918,36 @@ describe('attachScrollMemory teardown', () => {
         followsLiveEdge: true,
       });
       expect(el.scrollTop).toBe(4200); // stood down at attach
+      expect(followingLiveEdge.value).toBe(true); // and resumed in place
 
       page.background();
       page.foreground();
 
       expect(el.scrollTop).toBe(4200); // and still stood down
+      expect(followingLiveEdge.value).toBe(true);
+      detach();
+    });
+
+    it('rebuilds a ride the wake itself destroyed, still without writing', () => {
+      // The hazard the wake reads the RECORD for: a bfcache scroll restore fires
+      // an event shaped exactly like the disarm, so the flag can be gone by the
+      // time this runs. With a deep-link owning the open the answer is the same
+      // one attach gives, the request back without the live edge over the event.
+      localStorage.setItem('k', LIVE_EDGE_VALUE);
+      const el = makeEl(4200, 20000);
+      const detach = attachScrollMemory(el, 'k', {
+        live: () => ({ shouldRestore: () => false }),
+        resetOnEmpty: true,
+        followsLiveEdge: true,
+      });
+
+      page.background();
+      stopFollowingBottom();
+      el.scrollHeight = 40000; // the turns that landed while they were away
+      page.foreground();
+
+      expect(followingLiveEdge.value).toBe(true);
+      expect(el.scrollTop).toBe(4200); // the event, not the new live edge
       detach();
     });
   });

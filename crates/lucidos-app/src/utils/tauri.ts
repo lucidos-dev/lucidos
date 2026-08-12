@@ -276,11 +276,25 @@ export function getOrCreateDeviceId(workspace: string, candidate: string): Promi
 
 // --- App auto-update (packaged desktop app) ---
 
-/** Check GitHub Releases for a newer signed packaged build. Returns the new
- *  version string when an update is available, else null. Drives the in-app
- *  update toast. Only call when isTauri() is true (no-op → null in dev). */
-export function checkAppUpdate(): Promise<string | null> {
-  return invoke<string | null>('check_app_update');
+/** A newer signed packaged build, and what is in it. */
+export interface AppUpdateOffer {
+  version: string;
+  /** The release's notes as raw markdown, or null when the manifest carries
+   *  none.
+   *
+   *  The ONLY way this client can say what a pending update contains: the
+   *  offered version postdates the binary offering it, so it is absent from the
+   *  changelog baked into that binary. Anything showing these must not fall back
+   *  to the installed changelog, which would show the notes for the version
+   *  already running. */
+  notes: string | null;
+}
+
+/** Check GitHub Releases for a newer signed packaged build. Returns the offer
+ *  when one is available, else null. Drives the in-app update toast. Only call
+ *  when isTauri() is true (no-op → null in dev). */
+export function checkAppUpdate(): Promise<AppUpdateOffer | null> {
+  return invoke<AppUpdateOffer | null>('check_app_update');
 }
 
 /** Install the available packaged update and restart the WHOLE stack — the

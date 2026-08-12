@@ -32,95 +32,19 @@
 
 use super::*;
 
-// Mirrors the inline FOUC IIFE in `crates/lucidos-app/index.html`. Keep the
-// two in sync — when adding a font/scale option, update both. The two scripts
-// can't share a source: this one is parser-blocking JS served to iframes, the
-// other is parser-blocking JS embedded in the parent shell HTML, and both
-// must run before any TS module bootstraps.
-const SDK_PREFS_JS: &str = r##"(function() {
-  var d = document.documentElement;
-  // Per-workspace key namespacing (mirrors workspaceStorage.ts + sdk/_storage.ts).
-  // App iframes load at /<slug>/app/<id>/ with no <base>, so derive the slug from
-  // everything before "/app/". Direct access (/app/<id>/) -> no slug -> raw key.
-  var p = (location.pathname || "");
-  var ai = p.indexOf("/app/");
-  var pre = ai >= 0 ? p.slice(0, ai) : "";
-  var seg = pre.replace(/^\/+|\/+$/g, "");
-  var slug = (seg === "" || seg === "~") ? null : seg;
-  function wsKey(name) { return slug ? "ws:" + slug + ":" + name : name; }
-  var raw = localStorage.getItem(wsKey("lucidos-theme"));
-  var theme = (raw === "light" || raw === "dark" || raw === "system") ? raw : "dark";
-  var resolved = theme === "system"
-    ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
-    : theme;
-  d.setAttribute("data-theme", resolved);
-  var bg = resolved === "light" ? "#ffffff" : "#07172e";
-  d.style.setProperty("--bg-primary", bg);
-  // iOS PWA: covers the WKWebView-white gap before sdk-iframe.css loads
-  // (mirrors the parent's inline FOUC IIFE in index.html).
-  d.style.background = bg;
-  var FONTS = {
-    monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
-    system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    inter: "'Inter', system-ui, sans-serif",
-    "jetbrains-mono": "'JetBrains Mono', monospace",
-    "ibm-plex-mono": "'IBM Plex Mono', monospace",
-    "fira-code": "'Fira Code', monospace"
-  };
-  var fontKey = localStorage.getItem(wsKey("lucidos-font-family"));
-  d.style.setProperty("--font-ui", FONTS[fontKey] || FONTS.monospace);
-  // Programming ligatures: OFF for text, ON for code, and only for fonts that
-  // ship them (Fira Code). Every other font gets `normal` for both, leaving its
-  // rendering unchanged. Mirrors FONT_FEATURES in preferences.ts and the same
-  // map in the index.html FOUC IIFE; consumed by the two rules in
-  // api/sdk_iframe.css. The off value MUST be the zeros, never `normal`: liga
-  // and calt are default-ON, so `normal` renders identically to `1` and Fira
-  // Code's calt still collapses a typed `...` into what reads as two dots. And
-  // the text rule has to name form controls, which do not inherit this property.
-  // See preferences.ts for the full why.
-  var FEATURES = { "fira-code": { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' } };
-  var feat = FEATURES[fontKey] || { text: "normal", code: "normal" };
-  d.style.setProperty("--font-features-text", feat.text);
-  d.style.setProperty("--font-features-code", feat.code);
-  var scale = localStorage.getItem(wsKey("lucidos-ui-scale"));
-  if (scale) {
-    // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
-    var legacy = { small: 100, medium: 112.5, large: 125 };
-    var n = legacy[scale];
-    if (n === undefined) n = parseFloat(scale);
-    if (!isNaN(n)) {
-      var snapped = Math.min(200, Math.max(75, Math.round(n / 12.5) * 12.5));
-      d.style.setProperty("--user-ui-scale", snapped + "%");
-    }
-  }
-  // The live style remote's custom property overrides. An app iframe has to
-  // apply the same map as the shell around it, for the same reason it applies
-  // the same theme: a value tuned in the host and not in the iframe shows as
-  // app chrome that does not match the app it is inside.
-  //
-  // LAST on purpose: the applies above write properties (--bg-primary,
-  // --user-ui-scale, --font-ui) the remote is allowed to override.
-  //
-  // The name and value rules MUST match `utils/styleOverrides.ts` and the
-  // index.html FOUC block. The `?style-reset` branch those two carry is
-  // deliberately absent here: the shell removes the key before the iframe
-  // loads, so there is nothing left for this realm to clear.
-  try {
-    var so = JSON.parse(localStorage.getItem(wsKey("lucidos-style-overrides")) || "{}");
-    var soCount = 0;
-    for (var soName in so) {
-      if (soCount >= 200) break;
-      if (!/^--[a-z][a-z0-9-]*$/.test(soName)) continue;
-      var soVal = so[soName];
-      if (typeof soVal !== "string") continue;
-      soVal = soVal.trim();
-      if (!soVal || soVal.length > 120) continue;
-      if (/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i.test(soVal)) continue;
-      d.style.setProperty(soName, soVal);
-      soCount++;
-    }
-  } catch (e) { /* a corrupt map must never break FOUC */ }
-})();"##;
+/// The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` and
+/// checked in. The app shell inlines the sibling `host` bundle into its own
+/// `<head>`, so the two documents run ONE program: they used to run two
+/// hand-copied ones, held together by a comment asking the next editor to keep
+/// them in sync.
+///
+/// `include_str!` bakes it into the binary at compile time (cross-crate path,
+/// same as `api/sdk.rs` does with the app's shared component CSS), so the
+/// packaged build carries it with no runtime file dependency and `cargo build`
+/// never needs npm to have run. A staleness test in the SDK package fails if
+/// the committed bundle no longer matches its source.
+const SDK_PREFS_JS: &str =
+    include_str!("../../../../packages/lucidos-sdk/src/generated/appearance-boot.iframe.js");
 
 /// GET /api/v1/sdk-prefs.js — synchronous prefs script driven by localStorage.
 pub(super) async fn serve_sdk_prefs_js() -> Response {
@@ -146,74 +70,87 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    /// The VALUES this script applies (the theme default, the font stacks, the
+    /// ligature pairs, the scale grid, the style-override rules) are asserted
+    /// once, at their source, in `packages/lucidos-sdk/src/appearance.test.ts`.
+    /// Re-asserting them here would be re-checking a copy that no longer exists,
+    /// and it would pin esbuild's output formatting instead of behaviour.
+    ///
+    /// What is left is the ENGINE's side of the contract: that the artifact it
+    /// serves is the boot script, is complete, is the IFRAME build, and still
+    /// reads the workspace-scoped keys the shell writes.
+
     #[test]
-    fn script_reads_theme_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-theme\"))"));
+    fn serves_the_generated_boot_bundle() {
+        assert!(
+            SDK_PREFS_JS.contains("GENERATED from packages/lucidos-sdk/src/boot/"),
+            "the served script must be the built bundle, not something hand-edited here"
+        );
+        // Wrapped so its locals never reach the iframe's global scope. esbuild's
+        // IIFE wrapper is an arrow form, hence the loose check.
+        assert!(SDK_PREFS_JS.contains("(() => {"));
+        assert!(SDK_PREFS_JS.trim_end().ends_with("})();"));
     }
 
     #[test]
-    fn script_reads_font_family_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-font-family\"))"));
+    fn script_is_the_iframe_build_not_the_shell_one() {
+        // The two entry points differ in exactly the pieces that are the SHELL's:
+        // the boot-splash gradient and the theme-telemetry POST. Serving the host
+        // bundle to app iframes would paint the brand gradient behind every app
+        // and have each of them POST breadcrumbs on load.
+        assert!(
+            !SDK_PREFS_JS.contains("radial-gradient"),
+            "the boot splash belongs to the shell"
+        );
+        assert!(
+            !SDK_PREFS_JS.contains("client-log"),
+            "theme telemetry belongs to the shell"
+        );
+        // And the shell's escape hatch is not the iframe's: the shell clears the
+        // key before an iframe loads, so `?style-reset` must be off here.
+        assert!(SDK_PREFS_JS.contains("styleReset: false"));
     }
 
     #[test]
-    fn script_reads_ui_scale_from_localstorage() {
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-ui-scale\"))"));
+    fn script_reads_theme_font_and_scale_from_localstorage() {
+        // Through `wsLocalGet`, the SDK's per-workspace storage helper, which is
+        // the same one the SDK's live `applyPreferences()` uses. Reading raw
+        // `localStorage` here is what the next test forbids.
+        for key in ["lucidos-theme", "lucidos-font-family", "lucidos-ui-scale"] {
+            assert!(
+                SDK_PREFS_JS.contains(&format!("wsLocalGet(\"{key}\")")),
+                "sdk-prefs.js must read {key}"
+            );
+        }
     }
 
     #[test]
     fn script_namespaces_keys_per_workspace() {
         // The iframe realm has no access to the parent's Storage.prototype
         // override, so it must derive the workspace slug and namespace the keys
-        // itself — or a parent `ws:<slug>:lucidos-theme` write would never match
-        // the iframe read and every app would FOUC. The slug comes from the path
-        // before `/app/` (mirrors sdk/_storage.ts + _fetch.ts).
+        // itself, or a parent `ws:<slug>:lucidos-theme` write would never match
+        // the iframe read and every app would FOUC. An app iframe has no <base>,
+        // so its slug is the path before `/app/`.
         assert!(SDK_PREFS_JS.contains("indexOf(\"/app/\")"));
-        assert!(SDK_PREFS_JS.contains("\"ws:\" + slug + \":\" + name"));
-        // Direct access (no slug) must fall back to the raw key.
-        assert!(SDK_PREFS_JS.contains("slug ? \"ws:\""));
+        assert!(SDK_PREFS_JS.contains("ws:"));
     }
 
     #[test]
     fn script_has_no_unscoped_appearance_reads() {
         // Guard against a regression that drops the wsKey() wrapper. No raw,
         // string-literal read of a per-workspace appearance key may remain.
-        for key in ["lucidos-theme", "lucidos-font-family", "lucidos-ui-scale"] {
+        for key in [
+            "lucidos-theme",
+            "lucidos-font-family",
+            "lucidos-ui-scale",
+            "lucidos-style-overrides",
+        ] {
             let raw = format!("localStorage.getItem(\"{key}\")");
             assert!(
                 !SDK_PREFS_JS.contains(&raw),
-                "sdk-prefs.js must not read {key} unscoped — wrap it in wsKey()"
+                "sdk-prefs.js must not read {key} unscoped, wrap it in wsKey()"
             );
         }
-    }
-
-    #[test]
-    fn script_maps_fira_code_font() {
-        // The FONTS map must carry every font-family option; a missing key
-        // falls back to monospace, so an app iframe would show the wrong font
-        // on first paint when the user picked Fira Code.
-        assert!(SDK_PREFS_JS.contains("\"fira-code\": \"'Fira Code', monospace\""));
-    }
-
-    #[test]
-    fn script_publishes_ligatures_off_for_text_and_on_for_code() {
-        // Fira Code's ligatures are gated to the fira-code key; every other
-        // font resolves to `normal` for both, leaving its rendering unchanged.
-        // Mirrors FONT_FEATURES in preferences.ts + index.html FOUC.
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-code\""));
-        assert!(SDK_PREFS_JS.contains("text: '\"liga\" 0, \"calt\" 0'"));
-        assert!(SDK_PREFS_JS.contains("code: '\"liga\" 1, \"calt\" 1'"));
-        // Fira Code's off value is the ZEROS above, never `normal`. `liga` and
-        // `calt` are default-ON features, so `normal` means "the font's
-        // defaults" and renders identically to `1`: an app's prose would keep
-        // the ligatures and a typed `...` would still read as two dots. Proven
-        // by pixel comparison, not by the computed value, which shows neither.
-        // (`normal` IS right for the non-Fira fallback, which wants defaults.)
-        //
-        // Never the bare property either: scope is decided by the two rules in
-        // api/sdk_iframe.css, which is the only thing that consumes the values.
-        assert!(!SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
     }
 
     #[test]
@@ -227,11 +164,14 @@ mod tests {
     fn script_sets_data_theme_and_bg_primary() {
         assert!(SDK_PREFS_JS.contains("setAttribute(\"data-theme\""));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--bg-primary\""));
+        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-ui\""));
+        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));
+        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-code\""));
     }
 
     #[test]
     fn script_sets_inline_html_background() {
-        // iOS PWA regression — until the iframe's stylesheet applies
+        // iOS PWA regression: until the iframe's stylesheet applies
         // `html { background: var(--bg-primary); }`, <html> has no background
         // and WKWebView's underlying white shows through any area body doesn't
         // cover. Setting style.background directly on <html> from FOUC closes
@@ -243,73 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn script_defaults_to_dark_for_unknown_theme() {
-        // Anything not light/dark/system falls back to dark — matches the
-        // SDK's `resolveThemePreference()` last-resort default (ui.ts), so the
-        // synchronous FOUC script and the later applyPreferences() agree.
-        assert!(SDK_PREFS_JS.contains("? raw : \"dark\""));
+    fn script_never_sets_font_feature_settings_directly() {
+        // Scope is decided by the two rules in api/sdk_iframe.css, which consume
+        // the published custom properties. The bare property is inherited, so
+        // writing it here would ligature an app's prose as well as its code.
+        assert!(!SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
     }
 
     #[test]
-    fn script_is_wrapped_in_iife() {
-        // IIFE keeps locals out of the iframe's global scope.
-        assert!(SDK_PREFS_JS.starts_with("(function()"));
-        assert!(SDK_PREFS_JS.ends_with("})();"));
-    }
-
-    #[test]
-    fn script_applies_style_overrides_scoped_per_workspace() {
-        // The live style remote reaches app iframes too, or a tuned token shows
-        // in the shell and not in the app inside it.
-        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-style-overrides\"))"));
-        assert!(SDK_PREFS_JS.contains("d.style.setProperty(soName, soVal)"));
-    }
-
-    #[test]
-    fn style_override_validator_matches_the_other_two_realms() {
-        // This validator is mirrored in `crates/lucidos-app/src/utils/styleOverrides.ts`
-        // (the app realm) and the index.html FOUC block (the boot realm). All
-        // three apply the map, so a rule relaxed in one realm and not the others
-        // is a hole: the preference is writable by any app via the SDK and by
-        // the chat agent over HTTP, so it is an untrusted path into inline
-        // style. `styleOverrides.test.ts` scans the other two for these same
-        // literals.
-        assert!(
-            SDK_PREFS_JS.contains("/^--[a-z][a-z0-9-]*$/"),
-            "only a custom property may be set"
-        );
-        assert!(
-            SDK_PREFS_JS.contains(r"/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i"),
-            "the banned-value pattern must match the other two realms exactly"
-        );
-        assert!(SDK_PREFS_JS.contains("soCount >= 200"), "entry cap");
-        assert!(
-            SDK_PREFS_JS.contains("soVal.length > 120"),
-            "value length cap"
-        );
-    }
-
-    #[test]
-    fn style_overrides_are_applied_after_theme_font_and_scale() {
-        // Order is load-bearing: the remote is allowed to override --bg-primary,
-        // --font-ui and --user-ui-scale, and inline properties are last-write-
-        // wins, so the override block has to come after all three.
-        let overrides = SDK_PREFS_JS
-            .find("lucidos-style-overrides")
-            .expect("override block");
-        for earlier in ["--bg-primary", "--font-ui", "lucidos-ui-scale"] {
-            let at = SDK_PREFS_JS.find(earlier).expect("earlier apply");
-            assert!(
-                at < overrides,
-                "{earlier} must be applied before the style overrides"
-            );
-        }
-    }
-
-    #[test]
-    fn script_omits_scale_var_when_unset() {
-        // The `if (scale)` branch means missing localStorage entry → no
-        // `--user-ui-scale` set, letting the stylesheet default apply.
-        assert!(SDK_PREFS_JS.contains("if (scale)"));
+    fn script_still_applies_the_style_remote() {
+        // Presence only. Two behaviours that used to be asserted here by reading
+        // the script top to bottom cannot be: in a BUNDLE the source order of a
+        // definition says nothing about execution order. That "overrides are
+        // applied last" rule, and "no stored scale leaves --user-ui-scale
+        // unset", are now driven for real against a fake document in
+        // `packages/lucidos-sdk/src/boot/appearanceBoot.test.ts`, which is a
+        // stronger check than the scan ever was.
+        assert!(SDK_PREFS_JS.contains("lucidos-style-overrides"));
     }
 }

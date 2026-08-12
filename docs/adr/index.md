@@ -69,3 +69,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0059: Acquiring the e2e lock stands down the acquirer's own watch for its release; the stand-down verb is by event type, not all](0059-acquiring-the-e2e-lock-ends-the-acquirers-own-watch.md)
 - [0060: An in-flight conflict resolution owns its change's merge exclusively](0060-apply-merge-ownership.md)
 - [0061: The embedding-model cache is shared per user, not per workspace](0061-shared-embedding-model-cache.md)
+- [0062: A condition can scope to a thread without the thread id being in the payload](0062-condition-scopes-to-a-thread-without-storing-it.md)

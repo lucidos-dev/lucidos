@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, settingsSubviewShortLabel, migrateSettingsSubview } from './store';
 
 describe('settings navigation', () => {
-  it('keeps System last in the Workspace group and owns Thread Queue, Backup, Memory, Disk Usage, Environment Variables, and Debugging as subpanels', () => {
+  it("keeps System last in the Workspace group and owns What's New, Thread Queue, Backup, Memory, Disk Usage, Environment Variables, and Debugging as subpanels", () => {
     const keys = SETTINGS_NAV_ITEMS.map((item) => item.key);
 
     // System is the last Workspace row: it is the deepest, least-often-wanted
@@ -16,7 +16,12 @@ describe('settings navigation', () => {
     expect(keys).not.toContain('disk-usage');
     expect(keys).not.toContain('environment-variables');
     expect(keys).not.toContain('debugging');
-    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging']);
+    expect(keys).not.toContain('whats-new');
+    // What's New leads: it is the one subpanel a user ARRIVES at rather than
+    // goes looking for (the Lucidos menu's version row opens it, and the update
+    // notice links to it), so it sits closest to Overview's own subject.
+    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging']);
+    expect(settingsSubviewLabel('whats-new')).toBe("What's New");
     expect(settingsSubviewLabel('thread-queue')).toBe('Thread Queue');
     expect(settingsSubviewLabel('backup')).toBe('Backup');
     expect(settingsSubviewLabel('environment-variables')).toBe('Environment Variables');

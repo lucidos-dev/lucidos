@@ -1056,10 +1056,13 @@ impl LucidosEngine {
         let mut tool_calls_seen: u32 = 0;
         // Count backend->model API calls seen before the first `Result`, read as
         // `no_api_call_this_turn` by `is_resume_settle_result`. A `Usage` event is
-        // emitted per real API call and ONLY for one: the parser drops all-zero
-        // usage frames, and a backend's `<synthetic>` message (the injected
-        // `Continue from where you left off.` / `No response requested.` pair, a
-        // drained task-notification) carries exactly that. So zero here is
+        // emitted per real API call and ONLY for one, which takes two guards in
+        // the parser: it drops all-zero usage frames, and a backend's
+        // `<synthetic>` message (the injected `Continue from where you left off.`
+        // / `No response requested.` pair, a drained task-notification) carries
+        // exactly that; and it reports a CC assistant message once, on its
+        // `message.id`, because CC splits one message into a frame per content
+        // block and repeats the same usage on each. So zero here is
         // positive proof no model call happened, which is what separates "this
         // Result closes the backend's own resume-settle turn" from "the model was
         // asked our prompt and answered with nothing". Those two shapes are

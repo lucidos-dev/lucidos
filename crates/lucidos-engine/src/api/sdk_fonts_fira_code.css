@@ -1,0 +1,30 @@
+/* Fira Code for app iframes. Served at /api/v1/fonts/fira-code.css and linked
+   by the SDK's `ui.applyPreferences()` when the resolved font is `fira-code`,
+   which is the default. See `api/sdk_fonts.rs` for why this is served locally
+   rather than fetched from Google Fonts.
+
+   The `url()` is RELATIVE on purpose. This stylesheet is served under the
+   workspace's gateway prefix (`/<slug>/api/v1/fonts/fira-code.css`), so a
+   relative reference resolves against whatever prefix actually delivered it,
+   where an absolute `/api/v1/...` would 404 on every non-root workspace.
+
+   It is also VERSIONED, and the version must match `FIRA_CODE_VERSION` in
+   `sdk_fonts.rs` (a unit test there fails if they drift). The font bytes are
+   served `immutable` for a year, which is only honest because upgrading the
+   font changes this filename: this stylesheet is the short-lived pointer that
+   hands clients the new one. Serving a new build at a stable URL would leave
+   every warm client on the old glyphs for up to a year.
+
+   `format('woff2')`, NOT `format('woff2-variations')`. The `-variations` form
+   is a non-standard Safari-10-era string that CSS Fonts 4 replaced with
+   `tech(variations)`, and a UA that does not recognise a format() value SKIPS
+   the source outright: the whole face would silently fail to load. Plain
+   `woff2` is what every browser with variable-font support reads, and it is
+   what Google Fonts serves its own variable faces as. */
+@font-face {
+    font-family: 'Fira Code';
+    src: url('fira-code-6.2.woff2') format('woff2');
+    font-weight: 300 700;
+    font-style: normal;
+    font-display: swap;
+}

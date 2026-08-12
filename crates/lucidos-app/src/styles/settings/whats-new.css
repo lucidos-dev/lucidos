@@ -1,0 +1,95 @@
+/* Settings > System > What's New: the release list. */
+
+.whats-new-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.whats-new-release {
+    border-top: 1px solid var(--border-color);
+}
+
+/* The whole header is the toggle, so it spans the row and keeps the version and
+   the date on one baseline. Reset of the UA button chrome, since this is a
+   full-width row rather than a control. */
+.whats-new-release-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 0;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    /* The shorthand above resets font-feature-settings to `normal`, which is not
+       "off" (liga and calt default ON), so without this a Fira Code user gets
+       ligatures back on this row's prose. */
+    font-feature-settings: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.whats-new-release-header:hover .whats-new-version {
+    color: var(--accent);
+}
+
+/* Sized by its ink rather than its box, so it sits on the text's baseline run
+   instead of pushing the row taller than the line it marks. */
+.whats-new-chevron {
+    display: flex;
+    align-self: center;
+    flex: 0 0 auto;
+    color: var(--text-muted);
+}
+
+.whats-new-version {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.whats-new-date {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+/* The chip naming what a row IS: the release you are running, or the one being
+   offered. A raised neutral surface, not a left-accent stripe (forbidden, see
+   .claude/rules/frontend-css.md) and not a coloured hue: both are statements of
+   fact, not warnings. */
+.whats-new-mark {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.25rem;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+/* The offer is the one thing here you can act on, so it takes the accent while
+   Running stays neutral. */
+.whats-new-mark.is-available {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* The offered release sits above the installed history with a gap, so the list
+   below it reads as a separate run rather than as its continuation. */
+.whats-new-offered {
+    margin-bottom: 1rem;
+}
+
+/* The notes are a card's contents, indented past the chevron so a release's
+   prose lines up under its own version rather than under the toggle. */
+.whats-new-notes {
+    padding: 0 0 0.75rem 1.5rem;
+}
+
+/* The list is the page's own content, so its first heading should not add a
+   second gap under the section title. */
+.whats-new-notes > :first-child {
+    margin-top: 0;
+}

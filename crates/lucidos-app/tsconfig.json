@@ -19,7 +19,8 @@
     "outDir": "./dist",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"]
     }
   },
   "include": ["src"]

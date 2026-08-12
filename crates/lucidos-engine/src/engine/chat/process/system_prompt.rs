@@ -546,8 +546,10 @@ LONG-RUNNING WORK, AND THE REPEATED-CALL GUARD:
 WAITING FOR A STATE CHANGE IN LUCIDOS: USE `await_event`, NEVER A POLL LOOP:
 - Everything above is about the OUTPUT of a process you started. A STATE CHANGE in Lucidos is a different thing: a change being proposed, a trigger firing, a thread you did NOT spawn going idle, a domain event. `await_event` subscribes you and re-opens this thread when it arrives.
 - Reach for it INSTEAD of a bash_output drain loop, a sleep-and-recheck script, or a `threads list` / `changes list` poll: a poll costs a turn per check and can miss a transition between samples. It is ALSO how you deliver, not only how you wait, so nothing has to be blocking you. It is NOT for external state with no Lucidos event (a third-party API, a file another process writes), which you poll with the background tools.
-- One subscription resolves on one match, which is the duration half of the choice; the destination half is TELL ME WHEN X HAPPENS above, which decides "let me know HERE".
-- IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD: it already re-opens this thread with its status, summary and pending change ids, so a wait on it is a second wake. Say you'll report back, and end the turn.
+- Whether the watch is one-shot is the duration half of the choice; the destination half is TELL ME WHEN X HAPPENS above, which decides "let me know HERE".
+- IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: `CodingAgentIdled` with a `condition` of `{"thread_id": "<uuid>"}`, which scopes ANY thread event to one thread. NOT YOUR OWN CHILD: it already re-opens this thread with its status, summary and pending change ids, so a wait on it is a second wake. Say you'll report back, and end the turn.
+- "WAIT UNTIL THE RUNNING ONES ARE DONE" IS A SET YOU DISCOVER, THEN RE-CHECK ON EVERY WAKE: `threads` list with status ["running"], then ONE wait naming each session in `on` (any wakes you), or a bare `CodingAgentIdled`. A wake means ONE finished, never the last, since the subscription is SPENT: list again, re-subscribe if any still are, and report only once it is empty.
+- "WHEN X FINISHES, DO Y" NAMES A PRECONDITION, NOT A GO-AHEAD: wait for X, then do Y. "Auto approved" pre-approves Y for when X has happened; it never replaces X.
 - IT RETURNS IMMEDIATELY AND BLOCKS NOTHING, so say what you're waiting for and END YOUR TURN. The tool's own schema carries the rest.
 - NEVER ANSWER "AM I STILL WATCHING FOR THAT?" FROM MEMORY: call `list_event_waits`, and `cancel_event_wait` to STOP.
 
@@ -1180,7 +1182,26 @@ mod tests {
     /// it takes the lock. Both surfaces share one engine function, so leaving
     /// `on` off the schema would mean the refusals naming it were addressed to
     /// an argument only one caller had. Measured total is 106,090, leaving 60.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 106_150;
+    ///
+    /// Raised to 106,750 for two bullets in WAITING FOR A STATE CHANGE, 651
+    /// characters net of the trims below, and what they buy is a request the
+    /// prompt got wrong five times in one day. "Wait until the running coding
+    /// agents finish" needs two things the section did not say. It is a SET
+    /// discovered at wait time, so it is a list-then-arm, and a subscription is
+    /// spent by the first event, so a wake means one agent finished and the
+    /// section has to say re-check rather than report. And a "when X finishes"
+    /// clause is a precondition: "release the patch when the agents are done,
+    /// auto approved" was read as a green light and acted on immediately, which
+    /// is a pre-approval swallowing the condition it was attached to. Neither
+    /// is inferable from the tool schema, which describes one subscription and
+    /// cannot know that the user named a set. Paid down by 68 first: the
+    /// spent-on-fire fact now sits in the new bullet, so the duration-half
+    /// bullet above it stopped restating it, keeping only the pointer to TELL
+    /// ME WHEN X HAPPENS that `trigger_vs_event_wait_rule_...` pins. The
+    /// third edit in the same section is free: the wrong `child_thread_id`
+    /// recipe was REPLACED by the `thread_id` one that works. Measured total is
+    /// 106,741, leaving 9.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 106_750;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1697,6 +1718,15 @@ mod tests {
     /// `a_wait_matches_a_child_completion_belonging_to_another_thread`), so the
     /// positive claim leads and the exclusion follows it.
     ///
+    /// **The condition it names has to be one that exists.** `child_thread_id`
+    /// is a field on `ChildThreadCompleted`, which only the parent/child fan-in
+    /// emits, so the section spent months telling threads to scope someone
+    /// else's coding-agent session with a condition that matches nothing: the
+    /// wait never fired and the thread never woke. The user asked five times in
+    /// one day and it failed five times. `thread_id` is the field that exists,
+    /// on every thread event, supplied by the *matchable payload*
+    /// (`a_wait_scopes_to_one_coding_agent_session_on_every_path`).
+    ///
     /// Source-scanned rather than asserted against a const, like
     /// `every_prompt_placeholder_is_substituted` above: this section is plain
     /// text inside [`SYSTEM_PROMPT_BASE`], and extracting it would only move the
@@ -1738,6 +1768,42 @@ mod tests {
             "a coding agent's finish must not be listed as a reason to subscribe: \
              for the caller's own child that is the redundant case the last bullet \
              forbids:\n{section}"
+        );
+
+        // The defect: a recipe naming a condition the event does not carry.
+        assert!(
+            section.contains("thread_id"),
+            "the section must name the condition that scopes a wait to one \
+             thread, or 'watch someone else's session' has no mechanism:\n{section}"
+        );
+        assert!(
+            !section.contains("child_thread_id"),
+            "`child_thread_id` is a field on ChildThreadCompleted only, which the \
+             parent/child fan-in alone emits. Naming it here sends a thread to \
+             scope a coding-agent session with a condition that matches nothing, \
+             and the wait then never fires:\n{section}"
+        );
+
+        // A set discovered at wait time, and the trap inside it.
+        assert!(
+            section.contains("RE-CHECK ON EVERY WAKE"),
+            "one subscription is spent by one event, so waiting on everything \
+             currently running is a loop: without the re-check the thread reports \
+             'all done' when the FIRST agent finished:\n{section}"
+        );
+        assert!(
+            section.contains("status [\"running\"]"),
+            "the set has to be discovered before it can be waited on, and the \
+             section must name the filter that lists it:\n{section}"
+        );
+
+        // A condition read as a green light. "Release the patch when the coding
+        // agents are done, auto approved" was acted on immediately.
+        assert!(
+            section.contains("PRECONDITION, NOT A GO-AHEAD"),
+            "a 'when X finishes' clause is something to wait for; a \
+             pre-approval attached to it covers the action once X has happened \
+             rather than replacing X:\n{section}"
         );
     }
 

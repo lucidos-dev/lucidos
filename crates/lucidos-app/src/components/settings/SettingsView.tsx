@@ -1397,6 +1397,7 @@ export function SettingsView() {
   function renderSubview() {
     switch (settingsSubview.value) {
       case 'system': return <SystemPage />;
+      case 'whats-new': return <SystemPage panel="whats-new" />;
       case 'thread-queue': return <SystemPage panel="thread-queue" />;
       case 'models': return modelsSection();
       case 'appearance': return appearanceSection();

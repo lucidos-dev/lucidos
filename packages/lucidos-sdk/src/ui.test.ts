@@ -1,40 +1,30 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ui, resolveThemePreference } from './ui';
+// The theme-precedence cases this file used to carry now live beside the rule
+// itself, in `appearance.test.ts`. `resolveThemePreference` moved into the
+// shared appearance contract when the four hand-copied versions of it were
+// collapsed into one.
+import { ui, webFontUrl } from './ui';
 
-describe('resolveThemePreference', () => {
-  it('prefers a valid server value over everything else', () => {
-    expect(resolveThemePreference('light', 'dark', () => 'dark')).toBe('light');
-    expect(resolveThemePreference('system', 'light', () => 'light')).toBe('system');
+describe('webFontUrl', () => {
+  it('serves the DEFAULT font from the local engine, never from Google', () => {
+    const url = webFontUrl('fira-code');
+    expect(url).toBe('/api/v1/fonts/fira-code.css');
+    // The point of vendoring it: a workspace with no internet must still
+    // render its own default font. A googleapis host here is the regression.
+    expect(url).not.toContain('googleapis');
   });
 
-  it('falls back to localStorage when the server value is missing or invalid', () => {
-    expect(resolveThemePreference(undefined, 'light', () => null)).toBe('light');
-    expect(resolveThemePreference('', 'light', () => null)).toBe('light');
-    expect(resolveThemePreference('bogus', 'dark', () => null)).toBe('dark');
+  it('still fetches the opt-in fonts from Google', () => {
+    for (const key of ['inter', 'jetbrains-mono', 'ibm-plex-mono'] as const) {
+      expect(webFontUrl(key)).toContain('fonts.googleapis.com');
+    }
   });
 
-  it('falls back to the data-theme attribute when server and localStorage miss', () => {
-    expect(resolveThemePreference(undefined, null, () => 'light')).toBe('light');
-    expect(resolveThemePreference(undefined, '', () => 'dark')).toBe('dark');
-  });
-
-  it('hard-defaults to dark only as a last resort', () => {
-    expect(resolveThemePreference(undefined, null, () => null)).toBe('dark');
-    expect(resolveThemePreference(undefined, null, () => 'bogus')).toBe('dark');
-  });
-
-  it('reads the attribute lazily — never when server or localStorage already answers', () => {
-    const getAttr = vi.fn(() => 'light');
-    resolveThemePreference('dark', null, getAttr);
-    resolveThemePreference(undefined, 'system', getAttr);
-    expect(getAttr).not.toHaveBeenCalled();
-  });
-
-  it('a missing server value never clobbers a present localStorage value (regression)', () => {
-    // The systemic dark-flash bug: the active device had no server-scoped
-    // theme, so `prefs['theme'] || 'dark'` returned 'dark' and overwrote the
-    // light value sdk-prefs.js had already applied from localStorage.
-    expect(resolveThemePreference(undefined, 'light', () => 'light')).toBe('light');
+  it('has nothing to load for fonts already on the device', () => {
+    // No garbage case: the parameter is a `FontFamily`, and `resolveFontKey`
+    // (the only producer) cannot hand out a key outside the set.
+    expect(webFontUrl('monospace')).toBeUndefined();
+    expect(webFontUrl('system')).toBeUndefined();
   });
 });
 

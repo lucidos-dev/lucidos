@@ -1,4 +1,9 @@
 import { build } from 'esbuild';
+import { buildAllBootBundles } from './appearanceBoot.build.mjs';
+
+// The appearance FOUC bundles. Unlike `dist/sdk.js` below these are CHECKED IN,
+// because the engine `include_str!`s one of them. See the build module's header.
+await buildAllBootBundles();
 
 await build({
   entryPoints: ['src/browser.ts'],

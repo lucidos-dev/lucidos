@@ -277,3 +277,82 @@ fn an_unknown_name_is_accepted_for_the_caller_to_corroborate() {
 fn an_empty_name_is_refused() {
     assert!(validate_awaitable_event_type("   ").is_err());
 }
+
+// ── matchable_payload ───────────────────────────────────────────────
+
+#[test]
+fn the_matchable_payload_carries_the_thread_the_event_belongs_to() {
+    let thread = Uuid::new_v4();
+    let view = matchable_payload(json!({"has_changes": true}), Some(thread));
+
+    assert_eq!(view["thread_id"], json!(thread.to_string()));
+    assert!(
+        sub(
+            "CodingAgentIdled",
+            Some(json!({"thread_id": thread.to_string()}))
+        )
+        .matches("CodingAgentIdled", &view),
+        "scoping a subscription to one thread is the whole point of the view"
+    );
+    assert!(
+        !sub(
+            "CodingAgentIdled",
+            Some(json!({"thread_id": Uuid::new_v4().to_string()})),
+        )
+        .matches("CodingAgentIdled", &view),
+        "and it must not match some other thread's event"
+    );
+}
+
+/// A `uuid::Uuid` serializes as its hyphenated string, so the injected value has
+/// to be that same spelling: a condition carries whatever the `threads` list
+/// printed, and `$eq` on a JSON string is a byte comparison.
+#[test]
+fn the_injected_id_is_spelled_the_way_a_uuid_serializes() {
+    let thread = Uuid::new_v4();
+    let view = matchable_payload(json!({}), Some(thread));
+    assert_eq!(view["thread_id"], serde_json::to_value(thread).unwrap());
+}
+
+/// Insert-if-absent. An event that owns the key keeps its value, which is what
+/// keeps a user-authored domain payload honest.
+#[test]
+fn an_owned_thread_id_is_never_shadowed() {
+    let carrier = Uuid::new_v4();
+    let owned = Uuid::new_v4();
+    let view = matchable_payload(json!({"thread_id": owned.to_string()}), Some(carrier));
+    assert_eq!(view["thread_id"], json!(owned.to_string()));
+}
+
+/// An event belonging to no thread is not thread-scopable, and the view says so
+/// by omission rather than by inventing a value. A condition naming a missing
+/// field never matches (`missing_field_does_not_match`), so such a subscription
+/// simply never fires, identically on the live and the replay path.
+#[test]
+fn an_event_with_no_thread_gets_no_key() {
+    let payload = json!({"summary": "release published"});
+    let view = matchable_payload(payload.clone(), None);
+    assert_eq!(view, payload);
+    assert!(view.get("thread_id").is_none());
+
+    // Which is what makes a domain event not thread-scopable, on every path:
+    // the key is absent rather than invented, and a condition naming a missing
+    // field never matches (`missing_field_does_not_match`). So such a
+    // subscription is silent, identically live and on replay, instead of one
+    // path resolving it.
+    assert!(
+        !sub(
+            "ReleasePublished",
+            Some(json!({"thread_id": Uuid::new_v4().to_string()})),
+        )
+        .matches("ReleasePublished", &view),
+        "a thread-scoped condition must match nothing on an event with no thread"
+    );
+}
+
+/// Domain payloads are whatever the workspace wrote, including a bare scalar.
+#[test]
+fn a_non_object_payload_is_left_alone() {
+    let view = matchable_payload(json!("just a string"), Some(Uuid::new_v4()));
+    assert_eq!(view, json!("just a string"));
+}

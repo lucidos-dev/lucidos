@@ -17,6 +17,10 @@
  * carries is absent WITH its icon proven present, so a trim can never be the
  * reason an action became unreachable.
  *
+ * The panel's other job is answering for the mark: when the connection light
+ * recedes, the menu is where the state is spelled out, and the third test here
+ * is the only check that a real drop reaches the real panel.
+ *
  * Desktop-only by viewport: the mobile layout has no `.desktop-header` at all.
  */
 import { test, expect, Page } from './fixtures';
@@ -166,6 +170,71 @@ test.describe('Lucidos menu from the desktop mark', () => {
     await toggle.click();
     await expect(menu).toHaveCount(0);
     await expect(page.locator('.brand-menu-scrim')).toHaveCount(0);
+  });
+
+  test('says why the mark is dim, and stops saying it on reconnect', async ({ page }) => {
+    // The one check in this file that is not about the panel's contents but
+    // about the WIRING. Everything else the notice promises is pinned cheaply
+    // (`connection-notice.test.ts` over the pure row, `header-mark-geometry`
+    // over its dressing), and none of it proves that a real drop reaches the
+    // real panel.
+    //
+    // It runs in one project, which is the file's `-desktop` suffix doing its
+    // job (playwright.config.ts ignores those in both mobile projects) rather
+    // than anything this test asks for. Worth knowing here, because the cost is
+    // real and paying it three times would not be: the dot flips only after
+    // MAX_SUPPRESSED_FAILURES + 1 consecutive failed polls at 5s
+    // (store/actions/connection.ts, the tolerance that stops an iOS radio nap
+    // painting red), so this spends ~20s going down and ~10s coming back
+    // (MIN_RECONNECT_SUCCESSES) and cannot be hurried from outside.
+    test.slow();
+
+    await navigateToApp(page);
+
+    const toggle = page.locator('.desktop-header [data-role="brand-menu-toggle"]');
+    const menu = page.locator('.brand-menu');
+    const notice = page.locator('.brand-menu-notice');
+    const open = async () => {
+      await toggle.click();
+      await expect(menu).toBeVisible();
+    };
+    const close = async () => {
+      await toggle.click();
+      await expect(menu).toHaveCount(0);
+    };
+
+    // Connected: the mark is at full strength and the panel has nothing to
+    // explain. Asserted first, so a notice found later is the state change and
+    // not something the panel always carried.
+    await expect(toggle).toHaveAttribute('data-conn', 'connected', { timeout: 30_000 });
+    await open();
+    await expect(notice).toHaveCount(0);
+    await close();
+
+    // The engine goes unreachable exactly as it does when it is down: the probe
+    // never lands. `page.route` is scoped to THIS page, and Playwright gives
+    // every test its own, so no sibling in this file inherits the outage.
+    await page.route('**/api/v1/health', (route) => route.abort());
+    await expect(toggle).toHaveAttribute('data-conn', 'disconnected', { timeout: 60_000 });
+
+    await open();
+    await expect(notice).toHaveCount(1);
+    // The state in words, with the workspace it is about, and the dot carrying
+    // the state so the shared `.status-dot` scale can colour it.
+    await expect(notice).toContainText(/^Disconnected from \S/);
+    await expect(notice.locator('.status-dot.disconnected')).toHaveCount(1);
+    // A statement, not a control: the panel's rows are what answer a tap.
+    await expect(notice.locator('button')).toHaveCount(0);
+    await close();
+
+    // ...and it retracts on its own the moment the engine answers again. A
+    // notice that outlived the outage would be worse than none: it would report
+    // an outage the mark says is over.
+    await page.unroute('**/api/v1/health');
+    await expect(toggle).toHaveAttribute('data-conn', 'connected', { timeout: 60_000 });
+    await open();
+    await expect(notice).toHaveCount(0);
+    await close();
   });
 
   test('opening and closing the menu does not move the mark or the workspace name', async ({ page }) => {

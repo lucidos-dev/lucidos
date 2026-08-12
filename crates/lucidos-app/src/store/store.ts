@@ -39,7 +39,7 @@ import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
+import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
 import type { EnvironmentVariable, ModelInfo } from '../api/types';
 import { markSwUpdateDismissed, markSwitchDismissed } from '../hooks/sw-update';
 
@@ -190,7 +190,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'debugging';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -226,6 +226,11 @@ export const settingsSubview = signal<SettingsSubview>('main');
 export const settingsScrollTarget = signal<string | null>(null);
 
 export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
+  // Leads the subpanels because it is the one a user arrives at rather than
+  // goes looking for: the Lucidos menu's version row opens it, and the update
+  // notice links to it. It also sits closest to what Overview already says,
+  // which release is running and how to move it forward.
+  { key: 'whats-new', label: "What's New" },
   { key: 'thread-queue', label: 'Thread Queue' },
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
@@ -400,9 +405,34 @@ export const workspacePath = signal<string>('');
 export const engineStartedAt = signal<string | null>(null);
 export const lucidosRelease = signal<string | null>(null);
 export const lucidosReleaseDirty = signal<boolean>(false);
+/** Every published release's notes, for Settings > System > What's New. Loaded
+ *  on the panel's mount rather than at startup: it is content the user asks
+ *  for, and the whole changelog is a few hundred kilobytes.
+ *
+ *  The history you HAVE. A release the updater is OFFERING postdates the binary
+ *  this came out of, so its notes arrive with the update check instead
+ *  (`whatsNewOfferNotes`). */
+export const changelogReleases = signal<Loadable<ChangelogRelease[]>>({ status: 'not-loaded' });
+/** The release whose What's New this client has opened, from localStorage, or
+ *  `null` when it never has. Drives the unread dot on the Lucidos menu's version
+ *  row. Per CLIENT, not per account: "have I read this" is a fact about this
+ *  browser, the same class as the diff-view and file-preview toggles above. */
+export const whatsNewSeenRelease = signal<string | null>(
+  localStorage.getItem('lucidos-whats-new-seen-release'),
+);
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 export const latestTauriAppVersion = signal<string | null>(null);
+/** What is in the packaged update being offered, as raw markdown, or `null` when
+ *  none is offered or its manifest carries no notes.
+ *
+ *  The only way this client can say what a PENDING update contains. The offered
+ *  version postdates the engine binary running here, so it is absent from the
+ *  baked changelog `changelogReleases` holds, and falling back to that would
+ *  show the notes for the version already installed. Written only by the update
+ *  check, beside `latestTauriAppVersion`, so the two cannot describe different
+ *  releases. */
+export const latestTauriAppNotes = signal<string | null>(null);
 /** Why the last packaged app-update check failed, or `null` when it succeeded
  *  (or has not run). Rendered in Settings → System so a failing check is
  *  DIAGNOSABLE instead of silent — swallowing it is what made a stranded 0.15.0

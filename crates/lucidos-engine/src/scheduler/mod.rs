@@ -787,9 +787,17 @@ impl SchedulerManager {
                             thread_id, event, ..
                         } = &emitted.typed
                         {
-                            use crate::engine::thread_events::EventMeta;
+                            use crate::core::event_subscription::matchable_thread_payload;
                             if !event.is_per_token_streaming() {
-                                let payload = event.to_payload(&EventMeta::NONE);
+                                // The same view the event-wait dispatcher
+                                // matches against, so one `condition` cannot
+                                // mean different things to a trigger and to a
+                                // wait: that parity is what
+                                // `core::event_subscription` exists to hold.
+                                // It is also what makes `thread_id` a usable
+                                // `on_event:` filter, and the trigger's own
+                                // Triggering Event block then names the thread.
+                                let payload = matchable_thread_payload(event, *thread_id);
                                 handle_domain_event(
                                     event.event_type(),
                                     &payload,

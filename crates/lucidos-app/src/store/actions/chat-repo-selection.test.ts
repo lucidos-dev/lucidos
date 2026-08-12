@@ -60,6 +60,7 @@ vi.mock('./devices', () => ({
 
 vi.mock('../../utils/platform', () => ({
   isTauri: () => false,
+  isIOS: () => false,
 }));
 
 import {

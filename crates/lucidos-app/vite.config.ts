@@ -176,6 +176,66 @@ function stampServiceWorker(): Plugin {
 }
 
 /**
+ * Inline the appearance FOUC script into `index.html`'s `<head>`.
+ *
+ * The script has to be parser-blocking and inline: it resolves the device's
+ * theme, font, scale and style overrides onto `<html>` before any stylesheet is
+ * parsed or any module loads, so the first frame is already the user's
+ * appearance. A `<script src>` would cost a round trip before first paint, and
+ * an import is not available to it at all.
+ *
+ * That is a runtime constraint, not a source one. The same program is served to
+ * every app iframe by the engine, and until this plugin the two documents
+ * carried two hand-copied copies of it. Both now come from
+ * `packages/lucidos-sdk/src/boot/`, built by that package into a committed
+ * bundle, and this plugin substitutes the shell's build into a marker comment.
+ *
+ * `transformIndexHtml` runs in `serve` as well as `build`, so the dev server
+ * gets it too. Reading the bundle per transform (rather than once at config
+ * time) is what makes an incremental dev rebuild pick up an edit.
+ */
+const APPEARANCE_BOOT_MARKER = '<!-- lucidos:appearance-boot -->';
+
+function inlineAppearanceBoot(): Plugin {
+  const bundlePath = resolve(
+    __dirname, '../../packages/lucidos-sdk/src/generated/appearance-boot.host.js',
+  );
+  return {
+    name: 'lucidos-appearance-boot',
+    transformIndexHtml(html) {
+      if (!html.includes(APPEARANCE_BOOT_MARKER)) {
+        // Fail the build rather than serve a shell with no FOUC script: the
+        // symptom would be a flash of the wrong theme on every cold load, which
+        // reads as a styling bug and not as a missing marker.
+        throw new Error(
+          `index.html is missing ${APPEARANCE_BOOT_MARKER}, so the appearance boot `
+          + 'script has nowhere to go.',
+        );
+      }
+      if (!fs.existsSync(bundlePath)) {
+        throw new Error(
+          `${bundlePath} is missing. Run: cd packages/lucidos-sdk && npm run build`,
+        );
+      }
+      const bundle = fs.readFileSync(bundlePath, 'utf-8');
+      // An HTML parser ends a <script> at the first `</script`, inside a string
+      // or a regex literal alike, so a bundle carrying that sequence would close
+      // its own tag and spill the remainder into the document as markup. Nothing
+      // in the boot source does today; this is here because inlining arbitrary
+      // built text is exactly where that stops being true quietly.
+      if (/<\/script/i.test(bundle)) {
+        throw new Error(
+          'The appearance boot bundle contains `</script`, which would terminate the '
+          + 'inline tag early. Rewrite the source so the sequence cannot appear '
+          + '(e.g. split the string).',
+        );
+      }
+      return html.replace(APPEARANCE_BOOT_MARKER, `<script>\n${bundle}</script>`);
+    },
+  };
+}
+
+/**
  * Re-copy public/ into the build outDir on EVERY build of the dev build-watch.
  *
  * `vite build --watch` copies publicDir only on the INITIAL build — public files
@@ -268,7 +328,7 @@ export default defineConfig({
   // engine static-serve, `vite preview`, and Tauri. In `vite serve` (HMR) a
   // relative base falls back to `/`, so the dev server is unaffected.
   base: './',
-  plugins: [buildIdVirtualModule(), suppressMergeReload(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
+  plugins: [buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
   build: {
     // The eager entry chunk is the first-paint-critical app core (shell, store,
     // SSE/event handling, signals, layout): ~585 kB minified / ~179 kB gzipped,
@@ -323,6 +383,12 @@ export default defineConfig({
     alias: {
       '@': resolve(__dirname, 'src'),
       '@lucidos/sdk': resolve(__dirname, '../../packages/lucidos-sdk/src/index.ts'),
+      // The appearance boot contract, reached WITHOUT the SDK barrel above.
+      // Deliberate: the barrel pulls the whole SDK in at module load, and the
+      // host store imports this from a module that installs an OS-theme
+      // listener at import time, so widening its graph reorders side effects
+      // for no gain. Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/appearance': resolve(__dirname, '../../packages/lucidos-sdk/src/appearance.ts'),
     },
   },
   server: {
