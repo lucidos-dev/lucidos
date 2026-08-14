@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
 import { actorInitiator, describeExecutor, shouldShowResponseStatusBadge } from './ChatExchange';
-import { ClaudeIcon, CodexIcon } from '../shared/icons';
+import { ClaudeIcon, CodexIcon, PowerIcon, PersonIcon, ApiPlugIcon } from '../shared/icons';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { LUCIDOS_AGENT_LABEL, type ThreadEvent } from '../../store/thread-events';
 
@@ -40,19 +40,23 @@ describe('describeExecutor', () => {
 
 describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / System / API caller)', () => {
   it('device → You (the only origin that is unambiguously the user)', () => {
-    expect(actorInitiator({ kind: 'device', device_id: 'd', label: 'L' }))
-      .toEqual({ icon: '\u{1F464}', label: 'You' });
+    const { icon, label } = actorInitiator({ kind: 'device', device_id: 'd', label: 'L' });
+    expect(label).toBe('You');
+    expect((icon as VNode).type).toBe(PersonIcon);
   });
   it('api with default mode → API caller (anonymous HTTP, never impersonates the user)', () => {
     // Regression: a Lucidos agent that POSTed via raw urllib without forwarding
     // x-lucidos-agent-origin-token used to land as Api{Human} and the chip
     // rendered "You". The chip now refuses to call any non-device origin
     // "You"; the popover still discloses the User-Agent.
-    expect(actorInitiator({ kind: 'api' })).toEqual({ icon: '🔌', label: 'API caller' });
+    const { icon, label } = actorInitiator({ kind: 'api' });
+    expect(label).toBe('API caller');
+    expect((icon as VNode).type).toBe(ApiPlugIcon);
   });
   it('api with explicit mode=human → API caller', () => {
-    expect(actorInitiator({ kind: 'api', mode: 'human', user_agent: 'curl/8' }))
-      .toEqual({ icon: '🔌', label: 'API caller' });
+    const { icon, label } = actorInitiator({ kind: 'api', mode: 'human', user_agent: 'curl/8' });
+    expect(label).toBe('API caller');
+    expect((icon as VNode).type).toBe(ApiPlugIcon);
   });
   it('api with mode=agent → Lucidos Agent (mark glyph)', () => {
     const { icon, label } = actorInitiator({ kind: 'api', mode: 'agent' });
@@ -65,8 +69,9 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
     expect((icon as VNode).type).toBe(LucidosGlyph);
   });
   it('workspace with mode=human → API caller (a human in another workspace is not "You" here)', () => {
-    expect(actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' }))
-      .toEqual({ icon: '🔌', label: 'API caller' });
+    const { icon, label } = actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'human' });
+    expect(label).toBe('API caller');
+    expect((icon as VNode).type).toBe(ApiPlugIcon);
   });
   it('workspace with mode=agent → Lucidos Agent (mark glyph)', () => {
     const { icon, label } = actorInitiator({ kind: 'workspace', workspace: 'p', mode: 'agent' });
@@ -93,8 +98,10 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
     expect(label).toBe('Lucidos Engine');
     expect((icon as VNode).type).toBe(LucidosGlyph);
   });
-  it('system origin → System (gear, distinct from the Lucidos mark — process killed by host, not engine-deliberate)', () => {
-    expect(actorInitiator({ kind: 'system' })).toEqual({ icon: '⚙', label: 'System' });
+  it('system origin → System (power symbol, distinct from the Lucidos mark: the host killed the process, the engine did not choose to)', () => {
+    const { icon, label } = actorInitiator({ kind: 'system' });
+    expect(label).toBe('System');
+    expect((icon as VNode).type).toBe(PowerIcon);
   });
   it('undefined origin → Lucidos Engine (mark glyph)', () => {
     const { icon, label } = actorInitiator(undefined);

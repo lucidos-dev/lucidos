@@ -32,6 +32,16 @@
 # are live is per language, because Rust's `'a` lifetime is not a string open
 # while shell's `'...'` is.
 #
+# PYTHON DOCSTRINGS ARE COMMENTS, which is cloc's rule and the reason a `.py`
+# tree cannot be counted with the generic scanner. It is also the single
+# exception to the per-line string reset below: a triple-quoted run has to be
+# matched to its close across lines or the prose inside it books as code. The
+# EOF canary bounds the damage when that goes wrong.
+#
+# Only in DOCSTRING POSITION, though. A run opening after code is data, and its
+# lines are code: SQL, templates and prompts live in `x = """…"""`, and one
+# measured repo held 9,790 such lines against 8,113 real docstring lines.
+#
 # SHELL HEREDOCS ARE TRACKED for the same reason: inside a heredoc body a
 # leading `#` is payload the script emits, or a comment belonging to an embedded
 # language, and neither is a comment in the .sh file. See detect_heredoc for the
@@ -83,19 +93,29 @@ function esc_run(str, p,   n) {
 #   QD / QS / QB  double quote / single quote / backtick open a string
 #   HD  1 when << heredocs apply (shell only)
 #   JSX 1 when `{/* ... */}` comment wrappers apply (tsx/jsx only)
+#   PYDOC 1 when a triple-quoted run is a docstring (python only)
 function set_style(path,   ext) {
     ext = path
     if (ext !~ /\./) { ext = "" } else { sub(/.*\./, "", ext) }
 
-    HD = 0; JSX = 0
+    HD = 0; JSX = 0; PYDOC = 0
     if (ext ~ /^(rs)$/) {
         # Single quotes are OFF: `&'a str` is a lifetime, not a string open.
         LC = "//"; BLK = 1; QD = 1; QS = 0; QB = 0
     } else if (ext ~ /^(ts|tsx|js|jsx|mjs|cjs)$/) {
         LC = "//"; BLK = 1; QD = 1; QS = 1; QB = 1
         if (ext ~ /^(tsx|jsx)$/) JSX = 1
+    } else if (ext ~ /^(kt|kts)$/) {
+        # Kotlin, listed rather than left to the fallback below. The fallback
+        # picks the same syntax, but warns per file, and a JVM repo then buries
+        # the real canaries under hundreds of lines of stderr.
+        LC = "//"; BLK = 1; QD = 1; QS = 0; QB = 0
+    } else if (ext == "py") {
+        LC = "#";  BLK = 0; QD = 1; QS = 1; QB = 0; PYDOC = 1
     } else if (ext == "css") {
         LC = "";   BLK = 1; QD = 1; QS = 1; QB = 0
+    } else if (ext == "scss") {
+        LC = "//"; BLK = 1; QD = 1; QS = 1; QB = 0
     } else if (ext == "sql") {
         LC = "--"; BLK = 1; QD = 1; QS = 1; QB = 0
     } else if (ext ~ /^(sh|bash|zsh)$/) {
@@ -224,11 +244,27 @@ function skip_string(s, q,   start, p, abs) {
     }
 }
 
+# Position of the first UNESCAPED occurrence of d in s, 0 if there is none.
+#
+# A docstring showing a literal `"""` escapes it as `\"""`, and a plain index()
+# reads that as the close. The prose after it then books as code, and the REAL
+# terminator opens a second docstring, so one escape can run to end of file.
+function find_unescaped(s, d,   start, p, abs) {
+    start = 1
+    while (1) {
+        p = index(substr(s, start), d)
+        if (p == 0) return 0
+        abs = start + p - 1
+        if (esc_run(s, abs) % 2 == 1) { start = abs + 1; continue }
+        return abs
+    }
+}
+
 # Set has_code / has_comment for one line, carrying in_block across lines.
 # Also sets cmt_pos: where the line comment began in the ORIGINAL line, 0 if
 # none. `origlen - length(s)` is how much has been consumed so far, which is
 # what turns a position inside the shrinking `s` back into an absolute one.
-function classify(input,   s, p, best, kind, q, origlen, before) {
+function classify(input,   s, p, best, kind, q, t3, origlen, before) {
     has_code = 0
     has_comment = 0
     cmt_pos = 0
@@ -236,6 +272,20 @@ function classify(input,   s, p, best, kind, q, origlen, before) {
     origlen = length(input)
 
     while (length(s) > 0) {
+        # A Python triple-quoted run is a docstring, which cloc books as
+        # comment, so it is the one place string state has to cross lines. The
+        # hazard the KNOWN LIMITS note describes applies in full: a missed close
+        # swallows the file. An unterminated run at EOF therefore warns and
+        # exits non-zero, exactly as the block-comment tracker does.
+        if (in_pydoc != "") {
+            if (pydoc_is_doc) has_comment = 1; else has_code = 1
+            p = find_unescaped(s, in_pydoc)
+            if (p == 0) return
+            s = substr(s, p + 3)
+            in_pydoc = ""
+            continue
+        }
+
         if (in_block) {
             has_comment = 1
             p = index(s, "*/")
@@ -277,6 +327,27 @@ function classify(input,   s, p, best, kind, q, origlen, before) {
         if (kind == 2) { has_comment = 1; in_block = 1; s = substr(s, best + 2); continue }
 
         q = (kind == 3) ? "\"" : ((kind == 4) ? "'" : "`")
+        t3 = q q q
+        if (PYDOC && substr(s, best, 3) == t3) {
+            # POSITION decides, not the quote. A triple-quoted run is a
+            # docstring only where it opens the line, bar an optional string
+            # prefix, which is cloc's rule too. `x = """…` is data: SQL, a
+            # template, a prompt. Reading every run as a docstring moved 9,790
+            # lines of one measured repo out of code and into comment, 17% of
+            # its Python. A prefix belongs to the opener, so `r"""docs"""` at
+            # the head of a line is still a docstring: 71 of that repo's 2,412
+            # openers carry one.
+            #
+            # py_prev_cont carries the rest: `SQL = (` then an indented `"""`
+            # opens the line but continues a statement, so it is data. 99 of
+            # that repo's 2,483 line-head openers sit in that position.
+            pydoc_is_doc = ((origlen - length(s)) == 0 && !py_prev_cont &&
+                            (before == "" || before ~ /^[rRbBuUfF]{1,2}$/))
+            if (pydoc_is_doc) { has_code = 0; has_comment = 1 } else has_code = 1
+            in_pydoc = t3
+            s = substr(s, best + 3)
+            continue
+        }
         has_code = 1
         s = skip_string(substr(s, best + 1), q)
     }
@@ -289,6 +360,7 @@ function classify(input,   s, p, best, kind, q, origlen, before) {
     set_style(path)
     in_block = 0
     in_hd = 0; hd_delim = ""
+    in_pydoc = ""; pydoc_is_doc = 0; py_prev_cont = 0
     f_code = 0; f_comment = 0; f_blank = 0; f_total = 0
 
     r = (getline line < path)
@@ -319,6 +391,19 @@ function classify(input,   s, p, best, kind, q, origlen, before) {
             else if (has_comment) f_comment++
             else                  f_blank++
             if (HD && has_code) detect_heredoc(line)
+
+            # Did this code line end mid-statement? A triple quote opening the
+            # NEXT line is then data, not a docstring. Skipped while a run is
+            # open, so the string's own content cannot set it.
+            #
+            # One line of memory, not bracket depth. Depth drifts, and drift
+            # here is unbounded. See docs/code-review-priors.md for the
+            # measurement that settled it.
+            if (PYDOC && in_pydoc == "" && has_code) {
+                ptail = (cmt_pos > 0) ? substr(line, 1, cmt_pos - 1) : line
+                sub(/[ \t\r]+$/, "", ptail)
+                if (ptail != "") py_prev_cont = (ptail ~ /[([{,=+\\]$/)
+            }
         }
         r = (getline line < path)
     }
@@ -339,6 +424,14 @@ function classify(input,   s, p, best, kind, q, origlen, before) {
     if (in_hd) {
         printf("sloc.awk: unterminated heredoc (%s) in %s, counts are wrong\n",
                hd_delim, path) > "/dev/stderr"
+        rc = 1
+    }
+
+    # And for the docstring tracker, whose failure direction is the same as the
+    # block comment's: every line after a false open was booked as comment.
+    if (in_pydoc != "") {
+        printf("sloc.awk: unterminated docstring (%s) in %s, comment count is wrong\n",
+               in_pydoc, path) > "/dev/stderr"
         rc = 1
     }
 

@@ -661,7 +661,7 @@ const HISTORY_STEPS_MAX_BYTES: usize = 2_000;
 
 /// Compact summary of an assistant turn's tool calls for the LLM's history
 /// string. Returns `None` when there's nothing tool-shaped to report
-/// (synthetic Thinking/MemorySearched steps lack `tool_name` and are
+/// (synthetic Thinking/MemoryRecalled steps lack `tool_name` and are
 /// skipped). Output is capped at [`HISTORY_STEPS_MAX_BYTES`].
 ///
 /// `skip_tool_event_ids` is the set of `ToolCalled` event ids that are

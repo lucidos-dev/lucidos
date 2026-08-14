@@ -870,7 +870,7 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
     );
     assert_eq!(
         cb.child_completed_event_id, card_event_id,
-        "re-fired wake must anchor to the SAME persisted ChildThreadCompleted event"
+        "a re-fired callback must anchor to the SAME persisted ChildThreadCompleted event"
     );
 
     pool.close().await;

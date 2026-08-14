@@ -525,30 +525,57 @@ describe('Flow: Edge cases', () => {
     expect((stepEvents[0] as { description: string }).description).toBe('Thinking');
   });
 
-  it('MemorySearched event creates a step', () => {
+  /** One recall turn under whichever raw `event_type` the caller names, so the
+   *  canonical and legacy cases below cannot drift apart. */
+  const recallTurn = (type: 'MemoryRecalled' | 'MemorySearched', results: number) => {
     const { map, id } = makeThread();
-
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'What is my birthday?' },
-      { type: 'MemorySearched', results: 12, queries: ['birthday', 'date of birth'] },
+      { type, results, queries: ['birthday', 'date of birth'] } as ThreadEvent,
       { type: 'ThoughtStreamed', text: 'Context: 2000 tokens, 2 messages', context_tokens: 2000, context_messages: 2 },
       { type: 'TextStreamed', text: 'Jan 1.' },
       { type: 'ResponseGenerated' },
     ]);
+    const exchange = getExchanges(map, id)[0];
+    return {
+      steps: exchangeSteps(exchange),
+      stepEvents: exchangeResponseEvents(exchange).filter(e => e.type === 'step'),
+    };
+  };
 
-    const exchanges = getExchanges(map, id);
-    const steps = exchangeSteps(exchanges[0]);
+  it('MemoryRecalled event creates a step labelled with the count', () => {
+    const { steps, stepEvents } = recallTurn('MemoryRecalled', 12);
+
     expect(steps).toHaveLength(2);
-    expect(steps[0].description).toBe('Memory searched');
+    expect(steps[0].description).toBe('Recalled 12 memories');
     expect(steps[0].outcome).toBe('success');
     expect(steps[1].description).toBe('Thinking');
 
-    const events = exchangeResponseEvents(exchanges[0]);
-    const stepEvents = events.filter(e => e.type === 'step');
     expect(stepEvents).toHaveLength(2);
-    // MemorySearched step should have queries as detail
-    const memStep = stepEvents[0] as { detail?: string };
-    expect(memStep.detail).toBe('birthday, date of birth');
+    // The recall step carries its classifier-derived queries as detail.
+    expect((stepEvents[0] as { detail?: string }).detail).toBe('birthday, date of birth');
+  });
+
+  /** The label must not mirror the `memory` tool's own "Searching memory
+   *  for ..." step: the two used to be one word apart and read as the same
+   *  thing happening twice. Zero and one get their own phrasings. */
+  it('recall step label covers zero, one and many, and never says "search"', () => {
+    expect(recallTurn('MemoryRecalled', 0).steps[0].description).toBe('No memories recalled');
+    expect(recallTurn('MemoryRecalled', 1).steps[0].description).toBe('Recalled 1 memory');
+    expect(recallTurn('MemoryRecalled', 12).steps[0].description).toBe('Recalled 12 memories');
+    for (const n of [0, 1, 12]) {
+      expect(recallTurn('MemoryRecalled', n).steps[0].description.toLowerCase()).not.toContain('search');
+    }
+  });
+
+  /** Rows persisted under the pre-rename name must render identically. The
+   *  serde alias on the Rust variant cannot reach them: the snapshot endpoint
+   *  serves the raw `event_type` column straight to the client. */
+  it('legacy MemorySearched rows render as a recall step', () => {
+    for (const n of [0, 1, 12]) {
+      expect(recallTurn('MemorySearched', n).steps).toEqual(recallTurn('MemoryRecalled', n).steps);
+      expect(recallTurn('MemorySearched', n).stepEvents).toEqual(recallTurn('MemoryRecalled', n).stepEvents);
+    }
   });
 
   it('ToolResult content is attached to the matching step (LLM tools)', () => {

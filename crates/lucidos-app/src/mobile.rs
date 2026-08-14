@@ -1,55 +1,22 @@
 //! Mobile access for the packaged desktop app: surface the connect URLs and
-//! drive the Tailscale setup the user consents to in the UI.
+//! drive the Tailscale setup the user consents to in the UI. The whole picture
+//! is [`system-knowhow/remote-access.md`](../../../system-knowhow/remote-access.md).
 //!
-//! The packaged gateway binds the [stable port](crate::desktop), so Lucidos is
-//! reachable on `localhost`, the LAN, and (once Tailscale is set up) at a
-//! tailnet-private `https://<machine>.<tailnet>.ts.net` URL with an auto-renewed
-//! cert (full PWA + web push, works off-LAN). Workspace engines stay behind the
+//! `tailscale serve` (tailnet-private), NEVER `tailscale funnel` (public):
+//! Lucidos has **no inbound API auth**. Workspace engines stay behind the
 //! gateway on loopback-only ports.
 //!
-//! We use `tailscale serve` (tailnet-private), NOT `tailscale funnel` (public):
-//! Lucidos has **no inbound API auth**, so it must never be exposed to the open
-//! internet. Mobile devices reach it by joining the same tailnet.
+//! **Nothing here runs on the main thread.** Every command is an `async fn`
+//! whose body runs through [`tauri::async_runtime::spawn_blocking`]. Tauri runs
+//! a synchronous command on the main thread, and all three of these block.
 //!
-//! The Mac side is scriptable only *after the user consents* (Tailscale is a
-//! system VPN whose install/login can't be silent). The phone side is guided
-//! (install Tailscale, join the tailnet), never silent: OS sandboxing prevents
-//! remote install/login.
+//! **Reading state never runs the CLI.** Tailnet membership and the MagicDNS
+//! name come from `lucidos-tailscale`, so a Mac with Tailscale working but no
+//! CLI still gets an accurate description of itself. Only actions are gated.
 //!
-//! # Nothing here runs on the main thread
-//!
-//! Every command in this file is an `async fn` whose body runs through
-//! [`tauri::async_runtime::spawn_blocking`]. Tauri runs a *synchronous* command
-//! on the main thread, and all three commands here block: [`tailscale_serve`]
-//! for as long as the setup takes, [`tailscale_up`] for as long as an
-//! interactive browser login takes, and even [`get_connect_info`] for a few
-//! seconds of bounded probes. As plain sync commands they froze the whole
-//! window, which is what the spinning-wait cursor on the Expose button was.
-//!
-//! # Reading state never runs the CLI
-//!
-//! Tailnet membership and the MagicDNS name come from `lucidos-tailscale`, which
-//! reads the interface list and does a reverse lookup. Two reasons, one of which
-//! is a shipped bug:
-//!
-//! - This page is reached from a phone as often as from the Mac, and a user
-//!   whose Tailscale already works should never be told to install a CLI just so
-//!   we can describe their own machine back to them.
-//! - The CLI probe used to pick `/Applications/Tailscale.app/Contents/MacOS/
-//!   Tailscale`, which is the GUI executable. It **exits 0** while printing "The
-//!   Tailscale GUI failed to start ... (Tailscale.CLIError error 3)", so every
-//!   check read as a success with unparseable output: the page showed **Sign
-//!   in** to a machine already on its tailnet, and pressing it reported success
-//!   and changed nothing.
-//!
-//! A CLI is still required for [`tailscale_serve`] (and [`tailscale_up`] where
-//! one exists), because `serve` has no GUI, config-file or admin-console
-//! equivalent. That is the only thing it gates: a Mac without a CLI still gets
-//! an accurate description of itself.
-//!
-//! Because exit 0 turned out to be a lie, nothing here trusts it alone. The CLI
-//! probe demands a parseable version, and every action re-reads the world
-//! afterwards and fails when it did not move.
+//! **Exit 0 is not proof.** The GUI executable exits 0 while printing an error,
+//! so the CLI probe demands a parseable version and every action re-reads the
+//! world afterwards.
 
 use serde::Serialize;
 use std::io::Read;
@@ -74,8 +41,8 @@ const SERVE_PROBE_TIMEOUT: Duration = Duration::from_millis(700);
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bound on one `ipconfig getifaddr` call. It answers instantly on a healthy
-/// machine; the ceiling is here because this runs on the same path a settings
-/// pane awaits, and every other call on that path is already bounded.
+/// machine. The ceiling is here because this runs on the path a settings pane
+/// awaits, and every other call on that path is already bounded.
 const LAN_IP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The port `tailscale serve` fronts, and the one [`tailscale_serve`] configures.
@@ -87,12 +54,11 @@ const SERVE_CONFIGURE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Bound on `tailscale serve` **after** it has printed the tailnet-approval URL.
 ///
-/// Once that notice appears the command is no longer stalled, it is waiting for
-/// a human to approve in a browser, and it completes by itself when they do. So
-/// the deadline stops being a stall guard and becomes a patience budget, and it
-/// is generous: ten minutes is long enough to find the right Tailscale login and
-/// short enough that an abandoned run does not sit there forever. Cancel is the
-/// real escape hatch.
+/// Once that notice appears the command is no longer stalled. It is waiting for
+/// a human to approve in a browser, and completes by itself when they do. So
+/// the deadline stops being a stall guard and becomes a patience budget: ten
+/// minutes is long enough to find the right login, and short enough that an
+/// abandoned run does not sit there forever. Cancel is the real escape hatch.
 const SERVE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Bound on the wait for something to answer HTTPS after `serve` returns. A
@@ -109,12 +75,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// what it actually takes. See [`supervise_serve`] for why it exists at all.
 const DRAIN_SETTLE: Duration = Duration::from_millis(500);
 
-/// Where the connect URLs point. `lan_ip` / Tailscale fields are `None` when
-/// not detectable (no LAN address, Tailscale absent, etc.). The LAN *URL* is
-/// deliberately not pre-built here: whether a LAN address is reachable at all
-/// depends on the gateway's network bind (loopback-only by default in
-/// packaged), which the frontend reads from `GET /api/v1/network-config` and
-/// combines with `lan_ip` + `port` (see `MobileAccessPage.tsx::lanRowState`).
+/// Where the connect URLs point. `lan_ip` and the Tailscale fields are `None`
+/// when not detectable.
+///
+/// The LAN *URL* is deliberately not pre-built here. Whether a LAN address is
+/// reachable at all depends on the gateway's network bind. The frontend reads
+/// that from `GET /api/v1/network-config` and combines it with `lan_ip` and
+/// `port`.
 #[derive(Serialize)]
 pub struct ConnectInfo {
     /// The stable gateway port the URLs use.
@@ -126,11 +93,9 @@ pub struct ConnectInfo {
 
 /// What this Mac's Tailscale setup looks like, as two independent facts.
 ///
-/// **Tailnet state** (`on_tailnet`, `tailnet_ip`, `magic_dns_name`, `serve_url`)
-/// is read without a CLI. **CLI availability** (`cli_available`) gates the
+/// **Tailnet state** is read without a CLI. **CLI availability** gates the
 /// buttons and nothing else. Keeping them apart is what lets the page stay
-/// accurate on a Mac that has Tailscale working but no CLI installed, which
-/// before this split rendered as a Sign in button that could not work.
+/// accurate on a Mac that has Tailscale working but no CLI installed.
 #[derive(Serialize)]
 pub struct TailscaleInfo {
     /// Tailscale is present at all: the app bundle, or a CLI. Drives the
@@ -145,9 +110,8 @@ pub struct TailscaleInfo {
     /// tailnet with MagicDNS disabled, which is not the same as being offline.
     pub magic_dns_name: Option<String>,
     /// `https://<magic_dns_name>`, set **only** once something is proven to be
-    /// serving it. Before `tailscale serve` runs there is no listener on 443, so
-    /// publishing the URL earlier would advertise a dead address as the one that
-    /// carries the PWA and push.
+    /// serving it. Before `tailscale serve` runs nothing listens on 443, so
+    /// publishing the URL earlier would advertise a dead address.
     pub serve_url: Option<String>,
     /// A working `tailscale` CLI was found. Gates the actions only: never the
     /// reporting above.
@@ -178,8 +142,8 @@ fn connect_info() -> ConnectInfo {
 /// Run a blocking body on a worker thread, so the calling command never occupies
 /// the main thread or an async-runtime worker.
 ///
-/// One helper rather than three copies of the same `spawn_blocking` + join-error
-/// mapping, and one place for a future reader to see the rule stated once.
+/// One helper rather than three copies of the same `spawn_blocking` and
+/// join-error mapping, and one place where the rule is stated.
 async fn off_main_thread<T, F>(label: &'static str, work: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -232,8 +196,8 @@ const TAILSCALE_APP_BUNDLE: &str = "/Applications/Tailscale.app";
 /// one URL, so the only honest test is whether exactly that endpoint responds.
 ///
 /// It proves a listener, not a working certificate. Tailscale can be listening
-/// while a first-run cert is still provisioning, which is why the serve run says
-/// so in its own failure message rather than implying the address is broken.
+/// while a first-run cert is still provisioning, so the serve run says as much
+/// in its own failure message.
 fn serve_is_live(addr: Ipv4Addr) -> bool {
     TcpStream::connect_timeout(
         &SocketAddr::from((addr, TAILNET_HTTPS_PORT)),
@@ -249,14 +213,13 @@ fn serve_is_live(addr: Ipv4Addr) -> bool {
 /// or a hung `ipconfig` would otherwise leave the pane loading with nothing to
 /// show and no way to know why.
 ///
-/// The two failures are kept apart in the message, since "the binary is not
-/// there" and "it never answered" call for different things from the reader.
+/// The two failures are kept apart in the message: "the binary is not there"
+/// and "it never answered" call for different things from the reader.
 ///
 /// Only safe for commands with SMALL output. It waits for exit before reading
 /// the pipes, so a child that filled a pipe buffer would block instead of
-/// exiting; `version` and `ipconfig getifaddr` both answer in a line or two.
-/// The `serve` run does NOT use this, because it needs to read the child's
-/// output while it is still running (see [`supervise_serve`]).
+/// exiting. The `serve` run does NOT use this, because it must read the
+/// child's output while it is still running (see [`supervise_serve`]).
 fn output_with_timeout(
     mut cmd: Command,
     label: &str,
@@ -290,12 +253,13 @@ fn output_with_timeout(
 
 /// The Mobile Access actions that must not overlap, held as Tauri managed state.
 ///
-/// Both guards became load-bearing the moment the commands stopped running on
-/// the main thread: Tauri used to serialise them there by accident, and two
-/// `tailscale serve` children racing to write the same mapping is not something
-/// to find out about from a bug report. The shapes differ because the actions
-/// do: a serve run is cancellable and so hands out a flag, while `up` is an
-/// interactive browser login with nothing to cancel from here.
+/// Both guards are load-bearing now that the commands run off the main thread.
+/// Two `tailscale serve` children racing to write the same mapping is not
+/// something to find out about from a bug report.
+///
+/// The shapes differ because the actions do: a serve run is cancellable and so
+/// hands out a flag, while `up` is an interactive browser login with nothing to
+/// cancel from here.
 #[derive(Clone, Default)]
 pub struct MobileAccessRuns {
     /// Cancellation flag of the in-flight `serve` run, when one holds the slot.
@@ -359,10 +323,10 @@ impl MobileAccessRuns {
     }
 }
 
-/// The `up` slot, released on drop for the same reason [`ServeSlot`] is: a slot
-/// released by an explicit call at the end of the happy path is a slot a panic
-/// or an early return strands forever, and a stranded one disables the Sign in
-/// button for the rest of the process.
+/// The `up` slot, released on drop for the same reason [`ServeSlot`] is. A slot
+/// released by an explicit call at the end of the happy path is one a panic or
+/// an early return strands forever. A stranded slot disables the Sign in button
+/// for the rest of the process.
 struct UpSlot {
     held: Arc<AtomicBool>,
 }
@@ -433,10 +397,9 @@ const SERVE_PROGRESS_EVENT: &str = "tailscale-serve-progress";
 
 /// Where an Expose run currently is.
 ///
-/// Internally tagged on `phase`, mirrored by a TypeScript discriminated union so
-/// a missing arm is a `tsc` error rather than a blank line in the toast. Same
-/// shape as the packaged updater's `AppUpdatePhase`, which is the tree's
-/// established way of narrating a long Rust operation to the page.
+/// Internally tagged on `phase`, mirrored by a TypeScript discriminated union.
+/// A missing arm is therefore a `tsc` error rather than a blank line in the
+/// toast. Same shape as the packaged updater's `AppUpdatePhase`.
 ///
 /// No variant carries a fraction, and that is deliberate: not one step of this
 /// flow can honestly report one, so the surface shows a spinner. A fabricated
@@ -613,35 +576,25 @@ fn wait_until(mut probe: impl FnMut() -> bool, cancel: &AtomicBool, timeout: Dur
     }
 }
 
-/// The two `tailscale serve` invocations we know, **current first**.
+/// The two `tailscale serve` invocations we know, **current first**. The syntax
+/// changed in CLI 1.52 and the old form has since been removed;
+/// `system-knowhow/remote-access.md` has both forms and what each CLI answers.
 ///
-/// Hardcoding a single form is what broke: the packaged app shipped the
-/// positional `--bg https / <target>` form, and a CLI new enough to have dropped
-/// it answers "the CLI for serve and funnel has changed", configures nothing,
-/// and exits non-zero. Tailscale reworked this CLI in **1.52**, which is where
-/// the flag form and `--bg` both arrive, and later removed the old syntax
-/// outright. So the fallback is the true pre-1.52 form and carries **no
-/// `--bg`**: a CLI too old for `--https=` has no `--bg` either, and `serve` was
-/// persistent by default before the rework.
-///
-/// The argv is deliberately **literal**, not derived from `serve --help` at
-/// runtime and not composed by anything that could be wrong. `serve` is
-/// tailnet-private while `funnel` is the open internet, they are adjacent
-/// subcommands of the same CLI, and the engine has **no inbound API auth**, so
-/// the one thing this must never do is guess. Version drift is absorbed by
+/// The argv is deliberately **literal**, never derived from `serve --help` at
+/// runtime. `serve` is tailnet-private while `funnel` is the open internet,
+/// they are adjacent subcommands, and the engine has **no inbound API auth**.
+/// So the one thing this must never do is guess. Version drift is absorbed by
 /// trying a second known-good form, never by inventing one.
 ///
 /// `--https` is pinned to [`TAILNET_HTTPS_PORT`] rather than left to the CLI's
 /// default, because that is exactly the port [`serve_is_live`] then probes. The
 /// target carries no path, so it mounts at `/` under both forms.
 ///
-/// There is deliberately **no `--yes`**. It suppresses interactive prompts, and
-/// the thing this command waits on is not a prompt: a tailnet without Serve
-/// enabled makes the CLI print an approval URL and poll the control plane until
-/// a human visits it. Measured on 2026-08-02, `--yes` blocks identically.
+/// There is deliberately **no `--yes`**: it suppresses interactive prompts, and
+/// what this waits on is a tailnet policy a human enables in a browser.
 ///
 /// The fallback is a temporary measure, registered in
-/// `docs/temporary-measures.md` § 3: it ages out once a pre-1.52 CLI stops
+/// `docs/temporary-measures.md` § 3. It ages out once a pre-1.52 CLI stops
 /// being worth supporting.
 fn serve_arg_forms(port: u16) -> (Vec<String>, Vec<String>) {
     let target = format!("http://127.0.0.1:{port}");
@@ -663,16 +616,15 @@ fn serve_arg_forms(port: u16) -> (Vec<String>, Vec<String>) {
 /// Both syntaxes were rejected, so say so without picking a favourite.
 ///
 /// Reporting only the current form's error would hide the actionable one from
-/// exactly the installs the fallback exists for: on a pre-1.52 CLI the current
-/// form fails as an unknown flag no matter what, so a real fault behind it
-/// (daemon down, not signed in, no permission) is only ever named by the legacy
-/// attempt. Reporting only the legacy error has the mirror problem.
+/// exactly the installs the fallback exists for. On a pre-1.52 CLI the current
+/// form fails as an unknown flag whatever else is wrong. A real fault behind it
+/// is then only ever named by the legacy attempt, and reporting only the legacy
+/// error has the mirror problem.
 ///
 /// So both are kept, current first, with the second labelled as a retry under
 /// the older syntax. Reachable only when the current form was **rejected as a
-/// flag**, which is what stops this from appearing on a modern CLI that simply
-/// timed out: that message used to lead with "the CLI for serve and funnel has
-/// changed" and send the reader after a syntax problem they did not have.
+/// flag**, which is what stops this appearing on a modern CLI that simply timed
+/// out.
 fn both_serve_forms_failed(current_err: &str, legacy_err: &str) -> String {
     if current_err == legacy_err {
         return current_err.to_string();
@@ -687,8 +639,8 @@ fn both_serve_forms_failed(current_err: &str, legacy_err: &str) -> String {
 ///
 /// The split exists to hold one rule: **only [`Self::FlagRejected`] earns a
 /// retry under the older syntax.** A deadline or a cancel is not the CLI
-/// declining our argv, and retrying on either is what put an irrelevant syntax
-/// error at the top of the failure the user actually hit.
+/// declining our argv. Retrying on either puts an irrelevant syntax error on
+/// top of the failure the user actually hit.
 enum ServeAttemptError {
     /// The CLI exited non-zero saying it does not know a flag we passed. On a
     /// pre-1.52 CLI that is `--bg` / `--https=`, and the positional form is
@@ -718,9 +670,8 @@ fn run_serve_attempt(
 ) -> Result<(), ServeAttemptError> {
     let mut cmd = Command::new(cli);
     cmd.args(args)
-        // Nothing may ever block on a terminal we do not have. `serve` also
-        // takes a `--yes` for its interactive prompts, but a GUI-spawned child
-        // reading a prompt is a hang either way, so the input is simply closed.
+        // Nothing may ever block on a terminal we do not have. A GUI-spawned
+        // child reading a prompt is a hang, so the input is simply closed.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -737,42 +688,25 @@ fn run_serve_attempt(
 }
 
 /// Watch a running `serve` child: stream what it says, notice when it starts
-/// waiting on the tailnet, and hold it to a deadline that depends on which of
-/// those two things it is doing.
+/// waiting on the tailnet, and hold it to a deadline. Which deadline depends on
+/// which of those two things it is doing.
 ///
-/// **Streaming is the load-bearing part.** The previous implementation read the
-/// pipes only after the child exited, so a child it killed contributed nothing
-/// at all to the error. That is precisely how the one line worth reading got
-/// lost: on a tailnet without Serve enabled the CLI prints
+/// **Streaming is the load-bearing part.** On a tailnet without Serve enabled
+/// the CLI prints an approval URL and then blocks, polling the control plane
+/// until a human visits it. Reading the pipes only after exit threw that line
+/// away with the killed child.
 ///
-/// ```text
-/// Serve is not enabled on your tailnet.
-/// To enable, visit:
-///          https://login.tailscale.com/f/serve?node=<node>
-/// ```
-///
-/// and then **blocks**, polling the control plane until a human visits that URL.
-/// The 20s deadline killed it and reported a bare timeout, with the link the
-/// user needed thrown away with the pipes.
-///
-/// So: two reader threads append into a shared buffer while this loop polls exit,
-/// cancel, and the deadline. The moment the approval notice appears, the phase
-/// changes and the deadline is re-based on the far longer approval budget, since
-/// the child is no longer stalled but waiting, and it completes by itself.
+/// Two reader threads therefore append into a shared buffer while this loop
+/// polls exit, cancel and the deadline. The moment the approval notice appears
+/// the phase changes and the deadline re-bases on the approval budget, since
+/// the child is waiting rather than stalled.
 ///
 /// **On exit, the readers are given a moment to finish first.** `try_wait` can
-/// see a child terminate before its reader thread has been scheduled to append
-/// the last of what it wrote, and the whole classification below reads that
-/// buffer. A pre-1.52 CLI rejecting `--bg` is exactly the case that loses the
-/// race: it writes one line and exits immediately, and an empty buffer reads as
-/// "not a flag rejection", which silently skips the legacy fallback that exists
-/// for it. So the exit path waits for both readers to reach EOF, bounded by
-/// [`DRAIN_SETTLE`] so a pipe some grandchild is holding open cannot turn this
-/// into the hang the deadline exists to prevent.
-///
-/// The kill paths do NOT wait: the output there is best-effort by nature (we are
-/// abandoning the child), and the approval notice they care about arrived long
-/// before.
+/// see a child terminate before its reader has appended the last of what it
+/// wrote, and the classification below reads that buffer. A pre-1.52 CLI
+/// rejecting `--bg` loses exactly that race, and an empty buffer would skip the
+/// fallback that exists for it. Bounded by [`DRAIN_SETTLE`]. The kill paths do
+/// NOT wait, since the notice they care about arrived long before.
 fn supervise_serve(
     mut child: Child,
     cancel: &AtomicBool,
@@ -859,9 +793,8 @@ fn supervise_serve(
 /// Copy a child pipe into the shared buffer as the bytes arrive.
 ///
 /// Chunk-wise rather than line-wise on purpose: a line read only completes at a
-/// newline, and the whole point is to see what a child that is about to be
-/// killed has already said. `from_utf8_lossy` cannot panic on a chunk boundary,
-/// and this output is ASCII.
+/// newline. The whole point is to see what a child about to be killed has
+/// already said. `from_utf8_lossy` cannot panic on a chunk boundary.
 ///
 /// `done` is never sent on. It exists so that dropping it at EOF disconnects the
 /// channel, which is how [`supervise_serve`] waits for every reader at once.
@@ -888,9 +821,9 @@ fn readable_output(seen: &Mutex<String>) -> String {
 
 /// What to say when an attempt ran out of time.
 ///
-/// The approval case is the one that matters, and it gets its own sentence: the
-/// user is not looking at a stall, they are looking at a run that was waiting
-/// for them, and the link is the whole answer.
+/// The approval case is the one that matters, and it gets its own sentence. The
+/// user is not looking at a stall but at a run that was waiting for them, and
+/// the link is the whole answer.
 fn timed_out_message(approval_url: Option<&str>, waited: Duration, output: &str) -> String {
     if let Some(url) = approval_url {
         return format!(
@@ -913,9 +846,9 @@ fn timed_out_message(approval_url: Option<&str>, waited: Duration, output: &str)
 /// The tailnet-approval URL a `serve` child printed, if it printed one.
 ///
 /// Verbatim from the CLI, never composed here: the node id in the query string
-/// is not something we could reconstruct. The URL is then checked before it is
-/// handed on, because this is subprocess output being turned into something the
-/// page opens in the system browser. See [`is_tailscale_https_url`].
+/// is not something we could reconstruct. The URL is checked before it is
+/// handed on, because this is subprocess output the page opens in the system
+/// browser. See [`is_tailscale_https_url`].
 fn tailnet_approval_url(output: &str) -> Option<String> {
     output
         .split_whitespace()
@@ -927,8 +860,9 @@ fn tailnet_approval_url(output: &str) -> Option<String> {
 /// Is this a URL we are willing to open: HTTPS, on a Tailscale host?
 ///
 /// Both halves are required. A plain-HTTP link would be a downgrade we should
-/// not perform on the user's behalf, and the host check is what stops anything
-/// that manages to get a line into this output from choosing the destination.
+/// not perform on the user's behalf. The host check stops anything that gets a
+/// line into this output from choosing the destination.
+///
 /// The userinfo split takes the segment AFTER the last `@`, which is the real
 /// host, so `https://login.tailscale.com@evil.example/` is rejected rather than
 /// mistaken for Tailscale.
@@ -960,9 +894,9 @@ fn is_flag_rejection(output: &str) -> bool {
 
 /// Drop Tailscale's client/daemon version-skew warning.
 ///
-/// It is printed on stderr by **every** command whenever the CLI and the running
-/// `tailscaled` differ in version, which is the normal state of a Homebrew CLI
-/// beside the Mac App Store daemon. Streaming stderr means it would otherwise be
+/// Printed on stderr by **every** command whenever the CLI and the running
+/// `tailscaled` differ in version. That is the normal state of a Homebrew CLI
+/// beside the Mac App Store daemon. Streaming stderr would otherwise make it
 /// the first line of every message we show, ahead of the actual reason.
 fn without_version_skew_warning(output: &str) -> String {
     output
@@ -1061,11 +995,10 @@ fn check_status(out: std::process::Output, label: &str) -> Result<(), String> {
 /// a spawn failure to a readable error.
 ///
 /// The missing deadline is deliberate and belongs to `up` alone: signing in is
-/// interactive, opening a browser for the tailnet login, so it legitimately
-/// takes as long as the user takes. Do not "fix" this by bounding it. It is safe
-/// to block in because the command that calls it runs on a worker thread, and it
-/// is safe to leave unguarded against a double press because
-/// [`MobileAccessRuns::start_up`] already refuses one.
+/// interactive, so it legitimately takes as long as the user takes. Do not
+/// "fix" this by bounding it. Blocking is safe because the caller runs on a
+/// worker thread, and a double press is already refused by
+/// [`MobileAccessRuns::start_up`].
 fn run_checked(mut cmd: Command, label: &str) -> Result<(), String> {
     let out = cmd
         .output()
@@ -1078,8 +1011,8 @@ mod tests {
     use super::*;
 
     /// Verbatim from `tailscale serve --bg --https=443 http://127.0.0.1:5252` on
-    /// a tailnet with Serve not enabled (2026-08-02, CLI 1.96.4 against a 1.98.9
-    /// daemon). The command printed this and then blocked indefinitely.
+    /// a tailnet with Serve not enabled, CLI 1.96.4 against a 1.98.9 daemon. The
+    /// command printed this and then blocked indefinitely.
     const SERVE_NOT_ENABLED: &str = "Warning: client version \"1.96.4-t41cb72f27\" != tailscaled server version \"1.98.9-t4fb758c39-g200941d74\"\n\nServe is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=nodeidEXAMPLE1234\n";
 
     fn sh(script: &str) -> Child {
@@ -1186,9 +1119,8 @@ mod tests {
     fn no_serve_form_passes_yes() {
         // `--yes` looks like the fix for a command that hangs, and is not: it
         // suppresses interactive prompts, while what this waits on is a tailnet
-        // policy a human enables in a browser. Measured 2026-08-02: with `--yes`
-        // the command blocks identically. Adding it would only hide prompts we
-        // have already closed stdin against.
+        // policy a human enables in a browser. Measured: with `--yes` the
+        // command blocks identically.
         let (current, legacy) = serve_arg_forms(5252);
         for form in [&current, &legacy] {
             assert!(!form.iter().any(|a| a == "--yes"), "{form:?}");
@@ -1197,13 +1129,10 @@ mod tests {
 
     #[test]
     fn the_legacy_serve_form_is_the_pre_rework_syntax_without_bg() {
-        // The fallback only ever runs on a CLI that rejected the flag form,
-        // i.e. one older than the 1.52 rework. That CLI has no `--bg` either
-        // (it came with the same rework, and `serve` was persistent before it),
-        // so carrying `--bg` here would make the fallback fail on the only
-        // installs it exists for. The previously shipped argv had exactly that
-        // bug latent in it, hidden behind a positional form that then got
-        // removed upstream.
+        // The fallback only ever runs on a CLI that rejected the flag form, so
+        // one older than the 1.52 rework. That CLI has no `--bg` either, since
+        // it came with the same rework. Carrying `--bg` here would make the
+        // fallback fail on the only installs it exists for.
         let (_, legacy) = serve_arg_forms(5252);
         assert_eq!(legacy, ["serve", "https", "/", "http://127.0.0.1:5252"]);
         assert!(!legacy.iter().any(|a| a == "--bg"));
@@ -1298,9 +1227,9 @@ mod tests {
     #[test]
     fn a_syntax_rejection_is_told_apart_from_every_other_failure() {
         // Only the first of these earns a retry under the older syntax. The
-        // second is the reported bug: it is what a MODERN CLI says about the
-        // LEGACY form, so treating it as a reason to retry is backwards, and
-        // the third is a deadline, which is not the CLI declining anything.
+        // second is what a MODERN CLI says about the LEGACY form, so treating
+        // it as a reason to retry is backwards. The third is a deadline, which
+        // is not the CLI declining anything.
         assert!(is_flag_rejection(
             "tailscale serve failed: flag provided but not defined: -bg"
         ));
@@ -1354,15 +1283,14 @@ mod tests {
 
     #[test]
     fn the_tailnet_notice_becomes_a_phase_and_buys_the_child_more_time() {
-        // The child is not stalled, it is waiting for a human, so the short
-        // configure deadline must give way to the long approval one, and the run
-        // must then finish by itself when the approval lands. With the old single
-        // deadline this run died at 20s with nothing to show.
+        // The child is not stalled, it is waiting for a human. So the short
+        // configure deadline must give way to the long approval one, and the
+        // run must then finish by itself when the approval lands.
         //
         // Proved by OUTCOME rather than by a stopwatch, so host load cannot
-        // decide it: the stub prints the notice, keeps going well past the
-        // configure deadline, and then exits 0 the way the real CLI does once
-        // Serve is enabled. Succeeding is only possible if the deadline moved.
+        // decide it. The stub prints the notice, keeps going past the configure
+        // deadline, then exits 0 the way the real CLI does once Serve is
+        // enabled. Succeeding is only possible if the deadline moved.
         let cancel = AtomicBool::new(false);
         let mut phases = Vec::new();
         let result = supervise_serve(
@@ -1473,10 +1401,9 @@ mod tests {
         //
         // Written as a child that exits while something else still holds the
         // pipe, because that is the DETERMINISTIC form of the hazard. The
-        // scheduling-race form (reader not yet run when the parent exits) is the
-        // same bug and the same fix, but it cannot be provoked reliably: the
-        // 100ms poll almost always hands the reader its slack for free, so a
-        // test written that way passes with the fix removed and guards nothing.
+        // scheduling-race form is the same bug and the same fix, but it cannot
+        // be provoked reliably. The 100ms poll almost always hands the reader
+        // its slack, so a test written that way guards nothing.
         let cancel = AtomicBool::new(false);
         let err = supervise_serve(
             sh("( sleep 0.2; printf 'flag provided but not defined: -bg\\n' >&2 ) & exit 1"),
@@ -1496,8 +1423,7 @@ mod tests {
     fn a_pipe_nothing_closes_does_not_hold_the_run_open() {
         // The other side of that wait: it is BOUNDED. A child that leaves a
         // grandchild holding the pipe would otherwise block the reader forever,
-        // turning the collection step into the exact hang the deadlines exist to
-        // prevent.
+        // turning the collection step into a hang.
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
         let err = supervise_serve(
@@ -1594,8 +1520,8 @@ mod tests {
     #[test]
     fn the_serve_phase_tags_are_the_ones_the_frontend_handles() {
         // The TypeScript mirror in `utils/tauri.ts` is a discriminated union on
-        // these exact strings, so a rename here that is not made there would
-        // render as a blank step rather than fail to compile.
+        // these exact strings. A rename here that is not made there renders as
+        // a blank step rather than failing to compile.
         let tag = |p: &ServePhase| {
             serde_json::to_value(p).unwrap()["phase"]
                 .as_str()

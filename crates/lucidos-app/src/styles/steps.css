@@ -216,7 +216,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     /* basis 0 + grow 1: the detail takes the space the description doesn't
-       need, so a short description (e.g. "Memory searched") next to a long
+       need, so a short description (e.g. "Requesting") next to a long
        detail isn't proportionally squeezed and ellipsized. The floor is the
        other half of that trade. A basis of 0 also means a scaled shrink factor
        of 0, so the description absorbs ALL shrinkage and a long one crushed the

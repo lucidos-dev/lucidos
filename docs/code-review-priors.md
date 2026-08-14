@@ -15,6 +15,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **An orphaned build outliving its `build-slot` wrapper is a weighed
+  trade-off, not an oversight.** `spawn_child`
+  (`lucidos-cli/src/build_slot.rs`) runs the build as a child and holds the
+  slot's flock in the parent. So a reviewer correctly observes that killing
+  the wrapper alone frees the slot while `cargo` compiles on. Codex flagged
+  exactly this on the branch that added it.
+
+  Two things make it narrow. The child deliberately stays in the wrapper's
+  process group, so every ordinary kill reaches both: a terminal Ctrl-C, and
+  the engine's `BuildProcessGroupGuard` on a coalesced Apply. The escape
+  needs a deliberate single-pid SIGKILL. The OOM killer will not do it, since
+  it picks the largest RSS and the wrapper is tiny.
+
+  The fix a reviewer reaches for is worse. Clear close-on-exec so the child
+  inherits the lock, and a leaked grandchild pins that slot until someone
+  kills it. That is the stale-holder failure the whole design avoids. Re-flag
+  only if the child gains its own process group, or if the wrapper starts
+  outliving the build. (ADR 0070 § Consequences.)
+
 - **`cancel_event_wait`'s `on` ending a whole multi-type subscription is the
   intended reading, not a leak.** `LiveWait::watches` (`event_wait/mod.rs`) is
   an `any` over the `on` list, so a wait armed with `--on A --on B` answers yes
@@ -525,6 +544,58 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   opens the pairing. Re-flag only with a path where the ff can SUCCEED between
   the pairing emit and session registration.
   (`engine/change_ops/mod.rs`, `engine/change_ops/apply.rs`, ADR 0060.)
+
+- **`BACKGROUND_PROCESS_RULE`'s `/tmp/$(basename "$PWD").log` example is unique
+  per session, not a shared path** (2026-08-13, Codex). The rule tells the agent
+  to redirect a long command's output so each blocking `TaskOutput` stays cheap
+  (it replays the task's whole accumulated output on every call), and builds the
+  example path from the worktree's basename. A `/tmp` name reads as
+  collision-prone across concurrent sessions. It is not: the engine prompt
+  reaches only engine-spawned sessions, and every one runs in
+  `deterministic_worktree_path`'s `thread-<short_thread_id>` directory, whose
+  collision namespace is `(workspace, thread)`. It deliberately does NOT use the
+  worktree-local `.lucidos/` that `/harden` and the `run-e2e` skill write to:
+  those are Lucidos-checkout-only, while four of the seven prompt flavors run in
+  an external repo or an app worktree, where an untracked `.lucidos/` log would
+  dirty someone else's tree. Re-flag only if worktrees stop being named per
+  thread. (`agent_session/prompts.rs`, `agent_session/resume.rs`.)
+
+- **A `continue` in the agentic loop's no-tool-calls branch cannot burn the
+  tool-call cap** (2026-08-13, Codex). Flagged against the *wake check*. The
+  worry is a turn that has just exhausted `max_tool_calls` losing its final
+  answer. The forced round would hit the cap check and return the generic cap
+  message, with no model call behind it.
+
+  It cannot happen, and the reason is where the counter moves.
+  `tool_calls_made += 1` fires at exactly one site, inside the tool-execution
+  path of the NON-empty branch. So the empty branch is entered holding whatever
+  count the top of that round held. That count already passed
+  `tool_calls_made >= max_tool_calls`, or the loop would have returned before
+  the model was called at all.
+
+  The forced round therefore sees the same count and is not capped. The round
+  backstop is not a route either: it is `max_tool_calls + NON_TOOL_ROUND_SLACK`,
+  and the slack is 100, sized for exactly this class of non-tool `continue`.
+  Re-flag only if the empty branch starts advancing `tool_calls_made`, or if the
+  slack is removed. (`engine/agentic_loop/run.rs`, `NON_TOOL_ROUND_SLACK` in
+  `helpers.rs`.)
+
+- **The branch-create retry reusing one worktree path cannot strand itself on a
+  leftover directory** (2026-08-13). `FreshBranch::create_worktree`
+  (`agent_session/spawn.rs`) loops on the same `wt_path`, re-deriving only the
+  branch name. A reviewer reasonably asks what happens if the losing
+  `git worktree add -b` left the directory behind: the next attempt would fail
+  on "path already exists", which `branch_name_is_taken` deliberately does not
+  match, so the spawn would die with a confusing error.
+
+  Git does not leave it. A name-taken failure aborts before the directory
+  exists, verified directly against git 2.50.1. It is also exercised by
+  `a_lost_branch_race_retries_until_it_wins`, where one task retried six times
+  at one path and succeeded. Do not "fix" this by clearing the directory inside
+  the loop: that puts a destructive call on a retry path, against the
+  failure-path cleanup rule, to no purpose. Re-flag only with a git version
+  that leaves the path behind on a name-taken abort.
+  (`agent_session/spawn.rs`, `git_ops/branch_name.rs`.)
 
 ## Desktop client (Tauri, macOS)
 
@@ -1438,6 +1509,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   which is strictly more than the ladder asks for. Re-flag only with a named
   engine, in the supported set, measured dropping one of these declarations.
 
+- **One shared toast column is the chosen design, not a revert of the per-pane
+  fix.** `34098b4c2` gave each pane its own `.toast-column`, so a toast raised
+  in one pane could not push the other pane's toasts down. A reviewer who finds
+  every toast back in a single stack will read that as the same bug returning.
+
+  It is a supersession, decided with the user and recorded in
+  `docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md` § Settled Decisions.
+  The old bug is unreachable rather than tolerated: it needed two panes each
+  holding their own toasts, and there is now one stack for all of them. Origin
+  moved off the axis entirely, and each message goes to the surface matching its
+  weight instead. Per-pane survives as one option in the placement picker while
+  the shape is being chosen (`docs/temporary-measures.md`).
+
+  Re-flag only if per-pane columns come back AND a toast in one pane again
+  displaces the other's.
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
@@ -1564,6 +1651,46 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   only with a measurement showing the multi-line share has grown materially, or
   with a tracker whose failure mode is bounded. (`.claude/skills/project-stats/sloc.awk`
   header § KNOWN LIMITS, fixtures in `sloc_test.sh`.)
+
+  **Python docstrings are the one exception, and they meet that second bar.** A
+  reviewer seeing `in_pydoc` carry across lines reads it as the reset above
+  being violated. It is the exemption the entry invites: a docstring IS the
+  comment in Python, so per-line reset does not misread a few lines, it books
+  every docstring as code. The tracker is bounded the way the entry asks. It
+  arms only for `.py`, matches an unescaped delimiter, and an unterminated run
+  at end of file warns and exits non-zero. Re-flag only for a shape the
+  fixtures miss, naming it.
+
+  **The `has_comment = 1` at the head of that branch does NOT capture blank
+  lines**, and the same reading is available against `in_block` above it. Both
+  branches sit inside `while (length(s) > 0)`, which an empty line never
+  enters, so `classify()` returns with both flags clear and the caller books
+  the line blank. That is cloc's partition: a blank line inside a comment block
+  is blank. The `python: docstrings are comments` fixture pins it with a blank
+  line inside a module docstring. Read the loop guard before flagging this one.
+
+- **`sloc.awk` decides Python docstring position from ONE line of memory, and
+  bracket depth is the wrong upgrade.** A reviewer sees `py_prev_cont` remember
+  only the previous line's last character, builds the case
+  `QUERY = (` / `"select "` / `"""from table"""`, and proposes bracket depth
+  instead.
+
+  The gap is real and measures near zero. Count a bare string-literal line
+  followed by a line-head triple quote: 0 hits in a 2,483-opener repo, 7 in a
+  48,734-opener one, 0 in a third.
+
+  The remedy costs far more than 0.01%. Depth counting must skip brackets inside
+  strings and comments, which needs the cross-line string state the entry above
+  rejects. Getting that wrong drifts silently and forever.
+
+  That is not hypothetical. The throwaway depth counter written to size this
+  residual reported 334 hits. Its first three examples were `def` signatures
+  whose next line held an ordinary docstring, because brackets inside SQL
+  strings had pushed the depth positive. One line of memory can mislabel one
+  run. A drifting depth mislabels every run after it.
+
+  Re-flag only with a corpus where the concatenation shape is material.
+  (`.claude/skills/project-stats/sloc.awk`, `py_prev_cont`.)
 
 - **`sloc.awk` closes a Rust block comment at the FIRST `*/` even though Rust
   block comments nest, and that is measured, not overlooked.** The language rule
@@ -1779,29 +1906,50 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the token is added to one of those two served files without the
   doc row. (`styles/global/base.css`, `crates/lucidos-engine/src/api/sdk.rs`.)
 
-- **The app iframe's `body` carries an explicit `font-size` and the host's does
-  NOT. That asymmetry is deliberate, and deleting it to "restore parity" is a
-  bug that has already shipped once.** The two files mirror each other by
-  construction (`sdk_iframe.css` repeats base.css's token blocks under "keep in
-  sync with base.css" markers), so a reviewer comparing them side by side reads
-  the extra declaration as drift. It is not, because the two documents are not
-  symmetric in what fills them: every text element in the host shell is
-  explicitly sized from a `--font-size-*` token, so the host body's computed size
-  is a value nothing actually renders at, whereas an app's prose is whatever the
-  app author wrote, and anything they did not size falls straight through to it.
-  Leave the declaration off and that fallthrough is the raw root (`1rem`, 18px at
-  a 112.5% UI scale) against a chat message body of `--font-size-sm` and a
-  documented app body step of `--font-size-md`. That is exactly what happened:
-  `2a742266b` (2026-06-19) dropped a `body { font-size: 0.875rem }` reasoning
-  that it "made app text permanently smaller and the user's UI-scale preference
-  look ignored", and both halves were wrong. `0.875rem` is a `rem`, so it tracked
-  the root the whole time, and 14px was at the TOP of the host's range rather
-  than below it. The measurement was against the host body's *computed* size
-  instead of against any pixel the host paints. Restored as `--font-size-md`, the
-  documented body step, on 2026-08-05 after a user reported apps rendering a
-  scale step larger than their threads. Pinned by
-  `api::sdk::tests::iframe_body_is_sized_from_the_type_scale`. Re-flag only if
-  the host shell starts rendering real body text at the unstyled root size.
+- **BOTH bodies carry an explicit `font-size: var(--font-size-md)` now, and so do
+  form controls. Deleting either one to "let it inherit" is a bug that has
+  shipped three times.** This entry used to say the opposite for the host, on
+  the theory that every host text element names its own token, so the host
+  body's computed size was a value nothing rendered at. It carried a re-flag
+  clause, *"re-flag only if the host shell starts rendering real body text at the
+  unstyled root size"*, and on 2026-08-12 that clause fired: Settings > System >
+  What's New shipped release notes larger than the version heading above them,
+  because `.whats-new-notes` styled its padding and stopped. The theory required
+  100% coverage forever, and one miss renders visibly wrong, so the host was
+  given the same default as the iframe on 2026-08-13.
+
+  **Why the failure is always "too big".** The root is
+  `var(--user-ui-scale)`, which is exactly `--font-size-xl` (`1rem`, labelled
+  "section headings"), while body is `--font-size-md` (`0.8125rem`). Text that
+  reaches the root is therefore a step and a half ABOVE prose, not "unstyled".
+  Reviewers reading a too-large surface should look for a MISSING declaration
+  before looking for a wrong one.
+
+  **Three separate deletions, so the history is the point of this entry.**
+  `2a742266b` (2026-06-19) dropped the iframe's `body { font-size: 0.875rem }`
+  reasoning that it "made app text permanently smaller and the user's UI-scale
+  preference look ignored". Both halves were wrong: `0.875rem` is a `rem`, so it
+  tracked the root the whole time, and 14px sat at the TOP of the host's range
+  rather than below it. That was measured against the host body's *computed*
+  size instead of against any pixel the host paints. Restored as
+  `--font-size-md` on 2026-08-05 after a user reported apps rendering a scale
+  step larger than their threads. The host's own absence caused What's New, and
+  the control gap caused `.welcome-dismiss` to paint in Arial while sizing
+  itself correctly from a token.
+
+  **Controls are a separate default, not the same one.** A control inherits
+  nothing from `body`: the UA stylesheet applies the `font` shorthand to it.
+  `base.css` hands the family and size back with LONGHANDS on
+  `input, textarea, select, button`, and the shorthand must never be used there,
+  because it also resets `font-weight` and `font-feature-settings` (which would
+  give Fira Code's ligatures back to every control at once). `html` is
+  deliberately absent from that selector list: `font-size: inherit` on the root
+  would override the ui-scale declaration, both being element selectors.
+
+  Pinned by `api::sdk::tests::iframe_body_is_sized_from_the_type_scale`,
+  `styles/__tests__/text-defaults-guard.test.ts`, and the rendered
+  `e2e/type-scale.spec.ts`. Re-flag if any of the three defaults goes missing,
+  or if a `font` shorthand appears on the control rule.
   (`crates/lucidos-engine/src/api/sdk_iframe.css`, `styles/global/base.css`.)
 
 - **`openScaleModal` deliberately does NOT blur the UI-scale trigger button, and
@@ -2190,7 +2338,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   with no route to its matched event. What makes it moot is that the attached
   shape was retired on 2026-08-06 (ADR 0049, *Every event wait is detached*):
   **`was_attached` appears in no Rust file at all**, so the engine cannot emit
-  one, and every delivery writes a `UserPromptInjected` wake anchor. The field
+  one, and every delivery writes a `UserPromptInjected` re-entry anchor. The field
   survives only on the frontend wire type and its fixtures, for rows persisted
   before that date. Putting the link back on the arming card to serve those is
   the wrong trade twice over: the user removed it from there deliberately (it
@@ -2252,3 +2400,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   UNCORRECTED glyph, which would be an argument for a second box, not a
   narrower selector. (`styles/global/host-components.css`,
   `styles/__tests__/trash-icon-optical-size.test.ts`.)
+
+- **`onResize` writing the live edge twice for a box change that also grew the
+  transcript is idempotent, not a redundant scroll** (2026-08-13). The box-change
+  branch and the growth branch are two of `keepTheLiveEdge`'s three callers, so a
+  resize that changes the box AND grows the content under an armed reader who was
+  on the edge satisfies both, and the second call writes `liveEdgeTop(el)` again.
+  That reads as a double write to a fresh reviewer, and it is, but it targets the
+  same number: nothing between them changes `scrollHeight` or `clientHeight`, so
+  the assignment is a no-op the browser fires no scroll event for. Collapsing
+  them is not free, because the box-change caller is also the condition whose
+  fallthrough runs `restoreAfterReflow`, and `honourGrowth` returns early on a
+  pending landing, so folding the two would leave a box change with a landing in
+  flight holding neither the correction nor the edge. That state is unreachable
+  today (`armFollowOn` clears the landing and a submit made while armed installs
+  none), and depending on it to place a write is exactly the coupling the early
+  return should not acquire. Re-flag only if the callers stop sharing
+  `keepTheLiveEdge`, or if something between them can change the container's
+  geometry. (`components/chat/scrollState.ts`.)

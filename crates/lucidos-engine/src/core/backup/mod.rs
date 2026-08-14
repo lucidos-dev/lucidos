@@ -16,9 +16,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Registry entry: (id, name, oauth_provider, required_scopes, grant_scopes,
 /// constructor).
-/// The constructor receives the pool AND the entry's `required_scopes`, so the
-/// readiness verdict the Settings page renders and the preflight the backup runs
-/// are checking one list rather than two that can disagree. `grant_scopes` is
+/// The constructor receives the pool AND the entry's `required_scopes`. The
+/// readiness verdict the Settings page renders and the preflight the backup
+/// runs therefore check one list, not two that can disagree. `grant_scopes` is
 /// what a user actually grants, used only to NAME an unmet requirement (see
 /// [`name_missing_scopes`]).
 type BackupProviderEntry = (
@@ -52,13 +52,12 @@ pub fn is_schedule_active(value: &str) -> bool {
 /// Read the backup retention count from preferences. A missing or unparseable
 /// row is the default; a FAILED read is an `Err`.
 ///
-/// The split matters because one caller acts destructively on the answer. This
-/// used to be `.ok().flatten()…unwrap_or(DEFAULT_BACKUP_RETENTION)`, so a
-/// transient `sqlx` failure (a pool timeout under load is the realistic one)
-/// read as "keep 5" and `scheduler::backup` fed that straight into
+/// The split matters because one caller acts destructively on the answer.
+/// Collapsing a failed read into the default means a transient `sqlx` failure
+/// reads as "keep 5". `scheduler::backup` then feeds that into
 /// [`prune_old_backups`], deleting every archive beyond the fifth. A workspace
-/// configured for the catalog maximum of 50 lost up to 45 backups on one blip,
-/// immediately after a SUCCESSFUL upload. That is the case
+/// configured for the catalog maximum of 50 would lose 45 backups on one pool
+/// timeout, immediately after a SUCCESSFUL upload. That is the case
 /// `.claude/rules/rust.md` names outright: an unknown must never authorize
 /// deleting. The two display callers still want the default on an unknown, and
 /// say so at their own call sites; the prune caller skips the prune.
@@ -84,9 +83,9 @@ const PROVIDERS: &[BackupProviderEntry] = &[
         "dropbox",
         "Dropbox",
         "dropbox",
-        // Empty until 2026-08-05, which made every connected Dropbox account
-        // read as ready however narrow its grant and pushed the failure all the
-        // way to `files/create_folder_v2` returning a 400 mid-backup.
+        // Never empty: an empty list makes every connected account read as
+        // ready however narrow its grant. The failure then lands on
+        // `files/create_folder_v2` returning a 400 mid-backup.
         dropbox::BACKUP_SCOPES,
         dropbox::GRANT_SCOPES,
         |pool, scopes| Box::new(dropbox::DropboxBackupProvider::new(pool, scopes)),
@@ -106,11 +105,11 @@ pub struct ProviderMeta {
     /// Every scope substring that must appear in the OAuth account's scopes for
     /// the provider to be ready. Empty slice means connecting is enough.
     ///
-    /// This is the SAME list the provider's preflight checks, deliberately: when
-    /// readiness gated on one scope and preflight demanded three, an account
-    /// holding only the first read as ready (so the page hid *Grant access* and
-    /// enabled *Back up now*) and then failed preflight telling the user to
-    /// reconnect, with no button left on the page to do it.
+    /// This is the SAME list the provider's preflight checks, deliberately.
+    /// Readiness gating on one scope while preflight demands three lets an
+    /// account holding only the first read as ready. The page then hides *Grant
+    /// access* and enables *Back up now*. Preflight fails and tells the user to
+    /// reconnect, with no button left to do it.
     pub required_scopes: &'static [&'static str],
     /// The scopes an authorization actually asks for. Not a second readiness
     /// list: it exists so an unmet `required_scopes` matcher can be reported
@@ -159,7 +158,7 @@ pub fn scopes_include(granted: &str, required: &str) -> bool {
 /// provider declared them so a message reads the same every time.
 ///
 /// The ONE place the scope question is answered. Both providers' preflights and
-/// [`provider_readiness`] call it with the same registry list, which is what
+/// [`provider_readiness`] call it with the same registry list. That is what
 /// stops the page and the backup disagreeing about whether an account works.
 pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&'static str> {
     required
@@ -171,9 +170,9 @@ pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&
 
 /// Rewrite a list of unmet requirements into the scopes a user can act on.
 ///
-/// `required_scopes` are MATCHERS, not names: readiness asks whether a granted
-/// scope CONTAINS the entry ([`scopes_include`]), which is why Google Drive's
-/// whole requirement is the fragment `drive` and it matches the full
+/// `required_scopes` are MATCHERS, not names. Readiness asks whether a granted
+/// scope CONTAINS the entry ([`scopes_include`]). Google Drive's whole
+/// requirement is therefore the fragment `drive`, matching the full
 /// `https://www.googleapis.com/auth/drive.file` URL. Reporting that fragment to
 /// a human names a "drive permission" that appears in no Google console, which
 /// defeats the point of naming it at all.
@@ -207,12 +206,10 @@ pub fn name_missing_scopes(
 ///
 /// Both halves of "is this working?" in one value: is the OAuth account
 /// connected at all, and does that account carry the scope the provider needs.
-/// Shared by the Settings page (`api::backup::list_providers`, which renders the
-/// dropdown and the red "connect your account" line) and by the agent's
-/// `get_backup_status`, so the human and the agent can never be told different
-/// things about the same provider. Before this existed only the page knew, and
-/// an agent reported a Dropbox backup as fully configured while its upload leg
-/// had no account behind it (2026-08-05).
+/// Shared by the Settings page (`api::backup::list_providers`) and the agent's
+/// `get_backup_status`. The human and the agent can never be told different
+/// things about the same provider. With only the page knowing, an agent reports
+/// a backup as fully configured while its upload leg has no account behind it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderReadiness {
     /// An OAuth account row exists for this provider.
@@ -223,24 +220,20 @@ pub struct ProviderReadiness {
     /// measure, and listing every scope as "missing" would describe a
     /// not-connected provider as a half-granted one.
     ///
-    /// Reported all the way to the Backup page, because "access not granted"
-    /// with no permission named cannot distinguish a grant that never happened
-    /// from one that came back a scope short. That was the reported dead end: a
-    /// user pressed *Grant access*, completed the authorization, and came back
-    /// to the same red line.
+    /// Reported all the way to the Backup page. "Access not granted" with no
+    /// permission named cannot distinguish a grant that never happened from one
+    /// that came back a scope short. A user presses *Grant access*, completes
+    /// the authorization, and meets the same red line.
     pub missing_scopes: Vec<&'static str>,
 }
 
 impl ProviderReadiness {
     /// Connected AND holding every required scope.
     ///
-    /// Derived rather than stored, deliberately. This verdict and the scope list
-    /// it comes from have now had to be reconciled twice (see
-    /// `docs/plans/2026-08-05-dropbox-backup-scopes-and-refresh.md`, where a
-    /// readiness gate checking one scope while preflight demanded three left an
-    /// account reading as ready with no working button on the page). Keeping
-    /// both a boolean and the list it is computed from allows a state where they
-    /// disagree; a method does not.
+    /// Derived rather than stored, deliberately. Keeping both a boolean and the
+    /// list it is computed from allows a state where they disagree, and a method
+    /// does not. See `docs/plans/2026-08-05-dropbox-backup-scopes-and-refresh.md`
+    /// for the two reconciliations that made the point.
     pub fn ready(&self) -> bool {
         self.connected && self.missing_scopes.is_empty()
     }
@@ -334,9 +327,9 @@ pub enum BackupRunStatus {
 }
 
 /// Persisted record of the most recent backup run's terminal outcome. Written
-/// by `run_backup` on both the success and failure paths and stored under
-/// `PREF_BACKUP_LAST_RUN`, so the page survives engine restarts (the
-/// `BackupCompleted` / `BackupFailed` SSE events are ephemeral).
+/// by `run_backup` on both paths and stored under `PREF_BACKUP_LAST_RUN`, so the
+/// page survives engine restarts. The `BackupCompleted` and `BackupFailed` SSE
+/// events are ephemeral.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupLastRun {
     pub status: BackupRunStatus,
@@ -516,10 +509,10 @@ pub trait BackupProvider: Send + Sync {
     async fn folder_url(&self) -> Option<String>;
     /// Fail-fast checks run BEFORE any expensive backup work (pg_dump, the
     /// multi-GB tar, the multi-minute encrypt). `estimated_upload_bytes` is the
-    /// orchestrator's estimate of the encrypted archive size; the provider uses
-    /// it to reject the run up front when the upload can't succeed (e.g. over
-    /// quota), instead of wasting the whole pipeline only to fail at the final
-    /// upload. Also verifies the token is valid and the required scope exists.
+    /// orchestrator's estimate of the encrypted archive size. The provider uses
+    /// it to reject the run up front when the upload cannot succeed, rather than
+    /// failing at the final upload. Also verifies the token is valid and the
+    /// required scope exists.
     async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError>;
     async fn upload(
         &self,
@@ -577,10 +570,10 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 }
 
 /// Restore a local encrypted backup archive INTO an already-provisioned
-/// workspace directory + database. This is the gateway picker's restore path:
-/// the gateway has already reserved the registry entry, provisioned Postgres,
-/// and created `workspace_dir`; here we only download-free decrypt → decompress →
-/// move the workspace files in → `pg_restore` the dump into `database_url`.
+/// workspace directory and database. This is the gateway picker's restore path.
+/// The gateway has already reserved the registry entry, provisioned Postgres,
+/// and created `workspace_dir`. Here we only decrypt, decompress, move the
+/// workspace files in, and `pg_restore` the dump into `database_url`.
 ///
 /// Deliberately NARROWER than the old cloud `restore_backup`:
 ///   * **No provider / download** — the archive is already on disk (`encrypted_path`).
@@ -588,10 +581,9 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 ///     provisioning and the dir (which may live under the gateway app-data dir).
 ///   * **No `user_dir/` extraction over `~/.lucidos`.** Current backups no longer
 ///     include `~/.lucidos` at all (see `tar_and_compress`). LEGACY archives
-///     carry it under `user_dir/`; applying that on restore would CLOBBER the
-///     target's gateway registry (`~/.lucidos/gateway/config/workspaces.json`)
-///     and other machine-global state, so we drop any `user_dir/` from the
-///     staging tree before moving files in.
+///     carry it under `user_dir/`, and applying that on restore would CLOBBER
+///     the target's gateway registry and other machine-global state. So we drop
+///     any `user_dir/` from the staging tree before moving files in.
 ///   * **No migrations** — the engine server the gateway spawns afterward runs
 ///     `sqlx::migrate!()` at construction, upgrading an older-schema restore.
 pub async fn restore_archive_into(
@@ -657,12 +649,10 @@ pub async fn restore_archive_into(
                 archive.unpack(&staging_dir)?;
             }
 
-            // Drop any `user_dir/` (the source's ~/.lucidos) so it is neither
-            // applied over the target's ~/.lucidos (which would clobber the
-            // gateway registry) nor littered into the restored workspace. Current
-            // backups no longer include `user_dir/` at all (see
-            // `tar_and_compress`); this stays as defense for LEGACY archives that
-            // still carry it.
+            // Drop any `user_dir/`, the source's ~/.lucidos, so it is neither
+            // applied over the target's ~/.lucidos nor littered into the restored
+            // workspace. Current backups no longer include it (see
+            // `tar_and_compress`); this stays as defense for LEGACY archives.
             let user_dir_staging = staging_dir.join("user_dir");
             if user_dir_staging.exists() {
                 std::fs::remove_dir_all(&user_dir_staging)?;
@@ -726,16 +716,14 @@ pub async fn create_backup(
         provider.id()
     );
 
-    // Fail fast if the bundled PG client tools can't be resolved (packaged
-    // build with a mis-staged `postgres/`), with a path-bearing message, before
-    // any upload-size walk / provider preflight / encryption.
+    // Fail fast if the bundled PG client tools cannot be resolved, with a
+    // path-bearing message, before any upload-size walk, preflight or encryption.
     pg_tools_preflight(database_url)?;
 
-    // Estimate the upload size up front — one workspace walk on the blocking
-    // pool — so the provider's preflight can fail fast BEFORE pg_dump, the
-    // multi-GB tar, and the multi-minute encrypt if it can't accept the upload
-    // (over quota, missing scope, bad token). This walk replaces the one
-    // estimate_weights used to do; the tar phase still walks once to stream files.
+    // Estimate the upload size up front, in one workspace walk on the blocking
+    // pool. The provider's preflight can then fail fast on a quota, scope or
+    // token problem, BEFORE pg_dump, the multi-GB tar and the encrypt. The tar
+    // phase still walks once more to stream the files.
     let ws_bytes = {
         let workspace = workspace.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -861,10 +849,10 @@ fn is_backup_timestamp(s: &str) -> bool {
 }
 
 /// True when `filename` is an encrypted backup archive produced by THIS
-/// workspace — it must match `lucidos-backup-{workspace_name}-{timestamp}.enc`
-/// exactly (timestamp shape validated). This is the guard that keeps pruning
-/// from ever touching another workspace's archives or any unrelated file the
-/// user placed in the shared cloud backup folder.
+/// workspace. It must match `lucidos-backup-{workspace_name}-{timestamp}.enc`
+/// exactly, timestamp shape included. This is the guard that keeps pruning off
+/// another workspace's archives, and off any unrelated file in the shared
+/// folder.
 fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
     let prefix = format!("lucidos-backup-{workspace_name}-");
     filename
@@ -901,11 +889,11 @@ fn select_prunable(
 /// newest `keep`.
 ///
 /// Lists everything in the provider's shared backup folder, narrows to THIS
-/// workspace's `lucidos-backup-{workspace_name}-*.enc` archives (so another
-/// workspace's backups and any unrelated file in the folder are never touched —
-/// see [`select_prunable`]), then deletes oldest-first. Returns the number of
+/// workspace's `lucidos-backup-{workspace_name}-*.enc` archives, then deletes
+/// oldest-first. Another workspace's backups and any unrelated file in the
+/// folder are never touched (see [`select_prunable`]). Returns the number of
 /// backups deleted. A single delete failure is logged and skipped rather than
-/// propagated — one stuck archive must not abort cleanup of the rest.
+/// propagated: one stuck archive must not abort cleanup of the rest.
 pub async fn prune_old_backups(
     provider: &dyn BackupProvider,
     workspace_name: &str,
@@ -932,9 +920,9 @@ pub async fn prune_old_backups(
 }
 
 /// Sum the on-disk size of every file that WILL be included in the backup tar
-/// (i.e. after the hardcoded + `.backupignore` exclusions). This is the one
-/// workspace walk shared by preflight's free-space estimate and the phase-weight
-/// estimate; the tar phase walks once more to actually stream the files.
+/// (i.e. after the hardcoded + `.backupignore` exclusions). One walk, shared by
+/// preflight's free-space estimate and the phase-weight estimate. The tar phase
+/// walks once more to actually stream the files.
 fn workspace_backup_size(workspace: &Path, ignore: &BackupIgnore) -> u64 {
     walkdir(workspace)
         .unwrap_or_default()
@@ -964,10 +952,11 @@ fn estimate_archive_size(ws_bytes: u64) -> u64 {
 /// Upload fills the remainder to 100%.
 ///
 /// Rough speed estimates from real workspaces:
-///   pg_dump  ~50 MB/s + 2s overhead
-///   compress ~25 MB/s (tar + zstd level 3)
-///   encrypt  ~5 MB/s  (AES-256-GCM, 1 MB chunks)
-///   upload   ~10 MB/s (network dependent)
+///
+/// - pg_dump: ~50 MB/s plus 2s overhead
+/// - compress: ~25 MB/s (tar + zstd level 3)
+/// - encrypt: ~5 MB/s (AES-256-GCM, 1 MB chunks)
+/// - upload: ~10 MB/s, network dependent
 fn estimate_weights(ws_bytes: u64) -> (usize, usize, usize) {
     let ws_mb = ws_bytes as f64 / 1_048_576.0;
     let compressed_mb = ws_mb * 0.33; // zstd ~3:1 ratio estimate
@@ -1084,8 +1073,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
 }
 
 /// Apply `pg_env_vars(database_url)` onto `cmd`. Returns `Err` when the URL
-/// doesn't match the expected shape so the caller fails loudly instead of
-/// spawning a subprocess that inherits zero `PG*` vars and gets a confusing
+/// does not match the expected shape, so the caller fails loudly. Otherwise it
+/// spawns a subprocess that inherits zero `PG*` vars and gets a confusing
 /// connection error from libpq.
 fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(), BoxError> {
     let vars = crate::core::pg_env_vars(database_url);
@@ -1106,11 +1095,11 @@ fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(
 ///
 /// In a packaged build the relocatable PG client binaries live at
 /// `<resources>/postgres/bin` (`LUCIDOS_PG_BIN_DIR`), which is NOT on the
-/// launchd minimal PATH — a bare `Command::new("pg_dump")` ENOENTs mid-backup.
-/// So resolve against `LUCIDOS_PG_BIN_DIR` when set (failing fast with the path
-/// if the binary is missing) and make the bundled libpq loadable via
-/// `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` from `LUCIDOS_PG_LIB_DIR`. In dev/docker
-/// neither var is set and we fall back to a bare PATH lookup (unchanged).
+/// launchd minimal PATH. A bare `Command::new("pg_dump")` ENOENTs mid-backup.
+/// So resolve against `LUCIDOS_PG_BIN_DIR` when set, failing fast with the path
+/// if the binary is missing. Make the bundled libpq loadable via
+/// `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH` from `LUCIDOS_PG_LIB_DIR`. In dev
+/// neither var is set and we fall back to a bare PATH lookup.
 fn pg_tool_command(name: &str, database_url: &str) -> Result<std::process::Command, BoxError> {
     let bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(PathBuf::from);
     let bin = resolve_pg_tool_path(name, bin_dir.as_deref())?;
@@ -1145,11 +1134,11 @@ fn resolve_pg_tool_path(name: &str, bin_dir: Option<&Path>) -> Result<PathBuf, B
     }
 }
 
-/// Fail fast at the START of a backup/restore if the bundled PG client tools
-/// can't be resolved, with a descriptive path-bearing error — rather than
-/// getting a cryptic ENOENT deep inside `pg_dump`/`pg_restore`/`psql` after the
-/// run has already started. A no-op in dev (LUCIDOS_PG_BIN_DIR unset → bare
-/// PATH lookup, validated when the tool actually runs).
+/// Fail fast at the START of a backup or restore if the bundled PG client tools
+/// cannot be resolved, with a path-bearing error. The alternative is a cryptic
+/// ENOENT deep inside `pg_dump`, `pg_restore` or `psql`, after the run has
+/// already started. A no-op in dev, where `LUCIDOS_PG_BIN_DIR` is unset and the
+/// bare PATH lookup is validated when the tool actually runs.
 fn pg_tools_preflight(database_url: &str) -> Result<(), BoxError> {
     if std::env::var_os("LUCIDOS_PG_BIN_DIR").is_none() {
         return Ok(());
@@ -1195,8 +1184,8 @@ fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
 
 /// The target database name from a postgres URL, for `psql --dbname`.
 ///
-/// We pull the name from the same `pg_env_vars` parse that seeds the `PG*` env,
-/// so host/port/user/password still flow via env (kept out of argv) and only
+/// We pull the name from the same `pg_env_vars` parse that seeds the `PG*` env.
+/// Host, port, user and password still flow via env, kept out of argv, and only
 /// the dbname lands on the command line.
 fn pg_dbname(database_url: &str) -> Result<String, BoxError> {
     crate::core::pg_env_vars(database_url)
@@ -1342,10 +1331,10 @@ enum IgnorePattern {
     Prefix(PathBuf),
     /// A pattern containing glob wildcards (`*`, `?`, `[`). Matched against the
     /// workspace-relative path *and each of its ancestors*, so a glob that
-    /// names a directory also excludes that directory's entire subtree. Note:
-    /// with `glob`'s default options `*` matches across `/`, so wildcard
-    /// patterns are greedy — `data/artifacts/*/klines` excludes `klines` at any
-    /// depth under `data/artifacts`, not just one level down.
+    /// names a directory also excludes that directory's entire subtree. With
+    /// `glob`'s default options `*` matches across `/`, so wildcard patterns are
+    /// greedy: `data/artifacts/*/klines` excludes `klines` at any depth under
+    /// `data/artifacts`, not just one level down.
     Glob(glob::Pattern),
 }
 
@@ -1360,16 +1349,16 @@ impl IgnorePattern {
 
 /// Parsed contents of a workspace's `data/.backupignore` — a gitignore-style
 /// list of workspace-relative paths to omit from the backup, *in addition* to
-/// the hardcoded exclusions. Loaded and parsed once per backup run and shared
-/// across the size estimate and the tar walk; an absent or empty file yields an
-/// empty set, preserving today's behavior.
+/// the hardcoded exclusions. Loaded and parsed once per backup run, and shared
+/// across the size estimate and the tar walk. An absent or empty file yields an
+/// empty set.
 #[derive(Default)]
 struct BackupIgnore(Vec<IgnorePattern>);
 
 impl BackupIgnore {
     /// Load `<workspace>/data/.backupignore`. A missing file is the common case
-    /// and yields no patterns silently; any other read error is logged and also
-    /// treated as no patterns — a broken ignore file never aborts the backup.
+    /// and yields no patterns silently. Any other read error is logged and also
+    /// treated as no patterns: a broken ignore file never aborts the backup.
     fn load(workspace: &Path) -> Self {
         let path = workspace.join("data").join(".backupignore");
         match std::fs::read_to_string(&path) {
@@ -1486,10 +1475,10 @@ fn header_for_file(metadata: &std::fs::Metadata) -> tar::Header {
 /// mid-walk: `Ok(Some(v))` = use it, `Ok(None)` = the path was removed
 /// (`NotFound`) so skip it, `Err(e)` = a real error to propagate.
 ///
-/// A workspace's background jobs constantly create and tear down git
-/// worktrees under `.git/`, so a file (or directory) enumerated by the walk can
-/// disappear before tar reads it. A single vanished path must not abort the
-/// whole backup — but other error kinds (permissions, I/O) still must.
+/// A workspace's background jobs constantly create and tear down git worktrees
+/// under `.git/`. A path the walk enumerated can disappear before tar reads it.
+/// A single vanished path must not abort the whole backup. Other error kinds,
+/// permissions and I/O, still must.
 fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>, BoxError> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -1525,10 +1514,10 @@ fn append_file<W: std::io::Write>(
 /// The workspace's own `.git/` IS included (artifact version history); only
 /// `.lucidos/`, `data/postgres*`, and `data/.backupignore` entries are excluded
 /// (see [`is_excluded_workspace_path`]). The user-level `~/.lucidos/` is
-/// deliberately NOT included: `restore_archive_into` unconditionally discards any
-/// `user_dir/` (it would clobber the target's machine-global gateway registry),
-/// so backing it up was multi-GB of dead weight (the gateway's `deleted/` stashes
-/// alone can be several GB). It is not backed up at all.
+/// deliberately NOT included. `restore_archive_into` unconditionally discards
+/// any `user_dir/`, because it would clobber the target's machine-global gateway
+/// registry, so backing it up is multi-GB of dead weight. The gateway's
+/// `deleted/` stashes alone can be several GB.
 fn tar_and_compress(
     workspace: &Path,
     sql_dump: &Path,

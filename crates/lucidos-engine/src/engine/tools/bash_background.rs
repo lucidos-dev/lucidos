@@ -1386,7 +1386,7 @@ mod tests {
     /// answers, itemised, and the chat turn tail arms one *event wait* per
     /// task it returns. Two things have to hold or that wait is useless: the
     /// `task_id` must be the one the eventual `BackgroundBashCompleted`
-    /// carries (an unconditioned subscription would wake on any thread's
+    /// carries (an unconditioned subscription would fire on any thread's
     /// task), and the deadline must be the point past which the watchdog kills
     /// the child (a wait expiring sooner is outlived by the work it watches).
     #[tokio::test]

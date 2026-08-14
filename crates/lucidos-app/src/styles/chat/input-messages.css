@@ -180,10 +180,17 @@
     margin: 0.75rem 0;
 }
 
+/* The textarea's own row, and it holds nothing else: the clear button used to
+   sit here as a second flex item pinned to the top-right corner, and moved to
+   the prompt row below (see PromptInput.tsx). So no `gap` and no
+   `align-items` here any more, both of which only ever described that pair. The
+   flex context itself stays, because `.prompt-row .prompt-textarea` is
+   `flex: 1`, and so does the wrapper: every composer-specific textarea rule
+   (this file's two below, mobile.css's iOS-zoom font-size floor,
+   e2e/prompt-transcript-alignment.spec.ts's selector) keys off `.prompt-row` to
+   miss the trigger form's Intent field, which is a `.prompt-box` without one. */
 .prompt-row {
     display: flex;
-    gap: 0.5rem;
-    align-items: center;
     position: relative;
 }
 
@@ -222,30 +229,13 @@
     padding-inline: calc(var(--turn-surface-inset) - var(--prompt-box-border-width));
 }
 
-.prompt-clear {
-    color: var(--text-muted);
-    align-self: flex-start;
-    margin-top: 0.5rem;
-    margin-right: 0.5rem;
-    flex-shrink: 0;
-}
-
-@media (max-width: 768px) {
-    .prompt-clear {
-        width: 2.25rem;
-        height: 2.25rem;
-        margin-top: 0.125rem;
-        margin-right: 0.125rem;
-        padding: 0;
-        justify-content: center;
-        -webkit-tap-highlight-color: transparent;
-    }
-
-    .prompt-clear svg {
-        width: var(--icon-size-lg);
-        height: var(--icon-size-lg);
-    }
-}
+/* `.prompt-clear` intentionally has NO rule of its own. It is one of the prompt
+   row's icons now, so `.icon-btn.header-icon` sizes and colours it and the nudge
+   below aligns it, exactly as for the three buttons beside it. The class is kept
+   purely as the selector the drafts e2e clicks. Giving it a size or a colour
+   here is what re-forks it from its neighbours, which is the defect the move
+   removed: see the guard in
+   components/chat/__tests__/composer-single-right-anchor.test.ts. */
 
 .prompt-actions-row {
     display: flex;
@@ -347,8 +337,11 @@
 
 .changes-bulk-actions {
     display: flex;
+    /* Right-aligned, on the same --space-lg gutter the .list-row change rows
+       below use, so the buttons' right edge lines up with the rows' content. */
+    justify-content: flex-end;
     gap: 0.5rem;
-    padding: 0.625rem 0.75rem;
+    padding: var(--space-sm) var(--space-lg);
 }
 
 .change-description {
@@ -990,32 +983,16 @@
     font-size: var(--font-size-md);
 }
 
-/* Box and correction come from `.icon-btn.row-icon` (host-components.css),
-   shared with the trigger group heading's trash. It used to be hand-sized
-   here, at 1.25rem around a 0.85rem glyph on no icon step: a target a thumb
-   misses, holding a glyph off the scale entirely. Being smaller than the
-   heading's trash was never the defect (it is smaller again below, on purpose
-   and by one step); being off the scale in an undersized box was. The colour
-   and the nominal glyph size are what stay local. */
+/* Box, nominal and correction all come from `.icon-btn.row-icon`
+   (host-components.css), shared with the trigger group heading's trash. It used
+   to be hand-sized here, at 1.25rem around a 0.85rem glyph on no icon step: a
+   target a thumb misses, holding a glyph off the scale entirely. Being smaller
+   than the heading's trash was never the defect; being off the scale in an
+   undersized box was. It later kept a local `--icon-glyph` one step below the
+   heading's, which is the step the shared class now takes for every row icon,
+   so only the colour stays local. */
 .queued-message-remove {
     color: var(--text-muted);
-}
-
-/* One step down from the trigger group heading's twin, because it sits in a
-   different place: inline against a --font-size-md "Queued" label rather than
-   in a heading band, where the heading's nominal read as a trash bin looming
-   over its own caption. The heading's pair is unchanged, this turns down only
-   the nominal for this button and the shared rule applies its ink correction
-   and its stroke division at that nominal as usual.
-
-   Only the GLYPH shrinks. The 2.25rem button box is the tap target, grown
-   deliberately after this very trash was reported unhittable on mobile, so it
-   stays exactly as it is and nothing here sets width, height or padding.
-
-   Three classes (0,3,0) so it outranks the two-class default in
-   host-components.css on specificity, whatever order the two sheets land in. */
-.icon-btn.row-icon.queued-message-remove {
-    --icon-glyph: var(--icon-size-md);
 }
 
 @media (hover: hover) {
@@ -1271,12 +1248,25 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     display: inline-flex;
     align-items: center;
 }
-/* Component icons (e.g. the Claude logo on a coding-agent question/permission
-   divider) — size + tint to match the response executor's icon. Emoji string
-   icons are unaffected. */
+/* Every actor chip's glyph is a component now, so the size applies to all of
+   them: the Lucidos mark, the coding-agent logos, and the four chrome icons
+   (trigger, System, You, API caller) that replaced this slot's emoji on
+   2026-08-13. */
 .initiator-icon svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
+}
+
+/* The coding-agent brand orange, and ONLY for the coding agent's own logo.
+   This used to be declared on `.initiator-icon svg`, which reached every SVG in
+   the slot; it was harmless purely by accident, because back then the slot's
+   only other components were the Lucidos mark (its own gradient) and the Codex
+   glyph (a hardcoded stroke), leaving the Claude logo as the single icon the
+   declaration actually painted. The chrome icons inherit `currentColor` from the
+   header, so an unscoped rule would now paint "You" and "System" coding-agent
+   orange. Mirrored by `.response-executor-icon .claude-icon` in chat/response.css,
+   which is the same claim about the executor chip. */
+.initiator-icon .claude-icon {
     color: var(--initiator-coding-agent);
 }
 

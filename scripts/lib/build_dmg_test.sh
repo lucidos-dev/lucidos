@@ -1288,6 +1288,99 @@ else
     fail "the repack gate does not follow the signing branch"
 fi
 
+# ── The camera capability ────────────────────────────────────────────────────
+# The composer's Camera item calls getUserMedia in the WKWebView. wry grants the
+# WebKit-level permission itself, so what decides is macOS TCC, and the shipped
+# bundle satisfied neither half of it: no NSCameraUsageDescription (so no consent
+# prompt, so getUserMedia hangs and the overlay sits on a black video) and no
+# camera entitlement under the hardened runtime the release path signs with. The
+# real proof is a build's readback assertions; these keep the wiring that feeds
+# them from being quietly undone.
+echo ""
+echo "test: the packaged app claims the camera, and only the outer .app does"
+ENT_PLIST="$PROJECT_DIR/crates/lucidos-app/Entitlements.plist"
+INFO_PLIST="$PROJECT_DIR/crates/lucidos-app/Info.plist"
+if grep -q 'com.apple.security.device.camera' "$ENT_PLIST" 2>/dev/null; then
+    pass "Entitlements.plist claims the camera"
+else
+    fail "no camera entitlement in $ENT_PLIST"
+fi
+if grep -q 'NSCameraUsageDescription' "$INFO_PLIST" 2>/dev/null; then
+    pass "Info.plist carries the consent-prompt string"
+else
+    fail "no NSCameraUsageDescription in $INFO_PLIST"
+fi
+# Audio is deliberately absent: getUserMedia is video-only. A key added here
+# without a capture site widens what the app may do for no reason. Matched as a
+# <key> element, so the comment explaining the absence isn't read as the key.
+if grep -q '<key>com.apple.security.device.audio-input</key>' "$ENT_PLIST" 2>/dev/null; then
+    fail "$ENT_PLIST claims audio input, which nothing in Lucidos captures"
+else
+    pass "no audio-input entitlement (nothing captures audio)"
+fi
+if command -v plutil >/dev/null 2>&1; then
+    if plutil -lint "$ENT_PLIST" >/dev/null 2>&1 && plutil -lint "$INFO_PLIST" >/dev/null 2>&1; then
+        pass "both plists parse"
+    else
+        fail "a plist does not parse (plutil -lint)"
+    fi
+fi
+# plutil is NOT a sufficient parse check for an entitlements file. codesign
+# hands it to AMFIUnserializeXML, a stricter XML parser that rejects a double
+# hyphen inside a comment (XML forbids it) and dies with "syntax error near
+# line N". plutil lints the same bytes as OK, so the file looks fine right up
+# until a signing run fails minutes into a release build. This is what broke
+# the v0.27.0 Phase A: prose naming codesign flags by their hyphenated names.
+ENT_COMMENT="$(awk '/<!--/{f=1} f{print} /-->/{f=0}' "$ENT_PLIST" \
+    | sed -e 's/<!--//' -e 's/-->//')"
+if printf '%s\n' "$ENT_COMMENT" | grep -q -- '--'; then
+    fail "$ENT_PLIST has a double hyphen inside a comment; AMFIUnserializeXML will reject it at codesign time"
+else
+    pass "no double hyphen inside the entitlements comment (AMFI-parseable)"
+fi
+# A plain `cargo tauri build` that DOES sign must claim the same thing, or the
+# two signing paths disagree about what the app may do.
+if grep -q '"entitlements": "Entitlements.plist"' "$PROJECT_DIR/crates/lucidos-app/tauri.conf.json"; then
+    pass "tauri.conf.json points bundle.macOS.entitlements at the same file"
+else
+    fail "tauri.conf.json does not carry the entitlements file"
+fi
+# Placement: on the outer .app codesign, never in the array the ~200 loose
+# Mach-O files are signed with (least privilege, and --deep has no nested
+# bundle to propagate to anyway).
+SIGN_FN="$(awk '/^sign_app_bundle\(\) \{$/,/^\}$/' "$BUILD_DMG")"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+LOOP_SIGN="$(printf '%s\n' "$SIGN_FN" | grep -- '--sign "\$identity" "\$path"')"
+APP_SIGN="$(printf '%s\n' "$SIGN_FN" | grep -A2 'codesign --force --deep')"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$APP_SIGN" | grep -q -- '--entitlements "\$APP_ENTITLEMENTS"'; then
+    pass "the outer .app is signed with the entitlements file"
+else
+    fail "the outer .app codesign no longer passes --entitlements"
+fi
+if printf '%s\n' "$LOOP_SIGN" | grep -q -- '--entitlements'; then
+    fail "the per-file signing loop passes entitlements: $LOOP_SIGN"
+else
+    pass "the loose Mach-O files are signed without entitlements"
+fi
+# Fail closed on a missing file: signing without it is precisely the state that
+# shipped, and it looks identical to a good build from the outside.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$SIGN_FN" | grep -q 'expected entitlements at \$APP_ENTITLEMENTS'; then
+    pass "a missing entitlements file kills the build"
+else
+    fail "sign_app_bundle no longer refuses a missing entitlements file"
+fi
+# Both halves are read back OFF THE ARTIFACT, so an upstream loss (a dropped
+# Tauri plist merge, an entitlements file that parsed to nothing) fails the
+# build rather than shipping.
+if printf '%s\n' "$SIGN_FN" | grep -q 'codesign -d --entitlements -' \
+   && printf '%s\n' "$SIGN_FN" | grep -q 'plutil -extract NSCameraUsageDescription'; then
+    pass "the signed bundle is re-read for both halves"
+else
+    fail "sign_app_bundle no longer verifies the camera halves off the artifact"
+fi
+
 echo ""
 echo "build_dmg: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

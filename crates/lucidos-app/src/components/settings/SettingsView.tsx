@@ -25,8 +25,7 @@ import {
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { availableReasoningLevels } from '../../store/models';
-import { chatModelOptions, loadChatModels } from '../../store/actions/models';
+import { chatModelOptions, loadChatModels, reasoningLevelsFor } from '../../store/actions/models';
 import { ModelsManager } from './ModelsManager';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
 import { OpenAiProviderSettings } from './OpenAiProviderSettings';
@@ -1051,7 +1050,7 @@ export function SettingsView() {
           <div class="settings-row" data-search-anchor="models:reasoning">
             <span class="settings-row-label">Reasoning</span>
             <Dropdown
-              options={availableReasoningLevels(currentModel.value)}
+              options={reasoningLevelsFor(currentModel.value)}
               value={reasoningEffort.value}
               onChange={(v) => void setReasoningEffort(v)}
             />
@@ -1414,6 +1413,7 @@ export function SettingsView() {
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;
       case 'debugging': return <SystemPage panel="debugging" />;
+      case 'communication-surfaces': return <SystemPage panel="communication-surfaces" />;
       default: return null;
     }
   }

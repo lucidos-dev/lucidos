@@ -16,7 +16,7 @@
 //! * registration (`EventWaitStarted`), the `await_event` call PAIRED with its
 //!   own result, and a turn that terminates normally and leaves the thread
 //!   `idle`, which is what makes a subscription not a park
-//! * delivery on a domain event emitted over HTTP, and the woken turn that
+//! * delivery on a domain event emitted over HTTP, and the re-entered turn that
 //!   follows, proving the message array the provider saw was well-formed
 //! * one-shot: a second matching event resolves nothing
 //! * an unrelated event resolving nothing, then Stop waiting cancelling
@@ -30,7 +30,7 @@
 //!   `cancel` call: the read, the refusals, and a stand-down that records its
 //!   own cause
 //! * a stand-down by EVENT TYPE (`--on`) ending exactly the watches for it and
-//!   leaving a second, unrelated one still able to wake the thread
+//!   leaving a second, unrelated one still able to re-open the thread
 
 use crate::support::{
     base_url, db_url, http_client, poll_thread_summary_by_marker, unique_marker, user_client,
@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 /// Poll a thread's events for one of `types`, returning the first row found.
 /// Fails the test with the thread's actual event list, which is the thing you
-/// want in the output when a wake did not happen.
+/// want in the output when a delivery did not happen.
 async fn await_event_row(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -164,7 +164,7 @@ async fn emit_domain_event(event_type: &str, summary: &str) {
     assert_eq!(resp.status(), 200, "events/emit should accept the event");
 }
 
-/// The headline case: subscribe, emit, wake. Everything else in this file is a
+/// The headline case: subscribe, emit, deliver. Everything else in this file is a
 /// variation on it.
 #[tokio::test]
 async fn a_subscribed_thread_wakes_when_its_event_arrives() {
@@ -205,7 +205,7 @@ async fn a_subscribed_thread_wakes_when_its_event_arrives() {
     let delivered = await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
     assert_eq!(delivered["event_type"], event_type.as_str());
 
-    // The wake arrives as a new turn, anchored on a `UserPromptInjected`
+    // The delivery arrives as a new turn, anchored on a `UserPromptInjected`
     // carrying the event as prose. That the provider accepted the rebuilt
     // message array is the point.
     let anchor = await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
@@ -214,23 +214,23 @@ async fn a_subscribed_thread_wakes_when_its_event_arrives() {
             .as_str()
             .unwrap_or_default()
             .contains(&event_type),
-        "the delivered event travels in the wake prompt: {anchor:?}"
+        "the delivered event travels in the re-entry prompt: {anchor:?}"
     );
-    // Poll rather than read once: the woken turn is still running when its
+    // Poll rather than read once: the re-entered turn is still running when its
     // anchor lands, so its terminator arrives a beat later.
     await_event_count(&pool, thread_id, "ResponseGenerated", 2, 25).await;
 
     let status = thread_status(&pool, thread_id).await;
     assert!(
         status == "idle" || status == "running",
-        "a woken thread settles like any other turn, got {status}"
+        "a re-entered thread settles like any other turn, got {status}"
     );
 }
 
 /// A wait is a rendezvous, not a stream. A tool call has exactly one result,
 /// so a second matching event must resolve nothing.
 #[tokio::test]
-async fn a_second_matching_event_wakes_the_thread_only_once() {
+async fn a_second_matching_event_delivers_only_once() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to the e2e workspace database");
@@ -254,7 +254,7 @@ async fn a_second_matching_event_wakes_the_thread_only_once() {
     assert_eq!(
         count_events(&pool, thread_id, "UserPromptInjected").await,
         1,
-        "one subscription, one wake"
+        "one subscription, one delivery"
     );
 }
 
@@ -282,7 +282,7 @@ async fn an_unrelated_event_leaves_a_subscribed_thread_subscribed() {
     assert_eq!(
         count_events(&pool, thread_id, "UserPromptInjected").await,
         0,
-        "still watching for its own event, and nothing woke it"
+        "still watching for its own event, and nothing delivered to it"
     );
 
     // Leave no live subscription behind for the rest of the suite.
@@ -405,7 +405,7 @@ async fn the_reload_snapshot_carries_the_event_wait_payloads() {
 /// It registers on a chat thread rather than standing up a coding-agent
 /// session, because the route is agent-agnostic by construction: it calls the
 /// same `register_event_wait` the tool does, and which lane the eventual
-/// delivery takes is decided later, at wake time, from the thread's own row.
+/// delivery takes is decided later, at re-entry time, from the thread's own row.
 #[tokio::test]
 async fn a_wait_can_be_registered_over_http() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -498,13 +498,13 @@ async fn a_wait_can_be_registered_over_http() {
         .expect("unknown-thread register request failed");
     assert_eq!(resp.status(), 404, "an unknown thread must not arm a wait");
 
-    emit_domain_event(&event_type, "waking the HTTP-registered wait").await;
+    emit_domain_event(&event_type, "delivering to the HTTP-registered wait").await;
     await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
     await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
 }
 
 /// The **arming lookback** over the real route: the event lands BEFORE the
-/// subscription exists, so nothing will ever wake the thread for it, and the
+/// subscription exists, so nothing will ever re-open the thread for it, and the
 /// registration response is the only place the caller can learn about it.
 ///
 /// This is the 2026-08-06 failure end to end. A chat thread checked the change
@@ -568,7 +568,7 @@ async fn a_registration_reports_a_match_that_landed_before_it() {
         "the report names the event: {message}"
     );
     assert!(
-        message.contains("will NOT wake you"),
+        message.contains("will NOT deliver anything below"),
         "a forward-only watch is the trap, and it has to be stated: {message}"
     );
     assert!(
@@ -577,7 +577,7 @@ async fn a_registration_reports_a_match_that_landed_before_it() {
     );
 
     // A report is not a delivery. The wait is live, unconsumed, and the thread
-    // is idle rather than mid-wake.
+    // is idle rather than mid-re-entry.
     await_event_row(&pool, thread_id, "EventWaitStarted", 10).await;
     assert_eq!(
         count_events(&pool, thread_id, "EventWaitDelivered").await,
@@ -586,7 +586,7 @@ async fn a_registration_reports_a_match_that_landed_before_it() {
     );
     assert_eq!(thread_status(&pool, thread_id).await, "idle");
 
-    // And the subscription really is still watching: the NEXT one wakes it.
+    // And the subscription really is still watching: the NEXT one delivers.
     emit_domain_event(&event_type, "the one the subscription is for").await;
     await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
 }
@@ -599,7 +599,7 @@ async fn a_registration_reports_a_match_that_landed_before_it() {
 ///
 /// Driven end to end rather than as a unit test because the coupling lived in
 /// the HTTP handler, and because the half that matters is what happens AFTER:
-/// the subscription must still be armed, and must still wake the thread.
+/// the subscription must still be armed, and must still re-open the thread.
 #[tokio::test]
 async fn stopping_a_turn_leaves_the_thread_s_subscriptions_watching() {
     let pool = sqlx::PgPool::connect(&db_url())
@@ -668,7 +668,7 @@ async fn stopping_a_turn_leaves_the_thread_s_subscriptions_watching() {
     );
 
     // The proof that the subscription is not merely un-cancelled but still
-    // ARMED: the event still wakes the thread.
+    // ARMED: the event still re-opens the thread.
     emit_domain_event(&event_type, "arriving after the Stop").await;
     let delivered = await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
     assert_eq!(delivered["event_type"], event_type.as_str());
@@ -801,7 +801,7 @@ async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
     let body: serde_json::Value = resp.json().await.expect("JSON body");
     assert_eq!(body["count"], 0);
 
-    // And it really is stood down: the event no longer wakes the thread.
+    // And it really is stood down: the event no longer re-opens the thread.
     emit_domain_event(&event_type, "arriving after the stand-down").await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert_eq!(
@@ -938,7 +938,7 @@ async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
     );
 
     // The proof that matters: the stopped one is inert and the survivor still
-    // wakes the thread. A cache that merely reported correctly would pass every
+    // re-opens the thread. A cache that merely reported correctly would pass every
     // assertion above and fail here.
     emit_domain_event(&answered, "arriving after the by-type stand-down").await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;

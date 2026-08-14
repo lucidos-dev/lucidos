@@ -980,8 +980,9 @@
 
 /* Same as the thread-filter row: this label is a flex line with its own `gap`,
    which already separates the explainer from the text, so drop the icon's base
-   `margin-left` rather than stacking the two. */
-.form-group label.form-checkbox-row > .explainer-btn {
+   `margin-left` rather than stacking the two. It sits on `.explainer-slot`, the
+   wrapper that glues the icon to its label, which is the flex item here. */
+.form-group label.form-checkbox-row > .explainer-slot {
     margin-left: 0;
 }
 

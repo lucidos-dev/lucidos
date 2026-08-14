@@ -1,4 +1,7 @@
-use crate::engine::git_ops::{allocate_coding_agent_branch, git_answer, BranchScope, GitAnswer};
+use crate::engine::git_ops::{
+    allocate_coding_agent_branch, branch_name_is_taken, git_answer, worktree_add, BranchScope,
+    GitAnswer,
+};
 use crate::engine::LucidosEngine;
 use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
@@ -34,33 +37,92 @@ pub(super) async fn spawn_or_resume(
     runtime.spawn(args, cancel).await
 }
 
+/// How many times a spawn may re-derive its branch name and try the create
+/// again. Each attempt costs one ref listing plus one `git worktree add`, and
+/// every retry means a sibling took the exact name this thread asked for. Ten
+/// is far past any real contention and still terminates.
+const MAX_BRANCH_CREATE_ATTEMPTS: usize = 10;
+
 /// Everything needed to mint a branch name for a thread that doesn't have one
-/// yet: `lucidos-<agent>-<app|repo>-<name>-<slug>`. See
+/// yet: `lucidos-<agent>-<app|repo>-<name>-<slug>-<id>`. See
 /// `git_ops::branch_name` for the shape and the duplicate numbering.
 pub(super) struct FreshBranch<'a> {
     pub(super) repo_root: &'a Path,
     pub(super) agent: CodingAgent,
     pub(super) scope: BranchScope,
     /// The thread's display name (title, else first message), slugified into
-    /// the branch. Empty is fine: the allocator falls back to the thread id.
+    /// the branch. Empty is fine: the slug then falls back to `thread`, and
+    /// the thread's short id is appended either way.
     pub(super) thread_name: &'a str,
     pub(super) thread_id: uuid::Uuid,
 }
 
 impl FreshBranch<'_> {
+    pub(super) async fn allocate(&self) -> String {
+        allocate_coding_agent_branch(
+            self.repo_root,
+            self.agent,
+            &self.scope,
+            self.thread_name,
+            self.thread_id,
+        )
+        .await
+    }
+
     async fn resolution(&self) -> BranchResolution {
         BranchResolution {
-            branch_name: allocate_coding_agent_branch(
-                self.repo_root,
-                self.agent,
-                &self.scope,
-                self.thread_name,
-                self.thread_id,
-            )
-            .await,
+            branch_name: self.allocate().await,
             reusing_branch: false,
             resume_session_id: None,
         }
+    }
+
+    /// Create `wt_path` on a newly created branch, returning the name the
+    /// branch ended up with.
+    ///
+    /// `git worktree add -b` is the allocator of record. A name belongs to this
+    /// thread only once git has created the ref. A create that loses the race
+    /// therefore re-derives and tries again, and the fresh listing sees the
+    /// winner's branch and steps past it. Bounded by
+    /// [`MAX_BRANCH_CREATE_ATTEMPTS`], and every other failure returns at once
+    /// rather than being retried into.
+    ///
+    /// Nothing here is destructive. A losing `-b` created no ref, so it leaves
+    /// nothing of its own behind and the winner's branch is untouched. That
+    /// keeps the caller's `branch_created` bookkeeping true: on success this
+    /// attempt created exactly the branch it returns.
+    pub(super) async fn create_worktree(
+        &self,
+        wt_path: &Path,
+        base_ref: Option<&str>,
+        allocated: String,
+    ) -> Result<String, String> {
+        let mut branch_name = allocated;
+        for attempt in 1..=MAX_BRANCH_CREATE_ATTEMPTS {
+            let mut args = vec!["-b", &branch_name];
+            if let Some(base) = base_ref {
+                args.push(base);
+            }
+            let stderr = match worktree_add(self.repo_root, wt_path, &args).await {
+                Ok(o) if o.status.success() => return Ok(branch_name),
+                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                Err(e) => return Err(e),
+            };
+            if !branch_name_is_taken(&stderr) {
+                return Err(stderr);
+            }
+            log!(
+                "[AgentSession] Branch {} was taken by a concurrent spawn (attempt {}/{}), re-deriving",
+                branch_name,
+                attempt,
+                MAX_BRANCH_CREATE_ATTEMPTS
+            );
+            branch_name = self.allocate().await;
+        }
+        Err(format!(
+            "gave up after {} attempts to create a branch for this thread: a concurrent spawn took every name, last tried {}",
+            MAX_BRANCH_CREATE_ATTEMPTS, branch_name
+        ))
     }
 }
 
@@ -177,20 +239,34 @@ mod tests {
     }
 
     fn fresh_branch(repo: &std::path::Path) -> FreshBranch<'_> {
+        fresh_branch_for(repo, uuid::Uuid::new_v4())
+    }
+
+    fn fresh_branch_for(repo: &std::path::Path, thread_id: uuid::Uuid) -> FreshBranch<'_> {
         FreshBranch {
             repo_root: repo,
             agent: CodingAgent::ClaudeCode,
             scope: BranchScope::Repo(BranchScope::LUCIDOS_REPO.to_string()),
             thread_name: "fix the auth timeout",
-            thread_id: uuid::Uuid::new_v4(),
+            thread_id,
         }
+    }
+
+    /// The name a `fresh_branch_for` thread mints when nothing is in its way.
+    fn expected_name(thread_id: uuid::Uuid) -> String {
+        format!(
+            "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout-{}",
+            crate::engine::git_ops::short_thread_id(thread_id)
+        )
     }
 
     #[tokio::test]
     async fn missing_resume_branch_drops_stale_session_id() {
         let (_tmp, repo) = make_test_repo().await;
+        let fresh = fresh_branch(&repo);
+        let expected = expected_name(fresh.thread_id);
         let resolution = resolve_branch_for_resume(
-            &fresh_branch(&repo),
+            &fresh,
             Some("e4a3d60a-ea4d-4592-b252-0558f8798cf3".into()),
             Some("claude-code/already-merged-and-pruned"),
         )
@@ -200,7 +276,7 @@ mod tests {
             "must not reuse a branch that doesn't exist"
         );
         assert_eq!(
-            resolution.branch_name, "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout",
+            resolution.branch_name, expected,
             "must mint a fresh thread-named branch"
         );
         assert_eq!(
@@ -283,23 +359,40 @@ mod tests {
         );
     }
 
-    /// Two threads with the same title in the same repo must not collide: the
-    /// second takes `-2`. Exercised end to end (through the ref listing) rather
-    /// than only against the pure allocator.
+    /// Two threads with the same title do not collide at all any more: the id
+    /// segment separates them before a single ref is read.
     #[tokio::test]
-    async fn a_second_thread_with_the_same_name_is_numbered() {
+    async fn two_threads_with_the_same_title_get_different_branches() {
         let (_tmp, repo) = make_test_repo().await;
         let first = resolve_branch_for_resume(&fresh_branch(&repo), None, None).await;
-        assert_eq!(
-            first.branch_name,
-            "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout"
-        );
         let _ = git_cmd(&["branch", &first.branch_name], &repo).await;
 
         let second = resolve_branch_for_resume(&fresh_branch(&repo), None, None).await;
+        assert_ne!(first.branch_name, second.branch_name);
+        assert!(
+            !second.branch_name.ends_with("-2"),
+            "numbering must not be what separates two threads: {}",
+            second.branch_name
+        );
+    }
+
+    /// Numbering is still there for the case it now covers: one thread minting
+    /// a second branch while the first one is still around. Exercised end to
+    /// end, through the ref listing, rather than against the pure allocator.
+    #[tokio::test]
+    async fn one_thread_minting_twice_is_numbered() {
+        let (_tmp, repo) = make_test_repo().await;
+        let thread_id = uuid::Uuid::new_v4();
+        let first =
+            resolve_branch_for_resume(&fresh_branch_for(&repo, thread_id), None, None).await;
+        assert_eq!(first.branch_name, expected_name(thread_id));
+        let _ = git_cmd(&["branch", &first.branch_name], &repo).await;
+
+        let second =
+            resolve_branch_for_resume(&fresh_branch_for(&repo, thread_id), None, None).await;
         assert_eq!(
             second.branch_name,
-            "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout-2"
+            format!("{}-2", expected_name(thread_id))
         );
     }
 
@@ -334,5 +427,88 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// How many spawns the two race tests run at once. Kept under
+    /// [`MAX_BRANCH_CREATE_ATTEMPTS`]: each loss means some other task really
+    /// created that name, so a task can lose at most `SPAWNS - 1` times.
+    const SPAWNS: usize = 8;
+
+    /// Run `SPAWNS` allocate-then-create sequences at once against one repo,
+    /// each with the thread id `id_for` hands it. Returns what each got.
+    async fn race_spawns(
+        repo: &std::path::Path,
+        id_for: impl Fn(usize) -> uuid::Uuid,
+    ) -> Vec<Result<String, String>> {
+        let wt_root = tempfile::tempdir().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..SPAWNS {
+            let repo = repo.to_path_buf();
+            let wt_path = wt_root.path().join(format!("wt-{i}"));
+            let thread_id = id_for(i);
+            handles.push(tokio::spawn(async move {
+                let fresh = FreshBranch {
+                    repo_root: &repo,
+                    agent: CodingAgent::ClaudeCode,
+                    scope: BranchScope::Repo(BranchScope::LUCIDOS_REPO.to_string()),
+                    thread_name: "you are one of six parallel partitions",
+                    thread_id,
+                };
+                let allocated = fresh.allocate().await;
+                fresh
+                    .create_worktree(&wt_path, Some("main"), allocated)
+                    .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("spawn task panicked"));
+        }
+        results
+    }
+
+    /// Every branch a race produced must exist, and be the only one holding
+    /// its name.
+    async fn assert_distinct_and_real(
+        repo: &std::path::Path,
+        results: Vec<Result<String, String>>,
+    ) {
+        let mut names = Vec::new();
+        for r in results {
+            names.push(r.expect("a concurrent spawn failed to create its branch"));
+        }
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            SPAWNS,
+            "two spawns ended up on one branch: {names:?}"
+        );
+        for name in &names {
+            let out = git_cmd(&["rev-parse", "--verify", name], repo)
+                .await
+                .unwrap();
+            assert!(out.status.success(), "branch {name} was never created");
+        }
+    }
+
+    /// The reported bug: six children spawned in one response, all against one
+    /// repo, all with prompts that open identically. Four died on
+    /// "a branch named X already exists" before doing any work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_spawns_from_one_prompt_get_distinct_branches() {
+        let (_tmp, repo) = make_test_repo().await;
+        let results = race_spawns(&repo, |_| uuid::Uuid::new_v4()).await;
+        assert_distinct_and_real(&repo, results).await;
+    }
+
+    /// The same race with the discriminator taken away. Every task shares one
+    /// thread id and one title, so all derive the identical name. The retry is
+    /// then the only thing left that can save them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_branch_race_retries_until_it_wins() {
+        let (_tmp, repo) = make_test_repo().await;
+        let thread_id = uuid::Uuid::new_v4();
+        let results = race_spawns(&repo, |_| thread_id).await;
+        assert_distinct_and_real(&repo, results).await;
     }
 }

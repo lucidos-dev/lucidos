@@ -30,9 +30,9 @@ fn a_well_formed_subscription_list_parses() {
 }
 
 #[test]
-fn an_empty_on_list_is_refused_because_nothing_could_wake_it() {
+fn an_empty_on_list_is_refused_because_nothing_could_match_it() {
     let err = parse_subscriptions(&json!({ "on": [] })).unwrap_err();
-    assert!(err.contains("nothing could ever wake you"), "{err}");
+    assert!(err.contains("nothing could ever match"), "{err}");
 }
 
 #[test]

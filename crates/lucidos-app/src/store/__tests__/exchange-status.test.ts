@@ -219,7 +219,7 @@ describe('exchangeStatus — full branch coverage', () => {
   });
 
   // 4d193da8: the parent is still RUNNING when the child completes — it's about
-  // to react (the WakeFromChild summary was injected into the live loop and its
+  // to react (the ReentryFromEngine summary was injected into the live loop and its
   // continuation req-id-routes into this card). The stepless card must read as
   // working, not "Done ✓", during the gap before the first post-completion step.
   it('a stepless ChildThreadCompleted card on a RUNNING parent reads as working (pre-first-step gap)', () => {

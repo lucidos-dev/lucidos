@@ -1,5 +1,5 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
@@ -11,12 +11,14 @@ effect(() => {
   document.title = pageTitle.value;
 });
 
-// Per-workspace PWA app-icon badge: mirror THIS workspace's unread count onto
-// the installed PWA icon (a workspace PWA badges its own workspace). The context
-// gates (picker / Tauri) live inside `syncWorkspaceAppBadge`, which also runs at
-// module init here — clearing an icon badge a push left behind before the unread
-// set has loaded. Live while the app is open; the service worker keeps a CLOSED
-// PWA fresh via the push payload's `app_badge`.
+// PWA app-icon badge: mirror the unread count onto the installed PWA icon. What
+// that count covers depends on the origin (behind the gateway one icon covers
+// every workspace, so this workspace's count is summed with the others); the
+// composition and the context gates (picker / Tauri) both live inside
+// `syncWorkspaceAppBadge`, which also runs at module init here, clearing an icon
+// badge a push left behind before the unread set has loaded. Live while the app
+// is open; the service worker keeps a CLOSED PWA fresh via the push payload's
+// `app_badge`.
 //
 // This effect covers only count CHANGES — a computed doesn't notify when its
 // recomputed value is equal. The no-change case (a reload landing the same
@@ -47,6 +49,12 @@ effect(() => {
 // Persist animation speed
 effect(() => {
   localStorage.setItem('lucidos-animation-speed-slider', String(animationSpeed.value));
+});
+
+// Persist the toast-placement pick, device-local like the slider above.
+// Temporary, and it goes when the shape is chosen (docs/temporary-measures.md).
+effect(() => {
+  localStorage.setItem('lucidos-toast-placement', toastPlacement.value);
 });
 
 // Publish the animation-speed slider to CSS. Every --duration-* token in

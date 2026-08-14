@@ -13,7 +13,7 @@ vi.mock('../api/client', () => ({ setPreference: vi.fn(() => Promise.resolve({})
 
 import {
   markSwUpdateDismissed, wasSwUpdateDismissed, noteUpdateBuildId,
-  markSwitchDismissed, wasSwitchDismissed, noteSwitchBuildId,
+  markEngineVersionDismissed, wasEngineVersionDismissed, noteAnnouncedEngineVersion,
   scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId,
   refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk,
 } from './sw-update';
@@ -31,32 +31,32 @@ describe('toast dismissal — workspace-global, build-id-keyed (engine switch + 
     preferences.value = { status: 'not-loaded' };
   });
 
-  it('wasSwitchDismissed / wasSwUpdateDismissed match only the exact dismissed build id', () => {
+  it('wasEngineVersionDismissed / wasSwUpdateDismissed match only the exact dismissed build id', () => {
     preferences.value = { status: 'loaded', data: { [SWITCH_KEY]: 'disk-a', [CLIENT_KEY]: 'served-a' } };
-    expect(wasSwitchDismissed('disk-a')).toBe(true);
+    expect(wasEngineVersionDismissed('disk-a')).toBe(true);
     expect(wasSwUpdateDismissed('served-a')).toBe(true);
     // A genuinely newer build (different id) is NOT dismissed → re-surfaces.
-    expect(wasSwitchDismissed('disk-b')).toBe(false);
+    expect(wasEngineVersionDismissed('disk-b')).toBe(false);
     expect(wasSwUpdateDismissed('served-b')).toBe(false);
   });
 
   it('fails OPEN — unloaded preferences read as not-dismissed (toast surfaces)', () => {
     preferences.value = { status: 'not-loaded' };
-    expect(wasSwitchDismissed('disk-a')).toBe(false);
+    expect(wasEngineVersionDismissed('disk-a')).toBe(false);
     expect(wasSwUpdateDismissed('served-a')).toBe(false);
   });
 
-  it('markSwitchDismissed writes the GLOBAL switch preference (no device id) + optimistic update', () => {
+  it('markEngineVersionDismissed writes the GLOBAL switch preference (no device id) + optimistic update', () => {
     preferences.value = { status: 'loaded', data: { theme: 'dark' } };
-    noteSwitchBuildId('disk-x');
-    markSwitchDismissed();
+    noteAnnouncedEngineVersion('disk-x');
+    markEngineVersionDismissed();
     // Global write is exactly (key, id) — the OMITTED 3rd arg (device id) is what
     // makes the dismiss workspace-wide (defers on every device).
     expect(mockSetPreference).toHaveBeenCalledWith(SWITCH_KEY, 'disk-x');
     // Optimistic local update so THIS device suppresses on its next poll without
     // waiting for its own PreferencesChanged round-trip; unrelated keys preserved.
     expect(preferences.value).toMatchObject({ status: 'loaded', data: { theme: 'dark', [SWITCH_KEY]: 'disk-x' } });
-    expect(wasSwitchDismissed('disk-x')).toBe(true);
+    expect(wasEngineVersionDismissed('disk-x')).toBe(true);
   });
 
   it('markSwUpdateDismissed writes the GLOBAL client-refresh preference (no device id)', () => {
@@ -69,11 +69,11 @@ describe('toast dismissal — workspace-global, build-id-keyed (engine switch + 
 
   it('a genuinely newer build re-surfaces after an earlier dismiss', () => {
     preferences.value = { status: 'loaded', data: {} };
-    noteSwitchBuildId('disk-a');
-    markSwitchDismissed();
-    expect(wasSwitchDismissed('disk-a')).toBe(true);
+    noteAnnouncedEngineVersion('disk-a');
+    markEngineVersionDismissed();
+    expect(wasEngineVersionDismissed('disk-a')).toBe(true);
     // The version poll passes the CURRENTLY on-disk id; a newer one re-surfaces.
-    expect(wasSwitchDismissed('disk-b')).toBe(false);
+    expect(wasEngineVersionDismissed('disk-b')).toBe(false);
   });
 });
 

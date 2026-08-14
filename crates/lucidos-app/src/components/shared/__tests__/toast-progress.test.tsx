@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { ToastList, toastProgressWidth } from '../Toast';
+import { ToastList } from '../Toast';
+import { progressFillWidth } from '../progressBar';
 import { toasts, showToast, engineRestarting } from '../../../store/store';
 
 /** Walk a vnode tree, returning every node whose className contains `cls`. */
@@ -31,26 +32,26 @@ beforeEach(() => {
   engineRestarting.value = false;
 });
 
-describe('toastProgressWidth', () => {
+describe('progressFillWidth', () => {
   it('maps a fraction onto a percentage width', () => {
-    expect(toastProgressWidth(0)).toBe('0%');
-    expect(toastProgressWidth(0.5)).toBe('50%');
-    expect(toastProgressWidth(1)).toBe('100%');
+    expect(progressFillWidth(0)).toBe('0%');
+    expect(progressFillWidth(0.5)).toBe('50%');
+    expect(progressFillWidth(1)).toBe('100%');
   });
 
   // The fraction comes from a byte count divided by a server-declared total, so
   // a bad total must not paint a bar running past its own track — or `NaN%`.
   it('clamps an out-of-range fraction into the track', () => {
-    expect(toastProgressWidth(1.4)).toBe('100%');
-    expect(toastProgressWidth(-0.2)).toBe('0%');
+    expect(progressFillWidth(1.4)).toBe('100%');
+    expect(progressFillWidth(-0.2)).toBe('0%');
   });
 
   // A non-finite fraction means the division went wrong, i.e. we do NOT know how
   // far along we are. An empty track next to the spinner says that; a full one
   // would claim the transfer finished.
   it('renders an unknown fraction as empty, not complete', () => {
-    expect(toastProgressWidth(NaN)).toBe('0%');
-    expect(toastProgressWidth(Infinity)).toBe('0%');
+    expect(progressFillWidth(NaN)).toBe('0%');
+    expect(progressFillWidth(Infinity)).toBe('0%');
   });
 });
 

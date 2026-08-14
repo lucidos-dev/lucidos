@@ -1,7 +1,18 @@
 # 0022 — A workspace launches a *published* binary, one directory per build variant — never cargo's shared uplift path
 
-- **Status** — Accepted
+- **Status**: Accepted. The published directory's LOCATION is amended by
+  [ADR 0063](0063-launch-binaries-live-outside-cargo-target.md)
 - **Date** — 2026-07-27
+
+> **Location amended.** Everything below stands except the literal path. The
+> published directory is now `.launch/<profile>/<variant>/`, not
+> `target/<profile>/launch/<variant>/`: keeping it under `target/` meant a
+> `cargo clean` deleted the `lucidos` CLI out from under a running engine, which
+> disabled every trigger and blocked `run_coding_agent` for eight hours on
+> 2026-08-13. The "Why not a per-workspace staged binary" section below is still
+> correct, and its three blockers are exactly what constrain the new location to
+> sit inside the CHECKOUT. See ADR 0063 for why a checkout-local dot-dir
+> satisfies all three.
 
 ## Context
 
@@ -161,6 +172,8 @@ direction guard uses.
 
 - ADR 0014 — dev runtime topology (the gateway spawns engines by `LUCIDOS_ENGINE_BIN`)
 - ADR 0021 — the long-lived stack never runs from a coding-agent worktree
+- ADR 0063: the published directory moves out of `target/` so a `cargo clean`
+  cannot delete the running system's `lucidos` CLI
 - `docs/plans/2026-07-27-launch-binary-published-per-variant.md` — the implementation plan
 - `docs/plans/2026-07-26-downgrade-switch-toast-loop.md` — the engine-side half (never offer a downgrade)
 - `.claude/rules/dev-runtime.md` — the day-to-day rule for launching a workspace

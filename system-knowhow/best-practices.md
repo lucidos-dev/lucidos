@@ -36,6 +36,38 @@ Apps that need persistent data store it in **`artifacts/{app-id}/`**:
 - Themed collections get their own folder (e.g., `artifacts/fargeleggingsark/`)
 - Never put generated content in `artifacts/artifacts/`
 
+### Standalone HTML: paste this type scale, never recall one
+
+A design mockup, report or dashboard written to `artifacts/` is a **standalone document**. Unlike an app it links no Lucidos stylesheet, so it has no tokens unless you write them, and unlike an app iframe nothing supplies a body default. Every such file written from memory so far has come out **one full step too large**, because a reconstructed "sensible scale" is calibrated to a 16px body and this one is not.
+
+Paste the block verbatim into `:root`, then use only these steps:
+
+```css
+:root {
+  --font-size-3xs: 0.5625rem;   /* 9px  micro-label, tiny uppercase badge */
+  --font-size-2xs: 0.625rem;    /* 10px dots, micro-meta */
+  --font-size-xs: 0.6875rem;    /* 11px dense metadata */
+  --font-size-sm: 0.75rem;      /* 12px labels, secondary */
+  --font-size-md: 0.8125rem;    /* 13px BODY DEFAULT */
+  --font-size-lg: 0.875rem;     /* 14px emphasis */
+  --font-size-xl: 1rem;         /* 16px section headings */
+  --font-size-2xl: 1.125rem;    /* 18px larger headings */
+  --font-size-3xl: 1.25rem;     /* 20px large headings */
+  --font-size-display: 2.25rem; /* 36px hero */
+}
+body { font-size: var(--font-size-md); line-height: 1.5; }
+input, textarea, select, button { font-family: inherit; font-size: inherit; }
+```
+
+Four things that go wrong, in the order they actually happen:
+
+1. **`1rem` is a HEADING here**, `--font-size-xl`, not body. Body is `0.8125rem`. Any size you reach for out of habit is a step and a half too big.
+2. **Do NOT hardcode a scale percentage on `html`** (`html { font-size: 125% }`). That bakes one device's UI-scale preference into a file the user opens on several, and it stacks with the preference wherever that is already applied. Leave the root alone and size in `rem`.
+3. **The body and control lines above are not optional.** A `<code>`, a `<button>` and an `<input>` each carry a UA font of their own and inherit nothing, so without them the document mixes its own font with the browser's.
+4. **Every `font-size` reads a step.** No `0.9375rem`, no `1.05rem`, no `0.8rem`. If none of the ten fits, you want a different step, not a new number.
+
+`--font-mono` for code, and the UI font is whatever the user picked, so a mockup meant to look like Lucidos should say `font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace`.
+
 ## apps/ — App UIs & Logic
 
 Each app: `apps/{id}/`

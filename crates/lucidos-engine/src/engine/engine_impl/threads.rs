@@ -309,9 +309,9 @@ impl LucidosEngine {
     /// Unified entry point for FanOut: a child thread has completed and the
     /// parent needs to react. Routes through [`Self::process_message_with_steps`]
     /// — same fast-path / slow-path decisions as a user follow-up, no parallel
-    /// routing. The wake-vs-user distinction (suppressing duplicate
-    /// exchange-starter events) lives on [`crate::engine::AgentInputKind::WakeFromChild`]
-    /// and [`crate::engine::InjectedPromptKind::WakeFromChild`]; this caller
+    /// routing. The re-entry-vs-user distinction (suppressing duplicate
+    /// exchange-starter events) lives on [`crate::engine::AgentInputKind::ReentryFromEngine`]
+    /// and [`crate::engine::InjectedPromptKind::ReentryFromEngine`]; this caller
     /// triggers it by passing `pre_emitted_origin = Some(child_completed_event_id)`.
     pub async fn notify_parent_of_child_completion(
         self: &Arc<Self>,
@@ -400,7 +400,7 @@ impl LucidosEngine {
     /// callback stands down when it will.
     ///
     /// **Two probes, because the two consumers race and either can win.** The
-    /// fan-in and the event-wait dispatcher are both woken by the same
+    /// fan-in and the event-wait dispatcher are both driven by the same
     /// post-commit broadcast, on separate tasks, in no fixed order:
     ///
     /// - The dispatcher has NOT run yet: the wait is still in the live cache and
@@ -475,9 +475,9 @@ impl LucidosEngine {
     ///
     /// The single-thread question `processing_thread_ids` answers in bulk, so a
     /// caller that only cares about one thread does not allocate the whole
-    /// list. Used by the event-wait dispatcher: a wake can only fill a parked
-    /// turn's dangling tool call in, so a thread that is already running has to
-    /// be woken as a new exchange instead.
+    /// list. Used by the event-wait dispatcher: a delivery can only fill a
+    /// parked turn's dangling tool call in, so a thread that is already running
+    /// has to be re-entered as a new exchange instead.
     pub fn thread_is_processing(&self, thread_id: Uuid) -> bool {
         self.active_threads.lock().unwrap().contains_key(&thread_id)
     }

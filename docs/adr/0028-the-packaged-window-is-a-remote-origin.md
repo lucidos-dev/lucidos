@@ -92,6 +92,25 @@ Concretely:
   `allow-app-ipc`. Both capabilities grant the identical set today, so the
   granularity would buy nothing and double the surface that can drift.
 
+### The residual on the granted set, and the two hardenings against it
+
+`GATEWAY_PERMISSIONS` includes `updater:default`, which pulls in
+`plugin:updater|download_and_install`. The honest statement is not "the app can
+update itself". It is that anything answering on that port can drive a signed
+bundle swap and a full stack restart. Nothing else in the set reaches as far.
+
+The residual is narrow and **accepted**. The origin is plain HTTP on loopback
+with no authentication, so a local process that bound the port first would
+receive this window's IPC. `desktop::launch` navigates only after the gateway
+answers, and the gateway holds the port for the life of the service.
+
+- **Drop `updater:default` from the gateway capability.** Rejected: it moves
+  the update path off the window that shows it, so the toast could narrate an
+  install it cannot start.
+- **Authenticate the loopback origin.** Rejected: it puts a shared secret in a
+  page the gateway itself serves, which is the same trust boundary written
+  twice.
+
 ## Consequences
 
 - Adding a `#[tauri::command]` now requires adding it to

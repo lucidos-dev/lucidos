@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { abortPromisesAutoResume, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, isSwitchTeardownAbort, responseAbortedSummary, resumeEngineNote, continuableAbortIndex, type AbortCause, type Exchange, type MessageOrigin, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { abortPromisesAutoResume, abortTookEngineDown, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, isSwitchTeardownAbort, responseAbortedSummary, resumeEngineNote, continuableAbortIndex, type AbortCause, type Exchange, type MessageOrigin, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -310,15 +310,15 @@ describe('groupIntoExchanges', () => {
   // Regression for the off-by-one rendering observed in real thread
   // 9b5a05aa: when the orphan-injection re-process loop stamped A's req_id
   // onto a turn whose response actually belonged to B, the events the chat
-  // loop emits BEFORE its first injection check (MemorySearched + the
+  // loop emits BEFORE its first injection check (the memory recall + the
   // per-call ContextCaptured) used to bypass request-id routing and leak into
   // B's exchange. The leaked step flipped the status heuristic to 'aborted'
   // (the "stale exchange" branch needs hasSteps=true). Route every chat-loop
   // event that carries request_event_id back to its anchor — none should
-  // fall through to `current`. `ContextCaptured` is the live event;
-  // `ContextAssembled`/`ContextTokensMeasured` are its retired predecessors,
-  // still routed for legacy DB rows.
-  it('routes ContextCaptured/MemorySearched (+ legacy context events) by request_event_id, not current pointer', () => {
+  // fall through to `current`. `ContextCaptured` and `MemoryRecalled` are the
+  // live events; `ContextAssembled`/`ContextTokensMeasured`/`MemorySearched`
+  // are their retired predecessors, still routed for legacy DB rows.
+  it('routes ContextCaptured/MemoryRecalled (+ legacy predecessors) by request_event_id, not current pointer', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
       [2, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
@@ -326,13 +326,14 @@ describe('groupIntoExchanges', () => {
       // B opens a new exchange in the timeline. Every late event for A's loop
       // (including the chat-loop preludes) lands AFTER B's MR in the seq stream.
       [4, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
-      [5, { type: 'MemorySearched', queries: [], results: [], request_event_id: 'A' } as unknown as StoredEvent],
+      [5, { type: 'MemoryRecalled', queries: [], results: 0, request_event_id: 'A' } as unknown as StoredEvent],
       [6, { type: 'ContextCaptured', producer: 'chat', model: 'm', context_window: 0, sections: [], tools: [], estimated_total_tokens: 0, request_event_id: 'A' } as unknown as StoredEvent],
       // Retired predecessors — still routed so legacy threads behave.
       [7, { type: 'ContextAssembled', sections: [], tools: [], model: 'm', total_chars: 0, request_event_id: 'A' } as unknown as StoredEvent],
       [8, { type: 'ContextTokensMeasured', tokens: 100, message_count: 1, request_event_id: 'A' } as unknown as StoredEvent],
-      [9, { type: 'TextStreamed', text: 'late', request_event_id: 'A' } as StoredEvent],
-      [10, { type: 'ResponseGenerated', text: 'late', request_event_id: 'A' } as StoredEvent],
+      [9, { type: 'MemorySearched', queries: [], results: 0, request_event_id: 'A' } as unknown as StoredEvent],
+      [10, { type: 'TextStreamed', text: 'late', request_event_id: 'A' } as StoredEvent],
+      [11, { type: 'ResponseGenerated', text: 'late', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
@@ -343,10 +344,11 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[0].steps.map(s => s.event.type)).toEqual([
       'TextStreamed',
       'ResponseGenerated',
-      'MemorySearched',
+      'MemoryRecalled',
       'ContextCaptured',
       'ContextAssembled',
       'ContextTokensMeasured',
+      'MemorySearched',
       'TextStreamed',
       'ResponseGenerated',
     ]);
@@ -656,7 +658,7 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBe(2);
   });
 
-  // An abort boundary can ACQUIRE a turn. An event-wait wake anchors on an
+  // An abort boundary can ACQUIRE a turn. An event-wait delivery anchors on an
   // event that is not an exchange-start type, so its whole turn folds into
   // whatever boundary is current, and if that boundary is an abort the turn
   // renders under it. Continue there re-runs completed work: on 2026-08-06 the
@@ -788,6 +790,38 @@ describe('abortPromisesAutoResume', () => {
   it('never reads a device-attributed stale_settle as a switch', () => {
     expect(isSwitchTeardownAbort(device, 'stale_settle')).toBe(false);
     expect(responseAbortedSummary(device, 'stale_settle')).toBe('Settled stuck response');
+  });
+
+  /** The two predicates answer different questions and differ by exactly the
+   *  actor: `abortTookEngineDown` asks whether the engine is gone (so nothing
+   *  can be running), `abortPromisesAutoResume` asks whether it promised to
+   *  bring the turn back (so the button and the wording change).
+   *
+   *  The row that matters is the unattributed shutdown, which is every terminal
+   *  `stop.sh`, external SIGUSR1 and ctrl-c: engine down, nothing promised. It
+   *  read as neither before 2026-08-13, so the boundary kept a shimmering
+   *  "Working" over a dead subprocess (real thread b146c294). */
+  it('separates "the engine is gone" from "the engine promised to resume"', () => {
+    const cases: { cause?: AbortCause; actor?: MessageOrigin; down: boolean; promised: boolean }[] = [
+      { cause: 'engine_shutdown', actor: device, down: true, promised: true },
+      { cause: 'engine_shutdown', actor: { kind: 'system' }, down: true, promised: false },
+      { cause: 'engine_shutdown', down: true, promised: false },
+      // The engine is alive for every other cause, so its boundary can still
+      // acquire a live turn (real thread ebc787a4, the `safety_net` case).
+      { cause: 'safety_net', down: false, promised: false },
+      { cause: 'recovery_after_restart', actor: device, down: false, promised: false },
+      { cause: 'stale_settle', actor: device, down: false, promised: false },
+      { cause: 'process_killed', down: false, promised: false },
+      { down: false, promised: false },
+    ];
+    for (const { cause, actor, down, promised } of cases) {
+      const ev = { type: 'ResponseAborted', cause, actor } as ThreadEvent;
+      expect(abortTookEngineDown(ev), `down for ${cause} / ${actor?.kind}`).toBe(down);
+      expect(abortPromisesAutoResume(ev), `promised for ${cause} / ${actor?.kind}`).toBe(promised);
+    }
+    // Only an abort qualifies: no other terminator takes the engine with it.
+    expect(abortTookEngineDown({ type: 'ResponseGenerated' })).toBe(false);
+    expect(abortTookEngineDown({ type: 'ResponseCanceled', cause: 'user_stop' })).toBe(false);
   });
 });
 

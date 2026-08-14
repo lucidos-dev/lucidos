@@ -1,6 +1,8 @@
-import { chatModels, configuredProviders, showToast, showConfirm } from '../store';
+import {
+  chatModels, configuredProviders, currentModel, reasoningEffort, showToast, showConfirm,
+} from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import { MODELS } from '../models';
+import { MODELS, REASONING_LEVELS, availableReasoningLevels, clampReasoningEffort } from '../models';
 import { listModels, createModel, updateModel, deleteModelApi } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -21,9 +23,41 @@ export async function loadChatModels(): Promise<void> {
   try {
     const data = await listModels();
     chatModels.value = { status: 'loaded', data: data.models || [] };
+    // The registry is the authority on which tiers a model supports, and it
+    // lands AFTER `loadPreferences` has already clamped the effort with the
+    // id-shape heuristic. Re-clamp so the picker never keeps displaying a tier
+    // the engine would silently snap on the way to the wire. Display only, like
+    // `loadPreferences`: the stored preference is left alone, since the model
+    // this clamps against may itself change again.
+    reasoningEffort.value = clampEffortFor(reasoningEffort.value, currentModel.value);
   } catch (error) {
     chatModels.value = toFailed(error);
   }
+}
+
+/** The reasoning tiers the engine says `modelId` supports, or `undefined` when
+ *  the registry cannot answer: it has not loaded (or failed), the id has no row
+ *  (a saved `chat_model` for a deleted model), or the engine predates the
+ *  field. Callers fall back to the id-shape heuristic in `store/models.ts`. */
+export function modelReasoningEfforts(modelId: string): string[] | undefined {
+  const loadable = chatModels.value;
+  if (loadable.status !== 'loaded') return undefined;
+  return loadable.data.find((m) => m.id === modelId)?.reasoning_efforts;
+}
+
+/** The reasoning options to OFFER for a model. Every Lucidos Agent effort
+ *  picker goes through this rather than `availableReasoningLevels` directly, so
+ *  the registry's answer is used wherever it exists. */
+export function reasoningLevelsFor(modelId: string): typeof REASONING_LEVELS {
+  return availableReasoningLevels(modelId, modelReasoningEfforts(modelId));
+}
+
+/** Snap an effort onto the closest tier a model supports. Call this on EVERY
+ *  model change: an effort left over from the previous model is exactly what
+ *  the engine has to clamp at the chokepoint, and a picker showing one value
+ *  while the request carries another is the confusion this pairing removes. */
+export function clampEffortFor(effort: string, modelId: string): string {
+  return clampReasoningEffort(effort, modelId, modelReasoningEfforts(modelId));
 }
 
 /** Options for the chat model `<Dropdown>` — enabled models from the loaded

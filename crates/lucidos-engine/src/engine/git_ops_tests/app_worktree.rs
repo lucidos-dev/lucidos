@@ -9,6 +9,7 @@ fn app_branch(app_id: &str) -> String {
         crate::runtime::CodingAgent::ClaudeCode,
         &BranchScope::App(app_id.to_string()),
         "add-streaks",
+        uuid::Uuid::new_v4(),
     )
 }
 

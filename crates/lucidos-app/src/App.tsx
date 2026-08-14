@@ -5,10 +5,12 @@ import { ThreadPane } from './components/layout/ThreadPane';
 import { ContentPane } from './components/layout/ContentPane';
 import { AppHeader } from './components/layout/AppHeader';
 import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
+import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
 import { ConfirmDialog } from './components/shared/ConfirmDialog';
+import { ProgressDialog } from './components/shared/ProgressDialog';
 import { PromptDialog } from './components/shared/PromptDialog';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
@@ -97,9 +99,13 @@ export function App() {
             (and is inert) off the macOS Tauri build — see .titlebar-strip CSS. */}
         <div ref={stripRef} class="titlebar-strip" />
         <AppHeader />
-        {/* Desktop's backup reminder: a flow sibling that pushes the panes down.
-            The mobile copy is mounted inside the fixed header instead (see
-            AppHeader), and each renders only under its own viewport. */}
+        {/* Desktop's app-shell banners: flow siblings that push the panes down.
+            The mobile copies are mounted inside the fixed header instead (see
+            AppHeader), and each renders only under its own viewport.
+            The connection bar leads: it says the workspace is unreachable right
+            now, where the reminder below it is about a risk that will still be
+            there later. */}
+        <ConnectionBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
         <Drawer />
         {mobile ? (
@@ -131,6 +137,7 @@ export function App() {
         <ImagePopupSlot />
         <MessageRoutePanelSlot />
         <ConfirmDialog />
+        <ProgressDialog />
         <PromptDialog />
         <StepDetailModalSlot />
         <CheckpointDiffSlot />

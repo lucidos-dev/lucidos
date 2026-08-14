@@ -19,6 +19,7 @@ import type {
   MarketplaceCatalog,
   ConfirmState,
   ConfirmDetails,
+  ProgressDialogState,
   ContextCapture,
   PromptState,
   ResponseEvent,
@@ -41,7 +42,7 @@ import type { EventChannel, ArchiveState, DisplaySection } from '../generated/th
 import { resetContentScroll } from '../hooks/useScrollMemory';
 import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
 import type { EnvironmentVariable, ModelInfo } from '../api/types';
-import { markSwUpdateDismissed, markSwitchDismissed } from '../hooks/sw-update';
+import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
  *  per-device, not worth round-tripping through the server. */
@@ -57,20 +58,18 @@ export type InlineForm =
   | { type: 'plugin-install'; request: PluginInstallRequest; installed?: PluginInstallReceipt }
   | { type: 'plugin-uninstall'; request: PluginUninstallRequest; removed?: PluginUninstallReceipt };
 
-/** The email confirmation panel, before or after the send. `sentAt` (an ISO
- *  timestamp) present ⇒ the email went out and the panel is a read-only receipt;
- *  one field rather than a `sent` boolean + timestamp pair, so the two can't
- *  desync. The marker lives on the form — persisted panel state — rather than in
- *  component state, so an already-sent email can never present a Send button
- *  again after a remount (a Back/Forward walk onto the entry, or a reload). */
+/** The email confirmation panel, before or after the send. A present `sentAt`
+ *  means the email went out and the panel is a read-only receipt. One field
+ *  rather than a boolean plus a timestamp, so the two cannot desync. The
+ *  marker lives on the form, which is persisted panel state, so a remount can
+ *  never present the Send button for an already-sent email. */
 export type EmailConfirmForm = Extract<InlineForm, { type: 'email-confirm' }>;
 
-/** The plugin install panel, before or after the confirm. `installed` present ⇒
- *  the files landed and the panel is a read-only receipt. Same shape and the
- *  same reasons as `EmailConfirmForm`'s `sentAt`: one field so "did it happen"
- *  and "what happened" can't desync, and it lives on the form (persisted panel
- *  state) so a remount can never present an Install button for a staged
- *  `install_id` the engine has already popped. */
+/** The plugin install panel, before or after the confirm. A present
+ *  `installed` means the files landed and the panel is a read-only receipt.
+ *  Same shape and the same reasons as `EmailConfirmForm`'s `sentAt`. A remount
+ *  can never present an Install button for a staged `install_id` the engine
+ *  has already popped. */
 export type PluginInstallForm = Extract<InlineForm, { type: 'plugin-install' }>;
 
 /** The plugin uninstall panel, before or after the confirm. `removed` present ⇒
@@ -106,14 +105,15 @@ export const previewFile = computed(() => {
 /** When true, file preview shows raw source instead of rendered output (for md, html, csv, svg). */
 export const filePreviewSource = signal(localStorage.getItem('lucidos-file-preview-source') === 'true');
 
-/** User override for the diff whole-file toggle. `null` = no explicit choice, so
- *  the effective view defaults by file status (see `diffWholeFileEffective`):
- *  added files open as the whole file, everything else on the unified hunks.
- *  `true`/`false` = the user toggled the header button. Orthogonal to
- *  filePreviewSource (which still toggles source-vs-rendered within the whole-file
- *  view). Transient, reset to `null` whenever the previewed file changes (see
- *  store/effects.ts) so each new diff re-derives its default — like
- *  filePreviewEditing, NOT persisted across diffs or reloads. */
+/** User override for the diff whole-file toggle. `null` means no explicit
+ *  choice, so the effective view defaults by file status (see
+ *  `diffWholeFileEffective`): an added file opens as the whole file,
+ *  everything else on the unified hunks. Orthogonal to `filePreviewSource`,
+ *  which still toggles source against rendered inside the whole-file view.
+ *
+ *  Transient. `store/effects.ts` resets it whenever the previewed file
+ *  changes, so each new diff re-derives its default. Like
+ *  `filePreviewEditing`, it is NOT persisted across diffs or reloads. */
 export const diffWholeFile = signal<boolean | null>(null);
 
 /** When true, a diff's unified hunks render as two columns instead: the original
@@ -126,21 +126,21 @@ export const diffWholeFile = signal<boolean | null>(null);
 export const diffSideBySide = signal(localStorage.getItem('lucidos-diff-side-by-side') === 'true');
 
 /** Whether the diff on screen is wide enough for two columns, measured by
- *  `DiffView` (see `fitsSideBySide`) and published here because the CONTENT
+ *  `DiffView` (see `fitsSideBySide`). Published here because the CONTENT
  *  pane's header needs the same answer: it offers the Side by side toggle only
- *  where the toggle would do something, and a control that is present but inert
- *  on a phone or a collapsed pane is a lie about what the surface can do.
+ *  where the toggle would do something, and a present but inert control lies
+ *  about what the surface can do.
  *
  *  Written from the measuring component rather than derived, because only the
- *  DOM knows: the content pane is resizable, so this is not a function of the
+ *  DOM knows. The content pane is resizable, so this is not a function of the
  *  viewport. Defaults to true so the first paint does not flash the unified
  *  view before the ResizeObserver has run. */
 export const diffFitsSideBySide = signal(true);
 
 /** When true, the data-file preview shows an editable textarea instead of the
- *  rendered/source view. Reset to false whenever the previewed file changes
- *  (see store/effects.ts) so a stale draft toggle never carries to a new file.
- *  Not persisted — editing is always an explicit, in-session action. */
+ *  rendered or source view. `store/effects.ts` resets it whenever the previewed
+ *  file changes, so a stale draft toggle never carries to a new file. Not
+ *  persisted: editing is always an explicit, in-session action. */
 export const filePreviewEditing = signal(false);
 
 /** CSS-based pseudo-fullscreen fallback for mobile (when native Fullscreen API is unavailable). */
@@ -159,15 +159,14 @@ export const viewingNotification = computed(() => {
 });
 
 /** The notification whose detail is being FETCHED, or null. Set only on
- *  `viewNotification`'s miss path, where neither loaded list holds the row (the
- *  cold push-tap deep link) and a round-trip stands between the tap and the
- *  panel.
+ *  `viewNotification`'s miss path, where neither loaded list holds the row and
+ *  a round-trip stands between the tap and the panel.
  *
  *  Deliberately NOT a `panelOverlay` variant. `panelOverlay` is the panel nav
- *  stack's unit of history (`pushNavState` / `restoreState` / `overlaysEqual`),
- *  so a speculative write would leave a phantom entry that Back walks onto when
- *  the fetch fails. Keeping the pending state beside it means the overlay is
- *  still only ever written with a real notification in hand. */
+ *  stack's unit of history, so a speculative write would leave a phantom entry
+ *  that Back walks onto when the fetch fails. Keeping the pending state beside
+ *  it means the overlay is only ever written with a real notification in
+ *  hand. */
 export const notificationDetailPending = signal<string | null>(null);
 
 export function closeInlineForm(): void {
@@ -190,28 +189,25 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
   label: string;
   /** The header bar's form of `label`, when the full name does not fit there.
-   *  The bar is the narrowest place a category name is ever shown: on a phone
-   *  the title is one shrinkable member of a fixed-width cluster between two
-   *  chevrons (see `.header-title-cluster`, styles/header-mark.css), which
-   *  leaves it around a dozen characters, fewer at a raised UI scale.
+   *  The bar is the narrowest place a category name is shown: on a phone the
+   *  title is one shrinkable member of a fixed-width cluster between two
+   *  chevrons (`.header-title-cluster`, styles/header-mark.css). That leaves
+   *  around a dozen characters, fewer at a raised UI scale.
    *
-   *  Authored, never derived. A measured font-shrink was the alternative and is
-   *  rejected: a title that changes size from screen to screen makes the bar
-   *  jitter as the user navigates, and this header already carried a JS
-   *  measurement once (see `--mobile-content-title-max` in styles/mobile.css)
-   *  that was deleted for the complexity. Both the iOS and Material top-bar
-   *  conventions say the same thing: write a short title rather than scale a
-   *  long one, which is what a separate short back-button title exists for.
+   *  Authored, never derived. A measured font-shrink is rejected, because a
+   *  title that changes size from screen to screen makes the bar jitter as the
+   *  user navigates. Both the iOS and Material top-bar conventions say the
+   *  same thing: write a short title rather than scale a long one.
    *
    *  Only the bar reads it. The Settings home list, Search Everywhere, the
-   *  back/forward history menu and the title's own tap-tooltip all keep the
-   *  full `label`, so the shorthand never becomes the category's real name. */
+   *  history menu and the title's own tap-tooltip all keep the full `label`,
+   *  so the shorthand never becomes the category's real name. */
   short?: string;
 }
 /** Home-list grouping for the top-level Settings rows. Presentational only: a
@@ -237,51 +233,46 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
   { key: 'disk-usage', label: 'Disk Usage' },
   { key: 'environment-variables', label: 'Environment Variables', short: 'Env Vars' },
   { key: 'debugging', label: 'Debugging' },
+  { key: 'communication-surfaces', label: 'Communication Surfaces', short: 'Surfaces' },
 ];
 
 // The top-level Settings categories, in home-list order. Two rules hold this
-// list together, both learned the hard way (see
+// list together (see
 // docs/plans/2026-08-05-settings-information-architecture.md):
 //
 //  1. NO ENTRY IS PLATFORM-GATED. Every row here renders on every platform, so
 //     the nav has one shape everywhere and "go to Settings → X" is true for
-//     everyone. Platform gating belongs to a ROW or SECTION inside a category
-//     (the iOS external-link target and the Tauri in-app browser toggle both
-//     live inside Appearance & Behavior → Links that way). Gating a whole
-//     CATEGORY is what
-//     once hid the external-link setting from installed iOS PWAs, the only
-//     platform it applies to: the row's own predicate was right and the
-//     Experimental nav entry it sat behind was isTauri()-only. Pinned by
+//     everyone. Platform gating belongs to a ROW or SECTION inside a category:
+//     the iOS external-link target and the Tauri in-app browser toggle both
+//     live inside Appearance & Behavior → Links that way. Gating a whole
+//     CATEGORY hides a correctly-predicated row from the one platform it
+//     applies to. Pinned by
 //     components/settings/__tests__/settings-nav-structure.test.ts.
-//  2. A ROW IS A CATEGORY, NOT A SETTING. `Links` and `Experimental` were once
-//     top-level rows holding one control each, peers of System's twelve
-//     sections. A single control belongs in a section of a bigger category.
+//  2. A ROW IS A CATEGORY, NOT A SETTING. A single control belongs in a
+//     section of a bigger category, not as a peer of System's twelve.
 //
-// Groups are contiguous and rendered as headings; they add no tap depth.
+// Groups are contiguous and rendered as headings. They add no tap depth.
 export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   { key: 'models', label: 'Models', group: 'Assistant' },
   { key: 'permissions', label: 'Permissions', group: 'Assistant' },
-  // Binary paths + registered repositories: everything a coding-agent thread
-  // needs configured, in one place. Both halves used to live apart (paths under
-  // System → Overview, repositories as their own top-level row).
+  // Binary paths plus registered repositories: everything a coding-agent
+  // thread needs configured, in one place.
   { key: 'coding-agents', label: 'Coding Agents', short: 'Agents', group: 'Assistant' },
   { key: 'accounts', label: 'Accounts', group: 'Workspace' },
-  // Language + timezone: workspace-wide user preferences, and among the most
-  // looked-for settings there are. Previously buried under System → Overview.
+  // Language and timezone: workspace-wide user preferences, and among the most
+  // looked-for settings there are.
   { key: 'locale', label: 'Locale', group: 'Workspace' },
   { key: 'marketplaces', label: 'Marketplaces', group: 'Workspace' },
   // Reaching this engine from elsewhere: the mobile-access guide plus the
-  // engine's network bind, which used to be a System subpanel that the guide
-  // had to deep-link into.
+  // engine's network bind.
   { key: 'access', label: 'Access', group: 'Workspace' },
   { key: 'devices', label: 'Devices', group: 'Workspace' },
   { key: 'system', label: 'System', group: 'Workspace' },
-  // Widened, not renamed. Link routing moved in, and where a link opens is
-  // behaviour rather than display, so the label says both (the shape JetBrains
-  // uses for the same widened scope). The KEY stays the head noun, matching the
-  // repo's own ampersand precedent: "Chat & triggers" is anchored `models:chat`.
-  // Keeping `appearance` also keeps every persisted search recent, the LLM's
-  // `settings_view` value and the SDK type stable across this restructure.
+  // Where a link opens is behaviour rather than display, so the label says
+  // both. The KEY stays the head noun, matching the repo's own ampersand
+  // precedent: "Chat & triggers" is anchored `models:chat`. Keeping
+  // `appearance` also keeps every persisted search recent, the LLM's
+  // `settings_view` value and the SDK type stable.
   { key: 'appearance', label: 'Appearance & Behavior', short: 'Appearance', group: 'This device' },
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', short: 'Shortcuts', group: 'This device' },
 ];
@@ -302,17 +293,16 @@ export function settingsSubviewShortLabel(key: Exclude<SettingsSubview, 'main'>)
   return item && (item.short ?? item.label);
 }
 
-/** Where a subview key retired by the 2026-08-05 restructure now lives. The
- *  content did not disappear, it moved, so each maps to the category that
- *  absorbed it rather than to `main`.
+/** Where a retired subview key now lives. The content did not disappear, it
+ *  moved, so each maps to the category that absorbed it rather than to `main`.
  *
- *  A `Map`, not an object literal, because the lookup key is UNTRUSTED (it comes
- *  from persisted JSON). An object literal inherits `Object.prototype`, so
- *  `obj['constructor']` returns a truthy function and the migration would hand
- *  that back as a subview, landing on the blank panel it exists to prevent. */
+ *  A `Map`, not an object literal, because the lookup key is UNTRUSTED: it
+ *  comes from persisted JSON. An object literal inherits `Object.prototype`,
+ *  so `obj['constructor']` returns a truthy function. The migration would hand
+ *  that back as a subview, landing on the blank panel it prevents. */
 const RETIRED_SETTINGS_SUBVIEWS = new Map<string, SettingsSubview>([
   // Both were one-control categories folded into Appearance & Behavior's Links
-  // section. (`appearance` itself is NOT retired: it kept its key.)
+  // section. `appearance` itself is NOT retired: it kept its key.
   ['links', 'appearance'],
   ['experimental', 'appearance'],
   ['repositories', 'coding-agents'],
@@ -321,15 +311,14 @@ const RETIRED_SETTINGS_SUBVIEWS = new Map<string, SettingsSubview>([
 ]);
 
 /** Resolve a subview name that came from OUTSIDE this build into a renderable
- *  one: the persisted nav stack (`lucidos-nav-state`, restored across upgrades),
- *  or any other untrusted source.
+ *  one: the persisted nav stack (`lucidos-nav-state`), or any other untrusted
+ *  source.
  *
  *  The nav stack survives the upgrade that renames a subview, and
  *  `SettingsView.renderSubview` falls through to `null` for a key it no longer
- *  knows, so restoring the raw string lands the user on a BLANK Settings panel
- *  with no error. Retired keys map to the category that absorbed them;
- *  everything unrecognised falls back to the Settings home list, which is always
- *  renderable. */
+ *  knows, so restoring the raw string lands the user on a BLANK Settings
+ *  panel. A retired key maps to the category that absorbed it. Anything
+ *  unrecognised falls back to the Settings home list. */
 export function migrateSettingsSubview(raw: unknown): SettingsSubview {
   if (typeof raw !== 'string') return 'main';
   if (raw === 'main') return 'main';
@@ -343,24 +332,20 @@ export function migrateSettingsSubview(raw: unknown): SettingsSubview {
  *
  *  Split out from `migrateSettingsSubview` because the two callers want
  *  different treatment of an UNKNOWN key. Restoring the nav stack wants it
- *  collapsed onto `main` (there is no user to tell, and a blank panel is the
- *  alternative). A `NavigationRequested` from outside this build (a stored
- *  notification's deep link, an app built against an older SDK
- *  `SettingsViewTarget`, an LLM `navigate_ui` call) wants the alias applied but
- *  a genuinely unknown value REPORTED, since the caller can be told and a typo
- *  should not silently land on the Settings home. */
+ *  collapsed onto `main`, since there is no user to tell and a blank panel is
+ *  the alternative. A `NavigationRequested` from outside this build wants the
+ *  alias applied but a genuinely unknown value REPORTED: the caller can be
+ *  told, and a typo should not silently land on the Settings home. */
 export function aliasRetiredSettingsSubview(raw: string): string {
   return RETIRED_SETTINGS_SUBVIEWS.get(raw) ?? raw;
 }
 
 // --- Active menu item ---
-// The plugin Store moved out of the Apps section into its own top-level
-// **Plugins** panel. Migrate older persisted state to land on it:
-//  - the retired 'app-store' menu item → the Plugins panel;
-//  - someone last viewing Apps → Store (the prior fold-in) → the Plugins panel.
-// The former per-tab selection ('lucidos-plugins-tab') is retired — the panel
-// now uses a single "Installed only" filter instead of Installed | Store tabs,
-// so both that key and the older 'lucidos-apps-tab' are cleared.
+// Migrate older persisted state onto the top-level **Plugins** panel:
+//  - the retired 'app-store' menu item;
+//  - someone last viewing Apps → Store, the prior fold-in.
+// The per-tab selection keys are retired with them. The panel now uses a
+// single "Installed only" filter rather than Installed and Store tabs.
 {
   const savedMenu = localStorage.getItem('lucidos-active-menu-item');
   const legacyAppsTab = localStorage.getItem('lucidos-apps-tab');
@@ -393,11 +378,10 @@ export const workspaceName = signal<string>('');
  *  a registry write with no engine involvement, so the engine cannot report this
  *  and the app has to ask the gateway (see `actions/workspace-label.ts`). */
 export const workspaceDisplayName = signal<string>('');
-/** What every "which workspace is this" surface shows: the user's own label when
- *  we know it, else the engine's name. One derived value, so the header, the
- *  System page and the Files source dropdown cannot disagree with the switcher
- *  row sitting next to them (they did: the switcher reads the gateway listing,
- *  so after a rename one screen carried two names for one workspace). */
+/** What every "which workspace is this" surface shows: the user's own label
+ *  when we know it, else the engine's name. ONE derived value, so no screen
+ *  can carry a different name from the switcher row beside it. The switcher
+ *  reads the gateway listing, which is what a rename writes. */
 export const visibleWorkspaceName = computed(
   () => workspaceDisplayName.value || workspaceName.value,
 );
@@ -426,34 +410,33 @@ export const latestTauriAppVersion = signal<string | null>(null);
 /** What is in the packaged update being offered, as raw markdown, or `null` when
  *  none is offered or its manifest carries no notes.
  *
- *  The only way this client can say what a PENDING update contains. The offered
- *  version postdates the engine binary running here, so it is absent from the
- *  baked changelog `changelogReleases` holds, and falling back to that would
- *  show the notes for the version already installed. Written only by the update
- *  check, beside `latestTauriAppVersion`, so the two cannot describe different
- *  releases. */
+ *  The only way this client can say what a PENDING update contains. The
+ *  offered version postdates the engine binary running here, so the baked
+ *  changelog `changelogReleases` holds does not carry it. Falling back to that
+ *  would show the notes for the version already installed. Written only by the
+ *  update check, beside `latestTauriAppVersion`, so the two cannot describe
+ *  different releases. */
 export const latestTauriAppNotes = signal<string | null>(null);
 /** Why the last packaged app-update check failed, or `null` when it succeeded
- *  (or has not run). Rendered in Settings → System so a failing check is
- *  DIAGNOSABLE instead of silent — swallowing it is what made a stranded 0.15.0
- *  install indistinguishable from an up-to-date one. */
+ *  or has not run. Rendered in Settings → System so a failing check is
+ *  DIAGNOSABLE instead of silent. Swallowed, it makes a stranded install
+ *  indistinguishable from an up-to-date one. */
 export const appUpdateCheckError = signal<string | null>(null);
 /** Live phase of a packaged app-update run, or `null` when none is in flight.
- *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts);
- *  the engine has no part in it, so this stays null in a browser / PWA / dev
- *  client. Read by BOTH the progress toast and Settings → System so the two can
- *  never disagree about what the update is doing.
+ *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts).
+ *  The engine has no part in it, so this stays null in a browser, PWA or dev
+ *  client. Read by BOTH the progress toast and Settings → System, so the two
+ *  cannot disagree about what the update is doing.
  *
- *  Typed to the IN-FLIGHT frames only: `cancelled` / `failed` end a run, and the
- *  handler clears this signal on them rather than storing them, so "a terminal
- *  frame parked as live state" is not representable and no reader has to
- *  re-narrow for it. */
+ *  Typed to the IN-FLIGHT frames only. `cancelled` and `failed` end a run, and
+ *  the handler clears this signal rather than storing them. A terminal frame
+ *  parked as live state is therefore not representable. */
 export const appUpdateProgress = signal<AppUpdateRunning | null>(null);
 /** True when the packaged update has passed the point of no return: the bundle
  *  is being swapped or the stack restarted, which kills the gateway under the
- *  page. The resulting connection/SSE failures would bury the narration, so —
- *  exactly as `engineRestarting` does for a restart — they are suppressed and
- *  only the update's own toast (`showWhileUnavailable`) stays on screen. */
+ *  page. The resulting connection and SSE failures would bury the narration,
+ *  so they are suppressed exactly as `engineRestarting` suppresses them for a
+ *  restart. Only the update's own toast (`showWhileUnavailable`) stays up. */
 export const appUpdateCommitted = computed(() => {
   const phase = appUpdateProgress.value?.phase;
   return phase === 'installing' || phase === 'restarting-services' || phase === 'relaunching';
@@ -462,29 +445,28 @@ export const appUpdateCommitted = computed(() => {
  *  `database_reachable` by the connection poll; an older engine omits the field,
  *  which reads as `true`, so nothing changes for one.
  *
- *  An engine outlives its database (quitting Docker Desktop is the everyday dev
- *  case), and it keeps answering `/health` and streaming SSE while every query
- *  behind it fails. Without this signal the ~20 startup loads each reported that
- *  separately and the boot splash waited out its safety cap on a thread list that
- *  could never arrive. See ADR 0037 and `engine::db_health`. */
+ *  An engine outlives its database, most commonly when a dev quits Docker
+ *  Desktop. It keeps answering `/health` and streaming SSE while every query
+ *  behind it fails. Without this signal each of the ~20 startup loads reports
+ *  that separately. The boot splash then waits out its safety cap on a thread
+ *  list that can never arrive. See ADR 0037 and `engine::db_health`. */
 export const databaseReachable = signal(true);
 /** True when the connected engine is a packaged desktop build. Routes the
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
  *  the Tauri-only half of the Settings Access page. Set from /health. */
 export const enginePackaged = signal<boolean>(false);
 
-/** False when the connected engine booted with no LLM provider configured (the
- *  UnconfiguredProvider sentinel — a packaged build's first run). Drives the
- *  first-run provider onboarding in the welcome surface. Set from /health.
- *  Defaults to `true` so onboarding never flashes before the first health probe
- *  lands; the probe corrects it to `false` only when the engine reports so. */
+/** False when the connected engine booted with no LLM provider configured, the
+ *  UnconfiguredProvider sentinel a packaged build's first run leaves. Drives
+ *  the first-run provider onboarding in the welcome surface. Set from /health,
+ *  and defaults to `true` so onboarding never flashes before the first
+ *  probe. */
 export const llmConfigured = signal<boolean>(true);
 
-/** Provider backends the connected engine actually has configured
- *  (`vertex`/`anthropic`/`openai`/`openrouter`/`local`), from /health. Filters
- *  the chat model picker to providers the user has set up. `null` = don't filter
- *  (mock, or an older engine that doesn't report this) — the safe default so the
- *  picker is never empty before the first probe / under mock. */
+/** Provider backends the connected engine actually has configured, from
+ *  /health. Filters the chat model picker to providers the user has set up.
+ *  `null` means do not filter, which is the safe default so the picker is
+ *  never empty before the first probe or under mock. */
 export const configuredProviders = signal<string[] | null>(null);
 
 // --- Model (persisted via preferences; populated by loadPreferences) ---
@@ -502,18 +484,56 @@ export const animationSpeed = signal(
 /** Slider position (-10..10) → speed multiplier (0.1x..10x) via 10^(v/10). */
 export const speedMultiplier = computed(() => Math.pow(10, animationSpeed.value / 10));
 
+// --- Toast placement (temporary: a shape comparison, see docs/temporary-measures.md) ---
+
+/** Where the toast stack sits and what a toast is shaped like.
+ *
+ *   - `bottom-right`: one stack in the window's bottom-right corner, the spot
+ *     VS Code and IntelliJ both default to. Anchored to the WINDOW rather than
+ *     a pane, so it holds still through a divider drag and never meets the seam.
+ *   - `top-bleed` / `bottom-bleed`: ONE stack spanning both panes, edge to edge.
+ *     A full-bleed bar COVERS the pane divider for its whole width, where a
+ *     narrower card straddles it with the seam showing above and below.
+ *   - `card`: one stack, the toast still a 30rem card, centred on the viewport.
+ *     This is the shape the per-pane columns replaced.
+ *   - `pane`: today's behaviour, one column per visible pane.
+ *
+ *  The shapes exist only so they can be compared in the running app. Exactly
+ *  one survives, and the picker goes with the losers. */
+export type ToastPlacement = 'bottom-right' | 'top-bleed' | 'bottom-bleed' | 'card' | 'pane';
+
+const TOAST_PLACEMENTS: readonly ToastPlacement[] = [
+  'bottom-right', 'top-bleed', 'bottom-bleed', 'card', 'pane',
+];
+
+/** The one gate on the value, shared by the stored-value read below and the
+ *  picker. Both need it, and a second hand-written list of the same strings
+ *  would let a value be storable but unpickable, or the reverse. */
+export function isToastPlacement(value: string | null): value is ToastPlacement {
+  return value !== null && TOAST_PLACEMENTS.includes(value as ToastPlacement);
+}
+
+/** Device-local, like the animation-speed slider beside it: this is a diagnostic
+ *  for judging a shape, not a preference anyone should have to keep in sync
+ *  across devices. An unrecognised stored value falls back to the default rather
+ *  than reaching the CSS as an attribute matching no rule. */
+function storedToastPlacement(): ToastPlacement {
+  const raw = localStorage.getItem('lucidos-toast-placement');
+  return isToastPlacement(raw) ? raw : 'bottom-right';
+}
+
+export const toastPlacement = signal<ToastPlacement>(storedToastPlacement());
+
 /** What every animated duration is MULTIPLIED by: the reciprocal of the speed,
- *  so 10x speed is a 0.1 scale. Same name root in all three layers it crosses,
- *  which is the point of it existing next to the multiplier rather than each
- *  caller writing `1 / speed`:
+ *  so 10x speed is a 0.1 scale. It exists beside the multiplier, rather than
+ *  each caller writing `1 / speed`, so one name root crosses both layers:
  *
  *    - CSS reads it as `var(--duration-scale)`, published onto :root by
  *      store/effects.ts and folded into every `--duration-*` token in
- *      styles/global/base.css. That is what makes the slider reach a plain CSS
- *      transition at all; before it, the slider moved only the handful of
- *      JS-driven animations below.
- *    - TS reads it through `scaledDurationMs` for a timer that must outlive one
- *      of those transitions, and directly for a Web Animations duration
+ *      styles/global/base.css. That is what lets the slider reach a plain CSS
+ *      transition at all.
+ *    - TS reads it through `scaledDurationMs` for a timer that must outlive
+ *      one of those transitions, and directly for a Web Animations duration
  *      (useFlipAnimation).
  *
  *  1 at the slider's centre, so a user who never touches it sees today's
@@ -522,16 +542,15 @@ export const durationScale = computed(() => 1 / speedMultiplier.value);
 
 /** A base duration in ms, scaled to the current animation speed.
  *
- *  For a TS timer that MIRRORS a CSS duration (keeping an element mounted
- *  through its own fade, holding an animation class on for the length of a
- *  transition). Pass the 1x duration of the CSS it mirrors and add any safety
- *  slack OUTSIDE the call: slack is a fixed margin, not animation, so
- *  `scaledDurationMs(PANE_TRANSITION_MS) + 100` is the shape, never
- *  `scaledDurationMs(PANE_TRANSITION_MS + 100)`.
+ *  For a TS timer that MIRRORS a CSS duration, such as keeping an element
+ *  mounted through its own fade. Pass the 1x duration of the CSS it mirrors.
+ *  Add any safety slack OUTSIDE the call, since slack is a fixed margin rather
+ *  than animation. So `scaledDurationMs(PANE_TRANSITION_MS) + 100` is the
+ *  shape, never `scaledDurationMs(PANE_TRANSITION_MS + 100)`.
  *
- *  Scaling the CSS without scaling these desyncs the pair: at 0.1x the drawer's
- *  width transition runs 3s while an unscaled 350ms timer unmounts its list
- *  a tenth of the way in, so the drawer blanks and then slides shut empty. */
+ *  Scaling the CSS without scaling these desyncs the pair. At 0.1x the
+ *  drawer's width transition runs 3s while an unscaled 350ms timer unmounts
+ *  its list, so the drawer blanks and then slides shut empty. */
 export function scaledDurationMs(baseMs: number): number {
   return baseMs * durationScale.value;
 }
@@ -540,22 +559,18 @@ export function scaledDurationMs(baseMs: number): number {
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
 );
-/** The active drawer view, picked from the single drawer view selector and
- *  persisted across reloads. Four mutually-exclusive views:
- *    - `all`       — the default sectioned list (Current/Saved/Archive).
- *    - `attention` — Current/Saved threads where the agent is stuck and the user
- *                    must act: awaiting an answer/permission or a failed turn
- *                    (see `threadNeedsAttention`).
- *    - `review`    — Current/Saved threads carrying a change ready to apply
- *                    (see `threadInReview`).
- *    - `running`   — Current/Saved threads actively working on a response
- *                    (see `threadIsRunning`).
- *    - `drafts`    — threads with an unsent draft (`draftThreads`).
- *  The selector and its badge counts are backend-derived (recomputed from the
- *  rehydrated `threadMap`), so only this *active selection* needs persisting; a
- *  single key both stores the choice and encodes the one-active invariant.
- *  Legacy `'attention'`/`'drafts'` values still restore; the retired `'none'`
- *  and any unknown value fall back to `all`. */
+/** The active drawer view, picked from the drawer view selector and persisted
+ *  across reloads. Five mutually-exclusive views:
+ *    - `all`: the default sectioned list (Current/Saved/Archive).
+ *    - `attention`: the agent is stuck and the user must act, awaiting an
+ *      answer or permission, or holding a failed turn (`threadNeedsAttention`).
+ *    - `review`: carrying a change ready to apply (`threadInReview`).
+ *    - `running`: actively working on a response (`threadIsRunning`).
+ *    - `drafts`: threads with an unsent draft (`draftThreads`).
+ *
+ *  The badge counts are recomputed from the rehydrated `threadMap`, so only
+ *  the active SELECTION is persisted. One key stores the choice and encodes
+ *  the one-active invariant. Any unknown value falls back to `all`. */
 const ALT_VIEW_KEY = 'lucidos-alt-view';
 export type DrawerView = 'all' | 'attention' | 'review' | 'running' | 'drafts';
 
@@ -589,15 +604,15 @@ export const threadDrawerWidth = signal(
   )
 );
 
-/** Re-apply the floor after something moved it. The floor is derived from the
- *  root font size, so a UI-scale change can leave a settled drawer below it;
+/** Re-apply the floor after something moved it. The floor derives from the root
+ *  font size, so a UI-scale change can leave a settled drawer below it.
  *  `applyUiScale` calls this for the same reason it re-measures the scrollbar
  *  gutter. Widening persists, so the next reload starts from the corrected
  *  width rather than re-correcting every boot.
  *
- *  Stays HERE rather than moving to paneMinimums.ts with the floor it reads:
- *  it mutates `threadDrawerWidth`, and that module is imported by this one's
- *  init, so the import back would be a boot-time cycle. */
+ *  Stays HERE rather than moving to paneMinimums.ts with the floor it reads.
+ *  It mutates `threadDrawerWidth`, and this module's init imports that one, so
+ *  the import back would be a boot-time cycle. */
 export function clampThreadDrawerWidth(): void {
   const min = minDrawerWidth();
   if (threadDrawerWidth.value >= min) return;
@@ -609,12 +624,11 @@ export const focusedThreadId = signal<string | null>(
 );
 
 /** Single setter that keeps focusedThreadId and FOCUSED_THREAD_KEY in lockstep.
- *  Every production-code mutation of focusedThreadId must go through here so
- *  the next reload resumes the same thread (especially compose drafts whose
- *  id was allocated client-side and never touches the server until a Send).
- *  Idempotent: hot-path callers (sendMessage, focusThread on the focused row)
- *  fire with the same id repeatedly; skip the synchronous storage write when
- *  nothing changed. */
+ *  Every production-code mutation of focusedThreadId goes through here, so the
+ *  next reload resumes the same thread. That matters most for a compose draft,
+ *  whose id is allocated client-side and never reaches the server until a
+ *  Send. Idempotent, because hot-path callers fire with the same id
+ *  repeatedly and the storage write is synchronous. */
 export function setFocusedThread(id: string | null): void {
   if (focusedThreadId.peek() === id) return;
   focusedThreadId.value = id;
@@ -629,10 +643,10 @@ export function setFocusedThread(id: string | null): void {
 // ThreadView gates its content behind this to avoid rendering exchanges mid-slide.
 export const promptAnimating = signal(false);
 
-// One-shot ticket: PromptInput.submit() sets this on a compose→active send so the
-// ThreadPane FLIP knows to defer + animate the textarea height collapse together
-// with the position slide (instead of the textarea snapping short first). The FLIP
-// consumes it and owns the height reset in every exit path, so it can't stick tall.
+// One-shot ticket, set on a compose-to-active send. It tells the ThreadPane
+// FLIP to animate the textarea height collapse together with the position
+// slide, rather than letting the textarea snap short first. The FLIP consumes
+// it and owns the height reset in every exit path, so it cannot stick tall.
 export const promptSendCollapsing = signal(false);
 
 // True when the next focusThread should trigger slide-up reveal animation.
@@ -711,8 +725,8 @@ export function setSelectedTriggerIds(next: Set<string>): void {
 }
 
 // Empty set = "all repos". Non-empty = filter coding-agent threads to those
-// cc_repo_ids only. Mirrors `selectedTriggerIds` exactly — the dropdown turns
-// the Coding Agent parent indeterminate when this set is non-empty.
+// cc_repo_ids only. Mirrors `selectedTriggerIds`: the dropdown turns the
+// Coding Agent parent indeterminate when this set is non-empty.
 const SELECTED_REPO_IDS_KEY = 'lucidos-selected-repo-ids';
 
 function restoreSelectedRepoIds(): Set<string> {
@@ -732,8 +746,8 @@ export function setSelectedRepoIds(next: Set<string>): void {
   localStorage.setItem(SELECTED_REPO_IDS_KEY, JSON.stringify([...next]));
 }
 
-// Mirrors selectedRepoIds for app coding-agent threads. Apps live alongside
-// repos under the Coding Agent parent in the filter dropdown; their selection
+// Mirrors selectedRepoIds for app coding-agent threads. Apps sit beside repos
+// under the Coding Agent parent in the filter dropdown, and their selection
 // set is independent so a user can pick "this repo OR this app".
 const SELECTED_APP_IDS_KEY = 'lucidos-selected-app-ids';
 
@@ -754,11 +768,10 @@ export function setSelectedAppIds(next: Set<string>): void {
   localStorage.setItem(SELECTED_APP_IDS_KEY, JSON.stringify([...next]));
 }
 
-// Whether the filter dropdown lists deleted trigger/repo/app options (those
-// whose underlying entity is gone but threads still reference it, shown with a
-// `(deleted)` / `(until <date>)` suffix). Default OFF — deleted entries are
-// excluded unless the user opts in. A *selected* deleted option always stays
-// visible regardless, so a filter restored from localStorage is clearable.
+// Whether the filter dropdown lists deleted trigger, repo and app options:
+// those whose entity is gone but which threads still reference. Default OFF,
+// so a deleted entry is excluded unless the user opts in. A SELECTED deleted
+// option stays visible regardless, so a restored filter is clearable.
 const INCLUDE_DELETED_FILTERS_KEY = 'lucidos-filter-include-deleted';
 
 export const includeDeletedFilterOptions = signal<boolean>(
@@ -770,11 +783,10 @@ export function setIncludeDeletedFilterOptions(next: boolean): void {
   localStorage.setItem(INCLUDE_DELETED_FILTERS_KEY, String(next));
 }
 
-// Complete set of selectable filter facets (every trigger/repo/app that has a
-// thread), fetched from /api/v1/threads/filter-facets. Seeds the drawer "Show"
-// dropdown so it lists ALL session-having triggers/repos/apps, not just those
-// in the currently-loaded window. Refreshed on startup and after each full
-// thread reload.
+// Every trigger, repo and app that has a thread, from
+// /api/v1/threads/filter-facets. Seeds the drawer "Show" dropdown so it lists
+// all of them rather than only those in the loaded window. Refreshed on
+// startup and after each full thread reload.
 export const filterFacets = signal<Loadable<import('../api/threads').FilterFacets>>({ status: 'not-loaded' });
 
 // --- Thread search ---
@@ -789,14 +801,13 @@ export const threadsLoaded = signal(false);
  *  yet and a round-trip stands between the user's tap and anything appearing.
  *
  *  Two readers, both about that window:
- *   - The bootstrap focuses the thread OPTIMISTICALLY, so the pane moves on the
- *     tap and `ThreadView` renders its existing delay-gated skeleton instead of
- *     a dead interval. That is what a notification tap navigating to a thread
- *     outside the loaded window used to have none of.
- *   - `ThreadView` clears a `focusedThreadId` whose thread isn't in the map once
- *     `threadsLoaded` is true (stale-pointer cleanup). It must NOT do that to a
- *     thread whose metadata is still in flight, or the optimistic focus would be
- *     undone on the very next render. This signal is the exemption. */
+ *   - The bootstrap focuses the thread OPTIMISTICALLY, so the pane moves on
+ *     the tap and `ThreadView` renders its delay-gated skeleton rather than a
+ *     dead interval.
+ *   - `ThreadView` clears a `focusedThreadId` whose thread is not in the map
+ *     once `threadsLoaded` is true. It must NOT do that to a thread whose
+ *     metadata is still in flight, or the optimistic focus would be undone on
+ *     the next render. This signal is the exemption. */
 export const bootstrappingThreadId = signal<string | null>(null);
 /** Thread IDs whose title was set by a ThreadTitleGenerated event (authoritative). */
 export const generatedTitleIds = new Set<string>();
@@ -804,48 +815,50 @@ export const generatedTitleIds = new Set<string>();
 export const threadHasMore = signal(true);
 /** Whether a load-more request is currently in flight. */
 export const threadLoadingMore = signal(false);
-/** Total size of the archived pile from the backend (`archive_state='archived'`,
- *  unsaved) — refreshed by every `loadAllThreads` (startup / resume / reconnect).
- *  Drives the collapsed Archive section's count badge so it shows the true total
- *  rather than the loaded window. Plain signal (not `Loadable`) to match its
- *  sibling `threadMap` / `threadsLoaded`, which the same fetch populates; the
- *  badge falls back to the loaded count until this lands. */
+/** Total size of the archived pile from the backend, refreshed by every
+ *  `loadAllThreads`. Drives the collapsed Archive section's count badge, so it
+ *  shows the true total rather than the loaded window. A plain signal rather
+ *  than a `Loadable`, matching the `threadMap` and `threadsLoaded` the same
+ *  fetch populates. The badge falls back to the loaded count until it
+ *  lands. */
 export const archiveThreadCount = signal(0);
 /** Derive effective thread status, accounting for in-progress apply operations and pending messages. */
 export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
   // Archive = user acknowledged any prior failed/aborted state. Drop the red
   // status dot immediately, before the ThreadArchived SSE round-trip lands.
   if (archivingThreadIds.value.has(thread.meta.id)) return 'idle';
-  // Apply is *not* an optimistic running flip — the thread should stay in
-  // Review while the backend either finishes a clean fast-path apply (status
-  // stays Idle/Waiting) or wakes CC for harden / merge-conflict resolution
-  // (CC's own activity events will transition status to Running). The
-  // disabled "Apply..." button in WaitingBanner is the visual feedback.
-  // Pending user messages = request sent, thread is running before SSE event
-  // arrives. An `unconfirmed` row is excluded: the safety refetch has given up
-  // on it, so it is kept only to keep the text visible and there is no turn in
-  // flight behind it. Counting it would pin the thread on 'running' for the
-  // life of the page, keeping it out of Review and showing a Stop it cannot use.
+  // Apply is deliberately NOT an optimistic running flip. The thread stays in
+  // Review while the backend finishes a clean fast-path apply, or wakes the
+  // agent for harden or merge-conflict resolution. The agent's own activity
+  // events then transition the status. WaitingBanner's disabled "Apply..."
+  // button is the visual feedback.
+  //
+  // A pending user message means the request was sent and the thread is
+  // running ahead of the SSE event. An `unconfirmed` row is excluded: the
+  // safety refetch gave up on it, so it is kept only to keep the text visible
+  // and no turn is in flight behind it. Counting it would pin the thread on
+  // 'running' for the life of the page.
   if (thread.pendingUserMessages.some(p => !p.unconfirmed)) return 'running';
   return thread.meta.status;
 }
 
-/** True for the cancellable statuses — a turn is in flight or paused on a
- *  user question. The two states briefly transition through each other (via
- *  UserQuestionAnswered) so almost every "mid-turn" check needs both. */
+/** True for the cancellable statuses: a turn is in flight, or paused on a user
+ *  question. The two transition through each other via `UserQuestionAnswered`,
+ *  so almost every mid-turn check needs both. */
 export function isMidTurn(status: ThreadStatus): boolean {
   return status === 'running' || status === 'waiting_for_user_answer';
 }
 
-/** True when CC is not producing output: future events won't resolve trailing
- *  Thinking spinners in non-current exchanges, so the renderer must clean
- *  them up itself. NOT the inverse of `isMidTurn` — `waiting_for_user_answer`
- *  belongs to BOTH sets (mid-turn cancellable, but quiescent for output).
- *  That overlap is exactly the bug surface this predicate addresses: a
- *  CodingAgentPromptSent for a queued mid-flight follow-up that CC paused
- *  before consuming has a stranded Thinking step which can never be resolved
- *  naturally — CC's resume events attach to the new UserQuestionAsked
- *  exchange via current-pointer routing, not the stranded one. */
+/** True when the agent is not producing output. Future events will not resolve
+ *  trailing Thinking spinners in non-current exchanges, so the renderer must
+ *  clean them up itself.
+ *
+ *  NOT the inverse of `isMidTurn`. `waiting_for_user_answer` belongs to BOTH
+ *  sets: mid-turn cancellable, but quiescent for output. That overlap is the
+ *  bug surface this addresses. A `CodingAgentPromptSent` for a follow-up the
+ *  agent paused before consuming leaves a Thinking step nothing can resolve.
+ *  The resume events attach to the new `UserQuestionAsked` exchange by
+ *  current-pointer routing, not to the stranded one. */
 export function isThreadQuiescent(status: ThreadStatus | undefined): boolean {
   return status === 'idle' || status === 'waiting_for_user_answer';
 }
@@ -857,17 +870,14 @@ export function isThreadQuiescent(status: ThreadStatus | undefined): boolean {
  *  (`answeringThreadIds`) or typed a follow-up not yet ingested
  *  (`pendingUserMessages`).
  *
- *  Without this carve-out the answer→resume gap mislabels the answered turn as
- *  aborted: the backend flips the projection to `running` on
- *  `UserQuestionAnswered`, but the client's `meta.status` only advances when a
- *  per-event aggregate carrying `running` arrives — and the resume's first
- *  events can land while the snapshot still reads `waiting_for_user_answer`
- *  (quiescent). The answered question-divider then has steps + no terminal +
- *  `threadIdle`, and the stale-detector in `exchange-render.ts` flashes
- *  "Aborted ⚠" until the `running` aggregate finally lands (observed as an ~8s
- *  flash spanning the model's first post-answer LLM call). Mirrors the
- *  `?.status` → `undefined` → `false` (treat-as-active) fallback of the prior
- *  inline `isThreadQuiescent(threadMeta?.status)`. */
+ *  Without this carve-out the answer-to-resume gap mislabels the answered turn
+ *  as aborted. The backend flips the projection to `running` on
+ *  `UserQuestionAnswered`, but the client's `meta.status` advances only when a
+ *  per-event aggregate carrying `running` arrives. The resume's first events
+ *  can land while the snapshot still reads `waiting_for_user_answer`. The
+ *  answered divider then has steps, no terminal and `threadIdle`, and the
+ *  stale detector in `exchange-render.ts` flashes "Aborted" until the
+ *  aggregate lands. An unknown thread falls back to treat-as-active. */
 export function isRenderedThreadIdle(thread: ThreadState | undefined): boolean {
   if (!thread) return false;
   if (answeringThreadIds.value.has(thread.meta.id)) return false;
@@ -886,12 +896,11 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
   );
 }
 
-/** Threads in the Current drawer section, ignoring the active channel/trigger/
- *  repo/app filter. `displaySection` ignores `meta.state`, so the drawer-hidden
- *  carve-out is applied here too. This is the unfiltered section membership; the
+/** Threads in the Current drawer section, ignoring the active filter.
+ *  `displaySection` ignores `meta.state`, so the drawer-hidden carve-out is
+ *  applied here too. This is the UNFILTERED section membership. The
  *  archive-next-focus picker walks the drawer's filter-aware render order
- *  (`orderedCurrentForReview`) so it only lands on a thread the user can
- *  actually see. */
+ *  (`orderedCurrentForReview`), so it lands only on a visible thread. */
 export function getCurrentThreads(): ThreadState[] {
   const result: ThreadState[] = [];
   for (const thread of threadMap.value.values()) {
@@ -901,41 +910,43 @@ export function getCurrentThreads(): ThreadState[] {
   return result;
 }
 
-/** Whether a thread needs the user's attention: it sits in the Current or Saved
- *  section AND the agent is stuck waiting on the user — a question or permission
- *  request (both surface as `waiting_for_user_answer`) or a failed turn the user
- *  must address. This is the "you must act, nothing progresses until you do"
- *  subset; a change merely *ready to apply* is `threadInReview`, a separate
- *  view. (`waiting_for_user_answer`/`failed` are mutually exclusive with
- *  `running`, so no running guard is needed here.) Composing/discarded threads
- *  never qualify. Shared by `attentionThreadCount` (the selector's
- *  needs-attention badge) and `attentionThreads` (the view), so the count and
- *  the filtered list can never disagree. */
+/** Whether a thread needs the user's attention. It sits in the Current or
+ *  Saved section AND the agent is stuck waiting on the user: a question or a
+ *  permission request, both of which surface as `waiting_for_user_answer`, or
+ *  a failed turn. This is the "nothing progresses until you act" subset, where
+ *  a change merely READY to apply is `threadInReview`, a separate view.
+ *
+ *  Both statuses are mutually exclusive with `running`, so no running guard is
+ *  needed. A composing or discarded thread never qualifies. Shared by
+ *  `attentionThreadCount` and `attentionThreads`, so the badge and the
+ *  filtered list cannot disagree. */
 export function threadNeedsAttention(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
   const status = effectiveThreadStatus(thread);
-  // `paused` is deliberately absent, and since 2026-08-06 that is precise rather
-  // than a judgement call: the backend writes `paused` for exactly one shape, the
-  // user's own Switch to new version, which the engine resumes by itself within
-  // seconds. Nothing progresses *because* of the user there, so counting it would
-  // flash the badge on every version switch. Every OTHER interruption, including
-  // a boot that could not keep that resume promise, is written `failed` and lands
-  // in the `failed` arm below with its Continue button. A paused thread still
-  // floats to the top of Current with its own dot via `reviewTier`.
+  // `paused` is deliberately absent, and precisely so: the backend writes it
+  // for exactly one shape, the user's own Switch to new version, which the
+  // engine resumes by itself within seconds. Nothing progresses BECAUSE of the
+  // user there, so counting it would flash the badge on every switch.
+  //
+  // Every OTHER interruption is written `failed`, including a boot that could
+  // not keep that resume promise. Those land in the arm below with a Continue
+  // button. A paused thread still floats to the top of Current with its own
+  // dot via `reviewTier`.
   return status === 'waiting_for_user_answer' || status === 'failed';
 }
 
-/** Whether a thread is ready for review: it sits in the Current or Saved section
- *  AND carries a coding-agent change ready to apply (`codingAgentProposed`). A
- *  mid-turn (`running`) thread is excluded — a proposed change whose follow-up
- *  turn is still in flight is not yet *ready* to apply (its WaitingBanner shows
- *  Cancel, not Apply), mirroring `getCodingAgentWaitingInfo`'s running guard so
- *  the badge can't claim a thread whose Apply button isn't even showing.
- *  Independent of `threadNeedsAttention`: a thread that is both awaiting an
- *  answer AND carrying a proposed change legitimately surfaces in both views.
- *  Shared by `reviewThreadCount` and `reviewThreads`. */
+/** Whether a thread is ready for review. It sits in the Current or Saved
+ *  section AND carries a coding-agent change ready to apply
+ *  (`codingAgentProposed`). A `running` thread is excluded, because a proposed
+ *  change whose follow-up turn is in flight is not yet READY: its
+ *  WaitingBanner shows Cancel rather than Apply. That mirrors
+ *  `getCodingAgentWaitingInfo`'s running guard, so the badge cannot claim a
+ *  thread with no Apply button showing.
+ *
+ *  Independent of `threadNeedsAttention`. A thread both awaiting an answer and
+ *  carrying a proposed change legitimately surfaces in both views. */
 export function threadInReview(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
@@ -944,9 +955,9 @@ export function threadInReview(thread: ThreadState): boolean {
   return thread.meta.codingAgentProposed;
 }
 
-/** Count of threads where the agent is stuck waiting on the user — awaiting
- *  answer/permission or a failed turn (see `threadNeedsAttention`) — across the
- *  Current and Saved sections. Drives the selector's needs-attention badge. */
+/** Count of threads where the agent is stuck waiting on the user (see
+ *  `threadNeedsAttention`), across the Current and Saved sections. Drives the
+ *  selector's needs-attention badge. */
 export const attentionThreadCount = computed(() => {
   let count = 0;
   for (const thread of threadMap.value.values()) {
@@ -965,15 +976,15 @@ export const reviewThreadCount = computed(() => {
   return count;
 });
 
-/** Whether a thread is actively working: it sits in the Current or Saved section
- *  AND its effective status is `running` (the agent is producing a response — the
- *  same state the status dot labels "Running"). A `running` thread always routes
- *  to Current/Saved (see `displaySection`), so the section gate never drops one;
- *  it only keeps the excluded (composing/discarded) carve-out in lockstep with
- *  the sibling predicates. Independent of `threadNeedsAttention`/`threadInReview`
- *  — those exclude `running`, so the three views never claim the same thread.
- *  Shared by `runningThreadCount` (the selector's running badge) and
- *  `runningThreads` (the view) so the count and the filtered list can't disagree. */
+/** Whether a thread is actively working. It sits in the Current or Saved
+ *  section AND its effective status is `running`, the state the status dot
+ *  labels "Running".
+ *
+ *  A `running` thread always routes to Current or Saved (`displaySection`), so
+ *  the section gate never drops one. It only keeps the composing and discarded
+ *  carve-out in lockstep with the sibling predicates. Independent of
+ *  `threadNeedsAttention` and `threadInReview`, which both exclude `running`,
+ *  so the three views never claim the same thread. */
 export function threadIsRunning(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
@@ -994,10 +1005,10 @@ export const runningThreadCount = computed(() => {
 export const activeExchanges = computed<Exchange[]>(() => {
   const id = focusedThreadId.value;
   if (!id) return [];
-  // Subscribe to ONLY this thread's events bump — other threads' streaming
-  // doesn't fan out here. Then `threadMap.peek()` reads the current map
+  // Subscribe to ONLY this thread's events bump, so another thread's
+  // streaming does not fan out here. `threadMap.peek()` then reads the map
   // without a wide subscription. The bump fires on every event arrival for
-  // this thread (including the SSE skeleton-create path), so the computed
+  // this thread, including the SSE skeleton-create path, so the computed
   // catches a freshly-inserted thread as soon as its first event lands.
   getThreadEventsBump(id);
   const thread = threadMap.peek().get(id);
@@ -1008,9 +1019,9 @@ export const activeExchanges = computed<Exchange[]>(() => {
 export const activeStreamingBuffer = computed(() => {
   const id = focusedThreadId.value;
   if (!id) return '';
-  // Per-thread bump subscription — see `activeExchanges` above for the
-  // pattern. `streamingBuffer` mutates per token, which is exactly what
-  // bumpThreadEvents fires on, so the live token stream lands here.
+  // Per-thread bump subscription, as in `activeExchanges` above.
+  // `streamingBuffer` mutates per token, which is what bumpThreadEvents fires
+  // on, so the live token stream lands here.
   getThreadEventsBump(id);
   const thread = threadMap.peek().get(id);
   if (!thread) return '';
@@ -1023,11 +1034,11 @@ export const activeThreadIsComposing = computed(() => {
   return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
-// True when the prompt is in the centered "compose" layout: either the brand-new
-// blank view (no focused thread and no exchanges) or a focused composing draft.
-// Single source of truth for both ThreadPane's compose↔active FLIP and
-// PromptInput's compose↔compose height animation, so they agree by construction:
-// the FLIP fires only when this CHANGES; the height-anim only while it STAYS true.
+// True when the prompt is in the centered "compose" layout: either the blank
+// view, with no focused thread and no exchanges, or a focused composing draft.
+// One source of truth for ThreadPane's FLIP and PromptInput's height
+// animation, so they agree by construction. The FLIP fires only when this
+// CHANGES; the height animation runs only while it STAYS true.
 export const composeViewActive = computed(() => {
   const id = focusedThreadId.value;
   const isEmpty = activeExchanges.value.length === 0;
@@ -1061,13 +1072,11 @@ export const MOBILE_VIEWS: MobileView[] = [...PANE_DEFS];
 export const PANE_INDEX: Record<MobileView, number> =
   Object.fromEntries(PANE_DEFS.map((v, i) => [v, i])) as Record<MobileView, number>;
 export const PANE_COUNT = PANE_DEFS.length;
-// Persisted in localStorage so the last-viewed pane survives the PWA being killed
-// — reopening lands on the pane the user left (e.g. 'content'), not a forced reset
-// to 'thread'. Session-scoping was the old behavior, chosen to avoid stranding the
-// user on a content pane whose content didn't survive; that rationale is now
-// obsolete because the content pane's actual content (open app/file/url) is
-// independently restored from the localStorage nav stack (see navigation.ts
-// `restoreState`), so a restored 'content' pane is never blank.
+// Persisted in localStorage so the last-viewed pane survives the PWA being
+// killed. Reopening lands on the pane the user left rather than a forced reset
+// to 'thread'. Safe because the content pane's own content is independently
+// restored from the localStorage nav stack (navigation.ts `restoreState`), so
+// a restored 'content' pane is never blank.
 export const MOBILE_VIEW_KEY = 'lucidos-mobile-view';
 
 export function getInitialMobileView(): MobileView {
@@ -1088,9 +1097,9 @@ export type InputMode =
   | { type: 'coding_agent' };
 
 /** Remembers the last pick across page reloads via localStorage. The matching
- *  persist effect lives in `effects.ts`. `sendCompose` / `discardCompose` no
- *  longer reset this — the user explicitly asked for the choice to stick so
- *  picking Claude once means the next fresh compose stays on Claude too. */
+ *  persist effect lives in `effects.ts`. Send and discard deliberately do NOT
+ *  reset it: the choice sticks, so the next fresh compose keeps the mode the
+ *  user picked. */
 function restoreInputMode(): InputMode {
   try {
     const raw = localStorage.getItem('lucidos-input-mode');
@@ -1103,9 +1112,9 @@ function restoreInputMode(): InputMode {
     }
     return { type: 'do' };
   } catch (err) {
-    // Startup probe the user did not initiate — no toast/Loadable surface
-    // exists at module-load time. Self-recovery: the next toggle click fires
-    // the persist effect in effects.ts and overwrites the bad payload.
+    // Startup probe the user did not initiate, and no toast or Loadable
+    // surface exists at module-load time. Self-recovery: the next toggle click
+    // fires the persist effect in effects.ts and overwrites the bad payload.
     console.warn('[store] dropping malformed lucidos-input-mode payload', err);
     return { type: 'do' };
   }
@@ -1123,20 +1132,19 @@ export interface Repository {
 export const repositories = signal<Loadable<Repository[]>>({ status: 'not-loaded' });
 
 // --- Compose destination: coding target ---
-// Discriminated union of where a coding-agent thread should run — the coding
-// half of the compose destination (see store/composeDestination.ts). The
-// destination picker writes here via `applyDestination`; chat.ts resolves it
-// to the engine's `folder` request field; compose.ts binds the resolved values
-// onto the promoted thread's `meta` (codingAgentKind / codingAgentFolder /
-// repoId).
+// Where a coding-agent thread should run: the coding half of the compose
+// destination (see store/composeDestination.ts). The destination picker writes
+// here via `applyDestination`. chat.ts resolves it to the engine's `folder`
+// request field, and compose.ts binds the resolved values onto the promoted
+// thread's `meta`.
 export type Scope =
   | { kind: 'lucidos' }
   | { kind: 'external'; repoId: string }
   | { kind: 'app'; appId: string };
 
 const SCOPE_STORAGE_KEY = 'lucidos-coding-agent-last-scope';
-// Pre coding-agent-rename key name — read once, migrated to SCOPE_STORAGE_KEY,
-// then deleted so a long-lived PWA keeps the user's compose destination.
+// Legacy key names. Read once, migrated to SCOPE_STORAGE_KEY, then deleted, so
+// a long-lived PWA keeps the user's compose destination.
 const LEGACY_SCOPE_STORAGE_KEY = 'lucidos-cc-last-scope';
 const LEGACY_REPO_STORAGE_KEY = 'lucidos-cc-last-repo';
 
@@ -1154,7 +1162,7 @@ function parseStoredScope(raw: string | null): Scope | null {
       }
     }
   } catch {
-    // Corrupt value — fall through to migration / default.
+    // Corrupt value: fall through to migration or default.
   }
   return null;
 }
@@ -1163,9 +1171,8 @@ function restoreScope(): Scope {
   const current = parseStoredScope(localStorage.getItem(SCOPE_STORAGE_KEY));
   if (current) return current;
 
-  // One-time migration from the pre-rename `lucidos-cc-last-scope` key: read it,
-  // rewrite under the new key, and delete the old one so the next reload reads
-  // the new shape directly.
+  // One-time migration from the pre-rename key: read it, rewrite under the new
+  // key, and delete the old one, so the next reload reads the new shape.
   if (localStorage.getItem(LEGACY_SCOPE_STORAGE_KEY) !== null) {
     const renamed = parseStoredScope(localStorage.getItem(LEGACY_SCOPE_STORAGE_KEY));
     localStorage.removeItem(LEGACY_SCOPE_STORAGE_KEY);
@@ -1175,9 +1182,8 @@ function restoreScope(): Scope {
     }
   }
 
-  // Older one-time migration from the legacy `lucidos-cc-last-repo` string ('' meant
-  // Lucidos, any other value was an external repo UUID). Migrate once at
-  // startup and delete the legacy key so the next reload reads the new shape.
+  // Older one-time migration from a bare repo string, where '' meant Lucidos
+  // and any other value was an external repo UUID.
   const legacy = localStorage.getItem(LEGACY_REPO_STORAGE_KEY);
   if (legacy !== null) {
     localStorage.removeItem(LEGACY_REPO_STORAGE_KEY);
@@ -1192,20 +1198,21 @@ function restoreScope(): Scope {
 
 export const selectedScope = signal<Scope>(restoreScope());
 
-/** The account DEFAULT coding agent (Claude Code | Codex) — the SEED for a fresh
- *  compose's backend chip. Seeded from the `coding_agent_default` preference by
- *  `loadPreferences`. Per-draft compose picks live in `composeSelections` and do
- *  NOT write this back (draft-only), so changing the chip on one draft never
- *  changes another draft or this default; `resolveCodingAgent` falls back here
- *  for an override-less draft. Bound onto the thread's meta at compose promotion
- *  (`sendCompose`). (See ADR 0006 for the workspace-scoped default.) */
+/** The account DEFAULT coding agent: the SEED for a fresh compose's backend
+ *  chip, from the `coding_agent_default` preference.
+ *
+ *  A per-draft pick lives in `composeSelections` and does NOT write back here,
+ *  so changing the chip on one draft never changes another or this default.
+ *  `resolveCodingAgent` falls back here for an override-less draft.
+ *  `sendCompose` binds the result onto the thread's meta at promotion. See ADR
+ *  0006 for the workspace-scoped default. */
 export const selectedCodingAgent = signal<import('../api/types').CodingAgent>('claude-code');
 
-/** Translate a Scope into the engine's `folder` request field. Lucidos →
- *  empty string (engine defaults to Lucidos when both folder and repo_id are
- *  empty). External → the repo UUID (engine's `resolve_folder_input` looks
- *  it up in the registry). App → workspace-relative path which
- *  `classify_resolved_folder` matches to the app branch. */
+/** Translate a Scope into the engine's `folder` request field.
+ *  Lucidos gives the empty string, which the engine defaults to Lucidos.
+ *  External gives the repo UUID, which `resolve_folder_input` looks up.
+ *  App gives a workspace-relative path, which `classify_resolved_folder`
+ *  matches to the app branch. */
 export function scopeToFolder(scope: Scope): string {
   switch (scope.kind) {
     case 'lucidos': return '';
@@ -1214,9 +1221,8 @@ export function scopeToFolder(scope: Scope): string {
   }
 }
 
-/** Read the repo UUID out of a Scope when one applies — used by code paths
- *  that still need to surface the bound repo (e.g. CodingAgentControlMenu's
- *  per-repo command listing). App + Lucidos return undefined; the menu
+/** Read the repo UUID out of a Scope when one applies, for a path that has to
+ *  surface the bound repo. App and Lucidos return undefined, and the caller
  *  falls back to its default Lucidos resolution. */
 export function scopeToRepoId(scope: Scope): string | undefined {
   return scope.kind === 'external' ? scope.repoId : undefined;
@@ -1268,9 +1274,9 @@ export const selectedLines = signal<{ start: number; end: number } | null>(null)
  *
  *  Deliberately NOT derived from `selectedLines`. An effect keyed on the
  *  selection would re-scroll on every unrelated re-render that keeps the
- *  selection alive (an `artifactRevision` bump, a `repoPending` refetch),
- *  yanking a user who had scrolled away, and it would fight a shift-click that
- *  extends a selection upward. Mirrors `pluginScrollTarget`. */
+ *  selection alive, yanking a user who had scrolled away. It would also fight
+ *  a shift-click that extends a selection upward. Mirrors
+ *  `pluginScrollTarget`. */
 export const lineScrollTarget = signal<number | null>(null);
 
 /** Take the pending scroll target, clearing it so the same navigate can't
@@ -1284,15 +1290,15 @@ export function consumeLineScrollTarget(): number | null {
 /** Turn a navigate's `line` / `line_end` pair into a selectable range, or null
  *  when there is nothing usable to select.
  *
- *  These arrive from outside the app (an app iframe's `lucidos.ui.navigate`, an
- *  LLM `navigate_ui`, an `<a href>` inside a previewed artifact), so anything
- *  that isn't a positive whole number is rejected rather than trusted: a
- *  fractional or negative line would index a row that doesn't exist and a
- *  non-number would render as `NaN` in the highlight comparison. An inverted
- *  range is swapped rather than dropped, since the author's intent is
- *  unambiguous. Whether the range fits INSIDE the file is not checked here: the
- *  line count isn't known until the content loads, and a range past the end
- *  simply highlights nothing (the file still opens, which is the point). */
+ *  These arrive from outside the app, so anything that is not a positive whole
+ *  number is rejected rather than trusted. A fractional or negative line would
+ *  index a row that does not exist, and a non-number would render as `NaN` in
+ *  the highlight comparison. An inverted range is swapped rather than dropped,
+ *  since the author's intent is unambiguous.
+ *
+ *  Whether the range fits INSIDE the file is deliberately NOT checked. The
+ *  line count is unknown until the content loads, and a range past the end
+ *  highlights nothing while the file still opens. */
 export function normalizeLineRange(
   line: unknown,
   lineEnd?: unknown,
@@ -1321,10 +1327,10 @@ export const selectedChange = computed(() => {
 
 /** A file in a registered repository clone, named by an encoded `repo:` string.
  *
- *  The mode segment carries the qualifier both modes need, and they are
- *  different qualifiers, which is why this is a union rather than one shape with
- *  two optional fields: a `file` names a git revision, a `diff` names the Change
- *  whose hunks to show. Neither is meaningful in the other's mode. */
+ *  A union rather than one shape with two optional fields, because the two
+ *  modes need DIFFERENT qualifiers. A `file` names a git revision, a `diff`
+ *  names the Change whose hunks to show, and neither is meaningful in the
+ *  other's mode. */
 export type RepoLocator =
   | {
       repoId: string;
@@ -1339,46 +1345,42 @@ export type RepoLocator =
 /** Encode a repo file locator for the panel overlay.
  *
  *  The qualifier is embedded in the mode segment (`file#<ref>`,
- *  `diff#<changeId>`) rather than added as a fourth colon-separated field, so it
- *  survives nav history persistence AND stays unambiguous: a git ref cannot
- *  contain a colon (`git check-ref-format`), and a path can, so the existing
- *  "everything after the third colon is the path" rule still holds. Without the
- *  embedded changeId, reloading on a diff view hits a spinner forever because
+ *  `diff#<changeId>`) rather than added as a fourth colon-separated field. It
+ *  therefore survives nav history persistence AND stays unambiguous: a git ref
+ *  cannot contain a colon (`git check-ref-format`) and a path can, so the
+ *  "everything after the third colon is the path" rule still holds. Without
+ *  the embedded changeId, reloading on a diff view spins forever, because
  *  repoDiff is runtime-only state.
  *
  *  Takes the parsed shape so this is the exact inverse of `parseRepoPath`:
- *  `encodeRepoPath(parseRepoPath(s)) === s` for every locator `s` that parses. */
+ *  `encodeRepoPath(parseRepoPath(s)) === s` for every locator `s` that
+ *  parses. */
 export function encodeRepoPath(locator: RepoLocator): string {
   const qualifier = locator.mode === 'file' ? locator.ref : locator.changeId;
   const modeSeg = qualifier ? `${locator.mode}#${qualifier}` : locator.mode;
   return `repo:${locator.repoId}:${modeSeg}:${locator.path}`;
 }
 
-/** Decode a repo file path from the panel overlay. Returns null if not a repo path.
+/** Decode a repo file path from the panel overlay, or null when it is not one.
  *
  *  Four forms, all of them live:
  *
  *    repo:<repoId>:file:<path>              the clone's current HEAD
  *    repo:<repoId>:file#<ref>:<path>        that branch, tag or sha
  *    repo:<repoId>:diff#<changeId>:<path>   a Change's diff
- *    repo:<repoId>:diff:<path>              legacy, from nav histories persisted
- *                                           before the changeId was embedded;
- *                                           degrades to changeId-less but parses
+ *    repo:<repoId>:diff:<path>              legacy, changeId-less, still parses
  *
- *  Every segment must be non-empty: this is the single predicate that decides
- *  "is this a repo path" for `normalizeDataPath`, `ContentPane`'s routing, and
- *  `openEncodedRepoFilePreview`, and `file_path` reaches it from outside the app
- *  (an app iframe's `lucidos.ui.navigate` / `previewFile`, an LLM `navigate_ui`,
- *  an `<a href="repo:…">` inside a previewed artifact). A structurally
- *  incomplete encoding like `repo::file:x`, `repo:r1:file:` or `repo:r1:file#:x`
- *  would otherwise parse into an empty repoId (an "is a repo selected?" state
- *  that is neither null nor a real id), an empty path, or an empty ref, and open
- *  a preview that can only 404, instead of falling back to the data-path preview.
+ *  Every segment must be non-empty. This is the single predicate deciding "is
+ *  this a repo path" for `normalizeDataPath`, `ContentPane`'s routing and
+ *  `openEncodedRepoFilePreview`, and `file_path` reaches it from OUTSIDE the
+ *  app. A structurally incomplete encoding like `repo::file:x` would otherwise
+ *  parse into an empty repoId, path or ref. That opens a preview which can
+ *  only 404, instead of falling back to the data-path preview.
  *
  *  The qualifier is sliced at the FIRST `#`, so a ref that itself contains one
- *  (`#` is legal in a ref name, unlike `:`) survives intact. This is also what
- *  keeps a GitHub-style `#L510` line suffix on an href working: that suffix is
- *  stripped by `parseRepoFileHref` before the locator ever reaches here. */
+ *  survives intact (`#` is legal in a ref name, unlike `:`). That also keeps a
+ *  GitHub-style `#L510` line suffix working, since `parseRepoFileHref` strips
+ *  it before the locator reaches here. */
 export function parseRepoPath(encoded: string): RepoLocator | null {
   if (!encoded.startsWith('repo:')) return null;
   const [, repoId, modeSeg, ...rest] = encoded.split(':');
@@ -1396,15 +1398,16 @@ export function parseRepoPath(encoded: string): RepoLocator | null {
   return null;
 }
 
-/** Effective whole-file view state for the current diff preview. Resolves the
- *  `diffWholeFile` user override against a per-file default: an *added* file
- *  defaults to the whole-file (regular) view since its diff is 100% additions —
- *  rendering it as unified hunks just prefixes every line with `+`. Modified and
- *  deleted files default to the hunks. An explicit header toggle writes a boolean
- *  to `diffWholeFile`, which then wins until the previewed file changes (the reset
- *  in store/effects.ts puts it back to `null`). Derived from file status rather
- *  than stamped at open time so it stays correct after a reload, where `repoDiff`
- *  re-populates asynchronously under a nav-restored overlay. */
+/** Effective whole-file view state for the current diff preview, resolving the
+ *  `diffWholeFile` override against a per-file default. An ADDED file defaults
+ *  to the whole-file view, since its diff is all additions and unified hunks
+ *  would just prefix every line with `+`. A modified or deleted file defaults
+ *  to the hunks. An explicit header toggle writes a boolean and wins until the
+ *  previewed file changes.
+ *
+ *  Derived from file status rather than stamped at open time, so it stays
+ *  correct after a reload, where `repoDiff` re-populates asynchronously under
+ *  a nav-restored overlay. */
 export const diffWholeFileEffective = computed<boolean>(() => {
   const override = diffWholeFile.value;
   if (override !== null) return override;
@@ -1425,18 +1428,18 @@ export const applyingChangeIds = signal<Set<string>>(new Set());
  *  Tracks the phase: 'requesting' (waiting for backend) → 'applying' (ChangeProposed arrived).
  *  Cleared when the apply completes, fails, or the backend takes over. */
 export const applyingNowThreadIds = signal<Map<string, 'requesting' | 'applying'>>(new Map());
-/** Whether an "Apply All" batch is currently running. Drives the busy state of
- *  the bulk Apply All / Discard All buttons. Set optimistically when the user
- *  clicks Apply All (and by the ApplyAllBatchStarted SSE event — so a batch
- *  started on another device disables the buttons here too), cleared by
- *  ApplyAllBatchCompleted (or an immediate HTTP error). The batch applies the
- *  first change synchronously and drives the rest in the background — including
- *  a multi-minute wait while it hardens an unhardened member — so without this
- *  the button looked dead the whole time. */
+/** Whether an "Apply All" batch is running. Drives the busy state of the bulk
+ *  Apply All and Discard All buttons. Set optimistically on the click, and by
+ *  the ApplyAllBatchStarted SSE event so a batch started on another device
+ *  disables the buttons here too. Cleared by ApplyAllBatchCompleted.
+ *
+ *  The batch applies the first change synchronously and drives the rest in the
+ *  background, including a multi-minute wait while it hardens an unhardened
+ *  member. Without this the button reads as dead the whole time. */
 export const applyAllInProgress = signal(false);
 /** Thread IDs where archive is in progress (prevents duplicate API calls). */
 export const archivingThreadIds = signal<Set<string>>(new Set());
-/** Thread IDs where CC changes discard is in progress (hides Apply, shows "Discard..."). */
+/** Thread IDs whose change discard is in progress: hides Apply, shows "Discard...". */
 export const discardingCCThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs where Cancel was clicked while an exchange is active. Disables
  *  the Cancel button (shows "Cancel...") and drives the spinner status label.
@@ -1445,12 +1448,11 @@ export const cancelingThreadIds = signal<Set<string>>(new Set());
 /** Queued chat messages being removed optimistically, keyed by thread + event id. */
 export const removingQueuedMessageIds = signal<Set<string>>(new Set());
 export const queuedMessageRemovalKey = (threadId: string, messageId: string): string => `${threadId}:${messageId}`;
-/** Thread IDs where a pending question was just answered and the agent's resume
- *  hasn't yet advanced the client's `meta.status` off `waiting_for_user_answer`.
- *  Read by `isRenderedThreadIdle` to suppress the answer→resume "Aborted" flash
- *  (see that function). Set in the `answerThreadQuestion` action; cleared once
- *  the real status leaves `waiting_for_user_answer` (PromptInput effect) or on
- *  answer failure (the action's 409/catch paths). */
+/** Thread IDs whose pending question was just answered, where the agent's
+ *  resume has not yet moved the client's `meta.status` off
+ *  `waiting_for_user_answer`. `isRenderedThreadIdle` reads it to suppress the
+ *  "Aborted" flash in that gap. Set in the `answerThreadQuestion` action, and
+ *  cleared once the real status moves or the answer fails. */
 export const answeringThreadIds = signal<Set<string>>(new Set());
 
 /** Stamp a thread as awaiting question-answer resume (optimistic). */
@@ -1479,8 +1481,8 @@ export const appliedChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' 
  *  token; `failed` prevents refetching a 404. */
 export const lazyChanges = signal<Map<string, Loadable<Change>>>(new Map());
 /** Look up a change by id across all three chat-change sources. Returns the
- *  resolved `Change` only — callers that need to distinguish loading/failed
- *  should read `lazyChanges.value.get(id)` directly. */
+ *  resolved `Change` only. A caller that has to tell loading from failed reads
+ *  `lazyChanges.value.get(id)` directly. */
 export function findChangeById(id: string): Change | undefined {
   if (changes.value.status === 'loaded') {
     const pending = changes.value.data.find(c => c.id === id);
@@ -1493,8 +1495,8 @@ export function findChangeById(id: string): Change | undefined {
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;
 }
-/** All change IDs currently being applied — single source of truth combining
- *  change-level tracking (applyingChangeIds) and thread-level tracking (applyingNowThreadIds). */
+/** Every change id currently being applied: the single source of truth,
+ *  combining `applyingChangeIds` and `applyingNowThreadIds`. */
 export const busyChangeIds = computed(() => {
   const ids = new Set(applyingChangeIds.value);
   const threadIds = applyingNowThreadIds.value;
@@ -1505,13 +1507,11 @@ export const busyChangeIds = computed(() => {
   }
   return ids;
 });
-/** Thread IDs that own a pending change currently being applied — the reverse
- *  of busyChangeIds, mapping change-level apply tracking (applyingChangeIds: an
- *  Apply All batch member, hardening revival, or conflict resolution) back onto
- *  its originating thread. Lets the focused thread's WaitingBanner show
+/** Thread IDs that own a pending change currently being applied: the reverse of
+ *  `busyChangeIds`, mapping change-level apply tracking back onto its
+ *  originating thread. That lets the focused thread's WaitingBanner show
  *  "Apply..." when its change is applied from the Changes panel, mirroring the
- *  in-thread Apply Now path (applyingNowThreadIds) which is tracked thread-side
- *  to begin with. */
+ *  in-thread Apply Now path, which is thread-side to begin with. */
 export const applyingChangeThreadIds = computed(() => {
   const result = new Set<string>();
   const ids = applyingChangeIds.value;
@@ -1543,16 +1543,12 @@ export const restartGroups = signal<RestartGroup[]>([]);
  *  them off: a turn shows its full response and its step log by default.
  *
  *  Storage holds only the DEVIATION, which is what makes that a real default
- *  rather than one only a fresh browser profile ever sees. The pre-2026-08-11
- *  keys were written on every load, clicked or not, by a persisting effect that
- *  did not distinguish the default from a choice, so every browser that had
- *  opened the app held a `false` recording the old default and nobody's intent.
- *  Reading those would pin every existing reader to the default this replaces,
- *  and there is no intent in them to migrate, so the pair is dropped and the
- *  seeds read `-v2` keys. A reader who really had turned steps off pays for
- *  that once, by turning them off again.
+ *  rather than one only a fresh browser profile ever sees. The superseded keys
+ *  were written on every load, clicked or not, so they record the old default
+ *  and nobody's intent. There is nothing in them to migrate, so the seeds read
+ *  `-v2` keys instead.
  *
- *  `persistTurnControl` is the other half and keeps the rename from ever being
+ *  `persistTurnControl` is the other half, and it keeps the rename from being
  *  needed again: an ON control stores nothing at all, so a stored value always
  *  means the reader turned something off. */
 export const STEPS_EXPANDED_KEY = 'lucidos-steps-expanded-v2';
@@ -1575,9 +1571,10 @@ export function persistTurnControl(key: string, on: boolean): void {
 
 export const stepsExpanded = signal(seedTurnControl(localStorage.getItem(STEPS_EXPANDED_KEY)));
 export const detailsExpanded = signal(seedTurnControl(localStorage.getItem(DETAILS_EXPANDED_KEY)));
-// Clear the superseded pair rather than leaving a `false` sitting under a name
-// so close to the live one: nothing reads it, and the next person looking at
-// this app's storage would read it as the state of a control that is on.
+// Clear the superseded pair rather than leaving a `false` under a name so
+// close to the live one. Nothing reads it, and the next person looking at this
+// app's storage would read it as the state of a control that is on.
+//
 // A one-shot purge, so it is removable: docs/temporary-measures.md
 // § "Superseded turn-control localStorage keys cleared at load" holds the
 // condition, and says the `-v2` names and the deviation-only write stay.
@@ -1589,10 +1586,9 @@ localStorage.removeItem('lucidos-details-expanded');
  *
  *  `expand` is the one-way half, and it is one-way on purpose: a fold is an
  *  explicit act, so something else may lift it but nothing may impose it. Its
- *  caller is the pair of transcript-wide reveals in the response header, which
- *  draw nothing on a turn that is folded (see `toggleDetails` / `toggleSteps`
- *  in ChatExchange.tsx). Turning one ON lifts the fold on the turn it was
- *  clicked from; turning one off never re-folds anything. */
+ *  callers are the transcript-wide reveals in the response header, which draw
+ *  nothing on a folded turn. Turning one ON lifts the fold on the turn it was
+ *  clicked from. Turning one off never re-folds anything. */
 function createCollapsedStore(storageKey: string) {
   const sig = signal<Set<string>>(loadStringSet(storageKey));
   function toggle(threadId: string, userSeq: number): void {
@@ -1630,20 +1626,20 @@ export const [collapsedInitiators, toggleInitiatorCollapsed] =
 export const artifacts = signal<Loadable<string[]>>({ status: 'not-loaded' });
 export const artifactRevision = signal(0);
 export const panelTitle = signal<string | null>(null);
-/** The URL that was set when the browser panel was opened (via openUrl or nav restore).
- *  Used to detect whether the user has navigated within the webview. */
+/** The URL the browser panel was opened at, so `webviewHasHistory` can tell
+ *  whether the user has navigated inside the webview since. */
 export const webviewInitialUrl = signal<string | null>(null);
 export const fileSearchOpen = signal(false);
-/** The toggle button that opened the file-search modal — passed to `<Overlay>`
- *  as the dismiss anchor (exempt from outside-pointerdown dismiss). */
+/** The toggle button that opened the file-search modal, passed to `<Overlay>`
+ *  as the dismiss anchor, which the outside-pointerdown dismiss exempts. */
 export const fileSearchAnchor = signal<HTMLElement | null>(null);
 
 // --- Search Everywhere ---
 export const searchEverywhereOpen = signal(false);
 
 /** The toggle button that opened the modal. Passed to the dismiss hook as the
- *  anchor so re-tapping the toggle closes via its own handler instead of the
- *  outside-pointerdown dismiss racing the touch toggle (which reopened it). */
+ *  anchor, so re-tapping the toggle closes via its own handler rather than
+ *  letting the outside-pointerdown dismiss race the touch toggle. */
 export const searchEverywhereAnchor = signal<HTMLElement | null>(null);
 
 export const expandedFolders = signal<Set<string>>(
@@ -1660,15 +1656,14 @@ export const expandedFolders = signal<Set<string>>(
 // --- Notifications ---
 export const notifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
 /** Single source of truth for unread notifications. The bell badge is a pure
- *  projection of this set — there is NO separately-fetched unread count to
- *  drift from it (the old `unreadCount` number could, which is how the badge
- *  came to show unread when the inbox held none). Maintained by
- *  actions/notifications.ts: loaded on startup / resume / notification SSE, with
- *  optimistic removal on mark-read. Bounded — unread is naturally small and the
- *  load is capped — so a pathological backlog simply renders as "99+". */
+ *  projection of this set, and NO separately-fetched count exists to drift
+ *  from it. Maintained by actions/notifications.ts: loaded on startup, resume
+ *  and notification SSE, with optimistic removal on mark-read. Bounded,
+ *  because unread is naturally small and the load is capped, so a pathological
+ *  backlog renders as "99+". */
 export const unreadNotifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
-/** Bell-badge count — DERIVED from the unread set, never independently fetched.
- *  Because the count IS the set's length, the badge can never contradict the
+/** Bell-badge count, DERIVED from the unread set and never independently
+ *  fetched. The count IS the set's length, so the badge cannot contradict the
  *  notifications themselves. */
 export const unreadCount = computed(() =>
   unreadNotifications.value.status === 'loaded' ? unreadNotifications.value.data.length : 0,
@@ -1704,11 +1699,11 @@ export const knownOAuthProviders = signal<Loadable<KnownOAuthProviders>>({ statu
 
 /** What Settings → Accounts should arrive pre-filled with, set by a deep link.
  *
- *  Carries the SCOPES as well as the provider, because the caller knows what the
- *  connection is FOR. Backup passes its upload scopes, so one authorization
- *  covers sign-in and upload instead of leaving the user facing *Grant access*
- *  back on the Backup page: a second trip through the provider's consent screen
- *  for one intent.
+ *  Carries the SCOPES as well as the provider, because the caller knows what
+ *  the connection is FOR. Backup passes its upload scopes, so one
+ *  authorization covers sign-in and upload. Without them the user lands back
+ *  on the Backup page facing *Grant access*, a second trip through the
+ *  provider's consent screen for one intent.
  *
  *  Consumed once by `SettingsView` and cleared, like `settingsScrollTarget`. */
 export const oauthConnectPrefill = signal<{ provider: string; scopes?: string } | null>(null);
@@ -1716,21 +1711,20 @@ export const oauthConnectPrefill = signal<{ provider: string; scopes?: string } 
 // --- Triggers ---
 export const triggers = signal<Loadable<TriggerInfo[]>>({ status: 'not-loaded' });
 
-/** Thread Queue panel state — queued + running background spawns plus the
- *  capacity policy. Refreshed on ThreadQueue* / CapacityPolicyChanged SSE. */
+/** Thread Queue panel state: queued and running background spawns, plus the
+ *  capacity policy. Refreshed on the queue and capacity-policy SSE events. */
 export const threadQueue = signal<Loadable<ThreadQueueResponse>>({ status: 'not-loaded' });
 
 export const historicalTriggers = signal<Loadable<HistoricalTriggerInfo[]>>({ status: 'not-loaded' });
 
-/** User-visible folders that organize triggers in the panel. Pure label —
- *  groups don't fire or schedule anything. Loaded from /trigger-groups on
- *  startup and kept live via SSE handlers in `thread-events.ts`. */
+/** User-visible folders that organize triggers in the panel. A pure label: a
+ *  group fires and schedules nothing. Loaded from /trigger-groups on startup
+ *  and kept live via SSE handlers in `thread-events.ts`. */
 export const triggerGroups = signal<Loadable<TriggerGroup[]>>({ status: 'not-loaded' });
 
-/** Per-device collapsed state for trigger-group sections in the panel,
- *  keyed by group_id. localStorage-backed so a collapsed Morning Routine
- *  section stays collapsed across reloads and engine restarts on this
- *  device, but doesn't sync across devices (phone and laptop independent). */
+/** Per-device collapsed state for trigger-group sections, keyed by group_id.
+ *  localStorage-backed, so a collapsed section stays collapsed across reloads
+ *  and engine restarts on this device without syncing to any other. */
 const COLLAPSED_TRIGGER_GROUPS_KEY = 'lucidos-collapsed-trigger-groups';
 
 function restoreCollapsedTriggerGroups(): Set<string> {
@@ -1756,14 +1750,16 @@ export function toggleTriggerGroupCollapsed(groupId: string): void {
 // --- Pending message (used to send a message from outside the chat module) ---
 export const pendingChatMessage = signal<string | null>(null);
 
-// --- Claude Code session version — bumped when a Claude Code session starts/resumes so components can re-fetch commands ---
+// Bumped when a coding-agent session starts or resumes, so components re-fetch
+// their commands.
 export const codingAgentSessionVersion = signal(0);
 
-// --- CC pending preferences — set from compose view before a session starts, consumed on first CC message ---
+// Set from the compose view before a session starts, consumed on the first
+// coding-agent message.
 export const codingAgentPendingModel = signal<CodingAgentModelValue | null>(null);
 export const codingAgentPendingReasoningEffort = signal<CodingAgentReasoningEffort | null>(null);
 
-/** Reset pending CC preferences to defaults. Called on thread switch and after sending. */
+/** Reset the pending preferences. Called on thread switch and after sending. */
 export function resetCodingAgentPendingPreferences(): void {
   codingAgentPendingModel.value = null;
   codingAgentPendingReasoningEffort.value = null;
@@ -1772,35 +1768,34 @@ export function resetCodingAgentPendingPreferences(): void {
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });
 export const marketplaceCatalog = signal<Loadable<MarketplaceCatalog>>({ status: 'not-loaded' });
-/** Installed plugins for the Plugins → Installed tab (from GET /plugins/installed
- *  — the event projection, no marketplace scan, so it works offline and still
- *  lists a plugin whose marketplace was later removed). */
+/** Installed plugins for the Plugins → Installed tab, from GET
+ *  /plugins/installed. That is the event projection rather than a marketplace
+ *  scan, so it works offline and still lists a plugin whose marketplace was
+ *  later removed. */
 export const installedPlugins = signal<Loadable<InstalledPlugin[]>>({ status: 'not-loaded' });
-/** Incremented to force-refresh app UI iframes. Used as a cache-busting key in the
- *  iframe src so Preact naturally propagates the reload to ALL iframe instances
- *  (desktop + mobile). 0 = initial load (no cache-buster needed). */
+/** Incremented to force-refresh app UI iframes, as a cache-busting key in the
+ *  iframe src, so Preact propagates the reload to every iframe instance. 0 is
+ *  the initial load, which needs no cache-buster. */
 export const appRefreshKey = signal(0);
-/** When set, the app UI iframe renders from the named app coding-agent
- *  thread's worktree (`?thread_id=<id>` route) instead of the live workspace
- *  data — the WIP app preview. Cleared on: button re-click, navigating away
- *  from the thread or opening a different app (focusedThreadId / currentApp
- *  effect in `actions/wipPreview.ts`), and on terminal change events
- *  (ChangeApplied / ChangeDiscarded / ChangeReverted / ThreadArchived in
- *  thread-sync.ts, plus the AppUiRefreshRequested path in refreshAppUI).
- *  Apply removes the worktree as part of ff-merge, so cleanup must fire
- *  before the iframe re-renders — iframes do not raise `onError` for HTTP
- *  4xx responses, so SSE-driven cleanup is the only reliable signal. */
+/** The WIP app preview. When set, the app UI iframe renders from the named app
+ *  coding-agent thread's worktree instead of the live workspace data.
+ *
+ *  Three things clear it: a button re-click, navigating away from the thread
+ *  or opening a different app (`actions/wipPreview.ts`), and a terminal change
+ *  event (thread-sync.ts, plus `AppUiRefreshRequested` in refreshAppUI).
+ *  Apply removes the worktree as part of the ff-merge, so cleanup must fire
+ *  before the iframe re-renders. An iframe raises no `onError` for an HTTP
+ *  4xx, so SSE-driven cleanup is the only reliable signal. */
 export const wipPreviewThreadId = signal<string | null>(null);
 export const pinnedApps = signal<Loadable<PinnedAppEntry[]>>(
   hydratePinnedAppsFromStorage(),
 );
 
-/** The **Plugins** panel's All | Installed filter. One unified catalog list
- *  shows installed and available plugins the same way (status badge + Uninstall
- *  on installed rows); this toggle just narrows it. `false` (default) → All (the
- *  whole catalog, plus any installed plugin whose marketplace is gone); `true` →
- *  only installed plugins. Persisted so a reload returns to the same view; absent
- *  state defaults to All. */
+/** The **Plugins** panel's All / Installed filter. One catalog list shows
+ *  installed and available plugins the same way, and this toggle narrows it.
+ *  `false`, the default, is All: the whole catalog plus any installed plugin
+ *  whose marketplace is gone. `true` is installed only. Persisted, so a reload
+ *  returns to the same view. */
 const PLUGINS_INSTALLED_ONLY_KEY = 'lucidos-plugins-installed-only';
 export const pluginsInstalledOnly = signal<boolean>(
   localStorage.getItem(PLUGINS_INSTALLED_ONLY_KEY) === 'true',
@@ -1810,15 +1805,13 @@ export function setPluginsInstalledOnly(next: boolean): void {
   localStorage.setItem(PLUGINS_INSTALLED_ONLY_KEY, String(next));
 }
 /** A plugin id the Plugins panel's list should scroll to and pulse-highlight
- *  once it renders — set by the update-notification deep-link (`navigate_ui`
- *  target `plugins`) so a tap lands the user on the exact plugin that has the
- *  pending update. Mirrors `settingsScrollTarget`; the `StoreTab` scroll effect
- *  consumes it once and clears it. */
+ *  once it renders. The update-notification deep-link sets it, so a tap lands
+ *  the user on the exact plugin with the pending update. Mirrors
+ *  `settingsScrollTarget`, and the `StoreTab` scroll effect consumes it once. */
 export const pluginScrollTarget = signal<string | null>(null);
-/** Inline content-pane search bar (the SearchIcon in the Apps / Plugins panel
- *  header). Filters the active list client-side — installed apps on Apps,
- *  installed plugins or the catalog on Plugins — mirroring the thread search.
- *  Shared because only one panel is visible at a time. */
+/** The inline content-pane search bar in the Apps and Plugins panel headers.
+ *  Filters the active list client-side, mirroring the thread search. Shared,
+ *  because only one of those panels is visible at a time. */
 export const appSearchOpen = signal(false);
 export const appSearchQuery = signal('');
 
@@ -1833,6 +1826,19 @@ export const confirmState = signal<ConfirmState>({
   okLabel: 'Delete',
 });
 
+/** The progress-dialog slot, one at a time. Both flows that will write it take
+ *  the workspace away, so two at once is not a state that exists.
+ *
+ *  Nothing in the app writes it yet. The surface gallery drives it instead, so
+ *  the shape can be judged before a real flow is pointed at it. See
+ *  docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md. */
+export const progressDialog = signal<ProgressDialogState>({
+  visible: false,
+  title: '',
+  message: '',
+  progress: null,
+});
+
 // --- Prompt dialog ---
 export const promptState = signal<PromptState>({
   visible: false,
@@ -1842,18 +1848,18 @@ export const promptState = signal<PromptState>({
 // --- File preview modal ---
 /** A file an app asked the host to show over it, without navigating the shell
  *  away (`lucidos.ui.previewFile`). Read-only, and deliberately NOT a
- *  `panelOverlay` variant: `panelOverlay` is the content pane's nav-history
- *  unit, and a glance at a cited file is not a destination the Back button
- *  should walk onto. Opened and closed through `store/actions/filePreviewModal`,
- *  which owns the view-state borrowing that makes the shared preview components
- *  render it. */
+ *  `panelOverlay` variant: that is the content pane's nav-history unit, and a
+ *  glance at a cited file is not a destination Back should walk onto.
+ *
+ *  Opened and closed through `store/actions/filePreviewModal`, which owns the
+ *  view-state borrowing that makes the shared preview components render it. */
 export interface FilePreviewModalState {
   /** Bumped per open, so a second `previewFile` that replaces a showing modal
    *  re-runs the component's per-open effects instead of looking unchanged. */
   id: number;
   /** The resolved locator: a workspace data path, or a `repo:` encoded path.
-   *  Parsed by the renderer with `parseRepoPath`, exactly as `ContentPane` parses
-   *  the panel's own file-preview path. */
+   *  The renderer parses it with `parseRepoPath`, exactly as `ContentPane`
+   *  parses the panel's own file-preview path. */
   path: string;
   /** The line range the modal opened at, or null when the citation named none.
    *  Kept so the escalation into the Files panel carries the same lines. */
@@ -1864,35 +1870,33 @@ export const filePreviewModal = signal<FilePreviewModalState | null>(null);
 // --- Toasts ---
 let toastIdCounter = 0;
 export const toasts = signal<ToastItem[]>([]);
-/** Standard "passive status banner" duration. Keyed toasts default to
- *  sticky (see `scheduleAutoDismiss`); callers without an action button to
- *  wait on opt back in with this so every such banner shares one tunable. */
+/** Standard "passive status banner" duration. A keyed toast defaults to sticky
+ *  (see `scheduleAutoDismiss`). A caller with no action button to wait on opts
+ *  back in here, so every such banner shares one tunable. */
 export const TOAST_AUTO_DISMISS_MS = 5_000;
 /** Pending auto-dismiss timers for keyed toasts. Cleared when the same key is
- *  re-shown (window restarts) or when the toast is dismissed by other means
- *  (close button, explicit dismissToast call) — without this cleanup, the
- *  Map entry would survive until the setTimeout fires. */
+ *  re-shown, restarting the window, or when the toast is dismissed some other
+ *  way. Without the cleanup the Map entry survives until the timeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Is the workspace unable to serve requests right now, for a reason that is
  *  already stated on screen by one authoritative toast?
  *
- *  Three ways in, and they are the same situation reached differently: every
- *  request in flight fails at once, all for one cause, and a per-request failure
- *  toast adds nothing over the status toast already up.
+ *  Three ways in, all the same situation reached differently: every request in
+ *  flight fails at once, for one cause, and a per-request failure toast adds
+ *  nothing over the status toast already up.
  *
- *    • `engineRestarting`: the engine goes down under us (Apply & Restart), with
- *      the UiBlockingOverlay covering the screen and the "Restarting engine…"
- *      status toast narrating it.
+ *    • `engineRestarting`: the engine goes down under us, with the
+ *      UiBlockingOverlay covering the screen and a status toast narrating it.
  *    • `appUpdateCommitted`: a packaged update past its point of no return
  *      restarts the launchd service, killing the gateway serving this page.
  *    • `!databaseReachable`: the engine is up and answering `/health`, but its
- *      database is not, so every query behind it fails. This one can last as long
- *      as Docker is down, which is exactly why one accurate toast beats twenty
+ *      database is not, so every query behind it fails. This one lasts as long
+ *      as Docker is down, which is why one accurate toast beats twenty
  *      inaccurate ones.
  *
- *  Suppression is only ever legitimate WITH that authoritative toast, which opts
- *  in via `showWhileUnavailable`. Each producer above owns one. */
+ *  Suppression is legitimate only WITH that authoritative toast, which opts in
+ *  via `showWhileUnavailable`. Each producer above owns one. */
 export function workspaceUnavailable(): boolean {
   return engineRestarting.value || appUpdateCommitted.value || !databaseReachable.value;
 }
@@ -1919,14 +1923,14 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
     }
   }
   const id = ++toastIdCounter;
-  // Freeze the toast over the pane focused right now — a later focus switch must
-  // not make it jump panes (drawer counts as the thread pane). The keyed-update
-  // branch above deliberately does NOT touch `pane`, so an in-place update keeps
-  // the toast where it first appeared.
+  // Freeze the toast over the pane focused right now, so a later focus switch
+  // cannot make it jump panes. The drawer counts as the thread pane. The
+  // keyed-update branch above deliberately does NOT touch `pane`, so an
+  // in-place update keeps the toast where it first appeared.
   const pane = focusedPane.value === 'content' ? 'content' : 'thread';
-  // Prepend so the newest toast renders at the top of its pane's column-stacked
-  // stack and pushes that pane's existing toasts down (each column is pinned to
-  // the top of the viewport, so array order is top→bottom).
+  // Prepend, so the newest toast renders at the top of its pane's column and
+  // pushes that pane's existing toasts down. Each column is pinned to the top
+  // of the viewport, so array order runs top to bottom.
   toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, pane }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
@@ -1951,18 +1955,17 @@ function scheduleAutoDismiss(key: string, autoDismissMs: number | undefined): vo
   keyedDismissTimers.set(key, setTimeout(() => dismissToast(key), autoDismissMs));
 }
 
-/** Structurally remove a keyed toast WITHOUT the user-dismiss side effects — it
- *  does NOT clear a badge or record a build as user-dismissed. Use this to keep a
- *  toast in lockstep with the signal that drives it (e.g. hide the Refresh toast
- *  the moment the client is no longer stale): a signal-driven hide must never be
- *  mistaken for the user dismissing the prompt, which would wrongly suppress it
- *  for that build. `dismissToast` (the user path) layers the side effects on top. */
+/** Structurally remove a keyed toast WITHOUT the user-dismiss side effects, so
+ *  it clears no badge and records no build as user-dismissed. Use it to keep a
+ *  toast in lockstep with the signal driving it. A signal-driven hide must
+ *  never be mistaken for the user dismissing the prompt, which would suppress
+ *  it for that build. `dismissToast` is the user path and adds the side
+ *  effects on top. */
 export function removeToast(key: string): void {
-  // Only REASSIGN when that key is actually showing: a fresh array notifies
-  // every subscriber even when it removed nothing, and callers that keep a toast
-  // in lockstep with a signal make exactly that no-op call on their happy path
-  // (retracting the "preferences aren't reaching the engine" banner runs on
-  // every successful save). Timer cleanup below stays unconditional.
+  // Only REASSIGN when that key is actually showing. A fresh array notifies
+  // every subscriber even when it removed nothing. A caller keeping a toast in
+  // lockstep with a signal makes exactly that no-op call on its happy path.
+  // Timer cleanup below stays unconditional.
   if (toasts.value.some((t) => t.key === key)) {
     toasts.value = toasts.value.filter((t) => t.key !== key);
   }
@@ -1979,17 +1982,21 @@ export function dismissToast(idOrKey: number | string) {
     return;
   }
   removeToast(idOrKey);
-  // User-dismiss side effect, per update surface: remember THIS build as
-  // dismissed (keyed by build id in hooks/sw-update.ts) so the honest re-checks
-  // don't re-surface the toast — a genuinely newer build still will. Dismiss ==
-  // "defer to later": it does NOT clear the badge — the badge stays lit as the
-  // persistent update affordance (the user updates from the reload badge). The
-  // badge is re-derived from staleness/readiness by the sync/poll checks, so it
-  // clears on its own once the client is current / the engine has switched.
+  // The user-dismiss side effect, per update surface: remember THIS build as
+  // dismissed (keyed by build id in hooks/sw-update.ts) so the honest
+  // re-checks do not re-surface the toast. A genuinely newer build still will.
+  //
+  // Dismiss means "defer to later", so it does NOT clear the badge. The badge
+  // stays lit as the persistent update affordance, and the sync and poll
+  // checks re-derive it from staleness, so it clears on its own.
   if (idOrKey === 'update-available') {
     markSwUpdateDismissed();
   } else if (idOrKey === NEW_VERSION_TOAST_KEY) {
-    markSwitchDismissed();
+    // One key, both shapes the engine-version toast takes (a built version to
+    // switch onto, and one that exists only in source). The poll records which
+    // one is being announced; this only has to spend it. See
+    // `noteAnnouncedEngineVersion`.
+    markEngineVersionDismissed();
   }
 }
 
@@ -2002,10 +2009,11 @@ export function showConfirm(
     extraAction?: ToastAction;
     variant?: 'danger' | 'default';
     details?: ConfirmDetails;
+    acknowledge?: boolean;
   }
 ): Promise<boolean> {
-  // If a confirm is already visible, resolve its Promise as `false` before
-  // showing the new one — second call replaces, never queues.
+  // A second call replaces, never queues: resolve any visible confirm's
+  // Promise as `false` before showing the new one.
   const prior = confirmState.peek();
   if (prior.visible) prior.resolve?.(false);
 
@@ -2020,13 +2028,14 @@ export function showConfirm(
       resolve,
       extraAction: options?.extraAction,
       details: options?.details,
+      acknowledge: options?.acknowledge,
     };
   });
 }
 
 /** Show a text-input modal. Resolves the entered string on OK, or `null` on
- *  Cancel / Esc / backdrop. Like {@link showConfirm}, a second call replaces a
- *  visible prompt (the prior resolves `null`) — never queues. */
+ *  Cancel, Escape or a backdrop click. Like {@link showConfirm}, a second call
+ *  replaces a visible prompt and never queues, and the prior resolves `null`. */
 export function showPrompt(
   message: string,
   options?: {
@@ -2064,18 +2073,17 @@ export const stepDetailModal = signal<StepDetailModalState>(null);
 // --- Command checkpoint diff modal ---
 // Set to a checkpoint ResponseEvent to show what that command changed; null =
 // closed. Opened by the Diff button on the checkpoint card, so the Undo beside
-// it is not a blind button. A modal rather than an inline expansion because a
-// destructive command can touch a lot of files, and the transcript is not where
-// that belongs.
+// it is not a blind button. A modal rather than an inline expansion, because a
+// destructive command can touch a lot of files.
 export type CheckpointDiffModalState = Extract<ResponseEvent, { type: 'checkpoint' }> | null;
 export const checkpointDiffModal = signal<CheckpointDiffModalState>(null);
 
 // --- Context viewer ---
-// Set to a captured context to open the viewer; null = closed. Opened by the
-// context counter on a step row, which is its only door (the rest of the row
-// opens the step detail instead). It holds the snapshot rather than the step so
-// the viewer cannot be opened for a row that has none; `description` is carried
-// along purely as the subtitle naming which call the context belongs to.
+// Set to a captured context to open the viewer; null = closed. Its only door
+// is the context counter on a step row, since the rest of the row opens the
+// step detail. It holds the SNAPSHOT rather than the step, so the viewer
+// cannot be opened for a row that has none. `description` rides along purely
+// as the subtitle naming which call the context belongs to.
 export interface ContextViewerState {
   snapshot: ContextCapture;
   description?: string;
@@ -2104,17 +2112,15 @@ export const backupStatusVersion = signal(0);
  *  page renders: `backup_provider`, `backup_schedule`, `backup_retention`.
  *  BackupSection re-seeds its provider, schedule and retention controls on it.
  *
- *  A SIBLING of `backupStatusVersion` rather than a widening of it, on purpose.
- *  That signal means "a backup RUN reached a terminal state" and the health
- *  card refetches `/backup/status` on it, which lists the remote folder. Making
- *  a retention or schedule write bump the same counter would put a cloud
- *  round-trip behind a local preference edit, and would leave the name lying
- *  about what the signal reports. Two meanings, two signals.
+ *  A SIBLING of `backupStatusVersion` rather than a widening of it, on
+ *  purpose. That signal means "a backup RUN reached a terminal state", and the
+ *  health card refetches `/backup/status` on it. Making a retention or
+ *  schedule write bump the same counter would put a cloud round-trip behind a
+ *  local preference edit. Two meanings, two signals.
  *
- *  Without either, the panel read its three values once on mount and nothing
- *  moved them: an agent writing `backup_provider` (or the same page open on a
- *  second device) left the dropdown showing the old destination until a manual
- *  reload. */
+ *  Without either, the panel reads its three values once on mount and nothing
+ *  moves them. An agent writing `backup_provider`, or the same page open on a
+ *  second device, then leaves the dropdown showing the old destination. */
 export const backupPreferencesVersion = signal(0);
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
@@ -2125,157 +2131,157 @@ export const updateAvailable = signal(false);
 
 // --- New engine version ready to switch onto (dev background rebuild) ---
 // Set by the version-status poll (store/actions/engine-update.ts) when a newer
-// engine binary is on disk. Drives the "New version available → Switch to new
-// version" toast + the brand badge. Distinct from `updateAvailable` (the
-// client-bundle refresh) and `restartRequired` (a restart-requiring change was
-// applied): this is the honest "the rebuilt engine is READY to switch to" signal.
+// engine binary is on disk. Drives the Switch toast and the brand badge.
+// Distinct from `updateAvailable`, the client-bundle refresh, and from
+// `restartRequired`, which says a restart-requiring change was applied. This
+// is the honest "the rebuilt engine is READY to switch to" signal.
 export const engineVersionReady = signal(false);
 
+// --- New engine version pending in SOURCE, with nothing built to switch onto ---
+// Set by the version-status poll (store/actions/engine-update.ts) when the
+// engine source is behind HEAD, no newer binary is on disk, and nothing is
+// building one. The third state of the brand badge (a dot, not the ready "!"),
+// and the driver of the pending version toast.
+//
+// Distinct from `engineVersionReady` in the way that matters to the user. THAT
+// one says "there is something you can switch onto right now". This one says
+// "there is new code, and it has not become a version yet". Offering a Switch
+// here would respawn the same engine.
+export const engineVersionPending = signal(false);
+
+// --- ...and rebuilding has been proved unable to deliver it ---
+// The engine's verdict (`rebuild_wedged`), never derived here. Only the engine
+// knows which HEAD a completed build was built from, and a build that finished
+// before newer commits landed says nothing about a rebuild now. Meaningful
+// only while `engineVersionPending`. It tints the badge and swaps the toast's
+// Rebuild button for the operator fix.
+export const engineRebuildWedged = signal(false);
+
 // --- New engine version currently building (dev background rebuild) ---
-// Set by the version-status poll (store/actions/engine-update.ts) when the engine
-// reports `build_state === 'building'` — a background rebuild kicked off by Apply
-// is in progress but not yet ready to switch onto. Drives the spinning-refresh
-// brand badge. Always false in packaged builds (no background build there).
-// What the toast can say ABOUT that build (elapsed time, the commits it will
-// bring) rides `engineBuildDetail`, which lives with the other background-activity
-// feeds in `store/backgroundActivity.ts`. Both are written by the single
-// `setEngineBuilding` writer in `store/actions/engine-update.ts`, so the boolean
-// and the narration cannot drift apart.
+// Set by the version-status poll (store/actions/engine-update.ts) when the
+// engine reports `build_state === 'building'`: a background rebuild is in
+// progress but not yet ready to switch onto. Drives the spinning-refresh brand
+// badge, and is always false in a packaged build.
+//
+// What the toast can say ABOUT that build rides `engineBuildDetail`, in
+// `store/backgroundActivity.ts`. One writer, `setEngineBuilding`, sets both,
+// so the boolean and the narration cannot drift apart.
 export const engineBuilding = signal(false);
 
-/** Whether a new engine version is actually READY to switch onto — the honest
- *  "ready for the switch" signal that agrees with the background-build scheme.
- *  Lives here (not in a component) so BOTH the brand badge / Refresh row
- *  AND the restart progress-toast wording (chat-changes.ts `initiateEngineRestart`)
- *  derive from the SAME predicate — the toast must never disagree with the badge —
- *  without a chat-changes ↔ HeaderMark import cycle (same reasoning as
- *  NEW_VERSION_TOAST_KEY below).
+/** Whether a new engine version is READY to switch onto. Lives here rather
+ *  than in a component so the brand badge AND the restart progress-toast
+ *  wording derive from the SAME predicate, with no import cycle. Same
+ *  reasoning as `NEW_VERSION_TOAST_KEY` below.
  *
- *  In **dev** this is `engineVersionReady` alone: Apply is non-disruptive and
- *  kicks off a background rebuild, so a freshly-applied restart-requiring change
- *  (`restartRequired`) does NOT mean a new version exists yet — the switch only
- *  becomes available once that build finishes and the on-disk binary differs
- *  (the version-status poll flips `engineVersionReady`, see engine-update.ts).
- *  Restarting during the build window respawns the OLD binary, so keying off
- *  `restartRequired` here would falsely claim a new version.
+ *  In **dev** this is `engineVersionReady` alone. Apply is non-disruptive and
+ *  kicks off a background rebuild, so a freshly-applied restart-requiring
+ *  change does NOT mean a new version exists yet. The switch becomes available
+ *  once that build finishes and the on-disk binary differs. Restarting during
+ *  the build window respawns the OLD binary, so keying off `restartRequired`
+ *  here would falsely claim a new version.
  *
- *  In **packaged** there is no background build — a newer GitHub release is
- *  immediately installable — so `restartRequired` (set from the outdated-release
- *  check in connection.ts) IS the ready signal; `engineVersionReady` never fires
- *  there (the poll no-ops for packaged builds).
+ *  In **packaged** there is no background build, and a newer GitHub release is
+ *  immediately installable, so `restartRequired` IS the ready signal.
+ *  `engineVersionReady` never fires there, since the poll no-ops.
  *
- *  Note: `restartRequired` deliberately still gates the client-refresh ordering
- *  (client-update.ts holds a refresh until after the engine switch, even during
- *  the build window) — that is a different concern from this visible signal. */
+ *  `restartRequired` deliberately still gates the client-refresh ordering,
+ *  which is a different concern from this visible signal. */
 export function engineNewVersionReady(): boolean {
   return engineVersionReady.value || (enginePackaged.value && restartRequired.value);
 }
 
-// Toast key for the poll-driven "New version available → Switch to new version"
-// info toast (store/actions/engine-update.ts). Lives here (not in engine-update.ts)
-// so `initiateEngineRestart` (chat-changes.ts) can dismiss it when a switch begins
-// without a chat-changes ↔ engine-update import cycle — the switch progress toast
-// then replaces it as the single version surface.
+// Toast key for the poll-driven Switch info toast
+// (store/actions/engine-update.ts). Lives here rather than there so
+// `initiateEngineRestart` can dismiss it when a switch begins, with no import
+// cycle. The switch progress toast then replaces it as the version surface.
 export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
 
-// Toast key for a failed thread-list refresh. Both surfacing sites (the SSE
-// resync in thread-sync.ts and the resume sync in connection.ts) share it so a
-// sustained outage replaces one toast instead of stacking a new one on every
-// 3s SSE reconnect. Neither site reads this key directly anymore: they both go
-// through `refreshThreadList` (store/actions/thread-list-refresh.ts), which is
-// the only writer, so the card's copy, the rule for raising it and its
-// retraction cannot drift between the two.
+// Toast key for a failed thread-list refresh. Both surfacing sites share it,
+// so a sustained outage replaces one toast rather than stacking a new one on
+// every SSE reconnect. Neither reads the key directly: both go through
+// `refreshThreadList` (store/actions/thread-list-refresh.ts), the only writer,
+// so the copy, the raising rule and the retraction cannot drift.
 export const THREAD_LIST_REFRESH_TOAST_KEY = 'thread-list-refresh-failed';
 
-// Toast keys for the two per-thread event fetches (thread-loading.ts). The LOAD
-// one is still fanned out, one full snapshot per eagerly-loaded thread on boot
-// and per failed thread on the recovery path, so an unkeyed card meant one
-// permanent, undismissable toast PER THREAD for a single outage: dozens at once
-// on an iOS PWA. Keyed, the whole fan-out collapses into one card whose copy
-// counts the affected threads, and a landed fetch retracts it. The REFRESH one
-// no longer fans out at all (a sync point marks instead, see "stale thread
-// events"), but it keeps its key for the same reason: several threads can still
-// be failing at once as the user moves between them. Two keys, not one: a LOAD
-// failure means this device never got the thread's history, a REFRESH failure
-// means it did not get the newest events, and neither card may retract the other
-// while its own claim is still true.
+// Toast keys for the two per-thread event fetches (thread-loading.ts).
+//
+// The LOAD one fans out, one full snapshot per eagerly-loaded thread on boot
+// and per failed thread on the recovery path. Unkeyed, one outage means one
+// permanent, undismissable toast PER THREAD. Keyed, the whole fan-out
+// collapses into one card whose copy counts the affected threads.
+//
+// The REFRESH one no longer fans out, since a sync point marks instead. It
+// keeps its key because several threads can still be failing at once as the
+// user moves between them.
+//
+// Two keys, not one. A LOAD failure means this device never got the thread's
+// history; a REFRESH failure means it did not get the newest events. Neither
+// card may retract the other while its own claim is true.
 export const THREAD_EVENTS_LOAD_TOAST_KEY = 'thread-events-load-failed';
 export const THREAD_EVENTS_REFRESH_TOAST_KEY = 'thread-events-refresh-failed';
 
 /** How many per-thread event fetches one fan-out may have in flight at once.
- *  Named for the FETCH rather than the load because both remaining fan-outs are
- *  full snapshot loads: the eager boot loads in `loadAllThreads`, and the
- *  failed-load retry in `runResumeSync`. The wake refresh and the SSE-reconnect
- *  resync used to be here too; they now refresh only the focused thread and mark
- *  the rest (see `markLoadedThreadsStale` in `store/actions/thread-loading.ts`).
+ *  Two fan-outs remain, both full snapshot loads: the eager boot loads in
+ *  `loadAllThreads`, and the failed-load retry in `runResumeSync`.
  *
  *  Over HTTP/2 the browser applies no per-host connection cap, so an unbounded
- *  fan-out over a large workspace put ~85 requests a minute onto one connection,
- *  all racing the same 10s client deadline down a tunnel a wake had only just
- *  started re-establishing. The engine answers each in single-digit
- *  milliseconds, so the burst itself was what spent those deadlines. Four keeps
- *  the link saturated without the herd.
+ *  fan-out over a large workspace puts ~85 requests a minute onto one
+ *  connection, all racing the same 10s client deadline. The engine answers
+ *  each in single-digit milliseconds, so the burst itself is what spends those
+ *  deadlines. Four keeps the link saturated without the herd.
  *
- *  Deliberately PER FAN-OUT, not a global semaphore. A recovery wake can run both
- *  of the remaining ones concurrently (the failed-load retry, and `loadAllThreads`'
- *  own eager loads), so the real ceiling there is eight. A global cap would buy
- *  little and cost the property that matters most on a wake: the focused thread's
- *  fetch would have to queue behind unrelated background work.
+ *  Deliberately PER FAN-OUT, not a global semaphore. A recovery wake can run
+ *  both concurrently, so the real ceiling there is eight. A global cap would
+ *  buy little and cost the property that matters most on a wake: the focused
+ *  thread's fetch would queue behind unrelated background work.
  *
  *  Lives here rather than in `thread-loading.ts` for the same reason the toast
- *  keys above do: its other consumer is an action module that would otherwise
+ *  keys above do. Its other consumer is an action module that would otherwise
  *  import it across a mocked boundary. */
 export const THREAD_EVENTS_FETCH_CONCURRENCY = 4;
 
-/** How often the connection watchdog probes `/api/v1/health`. The dot the user
- *  sees is driven SOLELY by this poll, so the pair below is the whole timing
- *  contract of that dot, and the two numbers are only meaningful against each
- *  other. They live here, together, for that reason and for the one the
- *  concurrency limit above gives: their consumers (`hooks/useStartup.ts` and
- *  `api/client/chat.ts`) would otherwise each own half of a relation neither can
- *  see. */
+/** How often the connection watchdog probes `/api/v1/health`. This poll alone
+ *  drives the dot the user sees. So this number and the deadline below are the
+ *  whole timing contract of that dot, and are only meaningful against each
+ *  other. They live here together for that reason, and because their consumers
+ *  would otherwise each own half of a relation neither can see. */
 export const CONNECTION_POLL_INTERVAL_MS = 5000;
 
 /** Deadline for one health probe. Must stay STRICTLY BELOW
  *  `CONNECTION_POLL_INTERVAL_MS`, which is what keeps at most one probe in
- *  flight from the timer: overlapping probes would queue on the same HTTP/2
- *  connection and time out in turn, manufacturing the outage the dot is meant to
- *  report. `connection-poll-budget.test.ts` pins the relation so a later change
- *  to either number cannot quietly break it.
+ *  flight from the timer. Overlapping probes would queue on the same HTTP/2
+ *  connection and time out in turn, manufacturing the outage the dot reports.
+ *  `connection-poll-budget.test.ts` pins the relation.
  *
- *  It was 3s, sized against nothing in particular, and 3s is not a lot for a
- *  phone reaching a laptop over cellular and a Tailscale tunnel: a radio state
- *  transition alone can spend most of it, and a DERP relay hop adds more. Four
- *  consecutive misses paint the dot red, so a deadline that is merely tight
- *  reads as an outage. 4.5s costs no extra requests, and the case it buys
- *  patience for is exactly the case where the dot is most likely lying: a
- *  genuinely dead engine REFUSES the connection and fails fast whatever the
- *  deadline says, so only a hanging request is affected. */
+ *  Sized for a phone reaching a laptop over cellular and a Tailscale tunnel: a
+ *  radio state transition alone can spend seconds, and a DERP relay hop adds
+ *  more. Four consecutive misses paint the dot red, so a merely tight deadline
+ *  reads as an outage. A generous one costs no extra requests, and only a
+ *  HANGING request is affected: a genuinely dead engine refuses the connection
+ *  and fails fast whatever the deadline says. */
 export const HEALTH_PROBE_TIMEOUT_MS = 4500;
 
-// Toast key for the "frontend change applied — takes effect on Switch" hint,
-// shown when the engine emits FrontendUpdateDeferred (a frontend-only Apply
-// couldn't advance the served client in-process because an engine version
-// change is pending — see engine::frontend_refresh INV-A + engine-update.ts's
-// handleFrontendUpdateDeferred). Keyed so repeated frontend-only applies while
-// a Switch is pending coalesce into one toast. Lives here (not engine-update.ts)
-// so initiateEngineRestart (chat-changes.ts) can collapse it into the switch
-// progress toast without an import cycle — same pattern as NEW_VERSION_TOAST_KEY.
+// Toast key for the "takes effect on Switch" hint, shown when the engine emits
+// FrontendUpdateDeferred: a frontend-only Apply could not advance the served
+// client in-process, because an engine version change is pending. See
+// engine::frontend_refresh INV-A. Keyed, so repeated frontend-only applies
+// while a Switch is pending coalesce into one toast. Lives here so
+// initiateEngineRestart can collapse it into the switch progress toast with no
+// import cycle, the same pattern as NEW_VERSION_TOAST_KEY.
 export const FRONTEND_UPDATE_DEFERRED_TOAST_KEY = 'engine-frontend-update-deferred';
 
-// Sibling of the key above for the STRANDED case (handleFrontendUpdateStranded):
-// the frontend change rebuilt but the engine serves a dist/ that will never
-// receive it, so no Switch will deliver it. A separate key so a stranded warning
-// can't be coalesced into — or dismissed by — the "arrives on Switch" hint, which
-// would be actively misleading.
+// Sibling of the key above for the STRANDED case: the frontend change rebuilt,
+// but the engine serves a dist/ that will never receive it, so no Switch
+// delivers it. A separate key, so a stranded warning cannot be coalesced into
+// the "arrives on Switch" hint, which would be actively misleading.
 export const FRONTEND_UPDATE_STRANDED_TOAST_KEY = 'engine-frontend-update-stranded';
 
 // --- Service worker build id ---
-/** BUILD_ID of the active service worker (stamped into sw.js by the
- *  `lucidos-sw-stamp` Vite plugin — see vite.config.ts), reported by the SW on
- *  request and shown in the control panel. A debugging aid for "did the new
- *  build's SW actually take over?": it's the same value whose byte-change fires
- *  the update toast, so an unchanged id across an apply means the SW never
- *  updated. `null` until the SW answers; the live dev server reports the
- *  un-stamped `__LUCIDOS_BUILD_ID__` placeholder (shown as "dev"). */
+/** BUILD_ID of the active service worker, stamped into sw.js by the
+ *  `lucidos-sw-stamp` Vite plugin. The SW reports it on request and the
+ *  control panel shows it. A debugging aid for "did the new build's SW take
+ *  over?". It is the same value whose byte-change fires the update toast, so
+ *  an unchanged id across an apply means the SW never updated. `null` until
+ *  the SW answers, and the live dev server reports the un-stamped
+ *  placeholder. */
 export const serviceWorkerBuildId = signal<string | null>(null);

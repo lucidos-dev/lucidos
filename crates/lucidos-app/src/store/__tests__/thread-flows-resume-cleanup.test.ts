@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeStatus, exchangeSteps, hasRenderableResponseContent, type ThreadEvent } from '../thread-events';
+import { abortPromisesAutoResume, abortTookEngineDown, continuableAbortIndex, exchangeResponseEvents, exchangeStatus, exchangeSteps, hasRenderableResponseContent, responseAbortedSummary, type ThreadEvent } from '../thread-events';
 import { isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { StepOutcome } from '../types';
@@ -904,5 +904,116 @@ describe('an abort boundary must not read Working while the engine is down', () 
     insertEvents(map, id, [{ type: 'ResponseGenerated', text: 'done', created: t(-276000) }] as any);
     const finished = getExchanges(map, id).slice(-1)[0];
     expect(exchangeStatus(finished, '', true, false, false, false)).toBe('done');
+  });
+});
+
+// Regression (2026-08-13): the SAME shape as the suite above, from a restart
+// NOBODY clicked, reported as `started "Thinking" even tho we were in a restart`.
+//
+// The 2026-08-06 fix keyed "this boundary is closed by construction" on the
+// switch fingerprint, which is `engine_shutdown` AND a device actor. A restart
+// driven from the terminal (`stop.sh`, an external SIGUSR1, ctrl-c) leaves
+// `LucidosEngine::teardown_actor` `None`, so its teardown abort carries the
+// identical cause with no actor and matched neither reading. Reproduced from
+// real thread b146c294 in the `dev` workspace:
+//
+// | seq | event | at |
+// |---|---|---|
+// | 2916224 | `ResponseAborted` `engine_shutdown`, no actor | 12:29:27.801 |
+// | 2916225 | `CodingAgentTextStreamed` `"\n\n"` | 12:29:27.813 |
+// | 2916226 | `CodingAgentIdled` `engine_restart_interrupt` | 12:29:51.937 |
+//
+// For those 24 seconds the boundary read "Claude / Working" with a shimmering
+// "Thinking" under a "Response interrupted" panel and its Continue button.
+//
+// Note what the drain is here: the `"\n\n"` flush ALONE, with no Esc rejection.
+// That is the shape `hasRenderableResponseContent` already suppresses, so the
+// panel should not have existed at all. It came back because the derived live
+// `Thinking` row is itself renderable content: the spurious row hands the
+// suppressed panel back with the wrong badge on it.
+describe('an UNATTRIBUTED engine shutdown is just as down as a switch', () => {
+  const now = Date.now();
+  const t = (offset: number) => new Date(now + offset).toISOString();
+
+  /** The reproduced teardown. `esc` adds the Esc rejection the 2026-08-06 log
+   *  had and this one did not, so both drains are covered: with it the boundary
+   *  has renderable content and must merely not read "Working"; without it, it
+   *  must render no response panel at all. */
+  const seedUnattributedTeardown = (name: string, esc = false) => {
+    const { map, id } = makeThread(name, 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'pin the copy against reintroduction', channel: 'claude_code', created: t(-300000) },
+      { type: 'SessionStarted', session_id: 's1', created: t(-299000) },
+      { type: 'CodingAgentToolCalled', name: 'Write', args: { file_path: 'guard.test.ts' }, created: t(-290000) },
+      { type: 'CodingAgentToolResult', name: 'Write', result: 'BLOCKED: no em dashes', created: t(-289000) },
+      // No actor: nobody asked this engine to go down.
+      { type: 'ResponseAborted', cause: 'engine_shutdown', created: t(-200000) },
+      ...(esc
+        ? [{ type: 'CodingAgentToolResult' as const, name: '', result: "The user doesn't want to proceed with this tool use.", created: t(-199959) }]
+        : []),
+      { type: 'CodingAgentTextStreamed', text: '\n\n', created: t(-199948) },
+    ] as any);
+    return { map, id, exchanges: getExchanges(map, id) };
+  };
+
+  for (const [label, esc] of [['a bare flush', false], ['an Esc rejection too', true]] as const) {
+    it(`reads as settled, not Working, with ${label}`, () => {
+      resetSeqCounter();
+      const { map, id, exchanges } = seedUnattributedTeardown(`cc-unattributed-${esc}`, esc);
+
+      const boundary = exchanges[exchanges.length - 1];
+      expect(boundary.userEvent.type).toBe('ResponseAborted');
+      expect(boundary.steps.length).toBeGreaterThan(0);
+
+      // The unattributed abort settles at `failed`, which the drain preserves.
+      // Not quiescent (a `safety_net` abort pins `failed` over a LIVE turn), so
+      // the fix cannot lean on the thread's status here either.
+      expect(map.get(id)!.meta.status).toBe('failed');
+      const threadIdle = isRenderedThreadIdle(map.get(id));
+      expect(threadIdle).toBe(false);
+      expect(isThreadQuiescent(map.get(id)!.meta.status)).toBe(false);
+
+      const status = exchangeStatus(boundary, '', true, false, /* threadIsCC */ true, threadIdle);
+      expect(isActive(status)).toBe(false);
+      expect(status).toBe('aborted');
+    });
+  }
+
+  /** No live row is derived for the boundary, in EITHER projection. This is the
+   *  half the report named: the row is what shimmered, and it is what put the
+   *  panel back on screen. */
+  it('derives no live Thinking row over the dead subprocess', () => {
+    resetSeqCounter();
+    const { exchanges } = seedUnattributedTeardown('cc-unattributed-thinking');
+    const boundary = exchanges[exchanges.length - 1];
+
+    const pendingThinking = (s: { description?: string; outcome: StepOutcome }) =>
+      s.description === 'Thinking' && s.outcome === 'pending';
+
+    expect(exchangeSteps(boundary, true, false).filter(pendingThinking)).toHaveLength(0);
+    const events = exchangeResponseEvents(boundary, true, false);
+    expect(events.filter(e => e.type === 'step' && pendingThinking(e))).toHaveLength(0);
+
+    // With the row gone the drain is a blank `"\n\n"` again, so the boundary
+    // renders no response panel: the transcript is the "Response interrupted"
+    // panel alone.
+    expect(events.length).toBeGreaterThan(0);
+    expect(hasRenderableResponseContent(events)).toBe(false);
+  });
+
+  /** The promise side is deliberately untouched. Nobody asked for this restart,
+   *  so the engine owes no resume: the panel keeps saying "Response interrupted"
+   *  and keeps offering Continue. Widening the live-ness reading must not widen
+   *  that, which is the whole reason the two predicates were split. */
+  it('still offers Continue and still says nothing about resuming', () => {
+    resetSeqCounter();
+    const { exchanges } = seedUnattributedTeardown('cc-unattributed-continue');
+    const boundary = exchanges[exchanges.length - 1];
+    const abort = boundary.userEvent as Extract<ThreadEvent, { type: 'ResponseAborted' }>;
+
+    expect(abortTookEngineDown(abort)).toBe(true);
+    expect(abortPromisesAutoResume(abort)).toBe(false);
+    expect(responseAbortedSummary(abort.actor, abort.cause)).toBe('Response interrupted');
+    expect(continuableAbortIndex(exchanges)).toBe(exchanges.length - 1);
   });
 });

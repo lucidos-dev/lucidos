@@ -17,15 +17,19 @@ describe('settings navigation', () => {
     expect(keys).not.toContain('environment-variables');
     expect(keys).not.toContain('debugging');
     expect(keys).not.toContain('whats-new');
+    expect(keys).not.toContain('communication-surfaces');
     // What's New leads: it is the one subpanel a user ARRIVES at rather than
     // goes looking for (the Lucidos menu's version row opens it, and the update
     // notice links to it), so it sits closest to Overview's own subject.
-    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging']);
+    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
     expect(settingsSubviewLabel('whats-new')).toBe("What's New");
     expect(settingsSubviewLabel('thread-queue')).toBe('Thread Queue');
     expect(settingsSubviewLabel('backup')).toBe('Backup');
     expect(settingsSubviewLabel('environment-variables')).toBe('Environment Variables');
     expect(settingsSubviewLabel('debugging')).toBe('Debugging');
+    expect(settingsSubviewLabel('communication-surfaces')).toBe('Communication Surfaces');
+    // The bar's form: the full name does not fit between two chevrons.
+    expect(settingsSubviewShortLabel('communication-surfaces')).toBe('Surfaces');
   });
 
   it('no longer carries Network access as a System subpanel: it lives in Access', () => {

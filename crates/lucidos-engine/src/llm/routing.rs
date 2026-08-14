@@ -2,6 +2,7 @@ use crate::llm::anthropic::AnthropicProvider;
 use crate::llm::model_registry::{provider_kind_for, ModelRegistry, ProviderKind};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::reasoning::clamp_effort;
 use crate::llm::vertex::VertexProvider;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -42,6 +43,42 @@ impl RoutingProvider {
             registry,
             default_model,
         }
+    }
+
+    /// Snap a reasoning effort onto the closest tier the model's resolved
+    /// provider actually supports.
+    ///
+    /// **This is the chokepoint**, and it is here rather than in each provider
+    /// because this is the only layer that knows the [`ProviderKind`]: the
+    /// OpenAI, OpenRouter and local backends are all the same
+    /// [`OpenAiProvider`] struct with a different base URL, so a rule inside it
+    /// can only see the model id and cannot tell whose vocabulary applies. It
+    /// covers every producer of an effort at once, the chat picker, a trigger's
+    /// pinned effort, the `preferences` tool, the HTTP API, and a per-thread
+    /// value remembered from a model the thread no longer runs on.
+    fn effort_for_model<'a>(&self, model: &str, effort: Option<&'a str>) -> Option<&'a str> {
+        let effort = effort?;
+        let Some(clamped) = clamp_effort(effort, provider_kind_for(&self.registry, model), model)
+        else {
+            // Not one of our tiers at all, so there is nothing to snap it onto.
+            // Send no effort and let the provider default apply, rather than
+            // guessing a tier a typo would then be billed for.
+            crate::log!(
+                "[Routing] dropping unrecognised reasoning effort '{}' for '{}'; provider default applies",
+                effort,
+                model
+            );
+            return None;
+        };
+        if clamped != effort {
+            crate::log!(
+                "[Routing] reasoning effort '{}' is unavailable on '{}'; using closest supported '{}'",
+                effort,
+                model,
+                clamped
+            );
+        }
+        Some(clamped)
     }
 
     fn provider_for_model(
@@ -87,6 +124,7 @@ impl LlmProvider for RoutingProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = model_override.unwrap_or(&self.default_model);
         let provider = self.provider_for_model(model)?;
+        let reasoning_effort = self.effort_for_model(model, reasoning_effort);
         provider
             .chat(
                 messages,
@@ -121,5 +159,127 @@ impl LlmProvider for RoutingProvider {
             kinds.push(ProviderKind::Local);
         }
         Some(kinds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::model_registry::ModelRouting;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    /// A provider-less router: the clamp reads only the registry, so no backend
+    /// needs configuring to exercise it.
+    fn router(rows: &[(&str, ProviderKind)]) -> RoutingProvider {
+        let registry: ModelRegistry = Arc::new(RwLock::new(
+            rows.iter()
+                .map(|(id, provider)| {
+                    (
+                        id.to_string(),
+                        ModelRouting {
+                            provider: *provider,
+                            context_window: None,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        ));
+        RoutingProvider::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            registry,
+            "claude-opus-5@default".to_string(),
+        )
+    }
+
+    /// The chokepoint. Each model's effort is snapped using the provider its
+    /// registry row names, not the shape of its id, so the same effort resolves
+    /// differently per backend.
+    #[test]
+    fn effort_is_clamped_against_the_registry_provider() {
+        let router = router(&[
+            ("claude-opus-5@default", ProviderKind::Vertex),
+            ("gemini-3.5-flash", ProviderKind::Vertex),
+            ("gpt-5.6-sol", ProviderKind::OpenAi),
+            ("gpt-5.4", ProviderKind::OpenAi),
+            ("muse-glimmer:30b-mlx", ProviderKind::Local),
+            ("z-ai/glm-5.2", ProviderKind::OpenRouter),
+        ]);
+        for (model, expected) in [
+            ("claude-opus-5@default", "max"),
+            ("gemini-3.5-flash", "high"),
+            ("gpt-5.6-sol", "max"),
+            ("gpt-5.4", "xhigh"),
+            ("muse-glimmer:30b-mlx", "high"),
+            ("z-ai/glm-5.2", "high"),
+        ] {
+            assert_eq!(
+                router.effort_for_model(model, Some("max")),
+                Some(expected),
+                "{model}"
+            );
+        }
+    }
+
+    /// The regression, at the layer that prevents it. A local model's turn must
+    /// never carry `xhigh`, whichever tier the caller asked for.
+    #[test]
+    fn a_local_model_never_leaves_the_chokepoint_carrying_xhigh() {
+        let router = router(&[("muse-glimmer:30b-mlx", ProviderKind::Local)]);
+        for effort in crate::llm::reasoning::EFFORT_LADDER {
+            let sent = router.effort_for_model("muse-glimmer:30b-mlx", Some(effort));
+            assert_ne!(sent, Some("xhigh"), "asked for {effort}");
+        }
+    }
+
+    /// A model with no registry row falls back to the same prefix heuristic
+    /// routing uses, so its clamp matches the provider it will actually reach.
+    #[test]
+    fn an_unregistered_model_clamps_against_its_heuristic_provider() {
+        let router = router(&[]);
+        // `gpt-` → OpenAI, which tops out at xhigh below 5.6.
+        assert_eq!(
+            router.effort_for_model("gpt-5.4", Some("max")),
+            Some("xhigh")
+        );
+        // Non-fable `claude-` → Vertex Claude, adaptive, so max survives.
+        assert_eq!(
+            router.effort_for_model("claude-opus-5@default", Some("max")),
+            Some("max")
+        );
+    }
+
+    /// No effort in, no effort out: the clamp must not invent one, or every
+    /// caller that deliberately leaves the provider on its own default would
+    /// start being told a tier.
+    #[test]
+    fn no_effort_stays_absent() {
+        let router = router(&[("gpt-5.4", ProviderKind::OpenAi)]);
+        assert_eq!(router.effort_for_model("gpt-5.4", None), None);
+    }
+
+    /// A string that is not one of our tiers is dropped here rather than
+    /// guessed at, so the provider applies its own default.
+    ///
+    /// It really does reach this point: only the `preferences` LLM tool
+    /// validates against the ladder, while `PUT /api/v1/preferences` and the
+    /// `reasoning_effort` on `POST /api/v1/chat/stream` do not. Before the
+    /// clamp existed such a value went to the wire and the provider rejected
+    /// it, so the one thing this must NOT do is quietly promote it to a real
+    /// tier the user then pays for.
+    #[test]
+    fn an_unrecognised_effort_is_dropped_not_promoted() {
+        let router = router(&[("gpt-5.4", ProviderKind::OpenAi)]);
+        for junk in ["", "ultra", "MAX"] {
+            assert_eq!(
+                router.effort_for_model("gpt-5.4", Some(junk)),
+                None,
+                "{junk:?}"
+            );
+        }
     }
 }

@@ -2,28 +2,30 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/client', () => ({ engineVersionStatus: vi.fn(), rebuildEngine: vi.fn() }));
 vi.mock('./chat-changes', () => ({ initiateEngineRestart: vi.fn() }));
-// Engine-switch dismissal is keyed on the on-disk build id (INV-C). Mock it so
-// each test controls whether THIS build was dismissed.
+// The engine-version dismissal is keyed on the ANNOUNCED VERSION id: the on-disk
+// build when one is switchable, the checkout's HEAD when the version exists only
+// in source. Mock it so each test controls what has been dismissed.
 vi.mock('../../hooks/sw-update', () => ({
-  noteSwitchBuildId: vi.fn(),
-  wasSwitchDismissed: vi.fn(() => false),
+  noteAnnouncedEngineVersion: vi.fn(),
+  wasEngineVersionDismissed: vi.fn(() => false),
   // store.ts (imported transitively by the store import below) pulls these from
-  // the same module; markSwitchDismissed is exercised by the dismiss-defer test.
-  markSwitchDismissed: vi.fn(),
+  // the same module; markEngineVersionDismissed is exercised by the
+  // dismiss-defer tests.
+  markEngineVersionDismissed: vi.fn(),
   markSwUpdateDismissed: vi.fn(),
 }));
 
-import { checkEngineVersion, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
+import { checkEngineVersion, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
 import type { PendingCommits } from '../../api/client';
-import { noteSwitchBuildId, wasSwitchDismissed, markSwitchDismissed } from '../../hooks/sw-update';
-import { toasts, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { noteAnnouncedEngineVersion, wasEngineVersionDismissed, markEngineVersionDismissed } from '../../hooks/sw-update';
+import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
-const mockWasSwitchDismissed = vi.mocked(wasSwitchDismissed);
-const mockNoteSwitchBuildId = vi.mocked(noteSwitchBuildId);
-const mockMarkSwitchDismissed = vi.mocked(markSwitchDismissed);
+const mockWasDismissed = vi.mocked(wasEngineVersionDismissed);
+const mockNoteAnnounced = vi.mocked(noteAnnouncedEngineVersion);
+const mockMarkDismissed = vi.mocked(markEngineVersionDismissed);
 const mockRebuild = vi.mocked(rebuildEngine);
 
 function status(over: Partial<{
@@ -33,6 +35,8 @@ function status(over: Partial<{
   packaged: boolean;
   build_state: 'idle' | 'building' | 'ready' | 'failed';
   source_behind_head: boolean;
+  head_commit: string;
+  rebuild_wedged: boolean;
   shared_build_in_progress: boolean;
   build_elapsed_ms: number;
   pending_commits: PendingCommits;
@@ -44,6 +48,8 @@ function status(over: Partial<{
     packaged: false,
     build_state: 'idle' as const,
     source_behind_head: false,
+    head_commit: 'head777',
+    rebuild_wedged: false,
     shared_build_in_progress: false,
     ...over,
   };
@@ -56,14 +62,17 @@ function hasSwitchToast(): boolean {
 describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; dismiss defers)', () => {
   beforeEach(() => {
     mockStatus.mockReset();
-    mockWasSwitchDismissed.mockReset();
-    mockWasSwitchDismissed.mockReturnValue(false);
-    mockNoteSwitchBuildId.mockReset();
-    mockMarkSwitchDismissed.mockReset();
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
+    mockNoteAnnounced.mockReset();
+    mockMarkDismissed.mockReset();
     mockRebuild.mockReset();
     mockRebuild.mockResolvedValue(undefined);
     toasts.value = [];
     engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     engineRestarting.value = false;
     // The switch dismissal is a global preference, so checkEngineVersion skips
@@ -81,7 +90,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     // "Later" is the explicit defer affordance (dismisses; badge stays lit).
     expect(toast?.secondaryAction?.label).toBe('Later');
     // Records the on-disk build so a later dismiss pins the right id.
-    expect(mockNoteSwitchBuildId).toHaveBeenCalledWith('disk999');
+    expect(mockNoteAnnounced).toHaveBeenCalledWith('disk999');
   });
 
   it('does not surface a new version while a build is still in progress, even if the on-disk binary already differs', async () => {
@@ -117,7 +126,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
   it('keeps the badge lit but suppresses the toast for an on-disk build already dismissed', async () => {
     // Dismiss defers: the toast is gone for THIS build, but the badge stays lit
     // (build is ready) so the user can still switch from the reload badge.
-    mockWasSwitchDismissed.mockImplementation((id) => id === 'disk999');
+    mockWasDismissed.mockImplementation((id) => id === 'disk999');
     mockStatus.mockResolvedValue(status({ update_available: true, build_state: 'ready', disk_build_id: 'disk999' }));
     await checkEngineVersion();
     expect(engineVersionReady.value).toBe(true); // badge persists
@@ -133,16 +142,16 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     dismissToast('engine-new-version');
     expect(hasSwitchToast()).toBe(false); // toast deferred away
     expect(engineVersionReady.value).toBe(true); // badge persists (update from badge)
-    expect(mockMarkSwitchDismissed).toHaveBeenCalled(); // build remembered (durable)
+    expect(mockMarkDismissed).toHaveBeenCalled(); // build remembered (durable)
   });
 
   it('re-surfaces badge + toast for a genuinely newer on-disk build after a prior dismiss', async () => {
-    mockWasSwitchDismissed.mockImplementation((id) => id === 'disk-old');
+    mockWasDismissed.mockImplementation((id) => id === 'disk-old');
     mockStatus.mockResolvedValue(status({ update_available: true, build_state: 'ready', disk_build_id: 'disk-new' }));
     await checkEngineVersion();
     expect(engineVersionReady.value).toBe(true);
     expect(hasSwitchToast()).toBe(true);
-    expect(mockNoteSwitchBuildId).toHaveBeenCalledWith('disk-new');
+    expect(mockNoteAnnounced).toHaveBeenCalledWith('disk-new');
   });
 
   it('shows a build-failed error toast and does not light the badge on a failed rebuild', async () => {
@@ -243,7 +252,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     // source_behind_head (running commit still behind HEAD) are true. Dismissing
     // the Switch must not re-surface as a "Rebuild" pending toast — a switchable
     // binary already exists; that's the ready branch's per-build dismissal, not here.
-    mockWasSwitchDismissed.mockImplementation((id) => id === 'disk999');
+    mockWasDismissed.mockImplementation((id) => id === 'disk999');
     mockStatus.mockResolvedValue(status({ source_behind_head: true, update_available: true, build_state: 'ready', disk_build_id: 'disk999' }));
     await checkEngineVersion();
     expect(engineVersionReady.value).toBe(true); // badge persists (a binary IS ready)
@@ -301,6 +310,196 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
   });
 });
 
+/** The pending version, given the shape every other version surface already
+ *  has: a toast the user can put away, and a badge that stays lit after they do.
+ *
+ *  Before this it was the only one with neither. Its X called `removeToast` and
+ *  the 4s poll drew it again, because there was no id to pin a dismissal to (a
+ *  pending version has no on-disk build by definition). The engine now names the
+ *  HEAD, so the dismissal has something to be about. */
+describe('checkEngineVersion: the pending version is dismissable, and the badge is the way back', () => {
+  const PENDING = { source_behind_head: true, update_available: false, build_state: 'idle' as const };
+
+  beforeEach(() => {
+    mockStatus.mockReset();
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
+    mockNoteAnnounced.mockReset();
+    mockMarkDismissed.mockReset();
+    mockRebuild.mockReset();
+    mockRebuild.mockResolvedValue(undefined);
+    toasts.value = [];
+    engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    engineRebuildWedged.value = false;
+    engineBuilding.value = false;
+    engineRestarting.value = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('lights the pending badge and pins the announcement to the checkout HEAD', async () => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
+    await checkEngineVersion();
+    expect(engineVersionPending.value).toBe(true);
+    expect(engineRebuildWedged.value).toBe(false);
+    // The HEAD is the pending version's identity, standing in for the on-disk
+    // build id the ready branch pins to.
+    expect(mockNoteAnnounced).toHaveBeenCalledWith('head777');
+  });
+
+  it('offers a Later beside the Rebuild, like the Switch toast does', async () => {
+    mockStatus.mockResolvedValue(status(PENDING));
+    await checkEngineVersion();
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.action?.label).toBe('Rebuild');
+    expect(toast?.secondaryAction?.label).toBe('Later');
+  });
+
+  /** The reported bug, and the one that matters: the X used to buy 4 seconds. */
+  it('a dismissal survives repeated polls at the same HEAD', async () => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(true);
+
+    dismissToast('engine-new-version');
+    expect(mockMarkDismissed).toHaveBeenCalled();
+    mockWasDismissed.mockImplementation((id) => id === 'head777');
+
+    await checkEngineVersion();
+    await checkEngineVersion();
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+    // ...and the badge is still lit, which is what makes putting it away safe.
+    expect(engineVersionPending.value).toBe(true);
+  });
+
+  it('new commits re-announce it: the dismissal was about the old HEAD', async () => {
+    mockWasDismissed.mockImplementation((id) => id === 'head-old');
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head-new' }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(true);
+    expect(mockNoteAnnounced).toHaveBeenCalledWith('head-new');
+  });
+
+  it('the badge brings a dismissed toast back, and the next poll leaves it alone', async () => {
+    mockWasDismissed.mockImplementation((id) => id === 'head777');
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+
+    openEngineVersionToast();
+    expect(hasSwitchToast()).toBe(true);
+
+    // The poll may UPDATE a toast on screen but never create one; without that
+    // half, the re-opened toast would vanish again within 4s.
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(true);
+  });
+
+  it('the badge opens nothing when nothing is pending', () => {
+    openEngineVersionToast();
+    expect(hasSwitchToast()).toBe(false);
+  });
+
+  /** The dismissal is a workspace-GLOBAL preference on purpose, so putting the
+   *  toast away on the phone must put it away on the laptop too. The re-open
+   *  exemption is therefore keyed on a tap taken HERE, not on the toast merely
+   *  being on screen, which every device with it up would satisfy. */
+  it('a dismissal from another device closes a toast this one still has up', async () => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(true);
+
+    // The peer's dismiss arrives as a PreferencesChanged reload, not as a local
+    // dismissToast, so nothing on this device removed the toast.
+    mockWasDismissed.mockImplementation((id) => id === 'head777');
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+    expect(engineVersionPending.value).toBe(true);
+  });
+
+  /** ...and the exemption retires with the toast, rather than making the
+   *  re-opened one permanently immune to its own dismissal. */
+  it('dismissing a re-opened toast sticks', async () => {
+    mockWasDismissed.mockImplementation((id) => id === 'head777');
+    mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
+    await checkEngineVersion();
+
+    openEngineVersionToast();
+    expect(hasSwitchToast()).toBe(true);
+
+    dismissToast('engine-new-version');
+    await checkEngineVersion();
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+  });
+
+  /** The second reported bug: Rebuild ran a few-second no-op build and the toast
+   *  came straight back. The engine now says a rebuild for this HEAD already
+   *  proved futile, so the button that loops is withheld. */
+  it('a wedged rebuild withholds the button that loops and names the fix', async () => {
+    mockStatus.mockResolvedValue(status({
+      ...PENDING,
+      build_state: 'ready',
+      rebuild_wedged: true,
+    }));
+    await checkEngineVersion();
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.type).toBe('warning');
+    expect(toast?.action?.label).not.toBe('Rebuild');
+    expect(toast?.message).toMatch(/relaunch/i);
+    expect(engineRebuildWedged.value).toBe(true);
+  });
+
+  it('a wedged toast is acknowledged with OK rather than a bare X', async () => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, build_state: 'ready', rebuild_wedged: true }));
+    await checkEngineVersion();
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.dismissable).toBe(false);
+    expect(toast?.action?.label).toBe('OK');
+    toast?.action?.onClick();
+    expect(hasSwitchToast()).toBe(false);
+  });
+
+  it('keeps Rebuild for a completed build that says nothing about this HEAD', async () => {
+    // build_state 'ready' looks like the wedge and is not: only the engine knows
+    // which HEAD that build was started from, so the verdict is its call. With
+    // the flag false, the escape hatch stays offered.
+    mockStatus.mockResolvedValue(status({ ...PENDING, build_state: 'ready', rebuild_wedged: false }));
+    await checkEngineVersion();
+    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
+    expect(engineRebuildWedged.value).toBe(false);
+  });
+
+  it.each([
+    ['a build is in flight', status({ ...PENDING, build_state: 'building' })],
+    ['a co-located peer is building', status({ ...PENDING, shared_build_in_progress: true })],
+    ['a switchable binary landed', status({ source_behind_head: true, update_available: true, build_state: 'ready' })],
+    ['nothing is pending at all', status({})],
+    ['this is a packaged build', status({ ...PENDING, packaged: true })],
+  ])('drops the pending badge once %s', async (_case, next) => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, rebuild_wedged: true, build_state: 'ready' }));
+    await checkEngineVersion();
+    expect(engineVersionPending.value).toBe(true);
+    expect(engineRebuildWedged.value).toBe(true);
+
+    mockStatus.mockResolvedValue(next);
+    await checkEngineVersion();
+    expect(engineVersionPending.value).toBe(false);
+    // The wedged flag is written by the same helper, so it cannot outlive the
+    // state it describes and tint a badge for a workspace that is merely busy.
+    expect(engineRebuildWedged.value).toBe(false);
+  });
+
+  it('the pending badge stands down for a failed build, which owns its own toast and Retry', async () => {
+    mockStatus.mockResolvedValue(status({ source_behind_head: true, build_state: 'failed' }));
+    await checkEngineVersion();
+    expect(engineVersionPending.value).toBe(false);
+    expect(toasts.value.find((t) => t.key === 'engine-build-failed')?.action?.label).toBe('Retry build');
+  });
+});
+
 /** `engineBuilding` and `engineBuildDetail` are written by one helper, because
  *  `pollEngineVersion` decides "not building" on three separate paths and two
  *  independent assignments is how a stale narration outlives its build. That
@@ -309,9 +508,10 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
 describe('checkEngineVersion: the build narration cannot outlive the build', () => {
   beforeEach(() => {
     mockStatus.mockReset();
-    mockWasSwitchDismissed.mockReset();
-    mockWasSwitchDismissed.mockReturnValue(false);
-    mockNoteSwitchBuildId.mockReset();
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
+    mockNoteAnnounced.mockReset();
     mockRebuild.mockReset();
     mockRebuild.mockResolvedValue(undefined);
     toasts.value = [];
@@ -467,8 +667,9 @@ describe('handleFrontendUpdateDeferred — deferral hint (keyed, freshness-gated
 describe('handleEngineBuildStateChanged — SSE poke re-runs the authoritative check', () => {
   beforeEach(() => {
     mockStatus.mockReset();
-    mockWasSwitchDismissed.mockReset();
-    mockWasSwitchDismissed.mockReturnValue(false);
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
     toasts.value = [];
     engineVersionReady.value = false;
     engineBuilding.value = false;

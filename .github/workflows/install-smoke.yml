@@ -25,8 +25,12 @@
 #     listed on the public releases page, and it also fires no webhook, so Phase
 #     A DISPATCHES this workflow with `dmg_tag=rc-<ver>` (ADR 0036). This job
 #     downloads the rc DMG asset onto a FRESH macOS runner (one that has never
-#     trusted your cert) and runs spctl + stapler validate + a mount/launch, the
-#     real "does a stranger's Mac accept this DMG" check. Gates BEFORE the real tag.
+#     trusted your cert) and runs spctl + stapler validate + codesign, then
+#     launches the app and asserts it BECOMES READY (its gateway answers health
+#     as the expected build, and the frontend is served). That is the real "does
+#     a stranger's Mac accept this DMG, and does the thing then work" check, and
+#     it is what replaces mounting every release DMG by hand. Gates BEFORE the
+#     real tag.
 #
 #   * SAFETY NET (job: smoke, on `release: published`) — the only trigger that
 #     exercises the REAL stranger path (curl|sh -> git clone lucidos-dev), because
@@ -138,9 +142,9 @@ on:
       #     staples and swaps the asset, it dispatches dmg_tag=v<ver> so
       #     verification FOLLOWS the artifact to the GA tag.
       #
-      # Setting it runs dmg-verify and NOTHING else — every other job guards on
-      # it being empty, or a 30-second asset check would drag a 40-minute source
-      # install and a 90-minute tarball build along with it.
+      # Setting it runs dmg-verify and NOTHING else. Every other job guards on it
+      # being empty, or a few minutes of asset checking would drag a 40-minute
+      # source install and a 90-minute tarball build along with it.
       dmg_tag:
         description: 'dmg-verify: verify the DMG on this tag, either an rc-<ver> draft or a published v<ver>. Runs dmg-verify only.'
         type: string
@@ -180,6 +184,15 @@ env:
   LUCIDOS_HOME: ${{ github.workspace }}
   LUCIDOS_WORKSPACE: ${{ github.workspace }}/.smoke-ws
   HEALTH_TIMEOUT_SECS: '2400'   # 40 min: first-run source build is slow
+  # dmg-verify's readiness deadline. Nothing compiles there (the DMG is already
+  # built), but a FIRST launch on a clean runner still pays Gatekeeper's
+  # first-launch verification of a several-hundred-megabyte notarized bundle,
+  # LaunchServices registration, the launchd bootstrap of the service agent, and
+  # the gateway's own boot. The 30 s the old liveness check allowed was only ever
+  # enough to watch a process appear. 10 minutes is generous for all of the above
+  # and still leaves two thirds of that job's `timeout-minutes: 30` for the
+  # download, spctl, stapler, codesign and teardown around it.
+  DMG_READY_TIMEOUT_SECS: '600'
 
 jobs:
   smoke:
@@ -388,11 +401,29 @@ jobs:
   #   • the legacy path (release event): a NON-draft rc-<ver> prerelease made by
   #     hand or by an older release.sh (`prereleased` OR `released`, guarded on
   #     prerelease==true; see the release-types note above).
-  # Either way it downloads the DMG asset onto a CLEAN macOS runner — one that has never trusted your Developer ID
-  # cert and has no prior state — and confirms Gatekeeper accepts it, the
-  # notarization ticket is stapled, and the app actually mounts + launches. This
-  # is strictly stronger than verifying on your dev box (which already trusts the
-  # cert). Signing stays local; CI only CONSUMES the artifact.
+  # Either way it downloads the DMG asset onto a CLEAN macOS runner (one that has
+  # never trusted your Developer ID cert and has no prior state) and confirms
+  # Gatekeeper accepts it, the notarization ticket is stapled, and the app
+  # actually BECOMES READY. This is strictly stronger than verifying on your dev
+  # box (which already trusts the cert). Signing stays local; CI only CONSUMES the
+  # artifact.
+  #
+  # Verification ladder:
+  #   1. spctl accepts the DMG as a Notarized Developer ID
+  #   2. the notarization ticket is stapled (`stapler validate`)
+  #   3. the mounted .app passes `codesign --verify --deep --strict`
+  #   4. launched, its gateway answers `/~/api/v1/health` with status: ok and
+  #      role: gateway  (real readiness, polled, sigil namespace: see the step)
+  #   5. that health payload's `release` == the version the TAG names, so the
+  #      artifact on this tag is the build this tag is for
+  #   6. the packaged frontend serves HTTP 200 on the gateway root
+  #
+  # Rungs 4-6 replaced a `pgrep` on 2026-08-12. THE PROCESS-EXISTS CHECK IS NOT
+  # COMING BACK, and the reason is not that it was weak but that it could not
+  # fail: an engine that never spawns, a frontend bundle that 404s and a
+  # first-run path that throws all leave a live process. It is the only reason a
+  # human still mounted every release DMG by hand, and rungs 4-6 are what let
+  # that manual gate go.
   dmg-verify:
     name: dmg-verify (macOS, clean)
     # Public mirror only (see the smoke job's repo guard) — never bill the private
@@ -418,6 +449,20 @@ jobs:
       contents: write
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      # The port the packaged app's gateway comes up on, pinned so the readiness
+      # probe below and the app itself cannot disagree about where to look.
+      # `resolve_engine_port` (crates/lucidos-app/src/desktop.rs) takes
+      # LUCIDOS_ENGINE_PORT first, then `<app-data>/config/engine-port`, then
+      # DEFAULT_ENGINE_PORT, so 5252 IS what an unconfigured run resolves to:
+      # pinning it removes the ambiguity rather than changing the behaviour.
+      #
+      # JOB-scoped, deliberately not workflow-scoped. `smoke` reads its port out
+      # of the installer's ports file and `tarball-smoke` pins its own GW_PORT,
+      # and neither must inherit this one. Nothing else in the tree reads this
+      # variable (the gateway takes LUCIDOS_API_PORT, which the service derives
+      # from the resolved value), so exporting it cannot move any other process.
+      LUCIDOS_ENGINE_PORT: '5252'
     steps:
       - name: Download the DMG from the release
         env:
@@ -449,6 +494,41 @@ jobs:
           echo "DMG=$DMG" >> "$GITHUB_ENV"
           echo "Downloaded: $DMG ($(du -h "$DMG" | cut -f1))"
 
+          # WHICH BUILD this run is verifying, for the readiness probe's version
+          # assertion. Derived from the TAG, deliberately NOT from the DMG
+          # filename, and the difference is the whole value of the assertion.
+          # `Lucidos_<version>_aarch64.dmg` is stamped by the same build that
+          # produced the bytes inside it, so checking health against the filename
+          # only asserts that the DMG agrees with itself: a DMG from some other
+          # build, uploaded to this tag, carries a self-consistent name and sails
+          # through. The tag is the INDEPENDENT fact. It is what release.sh armed
+          # the gate at, so comparing the running gateway's baked release against
+          # it is what catches the wrong artifact on the right tag.
+          #
+          # $TAG rather than inputs.dmg_tag because all three ways into this job
+          # have to work: the rc-<ver> draft dispatch, the deferred v<ver>
+          # dispatch, and the legacy non-draft rc RELEASE EVENT, on which
+          # inputs.dmg_tag is empty and only github.event.release.tag_name is set.
+          EXPECTED_VERSION="${TAG#rc-}"
+          EXPECTED_VERSION="${EXPECTED_VERSION#v}"
+          # Fail closed on anything that is not a bare dotted release number. The
+          # value is written to $GITHUB_ENV and is derived from a dispatch input,
+          # so the character-class guard runs first: it rejects a newline, which
+          # a later `x.y.z` glob would happily match through.
+          case "$EXPECTED_VERSION" in
+            ""|*[!0-9.]*)
+              echo "::error::tag '$TAG' does not yield a bare release number (got '$EXPECTED_VERSION'); expected rc-<x.y.z> or v<x.y.z>"
+              exit 1 ;;
+          esac
+          case "$EXPECTED_VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::tag '$TAG' does not yield an <x.y.z> release number (got '$EXPECTED_VERSION')"
+              exit 1 ;;
+          esac
+          echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_ENV"
+          echo "Verifying release version: $EXPECTED_VERSION"
+
       - name: Gatekeeper accepts it (notarized Developer ID)
         run: |
           set -euo pipefail
@@ -462,28 +542,285 @@ jobs:
           set -euo pipefail
           xcrun stapler validate "$DMG" || { echo "::error::stapler validate failed — ticket not stapled"; exit 1; }
 
-      - name: App mounts and launches
+      - name: App mounts and the bundle is signed
         run: |
           set -euo pipefail
           MNT="$(mktemp -d)"
+          # Resolve to the PHYSICAL path before anything else uses it. `/var` is a
+          # symlink to `/private/var` on macOS and `mktemp -d` hands back the
+          # symlinked form, while a process launched out of the bundle reports the
+          # resolved one, so an unresolved $APP silently matches no process at all
+          # in the teardown below.
+          MNT="$(cd "$MNT" && pwd -P)"
           hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+          # Handed forward IMMEDIATELY, and before the .app lookup below, because
+          # the teardown is now its own `if: always()` step and can only detach a
+          # mount it can see. Every line from here on can abort the step under
+          # `set -e` (a DMG that attaches but carries no .app does exactly that),
+          # and each one of those aborts would otherwise leave the volume mounted.
+          echo "MNT=$MNT" >> "$GITHUB_ENV"
           APP="$(ls -d "$MNT"/*.app | head -1)"
           echo "Mounted app: $APP"
-          # Verify the .app itself is signed + accepted, then launch headless and
-          # confirm the process comes up before tearing down.
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          # Verify the .app itself is signed + accepted.
           codesign --verify --deep --strict --verbose=2 "$APP" \
-            || { echo "::error::app bundle failed codesign --verify"; hdiutil detach "$MNT" -quiet || true; exit 1; }
-          open -g "$APP" || { echo "::error::open failed"; hdiutil detach "$MNT" -quiet || true; exit 1; }
-          ok=0
-          for i in $(seq 1 30); do
-            if pgrep -f "$APP" >/dev/null 2>&1; then ok=1; break; fi
+            || { echo "::error::app bundle failed codesign --verify"; exit 1; }
+
+      # ── READINESS, not liveness ──────────────────────────────────────────────
+      # This step used to `open -g` the bundle and `pgrep -f` for it. That asks
+      # only whether a PROCESS EXISTS, which it cannot fail to find: an engine
+      # that never spawns, a frontend bundle that 404s and a first-run path that
+      # throws all leave a live process behind and all passed. That gap is why a
+      # human still mounted every release DMG by hand. So this asks the packaged
+      # client's own gateway the same three questions the `smoke` job asks of the
+      # source install: does it answer health, is it the RIGHT build, and is the
+      # frontend actually served.
+      #
+      # TWO TRAPS ARE ENCODED BELOW, AND BOTH LOOK LIKE NOISE TO SIMPLIFY AWAY:
+      #
+      #  1. THE SIGIL NAMESPACE. The packaged gateway serves health at
+      #     `/~/api/v1/health` (ADR 0014), never at a bare `/api/v1/health`. That
+      #     is not a near-miss path: the gateway resolves the FIRST path segment
+      #     as a WORKSPACE SLUG, so `/api/v1/health` reads as a request for a
+      #     workspace called `api` and never answers. A probe written the obvious
+      #     way therefore fails for a reason that has nothing to do with the DMG.
+      #     `wait_for_health` in crates/lucidos-app/src/desktop.rs is the
+      #     reference, and it carries the same warning.
+      #  2. `open` DOES NOT INHERIT THIS SHELL'S ENVIRONMENT. LaunchServices
+      #     starts the app from launchd's environment, so the job's exported
+      #     LUCIDOS_ENGINE_PORT reaches the probe and nothing else.
+      #     `launchctl setenv` is what puts it where `resolve_engine_port` reads
+      #     it. A failure there is only a warning: the next two rungs of that
+      #     resolution are `<app-data>/config/engine-port` and then
+      #     DEFAULT_ENGINE_PORT, and on a clean runner both land on the same 5252.
+      #
+      # Plain http on loopback with no https fallback, unlike the `smoke` job's
+      # `health_get`: a packaged window is pointed at `gateway_url`, which builds
+      # `http://localhost:<port>` unconditionally, and a packaged gateway binds
+      # loopback-only with no TLS opt-in.
+      #
+      # `scripts/e2e-packaged.sh` runs a longer version of this same ladder
+      # locally, and the two are NOT redundant, so do not delete either for the
+      # other. That script runs the bundle's headless `--service` role directly
+      # under a temp HOME (ADR 0016: WKWebView exposes no WebDriver, so the
+      # packaged window cannot be automated), which means it never touches
+      # `open`, LaunchServices, launchd or the GUI client. This job is the only
+      # thing that exercises the path a person actually takes, and the only one
+      # that does it on a machine that has never seen the certificate.
+      - name: App launches and the gateway becomes READY
+        run: |
+          set -uo pipefail
+          base="http://127.0.0.1:$LUCIDOS_ENGINE_PORT"
+          app_data="$HOME/Library/Application Support/com.lucidos.app"
+
+          # Everything the runner can still say about a start that did not
+          # finish. A bare "did not become ready" is what makes a red release
+          # gate useless at 03:00, and this is the only place these files are
+          # reachable: the service agent's plist redirects its stdout/stderr to
+          # `<app-data>/logs/engine-service.{out,err}.log`, and the gateway is
+          # spawned as its child with those descriptors inherited, so the service
+          # log IS the gateway log.
+          diagnostics() {
+            echo "----- launchd agents on disk -----"
+            ls -la "$HOME/Library/LaunchAgents" 2>/dev/null || echo "(no ~/Library/LaunchAgents)"
+            echo "----- service agent in the launchd domain -----"
+            launchctl print "gui/$(id -u)/com.lucidos.engine" 2>&1 | head -40 || true
+            echo "----- lucidos processes -----"
+            ps -Ao pid=,command= | grep -i lucidos | grep -v grep || echo "(none)"
+            for logfile in engine-service.err.log engine-service.out.log client-login.err.log; do
+              echo "----- $logfile (tail) -----"
+              tail -n 120 "$app_data/logs/$logfile" 2>/dev/null || echo "(absent)"
+            done
+            echo "----------------------------------"
+          }
+
+          launchctl setenv LUCIDOS_ENGINE_PORT "$LUCIDOS_ENGINE_PORT" \
+            || echo "::warning::launchctl setenv failed; the app falls back to <app-data>/config/engine-port and then DEFAULT_ENGINE_PORT, both $LUCIDOS_ENGINE_PORT on a clean runner"
+
+          open -g "$APP" || { echo "::error::open failed"; diagnostics; exit 1; }
+          echo "Launched $APP; polling $base/~/api/v1/health (timeout ${DMG_READY_TIMEOUT_SECS}s)…"
+
+          # ── rung 1: the gateway answers health with status: ok ───────────────
+          # First launch installs the LaunchAgent, launchd starts the service,
+          # the service spawns the gateway, and only then does anything bind, so
+          # the early attempts legitimately fail to connect.
+          deadline=$(( $(date +%s) + DMG_READY_TIMEOUT_SECS ))
+          body=""
+          until [ "$(date +%s)" -ge "$deadline" ]; do
+            body="$(curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
+            if echo "$body" | grep -q '"status":"ok"'; then echo "Gateway healthy."; break; fi
+            sleep 2
+          done
+          # The last response is quoted, and that is not padding: it is the one
+          # fact separating "nothing was ever listening" from "it answered and
+          # said it was unwell", and the two send a reader to different places.
+          echo "$body" | grep -q '"status":"ok"' || {
+            echo "::error::the packaged app never reported healthy at $base/~/api/v1/health within ${DMG_READY_TIMEOUT_SECS}s (last response: '$body'). A live process is not a working app, and this rung exists to say so."
+            diagnostics
+            exit 1
+          }
+          echo "health: $body"
+
+          # role=gateway is what proves the answer came from OUR gateway rather
+          # than from whatever else might be holding the port on the runner. A
+          # status-only check would accept any local server that says "ok".
+          echo "$body" | grep -q '"role":"gateway"' || {
+            echo "::error::whatever answered $base/~/api/v1/health is not the Lucidos gateway (no role=gateway): $body"
+            diagnostics
+            exit 1
+          }
+
+          # ── rung 2: it is the RIGHT build ────────────────────────────────────
+          # The GATEWAY's health payload is not the engine's, so do not copy the
+          # `smoke` job's assertions verbatim: `gateway_health` in
+          # crates/lucidos-gateway/src/server.rs emits
+          # {status, role, release, workspaces, pending_binds}, with no
+          # engine_version and no llm_configured to check. `release` is
+          # LUCIDOS_RELEASE, baked from the repo's RELEASE file at compile time
+          # (crates/lucidos-gateway/src/main.rs), so it names the build these
+          # bytes came from and is exactly the field to compare against the tag.
+          echo "$body" | grep -q "\"release\":\"$EXPECTED_VERSION\"" || {
+            echo "::error::the DMG on this tag reports a release other than $EXPECTED_VERSION, so the wrong build is attached to it: $body"
+            diagnostics
+            exit 1
+          }
+          echo "Version matches ($EXPECTED_VERSION)."
+
+          # ── rung 3: the frontend is served ───────────────────────────────────
+          # 200 rather than a redirect is the correct expectation on a clean
+          # runner: the smart root redirects into the sole workspace only when
+          # there is exactly one, and a first run registers none, so `/` serves
+          # the picker itself out of the bundle's Resources/frontend.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "$base/" || echo 000)"
+          [ "$code" = "200" ] || {
+            echo "::error::gateway root $base/ returned HTTP $code, so the packaged frontend is not being served"
+            diagnostics
+            exit 1
+          }
+          echo "Frontend serving 200 at $base/"
+
+          echo "OK: DMG accepted, stapled, mounts, and its app BECOMES READY on a clean macOS runner."
+
+      # ── TEARDOWN: bootout BEFORE detach ──────────────────────────────────────
+      # `if: always()` so a failed probe still leaves the runner clean. It cannot
+      # mask that probe either: every command here is best-effort and this step
+      # always exits 0, so a red probe stays red and a green one cannot be turned
+      # red by a wedged unmount on a machine that is about to be destroyed.
+      #
+      # THE ORDER IS LOAD-BEARING, top to bottom:
+      #
+      #  1. The LOGIN agent (`com.lucidos.client`) goes first. Its entire job is
+      #     to `open` the client again, and nothing else may do that while the
+      #     rest is being torn down.
+      #  2. The CLIENT process next, and only the client. It is not a launchd job
+      #     once running, so bootout does not reach it, and while it is alive its
+      #     start-and-navigate loop re-bootstraps a service it finds missing:
+      #     boot the service out first and a client still waiting on health (i.e.
+      #     the failure path, the one case where teardown matters most) puts it
+      #     straight back. The launchd-owned service is deliberately skipped here
+      #     because killing it directly only earns a KeepAlive respawn.
+      #  3. The SERVICE agent (`com.lucidos.engine`), whose stop handler tears
+      #     down the gateway, then the workspace engines, then the embedded
+      #     Postgres cluster (`GatewayService::shutdown`). Those all run straight
+      #     out of the MOUNTED bundle, which is why this has to happen before the
+      #     detach: unmount first and hdiutil fights a live engine holding files
+      #     on the volume, leaving the runner with both a mount and a launchd job.
+      #  4. Only now, the detach.
+      #
+      # And the WAIT in step 3 is not optional. `launchctl bootout` returns 0 when
+      # launchd ACCEPTS the request, not when the job is gone, and the gateway
+      # ignores SIGTERM (crates/lucidos-gateway/src/server.rs) so launchd has to
+      # wait out ExitTimeOut and then SIGKILL it. Deciding on the exit code
+      # instead has already shipped two bugs in the installer's own launchd
+      # wrappers; scripts/lib/service.sh decides by observing the domain, and so
+      # does this.
+      - name: Tear down the launched app and unmount
+        if: always()
+        run: |
+          set -uo pipefail
+          uid="$(id -u)"
+
+          bootout_and_wait() {
+            local target="gui/$uid/$1"
+            launchctl print "$target" >/dev/null 2>&1 || { echo "$1: not loaded"; return 0; }
+            launchctl bootout "$target" 2>&1 || true
+            for _ in $(seq 1 60); do   # launchd's own ExitTimeOut is 20s; allow headroom
+              launchctl print "$target" >/dev/null 2>&1 || { echo "$1: left the launchd domain"; return 0; }
+              sleep 1
+            done
+            echo "::warning::$1 was still in the launchd domain 60s after bootout"
+          }
+
+          # Every process running out of the mounted bundle EXCEPT the launchd
+          # service, which carries `--service` in its argv (see
+          # `desired_service_plist`). See point 2 of the ordering note above.
+          #
+          # SELECTION IS ON argv[0], NEVER ON THE WHOLE COMMAND LINE, because
+          # this function's output is fed to `kill -9`. A process belongs to the
+          # bundle if the BINARY IT RUNS is inside it; what its arguments happen
+          # to mention is irrelevant, and a substring test over `ps -o command=`
+          # cannot tell those apart. That is the rule in
+          # `.claude/rules/dev-runtime.md` (ADR 0025), written after the same
+          # shape SIGKILLed two coding-agent sessions on 2026-08-03, and the
+          # login agent here is exactly the process it protects: its argv is
+          # `/bin/sh -c … /usr/bin/open -g -a <bundle> …`, so it MENTIONS the
+          # bundle while running none of it. The `--service` discriminator is
+          # the one thing that must read the full line, and it only ever
+          # SUBTRACTS from an already-selected set.
+          #
+          # The marker is `<bundle>/Contents/MacOS/` rather than the absolute
+          # $APP, so the two path forms macOS uses for one file cannot make this
+          # quietly match nothing. On a clean runner the mounted DMG is the only
+          # place that bundle name exists.
+          client_pids() {
+            [ -n "${APP:-}" ] || return 0
+            local marker
+            marker="/$(basename "$APP")/Contents/MacOS/"
+            ps -Ao pid=,command= | while read -r pid cmd; do
+              # argv[0] is everything up to the first space, so a bundle name
+              # containing one would silently select nothing. Warned about
+              # rather than worked around: the productName has never had one,
+              # and a guard that quietly stops guarding is the failure mode ADR
+              # 0025 is about.
+              case "${cmd%% *}" in
+                *"$marker"*) ;;
+                *) continue ;;
+              esac
+              case "$cmd" in
+                *--service*) ;;          # launchd's: `bootout` stops it, not us
+                *) echo "$pid" ;;
+              esac
+            done
+          }
+
+          case "${APP:-}" in
+            *\ *) echo "::warning::the bundle path contains a space, so the argv[0] match in client_pids may select nothing and the teardown may leave the client running: ${APP}" ;;
+          esac
+
+          bootout_and_wait com.lucidos.client
+
+          for pid in $(client_pids); do kill "$pid" 2>/dev/null || true; done
+          for _ in $(seq 1 10); do
+            if [ -z "$(client_pids)" ]; then break; fi
             sleep 1
           done
-          # Clean up the launched app + mount regardless.
-          pkill -f "$APP" 2>/dev/null || true
-          hdiutil detach "$MNT" -quiet || true
-          [ "$ok" = "1" ] || { echo "::error::app did not start within 30s of launch"; exit 1; }
-          echo "OK — DMG accepted, stapled, mounts, and launches on a clean macOS runner."
+          for pid in $(client_pids); do kill -9 "$pid" 2>/dev/null || true; done
+
+          bootout_and_wait com.lucidos.engine
+
+          launchctl unsetenv LUCIDOS_ENGINE_PORT 2>/dev/null || true
+
+          if [ -n "${MNT:-}" ]; then
+            for _ in $(seq 1 15); do
+              if hdiutil detach "$MNT" -quiet 2>/dev/null; then MNT=""; break; fi
+              sleep 2
+            done
+            if [ -n "$MNT" ]; then
+              echo "::warning::$MNT was still busy 30s after the graceful teardown; forcing the detach"
+              hdiutil detach "$MNT" -force -quiet 2>/dev/null || true
+            fi
+          fi
+          echo "Teardown complete."
 
   # ── TARBALL + SERVICE SMOKE ───────────────────────────────────────────────────
   # End-to-end smoke for the NEW DEFAULT installer path (download a prebuilt headless

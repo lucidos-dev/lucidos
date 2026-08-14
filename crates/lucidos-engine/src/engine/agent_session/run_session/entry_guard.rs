@@ -180,7 +180,7 @@ async fn settle_dropped_session(pool: &sqlx::PgPool, event_bus: &EventBus, threa
         None,
         // No actor: nobody chose this. The caller's future was cancelled out
         // from under the session, a transport event rather than a decision, so
-        // the panel reads ⚙ System the same way `stamp_host_actor_if_aborted`'s
+        // the panel reads System the same way `stamp_host_actor_if_aborted`'s
         // safety-net caller makes it read.
         EventMeta::NONE,
         "[AgentSession] ResponseAborted (session future dropped)",

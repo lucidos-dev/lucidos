@@ -55,11 +55,12 @@ interface Edges {
   cardInsetRight: number;
   composerInset: number;
   composerInsetRight: number;
-  /** Width of the spliced-in card probe, and the gap (expected 0) between the
-   *  composer box's content edge and the textarea. Both are tripwires for the
-   *  measurements above rather than assertions about alignment. */
+  /** Width of the spliced-in card probe, and the gaps (both expected 0) between
+   *  the composer box's content edges and the textarea. All three are tripwires
+   *  for the measurements above rather than assertions about alignment. */
   probeWidth: number;
   rowLeftGap: number;
+  rowRightGap: number;
 }
 
 /** Content edges of the last user turn's body, the composer box's own edges,
@@ -122,20 +123,24 @@ async function measure(page: Page): Promise<Edges | null> {
       cardInset,
       cardInsetRight,
       probeWidth,
-      // LEFT is measured geometrically: the textarea is `.prompt-row`'s first
-      // child and the row has no padding, so its content edge IS the
-      // composer's, and this catches anything creeping in between.
+      // BOTH edges are measured geometrically: the textarea is `.prompt-row`'s
+      // only child and the row has no padding, so its content edges ARE the
+      // composer's, and this catches anything creeping in on either side.
+      //
+      // The right one used to be summed from computed styles instead, because
+      // `.prompt-clear` sat in this row as an in-flow flex sibling after the
+      // textarea and kept its width, margin and the row gap even while
+      // `visibility: hidden` for an empty draft. So the field stopped ~38px
+      // short of the box on the right and a geometric measurement would have
+      // failed on a composer that was aligned everywhere the sum could see.
+      // The button is one of the prompt row's own icons now, which is what lets
+      // this side be measured the same way as the other, and the tripwire below
+      // is what fails if a second control is ever put back in this row.
       composerInset: taRect.left + parseFloat(taStyle.paddingLeft) - boxRect.left,
-      // RIGHT is summed from styles instead, because the textarea does NOT reach
-      // the box's right content edge: `.prompt-clear` is an in-flow flex sibling
-      // after it, and it only goes `visibility: hidden` when the field is empty,
-      // so it keeps its width, margin and the row gap either way. Measuring
-      // geometrically here would fold that button in and fail on a composer that
-      // is correctly aligned.
-      composerInsetRight:
-        parseFloat(boxStyle.borderRightWidth) + parseFloat(taStyle.paddingRight),
-      // Tripwire for the assumption the LEFT measurement rests on.
+      composerInsetRight: boxRect.right - (taRect.right - parseFloat(taStyle.paddingRight)),
+      // Tripwires for the assumption both measurements rest on.
       rowLeftGap: taRect.left - (boxRect.left + parseFloat(boxStyle.borderLeftWidth)),
+      rowRightGap: (boxRect.right - parseFloat(boxStyle.borderRightWidth)) - taRect.right,
     };
   });
 }
@@ -185,6 +190,14 @@ test.describe('Composer aligns with the transcript content', () => {
     expect(
       e.rowLeftGap,
       `something sits between .prompt-box's content edge and the textarea (${e.rowLeftGap}px)`,
+    ).toBeCloseTo(0, 0);
+    // The right-hand twin. It reads 0 only because the textarea is alone in
+    // `.prompt-row`: a control put back beside it (the clear button used to be
+    // one) takes its width out of the field, and the composer's text stops
+    // short of the card text above it on that side.
+    expect(
+      e.rowRightGap,
+      `something sits between the textarea and .prompt-box's right content edge (${e.rowRightGap}px)`,
     ).toBeCloseTo(0, 0);
 
     expect(

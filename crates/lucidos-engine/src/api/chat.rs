@@ -9,34 +9,22 @@ use std::path::PathBuf;
 
 /// Allow/deny matrix for a subprocess-originated chat POST. Allowed:
 /// `lucidos spawn-thread` (`mode = Agent|Engine`, `parent_thread_id == source`,
-/// and the target does not exist yet) and same-thread follow-up
-/// (`target_thread_id == source`). Denied: any `mode = Human` (agents never
-/// claim user identity) and cross-thread agent posts (the original incident
-/// shape).
+/// target does not exist yet) and same-thread follow-up
+/// (`target_thread_id == source`). Denied: any `mode = Human`, since an agent
+/// never claims user identity, and cross-thread agent posts.
 ///
 /// `source_thread_id` is authenticated: it comes off the thread-bound origin
-/// token, which a subprocess cannot re-point at another thread (see
-/// `api::actor`). Before that binding, both allowing arms were forgeable and
-/// this whole matrix was accounting rather than authorization.
+/// token, which a subprocess cannot re-point at another thread (`api::actor`).
 ///
-/// ## Why the spawn arm also requires a target that does not exist
+/// The spawn arm also requires `!target_exists`. `parent_matches_source` says
+/// "I am spawning a child" and constrains nothing about the target. Without
+/// `!target_exists`, a subprocess in thread S could post into any existing
+/// thread by naming itself the parent. That is the last route by which an
+/// authenticated subprocess could write into a thread it does not own. It would
+/// also make `POST /threads/:thread_id/follow-up`'s refusal ladder bypassable.
 ///
-/// `parent_matches_source` says "I am spawning a child". Nothing in the
-/// *parent* claim constrains the *target*, so without the `!target_exists`
-/// conjunct a subprocess in thread S could post into ANY existing thread by
-/// naming it as the target and naming itself as the parent. That is the same
-/// cross-thread injection the `target_matches_source` arm refuses, reached
-/// through the other arm, and it is the last route by which an authenticated
-/// subprocess could write into a thread it does not own. It would also make
-/// `POST /threads/:thread_id/follow-up`'s refusal ladder bypassable: a caller
-/// refused there could post the same message here.
-///
-/// `lucidos spawn-thread` is unaffected. It generates a fresh client-side uuid
-/// and sends it with `parent_thread_id`, so the target provably does not
-/// exist (`crates/lucidos-cli/src/spawn_thread.rs`, and
-/// `spawn_thread_with_a_pregenerated_id_is_still_allowed` below).
-///
-/// Pure function — unit-testable without booting a router.
+/// `lucidos spawn-thread` sends a fresh client-side uuid with
+/// `parent_thread_id`, so its target provably does not exist.
 pub(crate) fn subprocess_chat_legitimate(
     mode: ActorMode,
     source_thread_id: Option<Uuid>,
@@ -60,8 +48,7 @@ pub(crate) fn subprocess_chat_legitimate(
 /// What the engine tells a caller that tried to record a turn as the user
 /// without any evidence of being the user. Written for the agent that will read
 /// it: what was refused, why, and what to do instead. A bare status code would
-/// reach the caller as nothing at all, since `statusText` is always empty over
-/// HTTP/2 (the same defect already fixed for the continuity lock below).
+/// reach the caller as nothing at all: `statusText` is always empty over HTTP/2.
 pub(crate) const HUMAN_MODE_UNATTRIBUTED: &str = "\
 `mode: \"human\"` requires a registered device, and this request has none, so \
 the engine cannot record it as something the user typed. If you are an agent: \
@@ -72,8 +59,8 @@ than working around the tool.";
 
 /// May this request be recorded as a turn the *user* authored?
 ///
-/// The engine holds exactly three kinds of identity evidence, and only two of
-/// them can vouch for a human:
+/// The engine holds three kinds of identity evidence, and only two can vouch
+/// for a human (ADR 0050):
 ///
 /// - **Device attribution**: a `device_id` (body field, else the
 ///   `x-lucidos-device-id` header) that resolves to a row in `devices`. This is
@@ -86,21 +73,9 @@ than working around the tool.";
 ///   `mode: Human` outright.
 ///
 /// Anything else is an *unattributed caller* and may not claim to be the user.
-///
-/// ## Why this exists on top of `subprocess_chat_legitimate`
-///
-/// That gate is the stricter one, but it only runs for a caller that
-/// *presents* a token, so **dropping the token bought strictly more privilege
-/// than presenting it**: a Lucidos-spawned subprocess that shelled out to
-/// `curl` instead of the CLI (which forwards the token automatically) read as
-/// an ordinary external API client and could post `mode: human` into any
-/// thread. That inversion is the 2026-08-06 incident, and this predicate is
-/// what removes it: the constraint no longer depends on the constrained party
-/// opting in.
-///
-/// Pure function, so the matrix is unit-testable without a router or a
-/// database. The device lookup happens in
-/// [`require_human_mode_is_attributed`].
+/// This gate sits in front of `subprocess_chat_legitimate`, which only runs for
+/// a caller that presents a token: dropping the token must not buy more
+/// privilege than presenting it.
 pub(crate) fn human_mode_is_attributed(
     mode: ActorMode,
     device_attributed: bool,
@@ -123,10 +98,10 @@ pub(crate) fn human_mode_is_attributed(
 /// field wins, then the `x-lucidos-device-id` header. The two must agree or the
 /// gate would accept a shape the origin builder then stamps differently.
 ///
-/// A database error counts as attributed. The probe is on the user's own send
-/// path, so an outage that made it fail closed would refuse real messages;
-/// `DeviceStore::is_registered` returns the error precisely so this fallback is
-/// chosen here, in the open, rather than swallowed at the query.
+/// A database error counts as attributed. The probe sits on the user's own send
+/// path, so failing closed would refuse real messages.
+/// `DeviceStore::is_registered` returns the error so this fallback is chosen
+/// here rather than swallowed at the query.
 async fn require_human_mode_is_attributed(
     pool: &sqlx::PgPool,
     headers: &axum::http::HeaderMap,
@@ -136,12 +111,11 @@ async fn require_human_mode_is_attributed(
         return Ok(());
     }
     // Blank-filter EACH source BEFORE falling back, not the winner afterwards.
-    // `Some("")` is a present-but-empty body field, and `Option::or` keeps it,
-    // so filtering after the fallback lets an empty `device_id` shadow a
-    // perfectly good `x-lucidos-device-id` header and refuse a request that is
-    // in fact device-attributed.
-    // A nested `fn` rather than a closure so it can borrow from its argument:
-    // that keeps both sources as `&str` and the whole resolution allocation-free.
+    // `Some("")` is a present-but-empty body field and `Option::or` keeps it.
+    // Filtering after the fallback would let an empty `device_id` shadow a good
+    // `x-lucidos-device-id` header and refuse a device-attributed request.
+    // A nested `fn`, not a closure: it borrows from its argument, keeping both
+    // sources `&str`.
     fn blank_filtered(s: &str) -> Option<&str> {
         let t = s.trim();
         (!t.is_empty()).then_some(t)
@@ -203,17 +177,14 @@ pub(crate) fn unknown_thread_message(thread_id: Uuid) -> String {
 
 /// May this request address `thread_id`?
 ///
-/// A thread has no creation event. It exists because an event exists on its
+/// A thread has no creation event: it exists because an event exists on its
 /// aggregate id, and the `MessageReceived` projection
-/// (`engine::event_bus_projection_thread`) is an `INSERT … ON CONFLICT DO
-/// UPDATE`, so an id naming nothing took the insert arm and the thread came
-/// into being. That made a client-supplied id self-fulfilling: a caller that
-/// reached the WRONG engine got its threads created there, and its own
-/// read-back-to-verify step then found the message and confirmed the mistake.
-/// A wrong-target write was indistinguishable from a correct one.
+/// (`engine::event_bus_projection_thread`) is an upsert. An id naming nothing
+/// therefore took the insert arm and created the thread. That made a
+/// client-supplied id self-fulfilling: a wrong-target write was
+/// indistinguishable from a correct one (ADR 0050).
 ///
-/// So a create must be explicit. Three things count as saying so, and the
-/// second and third are why no existing caller had to change:
+/// So a create must be explicit. Three things count as saying so:
 ///
 /// - `new_thread: true`, the frontend's raw-new and compose-first sends;
 /// - `parent_thread_id`, a same-workspace spawn with callback
@@ -222,10 +193,7 @@ pub(crate) fn unknown_thread_message(thread_id: Uuid) -> String {
 ///   (`engine::http::workspace_client`, `lucidos spawn-thread --to`).
 ///
 /// A request with no `thread_id` at all is not this function's business: the
-/// engine mints the id itself and there is nothing for a caller to have got
-/// wrong.
-///
-/// Pure function, unit-testable without a router.
+/// engine mints the id itself.
 pub(crate) fn thread_target_is_addressable(
     thread_exists: bool,
     new_thread: Option<bool>,
@@ -240,9 +208,8 @@ pub(crate) fn thread_target_is_addressable(
 
 /// Does a `thread_summaries` row exist for `thread_id`?
 ///
-/// `chat_submit` gets the same answer for free from the row it already reads
-/// for the continuity lock; this is for the legacy `/chat` route, which reads
-/// nothing else and would otherwise have to skip the check.
+/// For the legacy `/chat` route, which reads nothing else. `chat_submit` gets
+/// the same answer from the row it already reads for the continuity lock.
 async fn thread_summary_exists(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
@@ -260,17 +227,15 @@ async fn thread_summary_exists(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<b
 /// **The projection.** An orphan's `MessageReceived` was persisted before the
 /// terminator that ended the previous turn, so the re-process passes
 /// `PreEmittedOrigin::EngineReentry` and emits no starter event. That leaves
-/// `UserPromptInjected` as the only event in the whole re-processed turn whose
-/// lifecycle rule is `StatusRule::Set(ThreadStatus::Running)`. Skipping the
-/// first orphan therefore left a thread that was actively working projected
-/// `idle` for the entire turn: the user saw a finished-looking thread that
-/// silently produced an answer a minute later.
+/// `UserPromptInjected` as the only event in the turn whose lifecycle rule is
+/// `StatusRule::Set(ThreadStatus::Running)`. Skip the first orphan and a
+/// working thread projects idle for the whole turn.
 ///
 /// **The timeline.** The client absorbs a UPI into the `MessageReceived` it
-/// names via `injected_message_id` (so no duplicate panel renders) and
-/// re-anchors that exchange to the ingestion point. Without the first orphan's
-/// UPI, a follow-up that arrived before a `ResponseCanceled` stayed ABOVE the
-/// cancel boundary and rendered "Done ✓" while it was the turn being worked on.
+/// names via `injected_message_id` and re-anchors that exchange to the
+/// ingestion point. Without the first orphan's UPI, a follow-up that arrived
+/// before a `ResponseCanceled` stays above the cancel boundary. It then renders
+/// as done while it is the turn being worked on.
 ///
 /// See `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`.
 async fn announce_orphan_batch(
@@ -293,17 +258,12 @@ async fn announce_orphan_batch(
 /// Re-process orphaned injections sequentially until the chain settles.
 ///
 /// `process_message_with_steps` for a re-processed orphan can itself produce
-/// orphans (a follow-up MessageReceived arrived during the re-process loop
-/// but landed on `injection_rx` after the loop's final `try_recv()`). The
-/// caller used to fire-and-forget a `tokio::spawn` per orphan, throwing away
-/// `ProcessResult` and the inner `orphaned_injections` with it — so an
-/// orphan-of-orphan was silently lost, leaving its MR without a response and
-/// stamping the NEXT reply with the prior orphan's `request_event_id`
-/// (observed on real thread 9b5a05aa as a chat exchange where the second
-/// follow-up's MR went unanswered while the third turn's response bound
-/// onto the wrong MR). Iterating here keeps the chain bounded by the
-/// available orphans and serializes per-thread (`register_thread_queued`
-/// already serializes anyway, so a queue costs nothing extra).
+/// orphans: a follow-up `MessageReceived` that landed on `injection_rx` after
+/// the loop's final `try_recv()`. Iterating here keeps the chain bounded by the
+/// available orphans, and serializes per thread. A fire-and-forget spawn per
+/// orphan would drop the inner `orphaned_injections`, leaving an
+/// orphan-of-orphan unanswered and stamping the next reply with the wrong
+/// `request_event_id`.
 pub(crate) async fn process_orphan_chain(
     engine: SharedEngine,
     thread_id: Uuid,
@@ -387,11 +347,12 @@ pub(crate) async fn process_orphan_chain(
     .await;
 }
 
-/// Iterate over `initial`, calling `process_one` per item; any items the
-/// processor returns are appended to the queue and processed in turn. Pure
-/// queue-drain logic, extracted from `process_orphan_chain` so the
-/// orphan-of-orphan invariant ("if A's re-process produces orphan B, B is
-/// processed too") is unit-testable without a real engine.
+/// Iterate over `initial`, calling `process_one` per item; items the processor
+/// returns are appended to the queue and processed in turn.
+///
+/// Split out of `process_orphan_chain` so the orphan-of-orphan invariant is
+/// unit-testable without a real engine: if A's re-process produces orphan B,
+/// B is processed too.
 async fn drain_orphan_queue<F, Fut>(initial: Vec<InjectedPrompt>, mut process_one: F)
 where
     F: FnMut(Vec<InjectedPrompt>) -> Fut,
@@ -452,35 +413,27 @@ struct ValidatedSpawn {
 
 /// Validate `mode` against the spawning / caller context from a `ChatRequest`.
 ///
-/// `mode` is mandatory on the API: callers must explicitly state who originated
-/// the message. The mapping is enforced so the source of a thread is never
-/// silently inferred:
+/// `mode` is mandatory: callers state who originated the message, so a thread's
+/// source is never silently inferred.
 ///
-/// - `mode = Human` — must NOT supply `parent_thread_id` or `spawning_event_id`.
-///   Human-originated threads have no spawning context. May supply
-///   `caller_workspace` (e.g. a human curl from another workspace).
-/// - `mode = Agent | Engine` — provenance is REQUIRED. Either `parent_thread_id`
-///   (same-workspace spawn with callback) OR `caller_workspace`
-///   (cross-workspace origin, fire-and-forget) must be present.
+/// - `mode = Human` must NOT supply `parent_thread_id` or `spawning_event_id`.
+///   Human-originated threads have no spawning context. It may supply
+///   `caller_workspace` (a human curl from another workspace).
+/// - `mode = Agent | Engine` REQUIRES provenance: either `parent_thread_id`
+///   (same-workspace spawn with callback) or `caller_workspace`
+///   (cross-workspace origin, fire-and-forget).
 ///
 /// Cross-workspace `caller_*` fields are mutually exclusive with same-workspace
 /// `parent_thread_id` / `spawning_event_id`: they describe incompatible
-/// relationships (origin without callback vs. parent with callback). A
+/// relationships (origin without callback, parent with callback). A
 /// `caller_thread_id` or `caller_event_id` without `caller_workspace` is
 /// malformed.
-///
-/// Returns `Err(StatusCode::BAD_REQUEST)` if the constraint is violated or any
-/// UUID is malformed — failing fast beats silently dropping the parent link.
 fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, StatusCode> {
-    // Cross-workspace caller_* fields are mutually exclusive with same-workspace
-    // parent_thread_id / spawning_event_id. They describe incompatible
-    // relationships: caller_* = origin (no callback), parent_* = parent (callback).
     let has_caller = request.caller_workspace.is_some()
         || request.caller_thread_id.is_some()
         || request.caller_event_id.is_some();
 
     if has_caller && request.caller_workspace.is_none() {
-        // caller_thread_id / caller_event_id without caller_workspace is malformed.
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -502,9 +455,6 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, Stat
             }
         }
         ActorMode::Agent | ActorMode::Engine => {
-            // Agent/Engine mode requires EITHER parent_thread_id (same-workspace
-            // spawn with callback) OR caller_workspace (cross-workspace origin).
-            // Without either, no provenance — reject.
             if parent_thread_id.is_none() && request.caller_workspace.is_none() {
                 return Err(StatusCode::BAD_REQUEST);
             }
@@ -520,19 +470,19 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, Stat
 }
 
 /// Wire-format string for `ThreadType::CodingAgent` (`thread_summaries.source`
-/// and the `channel` payload field). Mirrored here to avoid pulling the engine
-/// enum across the API boundary just for this single comparison; the source of
-/// truth is the `#[serde(rename = "claude_code")]` on `ThreadType::CodingAgent`.
+/// and the `channel` payload field). Mirrored here rather than pulling the
+/// engine enum across the API boundary for one comparison. The source of truth
+/// is the `#[serde(rename = "claude_code")]` on `ThreadType::CodingAgent`.
 const CC_SOURCE: &str = "claude_code";
 
 /// A thread is locked to the (mode, repo) it picked on its first message.
-/// Subsequent follow-ups must match — switching either makes the executor card
-/// disagree with the commands menu (the menu collapses to one repo) and breaks
-/// the assumption that the thread's worktree branch lives in one repo.
+/// Switching either makes the executor card disagree with the commands menu,
+/// and breaks the assumption that the thread's worktree branch lives in one
+/// repo.
 ///
-/// `existing_source` is the thread's `thread_summaries.source`; `None` means
-/// no row yet (new thread — nothing to lock against). `existing_repo_id` is
-/// the bound `cc_repo_id`, only meaningful when the source is `claude_code`.
+/// `existing_source` is the thread's `thread_summaries.source`; `None` means no
+/// row yet, so there is nothing to lock against. `existing_repo_id` is the
+/// bound `cc_repo_id`, only meaningful when the source is `claude_code`.
 pub(super) fn validate_thread_continuity(
     existing_source: Option<&str>,
     existing_repo_id: Option<&str>,
@@ -628,9 +578,9 @@ pub(super) async fn chat(
     // thread (CLAUDE.md "no silent defaults").
     let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
     // And reject a WELL-FORMED id that names nothing, on the same terms as
-    // `chat_submit`. Two entry points that disagree about which requests are
-    // legitimate is the shape that leaves a hole, so this route pays for its own
-    // existence query rather than skipping the check.
+    // `chat_submit`. Two entry points disagreeing about which requests are
+    // legitimate is what leaves a hole, so this route pays for its own
+    // existence query.
     if let Some(tid) = thread_id {
         let exists = thread_summary_exists(state.engine.pool(), tid)
             .await
@@ -837,18 +787,16 @@ pub(super) async fn chat_submit(
     // Parse target thread id up front so the subprocess gate can see it.
     let target_thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
 
-    // The target's projection row, read ONCE and used twice: the subprocess
-    // gate needs to know whether the target already exists (see
-    // `subprocess_chat_legitimate`), and the mode/repo continuity lock further
-    // down needs the rest of the columns. Reading it here rather than there is
-    // what lets the gate run before any work happens; the continuity check
-    // stays exactly where it was and just stops issuing its own query.
+    // The target's projection row, read ONCE and used twice: by the subprocess
+    // gate, which needs to know whether the target exists, and by the mode/repo
+    // continuity lock further down. Reading it here is what lets the gate run
+    // before any work happens.
     //
     // Keyed on `target_thread_id`, the id the CALLER named. The continuity
     // check's `thread_id` is the same value in every case that can match a
     // row: it is `target_thread_id` outright on two branches, and on the app
     // branch it is `target_thread_id.unwrap_or_else(Uuid::new_v4)`, whose
-    // fresh uuid can never be in `thread_summaries` anyway.
+    // fresh uuid can never be in `thread_summaries`.
     let existing_thread_row: Option<(String, String, Option<String>, Option<String>)> =
         match target_thread_id {
             Some(tid) => sqlx::query_as(
@@ -867,10 +815,10 @@ pub(super) async fn chat_submit(
     let thread_exists = existing_thread_row.is_some();
 
     // An id-carrying create must say so. Runs before the subprocess gate
-    // deliberately: a caller that named a thread which does not exist here has
-    // most likely reached the wrong engine, and the 404 says so, where the
-    // subprocess gate's 403 would blame the caller's relationship to a thread
-    // that was never the one it meant. See `thread_target_is_addressable`.
+    // deliberately: a caller naming a thread that does not exist here has most
+    // likely reached the wrong engine, and the 404 says so. The subprocess
+    // gate's 403 would instead blame the caller's relationship to a thread it
+    // never meant. See `thread_target_is_addressable`.
     if let Some(tid) = target_thread_id {
         if !thread_target_is_addressable(
             thread_exists,
@@ -922,11 +870,9 @@ pub(super) async fn chat_submit(
     let reasoning_effort = request.reasoning_effort.clone();
     let device_id = request.device_id.clone();
 
-    // A cross-workspace caller (`caller_workspace` set in body) takes
-    // precedence over device_id in build_message_origin — skip the device-name
-    // lookup when present to save a roundtrip on the cross-workspace path.
-    // Lookups are otherwise independent, so run them concurrently when both
-    // apply.
+    // A cross-workspace caller takes precedence over `device_id` in
+    // `build_message_origin`, so skip the device-name lookup when one is
+    // present. The lookups are otherwise independent, so run them concurrently.
     let workspace_caller_present = request.caller_workspace.is_some();
     let device_lookup = async {
         match device_id.as_deref() {
@@ -988,16 +934,14 @@ pub(super) async fn chat_submit(
         request.repo_file_context.as_ref(),
     );
     let url_ctx = request.url_context;
-    // Resolve `image_hashes` to ChatImage by reading + base64-encoding the
-    // blobs once per send. Mutually exclusive with `images` (legacy base64
-    // body; dead once every frontend send takes the hash path). Both carry the
-    // image at original resolution — the blob store and UI keep full-res, and
-    // the fit-to-model-size step happens at the LLM boundary
-    // (`engine::chat::images` / the image-description pass) via
-    // `ChatImage::fit_for_llm`, so compression lives in exactly one place.
-    // Keep the caller-supplied hashes: the Thread Queue branch below persists
-    // hashes (never inline base64) into the queued request, and by that point
-    // both wire fields have already been consumed here.
+    // Resolve `image_hashes` to ChatImage by reading and base64-encoding the
+    // blobs once per send. Mutually exclusive with the legacy `images` body.
+    // Both carry the image at original resolution: the fit-to-model-size step
+    // happens at the LLM boundary via `ChatImage::fit_for_llm`, so compression
+    // lives in exactly one place.
+    // Keep the caller-supplied hashes. The Thread Queue branch below persists
+    // hashes, never inline base64, and by that point both wire fields have
+    // been consumed here.
     let supplied_image_hashes = request.image_hashes.take();
     let chat_images = if let Some(hashes) = &supplied_image_hashes {
         let mut resolved = Vec::with_capacity(hashes.len());
@@ -1027,18 +971,16 @@ pub(super) async fn chat_submit(
         return Err(StatusCode::BAD_REQUEST.into());
     }
     let event_id = request.event_id;
-    // Re-bind under the existing name so the rest of the handler reads
-    // exactly as before (this is the same value parsed above for the
-    // subprocess-origin gate). Re-parsing would double the 400 branch.
+    // Re-bind the value parsed above for the subprocess-origin gate.
+    // Re-parsing it here would double the 400 branch.
     let thread_id = target_thread_id;
     let conflict_change_id = parse_optional_uuid(request.conflict_change_id.as_deref())?;
-    // `repo_id` accepts either a UUID or a registered repo name (the
-    // `lucidos spawn-thread --repo <name>` CLI sends names). UUIDs pass
-    // through unchanged — they match `cc_repo_id` storage in
-    // `thread_summaries` directly, and downstream code already handles
-    // unknown UUIDs (the tests seeding random UUIDs depend on that). Names
-    // resolve to the registered UUID; an unknown name surfaces as a clean
-    // 400 here instead of a 500 from deep inside worktree creation.
+    // `repo_id` accepts a UUID or a registered repo name (the
+    // `lucidos spawn-thread --repo <name>` CLI sends names). A UUID passes
+    // through unchanged: it matches `cc_repo_id` storage in `thread_summaries`
+    // directly, and downstream code already handles an unknown one. A name
+    // resolves to the registered UUID. An unknown name surfaces as a clean 400
+    // here, not a 500 from deep inside worktree creation.
     let repo_id = match request.repo_id.as_deref() {
         Some(s) if !s.is_empty() && Uuid::parse_str(s).is_err() => {
             match crate::core::repositories::RepositoryStore::get_by_name(state.engine.pool(), s)
@@ -1077,9 +1019,9 @@ pub(super) async fn chat_submit(
             log!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
             return Err(StatusCode::BAD_REQUEST.into());
         }
-        // `folder` is a CC-spawn payload — when CC isn't requested, the
-        // resolved app_id_to_stash would sit forever in `pending_app_spawn`
-        // because the chat agent path never pops it. Reject early.
+        // `folder` is a coding-agent spawn payload. Without CC requested, the
+        // resolved `app_id_to_stash` would sit forever in `pending_app_spawn`,
+        // because the chat agent path never pops it.
         if use_coding_agent != Some(true) {
             log!(
                 "[Chat] chat_submit received `folder` without `use_coding_agent=true` — rejecting"
@@ -1116,10 +1058,9 @@ pub(super) async fn chat_submit(
             };
         // Canonicalize each registered path once. Both `resolve_folder_input`
         // and `classify_resolved_folder` canonicalize their working
-        // `folder_abs`; without symmetric canonicalization here, a
-        // registered repo under a symlinked ancestor (macOS `/var/...` →
-        // `/private/var/...`, /home → /Users, …) would miss the External
-        // branch and fall through to the unrecognised-path refusal.
+        // `folder_abs`. Without the same treatment here, a registered repo
+        // under a symlinked ancestor would miss the External branch and fall
+        // through to the unrecognised-path refusal.
         let registered_canonical: Vec<(uuid::Uuid, PathBuf)> = registered_repos
             .iter()
             .map(|r| {
@@ -1134,10 +1075,10 @@ pub(super) async fn chat_submit(
                 (r.id, canon)
             })
             .collect();
-        // The Lucidos *source* repo is registered only on a dev build (a real
-        // source checkout). On a packaged build it is absent — `None` means the
-        // Lucidos-source classification branch can't match; App + External still
-        // classify, so app/external coding spawns work without a source repo.
+        // The Lucidos *source* repo is registered only on a dev build. On a
+        // packaged build it is absent, and `None` means the Lucidos-source
+        // branch cannot match. App and External still classify, so those
+        // coding-agent spawns work without a source repo.
         let lucidos_repo_root = registered_repos
             .iter()
             .find(|r| r.name.eq_ignore_ascii_case(crate::engine::LucidosEngine::DEFAULT_REPO_NAME))
@@ -1237,21 +1178,17 @@ pub(super) async fn chat_submit(
         (repo_id, thread_id, None)
     };
 
-    // Lock thread to its first (mode, repo). Switching either mid-thread
-    // makes the executor card and commands menu disagree (different repo's
-    // skills, branch can't follow across repos). Frontend should already
-    // disable the selectors for existing threads — this is the backend
-    // backstop. See `validate_thread_continuity`.
+    // Lock the thread to its first (mode, repo). The frontend already disables
+    // the selectors for an existing thread, so this is the backend backstop.
+    // See `validate_thread_continuity`.
     //
     // Skip the lock for `state='composing'`: a draft's `source` reflects the
-    // last compose-mode toggle (the PUT compose CASE writes 'chat' or
-    // 'claude_code' to it). Toggling back across modes before the first send
-    // races the debounced PUT; reading the lagged source as authoritative
-    // here surfaces as a 409 ("Thread is locked to X mode") on Send. The
-    // lock only applies once the thread has actually been sent.
+    // last compose-mode toggle. Toggling back before the first send races the
+    // debounced PUT, and reading the lagged source as authoritative surfaces
+    // as a 409 on Send. The lock applies once the thread has been sent.
     //
-    // The row itself was read above, before the subprocess gate, which needed
-    // `thread_exists`. Only the check lives here.
+    // The row itself was read above, for the subprocess gate. Only the check
+    // lives here.
     if let (Some(tid), Some((state_str, source, existing_repo, existing_agent))) =
         (thread_id, existing_thread_row)
     {
@@ -1280,12 +1217,11 @@ pub(super) async fn chat_submit(
     }
 
     // ---- Thread Queue gate ----
-    // Agent/Engine-mode POSTs that START a new thread are background spawns
-    // (cross-workspace task POSTs, `lucidos spawn-thread` CLI) — they route
-    // through the Thread Queue's admission control like every other
-    // background path. mode=Human (a person typing, from any workspace) and
-    // follow-ups on existing threads (child→parent callbacks, injections)
-    // always run immediately — user-initiated chat preempts.
+    // Agent/Engine-mode POSTs that START a new thread are background spawns: a
+    // cross-workspace task POST, or the `lucidos spawn-thread` CLI. They route
+    // through the Thread Queue's admission control like every other background
+    // path. A `mode=Human` POST and a follow-up on an existing thread always
+    // run immediately: user-initiated chat preempts (ADR 0007, refined by 0008).
     if mode != ActorMode::Human && !thread_exists {
         let queue_thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
         // Persist images as content-addressed blobs — queue requests never
@@ -1336,14 +1272,12 @@ pub(super) async fn chat_submit(
         }));
     }
 
-    // Stash the app spawn AFTER every early-return gate above (continuity
-    // lock, thread_summaries lookup error). Earlier-stamped entries would
-    // leak in the in-memory map when those gates reject — `run_direct_agent`
-    // is the only popper, and it's never reached on the 4xx/5xx paths.
-    // Mutex poisoning: parking_lot would be cleaner, but the rest of the
-    // engine uses std::sync::Mutex with the same `match` guard; matching
-    // that pattern means a panic in any other holder of this lock degrades
-    // app-spawn dispatching to a 500 instead of crashing the worker.
+    // Stash the app spawn AFTER every early-return gate above. An entry
+    // stamped earlier would leak in the in-memory map when a gate rejects:
+    // `run_direct_agent` is the only popper, and it is never reached on the
+    // 4xx/5xx paths.
+    // On mutex poisoning the handler returns a 500, matching the rest of the
+    // engine's `std::sync::Mutex` guard shape rather than crashing the worker.
     if let Some((tid, app_id)) = app_id_to_stash {
         match state.engine.pending_app_spawn.lock() {
             Ok(mut guard) => {
@@ -1357,17 +1291,16 @@ pub(super) async fn chat_submit(
     }
 
     let title = request.title;
-    // Generate an event_id for tracking progress events
     let response_event_id = event_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // Persist the follow-up's MessageReceived BEFORE this handler acks, so the
-    // 200 means "recorded, with its sequence assigned" and a client that sends
-    // one message at a time per thread gets its order preserved end to end.
-    // Self-gating (mode, channel, thread state, open question) and non-fatal:
-    // see `pre_emit_chat_message_received`. Runs after every validation gate
-    // above, so a request that 4xx'd can't leave an orphaned message behind.
+    // Persist the follow-up's MessageReceived BEFORE this handler acks. The 200
+    // then means "recorded, with its sequence assigned". A client that sends one
+    // message at a time per thread keeps its order end to end.
+    // Self-gating and non-fatal: see `pre_emit_chat_message_received`. Runs
+    // after every validation gate above, so a request that 4xx'd cannot leave
+    // an orphaned message behind.
     let pre_emitted_origin = state
         .engine
         .pre_emit_chat_message_received(
@@ -1385,9 +1318,6 @@ pub(super) async fn chat_submit(
         )
         .await;
 
-    // Spawn task to process message — all events flow through EventBus now.
-    // The JoinHandle is monitored so panics emit ResponseFailed + SessionEnded
-    // instead of silently dropping the thread into a stuck "running" state.
     let result_started_at = state.started_at;
     let engine_for_panic = state.engine.clone();
     let thread_id_for_panic = thread_id;
@@ -1566,11 +1496,11 @@ pub(super) async fn chat_submit(
         }
     });
 
-    // Monitor the spawned task — if it panics, emit ResponseFailed + SessionEnded
-    // and clean up the Claude Code session so the thread doesn't get stuck in "running" state.
+    // Monitor the spawned task. On a panic it emits ResponseFailed and
+    // SessionEnded and cleans up the coding-agent session, so the thread does
+    // not stick in "running".
     if let Some(tid) = thread_id_for_panic {
-        // Fire-and-forget: the watcher cleans up on panic; nobody awaits it.
-        // Dropping the JoinHandle detaches the already-spawned watcher (it keeps running).
+        // Dropping the JoinHandle detaches the watcher, which keeps running.
         drop(LucidosEngine::monitor_cc_task(
             engine_for_panic,
             tid,
@@ -1602,18 +1532,17 @@ pub(super) async fn cancel_chat(
     Query(query): Query<CancelChatQuery>,
 ) -> Result<Json<super::CancelResponse>, StatusCode> {
     let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
-    // Resolve actor once and reuse for the question-card resolution, the
-    // cancel-thread call, and the settle fallback — the actor stamps
-    // `ResponseCanceled.actor` / `ResponseAborted.actor` so the timeline
+    // Resolve the actor once and reuse it for the question-card resolution, the
+    // cancel-thread call, and the settle fallback. It stamps
+    // `ResponseCanceled.actor` / `ResponseAborted.actor`, so the timeline
     // records which device clicked Stop.
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    // Resolve any pending question card before firing the cancel token —
-    // otherwise the chat agent's `ask_user_question` tool stays blocked on
-    // `walk_question_batch.recv()` (no cancel-aware select) and the cancel
-    // token is never observed. Mirrors `claude_code_stop`'s behavior; without
-    // it, canceling a chat thread with an active question card hangs
-    // indefinitely in the "Canceling…" state. A resolved card counts toward
-    // `canceled` — it IS a status-changing event the client will receive.
+    // Resolve any pending question card before firing the cancel token.
+    // Otherwise the chat agent's `ask_user_question` tool stays blocked on
+    // `walk_question_batch.recv()`, which has no cancel-aware select, and the
+    // cancel token is never observed. Mirrors `claude_code_stop`. A resolved
+    // card counts toward `canceled`: it is a status-changing event the client
+    // will receive.
     let question_resolved = if let Some(tid) = thread_id {
         crate::engine::agent_question::resolve_pending_question_as_canceled(
             &state.engine,
@@ -1625,21 +1554,11 @@ pub(super) async fn cancel_chat(
         false
     };
     // Stop ends the TURN, and nothing else. It deliberately leaves this
-    // thread's event subscriptions alone.
+    // thread's event subscriptions alone (ADR 0052): a subscription has not
+    // held a turn since ADR 0049, so it is not part of what a turn-scoped Stop
+    // owns.
     //
-    // It used to cancel every one of them, which is what made a Stop on one
-    // running turn silently kill unrelated long-running subscriptions on the
-    // same thread: no toast, no transcript line, and the indicator row just
-    // gone. A subscription has not held a turn since ADR 0049, so it is not
-    // part of what a turn-scoped Stop owns, and the coupling had outlived the
-    // parked shape that justified it. The ways to end one are the **Stop
-    // waiting** button (per subscription), archive and discard (off the bus,
-    // and the archive asks first), and the agent standing itself down.
-    //
-    // `EventWaitCancelCause::ThreadCanceled` is kept and still deserializes,
-    // because rows written before this carry it; see its doc comment.
-    //
-    // `canceled = false` means the server had nothing live to cancel — the
+    // `canceled = false` means the server had nothing live to cancel, so the
     // client's optimistic "canceling" state is stale and it must re-sync.
     let canceled = match thread_id {
         Some(uuid) => {

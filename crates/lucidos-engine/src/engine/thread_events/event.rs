@@ -153,7 +153,19 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         trimmed: bool,
     },
-    MemorySearched {
+    /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
+    /// long-term memory with classifier-derived `queries` and injected the hits
+    /// into the turn's context, before the model saw anything.
+    ///
+    /// **Not the agent's own lookup.** That one is a `ToolCalled` for the
+    /// `memory` tool's `search` action, which the agent issues mid-turn with a
+    /// query of its own when the injection missed (see `engine::memory::read`).
+    /// The two were both labelled around the word "search" until 2026-08-12,
+    /// which read as one thing happening twice; the labels and this name were
+    /// split onto recall-vs-search to keep them apart. `MemorySearched` is the
+    /// pre-rename name, kept as an alias for rows already persisted under it.
+    #[serde(alias = "MemorySearched")]
+    MemoryRecalled {
         #[serde(default)]
         results: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -803,8 +815,8 @@ pub enum ThreadEvent {
         // and for legacy DB rows that pre-date this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         injected_message_id: Option<uuid::Uuid>,
-        // Set ONLY on a detached event-wake anchor (ADR 0047): the id of the
-        // `EventWaitDelivered` this injection is the wake for. `text` has to
+        // Set ONLY on an event-delivery anchor (ADR 0047): the id of the
+        // `EventWaitDelivered` this injection carries. `text` has to
         // carry the matched event as prose because it IS the prompt the model
         // reads, and a transcript that renders that verbatim is a screen of
         // pretty-printed JSON. The id points at the row that already holds the

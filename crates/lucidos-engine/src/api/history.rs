@@ -8,18 +8,18 @@ use tokio::io::AsyncWriteExt;
 const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Inter-task pipe size between the gzip encoder writer and the response body
-/// reader. 64 KiB is large enough that a burst of small events doesn't have to
-/// round-trip through the writer for every single frame, but small enough to
-/// bound memory if a client stalls.
+/// reader. Large enough that a burst of small events need not round-trip
+/// through the writer per frame. Small enough to bound memory if a client
+/// stalls.
 const GZIP_PIPE_BUF_BYTES: usize = 64 * 1024;
 
 pub(super) async fn global_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // Register this connection in the live SSE-connection count. The guard is
-    // moved into the stream's map closure below so it's dropped — and the count
-    // decremented — exactly when the stream is dropped (client disconnects).
-    // The push fan-out reads this count to decide whether to run the
-    // PresenceCheck (system-knowhow/notifications.md §3): a connected page can
-    // pong even when its device_presence heartbeat has gone stale.
+    // moved into the stream's map closure below, so the count decrements
+    // exactly when the stream is dropped. The push fan-out reads this count to
+    // decide whether to run the PresenceCheck (system-knowhow/notifications.md
+    // §3): a connected page can pong even when its device_presence heartbeat
+    // has gone stale.
     let conn_guard = state.engine.sse_connections.connect();
     let rx = state.engine.event_bus.subscribe();
     let json_stream = BroadcastStream::new(rx).map(move |r| {
@@ -54,14 +54,13 @@ where
         .into_response()
 }
 
-/// Gzip-compressed SSE response. Uses a streaming `GzipEncoder` with explicit
-/// per-event `flush()` (Z_SYNC_FLUSH) so each event reaches the client as
-/// soon as it's emitted — not buffered until the encoder fills its window.
+/// Gzip-compressed SSE response. The streaming `GzipEncoder` gets an explicit
+/// per-event `flush()` (Z_SYNC_FLUSH). Each event therefore reaches the client
+/// as it is emitted, rather than when the encoder fills its window.
 ///
 /// Wire format is identical to plain SSE (`data: <json>\n\n` per event,
-/// `:keepalive\n\n` for keep-alives) — only the transport bytes are
-/// compressed, so EventSource parsers in browsers / curl `--compressed`
-/// see the same event stream.
+/// `:keepalive\n\n` for keep-alives). Only the transport bytes are compressed,
+/// so every EventSource parser sees the same event stream.
 fn gzipped_sse_response<S>(json_stream: S) -> Response
 where
     S: Stream<Item = String> + Send + 'static,
@@ -95,9 +94,9 @@ where
         keepalive.tick().await;
         tokio::pin!(json_stream);
         loop {
-            // Decide what to write inside the select (no encoder borrows here),
-            // then do the IO sequentially below so each write's `&mut encoder`
-            // borrow is released before the next.
+            // Decide what to write inside the select, with no encoder borrow,
+            // then do the IO sequentially below. Each write's `&mut encoder`
+            // borrow is then released before the next.
             let frame = tokio::select! {
                 item = json_stream.next() => match item {
                     Some(json) => Frame::Data(json),
@@ -215,11 +214,10 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
         "workspace": workspace_name,
         "workspace_path": state.workspace_path.to_string_lossy(),
         "started_at": state.started_at.to_rfc3339(),
-        // Is the workspace database answering? An engine outlives its database
-        // (quitting Docker Desktop is the everyday dev case), and a client that
-        // could not tell held a black boot splash and then reported the outage
-        // once per failed load. Read from an atomic the background probe writes,
-        // so this never puts database latency on the health endpoint.
+        // Is the workspace database answering? An engine outlives its database,
+        // and a client that cannot tell holds a black boot splash and reports
+        // the outage once per failed load. Read from an atomic the background
+        // probe writes, so this never puts database latency on the endpoint.
         "database_reachable": state.engine.database_reachable(),
         "release": crate::LUCIDOS_RELEASE,
         "release_dirty": crate::LUCIDOS_RELEASE_DIRTY,
@@ -246,22 +244,15 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
 }
 
 /// True in a packaged desktop build, detected by the ABSENCE of a Lucidos source
-/// checkout above the running binary: a packaged `.app` engine has no
-/// `scripts/web-dev.sh` ancestor (so [`crate::paths::repo_root`] errs), while a
-/// dev engine — built from source, whether under the gateway (ADR 0014) or the
-/// legacy single-engine model — resolves it.
-///
-/// The previous signal — `LUCIDOS_STATIC_DIR` being set — stopped discriminating
-/// when ADR 0014 made the DEV engine serve the built `dist/` from that same var.
-/// A dev engine then looked "packaged" and routed its Apply restart into
-/// [`restart_via_gateway`] (a plain-`http` POST to the dev gateway, which serves
-/// `https`) instead of rebuilding via `web-dev.sh --engine-only` — surfacing as
-/// "gateway restart request failed: error sending request for url".
+/// checkout above the running binary. A packaged `.app` engine has no
+/// `scripts/web-dev.sh` ancestor, so [`crate::paths::repo_root`] errs. A dev
+/// engine resolves it, under the gateway (ADR 0014) or the legacy single-engine
+/// model.
 ///
 /// Delegates to [`crate::paths::has_lucidos_source`] so this flag and the chat
-/// agent's own "can I edit Lucidos here?" answer cannot drift — the compose
-/// destination picker hides "Lucidos source" on the strength of THIS field,
-/// and `run_coding_agent` refuses a source spawn on the strength of that one.
+/// agent's own "can I edit Lucidos here?" answer cannot drift. The compose
+/// destination picker hides "Lucidos source" on the strength of THIS field, and
+/// `run_coding_agent` refuses a source spawn on that one.
 fn is_packaged() -> bool {
     !crate::paths::has_lucidos_source()
 }
@@ -297,24 +288,17 @@ fn read_app_version() -> String {
     read_version_file(&path)
 }
 
-/// Switch the engine onto the new version (the disruptive step of the
-/// new-version-available/switch flow — the `/api/v1/restart` route). The new
-/// binary is ALREADY on disk: dev's *Apply* rebuilt it in the background, or the
-/// packaged updater installed it — so this only RESPAWNS, it does not build.
+/// Switch the engine onto the new version, the disruptive step of the
+/// new-version-available flow. The new binary is ALREADY on disk, rebuilt by
+/// dev's *Apply* or installed by the packaged updater, so this only RESPAWNS.
 ///
-/// It does NOT pre-emit boundary events. Instead it **stashes the device actor**
-/// and returns; the actual boundary aborts are emitted at real teardown by the
-/// graceful-shutdown path (`main.rs::shutdown_signal` →
-/// `abort_in_flight_for_restart`, reading the stashed actor) — so nothing shows
-/// "Switched/Aborted" while the old engine is still alive. A device actor also
-/// marks the shutdown as a user-initiated switch, which recovery uses to
-/// auto-resume in-flight coding-agent threads (a crash leaves no such actor →
-/// manual Continue). Errors return `{"error": msg}` so the UI shows the reason.
-///
-/// Respawn path: prefer the gateway control API whenever the gateway spawned us
-/// (dev AND packaged — it injects `LUCIDOS_GATEWAY_PORT` + `LUCIDOS_WORKSPACE_ID`);
-/// fall back to launchd (packaged, no gateway) or `web-dev.sh --engine-only`
-/// (legacy `LUCIDOS_NO_GATEWAY` dev, where there's no gateway to do the respawn).
+/// It does NOT pre-emit boundary events. It stashes the device actor and
+/// returns; the boundary aborts are emitted at real teardown by
+/// `main.rs::shutdown_signal`. Nothing then shows "Switched" while the old
+/// engine is still alive. A device actor also marks the shutdown as a
+/// user-initiated switch, which recovery uses to auto-resume in-flight
+/// coding-agent threads. A crash leaves no such actor, so those threads keep a
+/// manual Continue.
 pub(super) async fn restart_engine(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -329,16 +313,14 @@ pub(super) async fn restart_engine(
 
     let outcome = respawn_this_engine(&state).await;
 
-    // Nothing asked this engine to go down after all: every arm below fails
-    // BEFORE the process is signalled (an unreachable gateway, a gateway that
-    // refused the id, launchctl or `web-dev.sh` failing to spawn), so the stash
+    // Nothing asked this engine to go down after all. Every arm in
+    // `respawn_this_engine` fails BEFORE the process is signalled, so the stash
     // now describes a restart that never happened. Left in place it would attach
-    // to whatever teardown came next, and under first-writer-wins it would also
-    // REFUSE that teardown's own actor, which is the case that actually bites: a
-    // stale non-device actor here (an API caller with no device header) would
-    // then block a later picker Restart from attributing itself at all, costing
-    // its threads the pause and the auto-resume. Only clear what THIS call
-    // stashed, so a concurrent notify's actor is never dropped on our behalf.
+    // to whatever teardown came next, and under first-writer-wins it would
+    // REFUSE that teardown's own actor. That is the case that bites: a stale
+    // non-device actor here would block a later picker Restart from attributing
+    // itself, costing its threads the pause and the auto-resume. Only clear what
+    // THIS call stashed, so a concurrent notify's actor is never dropped for us.
     if outcome.is_err() && stashed {
         state.engine.take_restart_actor();
         log!("[Restart] Respawn request failed, cleared the stashed restart actor");
@@ -350,10 +332,10 @@ pub(super) async fn restart_engine(
 /// [`restart_engine`] so its several failure exits meet the stash-cleanup above
 /// at one place instead of each having to remember it.
 ///
-/// Prefer the gateway control API whenever the gateway spawned us (dev AND
-/// packaged, since it injects `LUCIDOS_GATEWAY_PORT` + `LUCIDOS_WORKSPACE_ID`);
-/// fall back to launchd (packaged, no gateway) or `web-dev.sh --engine-only`
-/// (legacy `LUCIDOS_NO_GATEWAY` dev, where there's no gateway to do the respawn).
+/// Prefer the gateway control API whenever the gateway spawned us, in dev and
+/// packaged alike, since it injects `LUCIDOS_GATEWAY_PORT` and
+/// `LUCIDOS_WORKSPACE_ID`. Fall back to launchd (packaged, no gateway) or
+/// `web-dev.sh --engine-only` (legacy `LUCIDOS_NO_GATEWAY` dev).
 ///
 /// `Ok` means the teardown is under way, not merely requested: the gateway
 /// signals the engine inside the call it answers, and launchctl / `web-dev.sh`
@@ -439,11 +421,11 @@ async fn respawn_this_engine(
     }
 }
 
-/// `GET /api/v1/engine/version-status` — the running engine's build id, whether a
-/// newer engine version is ready to switch onto, whether this is a packaged build,
-/// and the dev background-rebuild state. Drives the unified "New version available
-/// → Switch to new version" surface (dev half; packaged routes to the release
-/// updater). See `crates/lucidos-engine/src/engine/engine_version.rs`.
+/// `GET /api/v1/engine/version-status`. Reports the running engine's build id
+/// and whether a newer version is ready to switch onto. Also reports whether
+/// the build is packaged, and the dev background-rebuild state. Drives the "New
+/// version available" surface; packaged routes to the release updater instead.
+/// See `crates/lucidos-engine/src/engine/engine_version.rs`.
 pub(super) async fn engine_version_status(
     State(state): State<AppState>,
 ) -> Json<crate::engine::engine_version::VersionStatus> {
@@ -453,29 +435,27 @@ pub(super) async fn engine_version_status(
 /// `GET /api/v1/engine/changelog`: every published release's notes, newest
 /// first, for the *What's New* panel (Settings > System).
 ///
-/// Takes no state and touches no disk. The text is baked into this binary (see
-/// `crate::engine::changelog`), so the answer is the same offline, on a packaged
-/// install with no checkout, and while the database is down.
+/// Takes no state and touches no disk. The text is baked into this binary
+/// (`crate::engine::changelog`), so the answer is the same offline, on a
+/// packaged install, and with the database down.
 ///
 /// Deliberately does NOT restate which release is running. `/health` already
-/// carries `release`, the frontend already holds it, and one source of truth for
-/// that value is what keeps the panel's "you are running this" mark from
-/// disagreeing with the Versions section two tabs away.
+/// carries `release` and the frontend already holds it. One source of truth
+/// keeps the panel's "you are running this" mark from disagreeing with the
+/// Versions section two tabs away.
 pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "releases": crate::engine::changelog::changelog_releases(),
     }))
 }
 
-/// `POST /api/v1/engine/rebuild` — manually kick off the dev background engine
-/// rebuild (the escape hatch behind the frontend "Rebuild & Switch" affordance),
-/// so a wedged workspace (source behind HEAD with a stale binary — e.g. after a
-/// failed background rebuild) can produce the new binary WITHOUT a manual
-/// `web-dev.sh -b`. Coordinated + coalesced by `trigger_background_rebuild`
-/// (checkout-shared build lock, single builder across co-located engines).
-/// No-op packaged (never rebuilds from source); returns 202 regardless so the
-/// caller isn't error-handling a no-op. The resulting `version-status`
-/// `build_state` transitions drive the UI (building → ready → Switch).
+/// `POST /api/v1/engine/rebuild` kicks off the dev background engine rebuild,
+/// the escape hatch behind the frontend "Rebuild & Switch" affordance. A wedged
+/// workspace (source behind HEAD with a stale binary) can then produce the new
+/// binary without a manual `web-dev.sh -b`. Coordinated and coalesced by
+/// `trigger_background_rebuild`, which holds the checkout-shared build lock.
+/// No-op packaged, and 202 regardless, so the caller is not error-handling a
+/// no-op. The resulting `version-status` `build_state` transitions drive the UI.
 pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode {
     state.engine.trigger_background_rebuild();
     StatusCode::ACCEPTED
@@ -483,18 +463,15 @@ pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode 
 
 /// Gateway-mode restart (ADR 0014): POST the gateway's control API (behind the
 /// sigil namespace `/~/`) to respawn just this workspace's stack. The gateway
-/// kills the old engine (SIGUSR1, with a drain window) and spawns a fresh one on
-/// the same loopback port; the frontend tolerates the brief network rejection
-/// after the 2xx.
+/// kills the old engine and spawns a fresh one on the same loopback port. The
+/// frontend tolerates the brief network rejection after the 2xx.
 ///
-/// Supports BOTH protocols: the scheme is resolved by [`net_config::tls_scheme`]
-/// (the ONE place — `https` in dev where the gateway keeps its TLS certs, `http`
-/// packaged where they're stripped), and [`net_config::peer_scheme_order`] puts
-/// it first with the other protocol as a fallback, so a mismatch still restarts.
-/// A non-2xx RESPONSE is a real gateway error and is returned immediately — only
-/// a failure to reach the gateway falls through to the other scheme. Accepts the
+/// Supports BOTH protocols. [`net_config::peer_scheme_order`] puts the resolved
+/// scheme first and the other one as a fallback, so a mismatch still restarts.
+/// A non-2xx RESPONSE is a real gateway error and returns immediately: only a
+/// failure to REACH the gateway falls through to the other scheme. Accepts the
 /// self-signed dev cert on this loopback call, the same posture as the gateway's
-/// own health client (`build_health_client`) and the dev scripts (`curl -sk`).
+/// own health client (`build_health_client`).
 async fn restart_via_gateway(
     gateway_port: &str,
     workspace_id: &str,
@@ -562,10 +539,9 @@ async fn restart_via_gateway(
 /// Packaged restart: the engine runs as the `com.lucidos.engine` launchd
 /// service, so it restarts itself with `launchctl kickstart -k`. launchd
 /// SIGTERMs the service supervisor, which sends the engine its graceful-stop
-/// SIGUSR1 (with a drain window) and respawns a clean Postgres + engine. We
-/// spawn launchctl and return 200 immediately — the response flushes during the
-/// drain window, and the frontend already tolerates a network rejection after a
-/// 2xx while the engine is being killed.
+/// SIGUSR1 and respawns a clean Postgres and engine. We spawn launchctl and
+/// return 200 at once: the response flushes during the drain window, and the
+/// frontend tolerates a network rejection after a 2xx.
 fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // `launchctl kickstart` targets `gui/<uid>/<label>`; resolve the uid of the
     // user whose launchd domain the service was bootstrapped into (us).
@@ -588,10 +564,10 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
     }
 }
 
-/// List all Lucidos workspaces by calling status.sh --json — including the
-/// current one, which the control panel renders as the active row with its
-/// refresh control (parity with the gateway picker). Times out after 10s to
-/// avoid blocking if Docker or target engines are unresponsive.
+/// List all Lucidos workspaces by calling `status.sh --json`, the current one
+/// included. The control panel renders that one as the active row with its
+/// refresh control, matching the gateway picker. Times out after 10s, so an
+/// unresponsive Docker or target engine cannot block the request.
 pub(super) async fn list_workspaces() -> Json<serde_json::Value> {
     let empty = || Json(serde_json::json!({ "workspaces": [] }));
     let script = match crate::paths::script("status.sh") {
@@ -858,33 +834,22 @@ pub(super) async fn query_events(
 /// Well-known persisted event types, always offered by `/events/types` even on
 /// a workspace whose `events` table has no row of that type yet.
 ///
-/// This list is what makes an event *discoverable*: the trigger-config
-/// `on_event:` dropdown (`fetchEventTypes` →
-/// `crates/lucidos-app/src/components/triggers/TriggerDetails.tsx`) is the
-/// merge of this constant with `distinct_event_types()`. A type that is absent
-/// here cannot be subscribed to from the UI until the workspace happens to
-/// produce one, which on a fresh install is exactly backwards: the useful
-/// subscriptions are the ones you want wired up BEFORE the thing has happened.
-/// `ChildThreadCompleted` was the reported case.
+/// The trigger-config `on_event:` dropdown merges this constant with
+/// `distinct_event_types()`. A type absent here cannot be subscribed to until
+/// the workspace happens to produce one, which is backwards on a fresh install.
 ///
 /// Membership rule, so additions stay auditable: a name belongs here iff a
-/// trigger subscribed to it would actually fire. In practice that means it must
-/// be a **`ThreadEvent`** variant that is persisted and not on the
-/// `ThreadEvent::is_per_token_streaming` blocklist.
+/// trigger subscribed to it would actually fire. That means a persisted
+/// **`ThreadEvent`** variant not on the `ThreadEvent::is_per_token_streaming`
+/// blocklist.
 ///
-/// **No `SystemEvent` name belongs here**, however useful it sounds. The
-/// scheduler's `BusEvent::System` arm routes exactly one variant to the trigger
-/// matcher, `SystemEvent::DomainEvent` (see `start_trigger_event_subscriber` in
-/// `crates/lucidos-engine/src/scheduler/mod.rs`); the `Trigger*` lifecycle
-/// variants go to `handle_trigger_event`, which is the scheduler's own
-/// bookkeeping and not the matcher, and everything else falls through `_ => {}`.
-/// So seeding e.g. `NotificationCreated` or `TriggerExecuted` offers a
-/// subscription that can never fire. `TriggerCompleted` and `TriggerStarted`
-/// ARE here, and legitimately: both names exist on `ThreadEvent` too, and it is
-/// the thread-side emit that reaches the matcher.
+/// **No `SystemEvent` name belongs here.** The scheduler routes exactly one
+/// variant to the trigger matcher, `SystemEvent::DomainEvent`, so seeding
+/// `NotificationCreated` offers a subscription that can never fire.
+/// `TriggerCompleted` and `TriggerStarted` ARE here, because both names exist
+/// on `ThreadEvent` too and it is the thread-side emit that reaches the matcher.
 ///
-/// Kept sorted; `known_event_types_are_triggerable_thread_events` holds the
-/// ordering and enforces the rule.
+/// Kept sorted, and `known_event_types_are_triggerable_thread_events` enforces both.
 const KNOWN_EVENT_TYPES: &[&str] = &[
     "BackgroundBashCompleted",
     "BackgroundBashStarted",
@@ -977,11 +942,11 @@ pub(super) async fn emit_event(
             .into_response();
     }
 
-    // App UI emits are user-driven on a real device — stamp the resolved actor
-    // so persisted rows and SSE frames carry the same `actor` key as every
-    // other actor-bearing event. The merge is done inside
-    // `SystemEvent::DomainEvent::to_payload` so non-object payloads are
-    // preserved unchanged (no panic, just a no-op merge).
+    // App UI emits are user-driven on a real device, so stamp the resolved
+    // actor. Persisted rows and SSE frames then carry the same `actor` key as
+    // every other actor-bearing event. The merge happens inside
+    // `SystemEvent::DomainEvent::to_payload`, so a non-object payload is
+    // preserved unchanged.
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     if body.transient {
@@ -1057,12 +1022,11 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// Regression: read_app_version must read fresh from disk on every call,
-    /// not return a cached value. The original bug cached the version in
-    /// AppState at startup, so version bumps from applied changes were
-    /// invisible to the health endpoint until an engine restart.
+    /// Regression: `read_app_version` must read fresh from disk on every call.
+    /// A cached value makes a version bump from an applied change invisible to
+    /// the health endpoint until an engine restart.
     ///
-    /// Single test to avoid races — both scenarios mutate the same file.
+    /// One test rather than three, because all three mutate the same file.
     #[test]
     fn read_app_version_reads_fresh_from_disk() {
         let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1108,13 +1072,10 @@ mod tests {
     }
 
     /// Regression (ADR 0014): an engine built from a source checkout must report
-    /// as NOT packaged. The old `is_packaged()` keyed off `LUCIDOS_STATIC_DIR`,
-    /// which ADR 0014 made the DEV engine set too — so a dev engine looked
-    /// packaged and routed its Apply restart into the packaged gateway POST
-    /// (plain-`http` to the `https` dev gateway) instead of rebuilding via
-    /// `web-dev.sh --engine-only`. Detection is now the presence of the
-    /// `scripts/web-dev.sh` source marker, so the test binary (which lives inside
-    /// the repo) classifies as dev.
+    /// as NOT packaged. Keying off `LUCIDOS_STATIC_DIR` made a dev engine look
+    /// packaged, because ADR 0014 has the dev engine set that var too. Detection
+    /// is the `scripts/web-dev.sh` source marker, so this test binary, living
+    /// inside the repo, classifies as dev.
     #[test]
     fn is_packaged_false_for_source_build() {
         assert!(
@@ -1124,9 +1085,9 @@ mod tests {
     }
 
     /// `Accept-Encoding` parser must recognise gzip in any of its standard
-    /// shapes — bare token, with a q-value, anywhere in a comma-separated list,
-    /// case-insensitive — and reject look-alikes like `x-gzip` (which is a
-    /// distinct historical encoding).
+    /// shapes: a bare token, a q-value, anywhere in a comma-separated list, and
+    /// case-insensitive. It must reject look-alikes like `x-gzip`, which is a
+    /// distinct historical encoding.
     #[test]
     fn accepts_gzip_recognises_standard_offers() {
         fn h(value: &str) -> axum::http::HeaderMap {
@@ -1161,11 +1122,10 @@ mod tests {
         assert!(accepts_gzip(&h("gzip, deflate;q=0")));
     }
 
-    /// Spoofing prevention: untrusted apps must not be able to emit a
-    /// domain event whose name collides with a `SystemEvent` variant —
-    /// after the SSE unwrap, the wire frame would be indistinguishable
-    /// from a real system frame (e.g. a forged `NotificationCreated`
-    /// would render a fake notification on every connected client).
+    /// Spoofing prevention: an untrusted app must not emit a domain event whose
+    /// name collides with a `SystemEvent` variant. After the SSE unwrap, the
+    /// wire frame would be indistinguishable from a real system frame, and a
+    /// forged `NotificationCreated` would reach every connected client.
     #[test]
     fn validate_emittable_event_type_rejects_reserved_system_names() {
         for name in [
@@ -1204,25 +1164,11 @@ mod tests {
     /// Every seeded name must be one a trigger can actually fire on.
     ///
     /// `/events/types` feeds the trigger `on_event:` dropdown, so a name the
-    /// matcher never sees doesn't fail loudly: it offers the user a
-    /// subscription that silently never fires. Two ways to get that wrong, and
-    /// this test covers both.
-    ///
-    /// A **typo or retired name** is caught by requiring
-    /// `thread_lifecycle::classify_event` to recognise the string. That matcher
-    /// is keyed on `ThreadEvent` variant names (plus their legacy aliases) and
-    /// returns `None` for everything else.
-    ///
-    /// A **`SystemEvent` name** is caught by the same requirement, and this is
-    /// the subtle half. The scheduler's `BusEvent::System` arm forwards exactly
-    /// one variant to the matcher, `SystemEvent::DomainEvent`; `Trigger*`
-    /// lifecycle variants go to the scheduler's own bookkeeping and the rest
-    /// fall through `_ => {}`. So a `SystemEvent`-only name like
-    /// `NotificationCreated` or `TriggerExecuted` is unsubscribable no matter
-    /// how plausible it reads, and `classify_event` rejects it because it is
-    /// not a `ThreadEvent`. (`TriggerCompleted` / `TriggerStarted` pass because
-    /// those names exist on BOTH enums and it is the thread-side emit that
-    /// reaches the matcher.)
+    /// matcher never sees offers a subscription that silently never fires.
+    /// `KNOWN_EVENT_TYPES` states the membership rule; this test enforces it by
+    /// requiring `thread_lifecycle::classify_event` to recognise every string.
+    /// That matcher is keyed on `ThreadEvent` variant names plus their legacy
+    /// aliases, so it catches a typo, a retired name, and a `SystemEvent` name.
     ///
     /// This is still a containment check, not a derivation: it cannot say "a
     /// new triggerable variant landed and nobody seeded it". Deriving the list
@@ -1279,11 +1225,10 @@ mod tests {
         );
     }
 
-    /// Regression: `ChildThreadCompleted` was missing from the seed list, so a
-    /// workspace could only subscribe a trigger to a child thread's outcome
-    /// after one had already completed and `distinct_event_types()` picked the
-    /// name up from the table. Wanting to be notified when a child thread
-    /// finishes is precisely a thing you wire up beforehand.
+    /// Regression: without `ChildThreadCompleted` in the seed list, a workspace
+    /// can only subscribe a trigger to a child thread's outcome after one has
+    /// completed. Being notified when a child thread finishes is exactly the
+    /// thing you wire up beforehand.
     #[test]
     fn known_event_types_seeds_child_thread_completed() {
         assert!(KNOWN_EVENT_TYPES.contains(&"ChildThreadCompleted"));

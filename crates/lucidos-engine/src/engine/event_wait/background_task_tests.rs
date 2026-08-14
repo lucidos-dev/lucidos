@@ -2,7 +2,7 @@
 //! arm at all, over which tasks, and for how long.
 //!
 //! Both are the parts that can be wrong silently. A coverage test that is too
-//! loose wakes the thread twice for one completion; one that is too strict
+//! loose delivers one completion to the thread twice; one that is too strict
 //! never arms at all and the stall comes straight back. A timeout shorter than
 //! the task is a subscription that expires before the thing it watches.
 //!
@@ -38,7 +38,7 @@ fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
 
 /// The case that matters: the model armed its own wait for exactly this task,
 /// so the engine must not arm a second one. Two waits over one completion is
-/// two wakes, and the second finds the work already reported.
+/// two deliveries, and the second finds the work already reported.
 #[test]
 fn a_wait_the_model_armed_for_this_task_covers_it() {
     let on = vec![sub(
@@ -60,9 +60,9 @@ fn a_wait_for_a_different_task_does_not_cover_this_one() {
     assert!(!wait_covers_task(&on, "abc", owner()));
 }
 
-/// An unconditioned subscription wakes on the first background task to finish
+/// An unconditioned subscription fires on the first background task to finish
 /// anywhere, including this one, so it genuinely covers it. Arming beside it
-/// would double the wake.
+/// would deliver it twice.
 #[test]
 fn an_unconditioned_subscription_covers_every_task() {
     let on = vec![sub("BackgroundBashCompleted", None)];
@@ -206,7 +206,7 @@ fn an_unwatched_task_is_armed() {
 }
 
 /// The model armed its own wait, so the engine must stand down. Two waits over
-/// one completion is two wakes.
+/// one completion is delivered twice.
 #[test]
 fn a_task_the_model_is_already_watching_is_not_armed_again() {
     let running = [task("build")];
@@ -221,7 +221,7 @@ fn a_task_the_model_is_already_watching_is_not_armed_again() {
 }
 
 /// Partial coverage still arms, over the remainder only. Arming over the
-/// covered one too would double its wake.
+/// covered one too would deliver it twice.
 #[test]
 fn only_the_uncovered_tasks_are_armed() {
     let running = [task("watched"), task("unwatched")];
@@ -265,7 +265,7 @@ fn the_live_wait_cap_refuses_and_says_why() {
 }
 
 /// The consecutive cap is what bounds the loop this mechanism could otherwise
-/// create: a turn woken by an engine-armed wait spawns another task and ends
+/// create: a turn re-entered by an engine-armed wait spawns another task and ends
 /// again, forever. Counting engine-armed waits stops it at the same ten the
 /// model gets.
 #[test]

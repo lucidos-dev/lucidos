@@ -226,8 +226,16 @@ export function exchangeUserImageHashes(exchange: Exchange): string[] {
  *  Walks steps backward, skipping terminal events that omit the field (recovery
  *  paths emit ResponseAborted with model=null). Claude Code sessions fall back to
  *  CodingAgentSettingsChanged (emitted at session start). Chat sessions fall back to the
- *  request metadata stamped on MessageReceived so the route tooltip shows
- *  model/effort while the response is still streaming. */
+ *  request metadata stamped on the exchange's STARTER event so the route popover
+ *  shows model/effort while the response is still streaming.
+ *
+ *  Both starter kinds carry that metadata and both are read here, mirroring
+ *  `threadModelSelections`' newest-starter lookup and the backend's
+ *  `IN ('MessageReceived', 'TriggerStarted')`: a chat turn starts with
+ *  `MessageReceived`, a trigger fire starts with `TriggerStarted` and emits no
+ *  `MessageReceived` at all. Reading only the former left a firing trigger's
+ *  Executor section with no Model and no Effort row for the whole run, even
+ *  though the fire had resolved both. */
 type ResponseField = 'model' | 'reasoning_effort';
 function extractResponseField(exchange: Exchange, field: ResponseField): string | undefined {
   let ccFallback: string | undefined;
@@ -242,8 +250,9 @@ function extractResponseField(exchange: Exchange, field: ResponseField): string 
     }
   }
   if (ccFallback) return ccFallback;
-  if (exchange.userEvent.type === 'MessageReceived') {
-    const v = exchange.userEvent[field];
+  const starter = exchange.userEvent;
+  if (starter.type === 'MessageReceived' || starter.type === 'TriggerStarted') {
+    const v = starter[field];
     if (v) return v;
   }
   return undefined;

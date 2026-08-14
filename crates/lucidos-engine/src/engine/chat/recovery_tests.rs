@@ -737,7 +737,7 @@ mod switch_resume {
         .await
         .unwrap();
 
-        // The subscribed event lands and wakes the thread into a NEW turn. The
+        // The subscribed event lands and re-opens the thread into a NEW turn. The
         // anchor is the injection, not a `MessageReceived`.
         tick().await;
         bus.emit(BusEvent::Thread {

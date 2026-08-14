@@ -41,7 +41,13 @@ export const clientRefreshing = signal(false);
 
 /** Global preference key: last-dismissed served client `/sw.js` BUILD_ID. */
 const CLIENT_REFRESH_DISMISSED_KEY = 'client_refresh_dismissed_build';
-/** Global preference key: last-dismissed on-disk engine `disk_build_id`. */
+/** Global preference key: last-dismissed ANNOUNCED ENGINE VERSION id (see
+ *  {@link noteAnnouncedEngineVersion}).
+ *
+ *  The stored key STRING still says "switch" because that is what is already
+ *  written in every user's preferences, and changing it would forget every
+ *  dismissal in flight the day this ships. What widened is the meaning of the
+ *  VALUE, not where it lives. */
 const ENGINE_SWITCH_DISMISSED_KEY = 'engine_switch_dismissed_build';
 
 /** Read a global dismissed-build preference; undefined until preferences load. */
@@ -86,22 +92,39 @@ export function wasSwUpdateDismissed(servedBuildId: string): boolean {
   return dismissedBuild(CLIENT_REFRESH_DISMISSED_KEY) === servedBuildId;
 }
 
-/** The on-disk build id the currently-shown Switch toast is offering. Set by the
- *  version poll so `markSwitchDismissed` (called from the store's keyed dismiss)
- *  can record THIS build as dismissed. */
-let pendingSwitchBuildId: string | null = null;
+/** The **announced engine version id**: which engine version the version toast
+ *  currently on screen is telling the user about. Set by the version poll so
+ *  `markEngineVersionDismissed` (called from the store's keyed dismiss, which
+ *  knows only the toast key) can record THAT version as dismissed.
+ *
+ *  One slot for BOTH shapes the toast takes, because a dismissal is about the
+ *  version being announced, not about which branch of the poll drew it:
+ *
+ *  - a version that is **built and switchable** is identified by its
+ *    `disk_build_id`;
+ *  - a version that exists **only in source** is identified by the checkout's
+ *    `head_commit`, because there is no on-disk build to name, and that absence
+ *    is exactly what makes it pending.
+ *
+ *  Before this, only the first had an id, so the pending toast had nothing to
+ *  pin a dismissal to and was undismissable by construction: its X hid it and
+ *  the next 4s poll drew it again. Sharing the slot also keeps the two honest
+ *  about each other. Dismissing the pending toast pins a HEAD; when a build
+ *  lands, the id becomes a disk build id, stops matching, and the toast
+ *  correctly re-surfaces as the Switch. */
+let announcedEngineVersionId: string | null = null;
 
-export function noteSwitchBuildId(diskBuildId: string): void {
-  pendingSwitchBuildId = diskBuildId;
+export function noteAnnouncedEngineVersion(versionId: string): void {
+  announcedEngineVersionId = versionId;
 }
 
-export function markSwitchDismissed(): void {
-  if (pendingSwitchBuildId === null) return; // nothing to pin
-  writeDismissedBuild(ENGINE_SWITCH_DISMISSED_KEY, pendingSwitchBuildId);
+export function markEngineVersionDismissed(): void {
+  if (announcedEngineVersionId === null) return; // nothing to pin
+  writeDismissedBuild(ENGINE_SWITCH_DISMISSED_KEY, announcedEngineVersionId);
 }
 
-export function wasSwitchDismissed(diskBuildId: string): boolean {
-  return dismissedBuild(ENGINE_SWITCH_DISMISSED_KEY) === diskBuildId;
+export function wasEngineVersionDismissed(versionId: string): boolean {
+  return dismissedBuild(ENGINE_SWITCH_DISMISSED_KEY) === versionId;
 }
 
 /** Spread of delays (ms) over which we re-check the service worker for a new

@@ -140,7 +140,7 @@ impl LucidosEngine {
     ///
     /// Emits ResponseAborted via EventBus with partial text so the thread is
     /// marked UNREAD and the user notices. The actor is stamped as `System` so
-    /// the AbortPanel renders "⚙ System" — the host system killed the previous
+    /// the AbortPanel renders "System": the host system killed the previous
     /// response (engine crashed, OS killed the process, etc.); the engine on
     /// restart is just marking it. `request_event_id` is the originating
     /// MessageReceived/TriggerStarted id — the user-facing rerun path uses

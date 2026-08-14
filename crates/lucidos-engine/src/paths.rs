@@ -64,13 +64,15 @@ fn compute_repo_root() -> Result<PathBuf, String> {
 /// The Lucidos repo root above `exe`, or `None` when there isn't one.
 ///
 /// Walks ancestors rather than counting `..` hops, so it is independent of HOW
-/// DEEP the binary sits under the checkout. That is load-bearing, not
-/// incidental: the dev launcher publishes the engine to
-/// `target/<profile>/launch/<variant>/lucidos-engine` (ADR 0022), two levels
-/// deeper than the historical `target/<profile>/`, and every dev-mode resource
-/// lookup (`scripts/`, `system-knowhow/`, the SDK bundle) resolves through here.
-/// Split out from [`compute_repo_root`] so the depth-independence is testable
-/// without touching `current_exe()`.
+/// DEEP the binary sits under the checkout AND of which top-level directory it
+/// sits in. That is load-bearing, not incidental: the dev launcher publishes the
+/// engine to `.launch/<profile>/<variant>/lucidos-engine` (ADR 0022, relocated
+/// out of `target/` so `cargo clean` cannot remove the running system's CLI),
+/// and every dev-mode resource lookup (`scripts/`, `system-knowhow/`, the SDK
+/// bundle) resolves through here. The walk is also exactly what makes that
+/// relocation safe: only "somewhere inside the checkout" is required, never a
+/// particular parent. Split out from [`compute_repo_root`] so the
+/// depth-independence is testable without touching `current_exe()`.
 ///
 /// The gateway has a hand-synced copy (`crates/lucidos-gateway/src/build_id.rs`
 /// `repo_root_from`) — ADR 0014 §1 keeps it free of any dependency on the
@@ -142,12 +144,15 @@ mod tests {
         );
     }
 
-    /// The checkout is found by WALKING ancestors, at any depth — the dev
-    /// launcher publishes the engine two levels deeper than the historical
-    /// `target/<profile>/` (ADR 0022), and every dev-mode resource lookup
-    /// (`scripts/`, `system-knowhow/`, the SDK bundle) hangs off this. A
-    /// fixed-hop-count resolver would silently stop finding the checkout — which
-    /// is exactly how the SDK bundle fell back to its stub.
+    /// The checkout is found by WALKING ancestors, at any depth and under any
+    /// top-level directory. The dev launcher publishes the engine three
+    /// directories below the checkout root, at `.launch/<profile>/<variant>/`
+    /// (ADR 0022, relocated out of `target/` by ADR 0063), and every
+    /// dev-mode resource lookup (`scripts/`, `system-knowhow/`, the SDK bundle)
+    /// hangs off this. A fixed-hop-count resolver would silently stop finding
+    /// the checkout, which is exactly how the SDK bundle fell back to its stub;
+    /// a resolver anchored on `target/` would have blocked the relocation that
+    /// keeps `cargo clean` from deleting the running system's `lucidos` CLI.
     #[test]
     fn repo_root_above_is_independent_of_binary_depth() {
         let dir = std::env::temp_dir().join(format!(
@@ -161,8 +166,8 @@ mod tests {
 
         for rel in [
             "target/debug/lucidos-engine",
-            "target/debug/launch/plain/lucidos-engine",
-            "target/release/launch/e2e-test-hooks/lucidos-engine",
+            ".launch/debug/plain/lucidos-engine",
+            ".launch/release/e2e-test-hooks/lucidos-engine",
             "target/debug/deps/lucidos_engine-abc123",
         ] {
             assert_eq!(
@@ -242,6 +247,10 @@ mod tests {
         for p in [
             "/w/dev/.lucidos/worktrees/thread-abc",
             "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
+            // The PUBLISHED launch path (ADR 0063). It moved out of `target/`
+            // so a `cargo clean` could not delete the CLI; the worktree
+            // refusal must not have moved with it.
+            "/w/dev/.lucidos/worktrees/thread-abc/.launch/debug/plain/lucidos-engine",
         ] {
             assert!(path_is_in_cc_worktree(Path::new(p)), "{p}");
         }

@@ -1,6 +1,6 @@
 import { computed } from '@preact/signals';
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { toasts, dismissToast, focusedPane, speedMultiplier, splitRatio } from '../../store/store';
+import { toasts, dismissToast, focusedPane, speedMultiplier, splitRatio, toastPlacement } from '../../store/store';
 import type { ToastItem, ToastType } from '../../store/types';
 import { CloseIcon } from './icons';
 import { parseToastMessage } from './toastMessage';
@@ -11,6 +11,7 @@ import { toastColumns, toastLayout } from './toastColumns';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
+import { progressFillWidth } from './progressBar';
 
 // Reflow (FLIP) timing for the toast stack. When a toast is added/removed the
 // survivors are re-laid-out instantly by the flex column; these values play that
@@ -25,7 +26,9 @@ const REFLOW_EASING = 'cubic-bezier(0.22, 0, 0, 1)';
  *  not on every `splitRatio` write: a divider drag writes the ratio on every
  *  pointermove, and a computed only wakes its readers when its value actually
  *  changes. */
-const paneLayout = computed(() => toastLayout(viewportIsMobile.value, splitRatio.value));
+const paneLayout = computed(() =>
+  toastLayout(viewportIsMobile.value, splitRatio.value, toastPlacement.value),
+);
 
 const icons: Record<ToastType, string> = {
   success: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12l2.5 2.5L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
@@ -117,15 +120,6 @@ function handleToastKeyDown(e: KeyboardEvent): void {
   } else {
     focusables[target].focus({ preventScroll: true });
   }
-}
-
-/** CSS width for a toast's determinate progress fill. Clamps to [0, 1] and
- *  rejects a non-finite fraction, so a bad value paints an empty track rather
- *  than `NaN%` or a bar running past its own container. Exported for the unit
- *  test that pins that. */
-export function toastProgressWidth(fraction: number): string {
-  if (!Number.isFinite(fraction)) return '0%';
-  return `${Math.min(1, Math.max(0, fraction)) * 100}%`;
 }
 
 function renderMessage(message: string) {
@@ -240,7 +234,15 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
   const columns = toastColumns(items, paneLayout.value);
 
   return (
-    <div ref={containerRef} class="toast-container" onKeyDown={handleToastKeyDown}>
+    <div
+      ref={containerRef}
+      class="toast-container"
+      /* The shape under comparison. Every difference between the four is a CSS
+         rule keyed on this, so the render stays one code path. Temporary, and it
+         goes with the picker (docs/temporary-measures.md). */
+      data-toast-placement={toastPlacement.value}
+      onKeyDown={handleToastKeyDown}
+    >
       {columns.map((column) => (
         <div
           key={column.pane ?? 'single'}
@@ -272,11 +274,11 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
       </div>
       {/* Determinate progress for a long operation (a packaged update's
           download). Absent when the operation has no honest percentage: the
-          spinner and the message carry it instead. `toastProgressWidth` clamps,
+          spinner and the message carry it instead. `progressFillWidth` clamps,
           so a bad fraction can never paint outside the track. */}
       {t.progress != null && (
         <div class="progress-bar toast-progress">
-          <div class="progress-bar-fill" style={{ width: toastProgressWidth(t.progress) }} />
+          <div class="progress-bar-fill" style={{ width: progressFillWidth(t.progress) }} />
         </div>
       )}
       {(t.action || t.secondaryAction) && (

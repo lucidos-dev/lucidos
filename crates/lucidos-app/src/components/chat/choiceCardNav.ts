@@ -1,5 +1,5 @@
 import { hasHoverPointer } from '../../utils/platform';
-import { isElementOnScreen, isElementVisible } from './scrollState';
+import { isElementOnScreen, isElementVisible, markRevealScroll } from './scrollState';
 import { getVisiblePromptInput } from './promptFocus';
 
 /** Keyboard navigation for **choice cards**: a live user question card or a live
@@ -142,6 +142,22 @@ export function handleChoiceCardKeyDown(e: KeyboardEvent, root: HTMLElement | nu
   // keeps an already-visible option perfectly still.
   items[next].focus({ preventScroll: true });
   items[next].scrollIntoView({ block: 'nearest' });
+  // And say the reveal was OURS. `scrollIntoView` moves the transcript without
+  // writing `scrollTop`, and the keydown landed on the button rather than on
+  // the transcript, so the scroll it fires a frame later is indistinguishable
+  // from the platform moving the container on its own. Three things read that
+  // question and all three were wrong about this reveal, the last one visibly:
+  // the mobile header slid away under an arrow step, the render window read it
+  // as a request for older turns, and the *standing follow*'s platform-scroll
+  // correction wrote an armed reader back to the live edge, taking the option
+  // they had just stepped to off the screen. See `markRevealScroll`.
+  //
+  // The transcript's own `focusin` listener would also catch this, since the
+  // `focus()` above bubbles one, and this call is kept anyway: it stamps the
+  // position AFTER the reveal rather than before it, and it does not depend on
+  // the observers being attached to the container this card happens to sit in.
+  // Belt and braces on a keypress costs one visibility check.
+  markRevealScroll();
 }
 
 /** Card ids whose arrival moment has already passed. See `claimSeedForCard`. */

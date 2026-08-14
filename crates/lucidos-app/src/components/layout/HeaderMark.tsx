@@ -5,6 +5,7 @@ import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
 import { openSettingsSubview } from '../../store/actions/menu';
+import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { composeHandlers } from '../chat/promptFocus';
 import { focusSearchInput } from '../search/searchEverywhereActions';
@@ -14,85 +15,6 @@ import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { BrandBadge } from './BrandBadge';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
 import { WorkspacesMenuRow } from './WorkspaceSwitcher';
-
-/** Readable spelling of the connection light, naming what it is connected TO.
- *
- *  The mark carries the state as colour and motion, and this is its readable
- *  half, read by three surfaces: the toggle's accessible name, the desktop hover
- *  tooltip, and the sentence the menu's own notice leads with (see
- *  `connectionNotice`, which sentence-cases exactly this). One table, so what a
- *  screen reader is told and what the panel says cannot drift into two
- *  different claims about one state.
- *
- *  On the tooltip the workspace matters as much as the state: the name beside
- *  the mark hides itself when the pane is narrow, so this is what answers
- *  "connected to what?" at any width.
- *
- *  Each state brings its own preposition rather than sharing one, because
- *  "disconnected to dev" is not English. With no workspace name yet (before
- *  /health answers) the phrase is the bare state word.
- *
- *  Exported for its own unit tests: it is pure, and the three states times two
- *  name cases is exactly the sort of string table that rots silently. */
-const CONNECTION_PHRASE: Record<string, (ws: string) => string> = {
-  connected: (ws) => `connected to ${ws}`,
-  connecting: (ws) => `connecting to ${ws}`,
-  disconnected: (ws) => `disconnected from ${ws}`,
-};
-
-export function connectionPhrase(status: string, workspace: string | null): string {
-  const phrase = CONNECTION_PHRASE[status];
-  if (!phrase) return status;
-  return workspace ? phrase(workspace) : status;
-}
-
-/** What the menu says while the mark is dimmed, and nothing at all while it is
- *  lit.
- *
- *  A state with no line here renders no notice, and `connected` is the only one
- *  the closed `ConnectionStatus` union leaves out. That is the whole condition,
- *  and it is deliberately the same one the MARK recedes on:
- *  `styles/header-mark.css` dims disconnected and breathes connecting, so a
- *  dimmed glyph above a panel that mentions nothing is what this exists to end.
- *
- *  The condition is the STATE, not the host that opened the panel, and on one
- *  host those differ. The mobile threads row's mark carries no `data-conn` at
- *  all (see `BrandMenuButton`: a glyph dimming itself among a row of icons that
- *  do not reads as disabled), so there is no light on that pane to explain, and
- *  the notice is instead the only place the state appears. Keying this on the
- *  host to "match" the mark would take it away exactly where it is worth most.
- *
- *  The disconnected line names no remedy, on purpose. Restart posts to the
- *  engine we cannot reach, and Refresh reloads a client that is not the thing
- *  that broke, so pointing at either row would be wrong in the ordinary case.
- *  The 5s health poll in `store/actions/connection.ts` genuinely does recover on
- *  its own, so that is what it promises instead. */
-const CONNECTION_DETAIL: Record<string, string> = {
-  connecting: 'Waiting for the workspace to answer.',
-  // Scoped to THIS WORKSPACE rather than the app, because a bare "nothing loads
-  // or sends" is refuted by the row directly under it: `connectionStatus` is
-  // driven solely by `/api/v1/health` against this workspace's engine, while the
-  // Workspaces row talks to the GATEWAY (`/~/api/v1/control/*`, a different
-  // process), so unfolding the list and switching away still work while this
-  // engine is unreachable. The narrower claim is both true and more useful,
-  // since switching is the one thing in the panel that still goes anywhere.
-  // Two lines in the panel's 17.5rem, and that is the ceiling worth spending:
-  // the notice pushes every row below it down, so a third line buys nothing the
-  // first two have not already said.
-  disconnected: 'Nothing in this workspace loads or sends. Still trying.',
-};
-
-export function connectionNotice(
-  status: ConnectionStatus,
-  workspace: string | null,
-): { title: string; detail: string } | null {
-  const detail = CONNECTION_DETAIL[status];
-  if (!detail) return null;
-  // Sentence-cased rather than a second string table: the preposition each
-  // state wants is already decided once, above.
-  const phrase = connectionPhrase(status, workspace);
-  return { title: phrase.charAt(0).toUpperCase() + phrase.slice(1), detail };
-}
 
 /** The notice at the head of the panel: a statement, not a row.
  *
@@ -368,9 +290,17 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
   // separator every other multi-part tooltip in the bar uses (see
   // `brandBadgeTooltip`): the state is a second fact about the mark, not a
   // subordinate clause of the first.
+  //
+  // The degraded states spend the second half on the WHOLE notice rather than on
+  // the phrase alone. Naming the state is enough while everything works, and is
+  // the least useful half of what we know once it does not: "disconnected from
+  // dev" leaves the reader to guess whether anything still functions, which is
+  // the guess the detail sentence answers. Same table as the bar and the menu
+  // notice, so a hover and a glance cannot disagree.
+  const sentence = connectionNoticeSentence(status, visibleWorkspaceName.value);
   const label = inRow
     ? 'Lucidos menu'
-    : `Lucidos menu · ${connectionPhrase(status, visibleWorkspaceName.value)}`;
+    : `Lucidos menu · ${sentence ?? connectionPhrase(status, visibleWorkspaceName.value)}`;
 
   return (
     <>

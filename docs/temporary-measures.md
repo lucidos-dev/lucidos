@@ -59,6 +59,35 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Toast placement picker
+
+- **Added:** 2026-08-13
+- **Lives in:** six sites, all in `crates/lucidos-app/src/`.
+  - `toastPlacement` + `ToastPlacement` + `isToastPlacement` in `store/store.ts`
+  - its persistence effect in `store/effects.ts`
+  - the placement argument to `toastLayout` in `components/shared/toastColumns.ts`
+  - the `data-toast-placement` attribute in `components/shared/Toast.tsx`
+  - the shape rules in `styles/components.css`
+  - the Placement row on `components/settings/CommunicationSurfacesPage.tsx`,
+    and `TOAST_PLACEMENT_OPTIONS` in `communicationSamples.ts`
+- **NOT the gallery.** The surface gallery those last two sit on is permanent,
+  kept so these surfaces can be iterated on. Only the placement picker is
+  temporary, and the gallery outlives it.
+- **Impermanent because:** It exists to choose ONE shape for the toast stack.
+  Per-pane columns, a centred card and a full-bleed bar were each rejected on
+  how they look. So the candidates ship together purely to be compared in the
+  running app, via the frontend preview. All but one are dead once a shape is
+  picked.
+- **Removal / resolution condition:** The user picks a shape. Then delete the
+  signal, its guard, the effect, the Placement row, `TOAST_PLACEMENT_OPTIONS`,
+  the `data-toast-placement` attribute and the losing shapes' CSS. Drop the
+  placement argument from `toastLayout` with them. If a cross-pane shape wins,
+  `ToastItem.pane` and the per-pane columns go too, per Phase 4 of
+  `docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md`. Verify with a
+  tree-wide search for `toastPlacement` and `data-toast-placement`, which must
+  return nothing, and with the geometry test that phase adds for the winner.
+- **Status:** `active`
+
 ### Recorded mirror-history exceptions
 
 - **Added:** 2026-08-11
@@ -759,27 +788,40 @@ condition; fix the condition rather than acting on it.
   in `llm/tools/tests.rs`.
 - **Impermanent because (tolerates):** The same "wrote the confirmation instead
   of calling the tool" mistake as the entry above, in the one place it is most
-  invited. A re-arm is the LAST thing a wake turn does, so the habit of writing
+  invited. A re-arm is the LAST thing a delivery turn does, so the habit of writing
   the closing paragraph after the last tool call puts prose exactly where the
   call had to go. (Until 2026-08-06 there was a second reason, since
   `await_event` was a TERMINAL tool that ended the turn outright; ADR 0049 made
   every wait detached, so it now returns like any other tool and the turn
   carries on. The mistake outlived the shape that invited it.) Observed
-  2026-08-06 in the *Notification of Agent Code Edits* thread: the thread woke
-  on a delivery, reported the edit, closed with "Re-arming the watch now, so
+  2026-08-06 in the *Notification of Agent Code Edits* thread: the thread was
+  re-opened by a delivery, reported the edit, closed with "Re-arming the watch now, so
   I'll keep reporting each edit as it happens" and ended the turn with no second
   `await_event` call, leaving an idle thread that had just promised to keep
   watching. Pure model-tolerance: a perfect model told the subscription is spent
   and to call again before the turn ends does not additionally need to be told
   that saying so is not doing so.
-- **Removal / resolution condition:** When a delivery wake reliably produces
+  **It recurred on 2026-08-13**, in *Comment Sweep and Engine Restart*, the same
+  way. A delivery turn closed with "I am watching for the sweep to land, and I
+  will apply build-slot the moment it does", and armed nothing. The user caught
+  it ("ur not actually watching tho?") against a `live_event_wait_count` of 0.
+  Two occurrences is what moved the answer from a fourth sentence to a
+  deterministic gate.
+- **Now backed by the wake check (ADR 0071).** The agentic loop refuses to end a
+  turn that leaves open *todo items* with no live wait and no background task,
+  and asks once instead. That closes the case where the thread had written the
+  work down. The prose still carries the case it cannot see, a claim made with
+  no todo list behind it, which is why these sentences stay.
+- **Removal / resolution condition:** When a delivery reliably produces
   either a re-arm call or an honest "I have stopped watching" in the same turn.
   Sample threads that took an `EventWaitDelivered` and whose reply claims to
   keep watching; if every such claim is backed by an `EventWaitStarted` in the
   SAME turn over a representative window, drop the two sentences and the
-  assertions that pin them. The rest of `WAIT_SPENT_NOTICE` stays either way:
-  "this subscription is now spent, call `await_event` again before this turn
-  ends" is a system fact a perfect model still needs, not a crutch.
+  assertions that pin them. **Sample only threads with no todo list**, or the
+  wake check answers for the prose and the measure reads as removable when it is
+  not. The rest of `WAIT_SPENT_NOTICE` stays either way: "this subscription is
+  now spent, call `await_event` again before this turn ends" is a system fact a
+  perfect model still needs, not a crutch.
 - **Investigation:** none (the mistake is understood, not under investigation).
 - **Status:** active
 

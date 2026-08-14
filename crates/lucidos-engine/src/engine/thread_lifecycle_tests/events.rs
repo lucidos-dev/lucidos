@@ -141,26 +141,26 @@ fn user_question_answered_status_transition_resumes_running() {
 }
 
 /// Regression: when a chat follow-up MR arrives during the prior turn's stream
-/// and the new turn's first event is `MemorySearched`, that event must bump
+/// and the new turn's first event is `MemoryRecalled`, that event must bump
 /// status back to Running. Without this, the frontend's stale-exchange detector
 /// (`exchange-status.ts::exchangeStatus`, the `threadIdle && hasSteps &&
 /// !isComplete` branch) briefly classifies the active turn as `'aborted'` in
-/// the window between MemorySearched landing over SSE and the next activity
+/// the window between MemoryRecalled landing over SSE and the next activity
 /// event (typically ThoughtStreamed) arriving milliseconds later. Reproduced on
 /// a real chat thread.
 #[test]
-fn memory_searched_bumps_status_to_running() {
+fn memory_recalled_bumps_status_to_running() {
     let transitions: std::collections::HashMap<&str, StatusTransition> =
         status_transitions().into_iter().collect();
     let t = transitions
-        .get("MemorySearched")
-        .expect("MemorySearched must have a status transition");
+        .get("MemoryRecalled")
+        .expect("MemoryRecalled must have a status transition");
     assert_eq!(t.status, StatusRule::Set(ThreadStatus::Running));
     assert_eq!(t.cc_flags, CcFlagRule::None);
     assert!(
-        LAST_ACTIVITY_EVENTS.contains(&"MemorySearched"),
-        "MemorySearched must appear in LAST_ACTIVITY_EVENTS so the thread \
-         timestamp stays current when memory retrieval is the only step of \
+        LAST_ACTIVITY_EVENTS.contains(&"MemoryRecalled"),
+        "MemoryRecalled must appear in LAST_ACTIVITY_EVENTS so the thread \
+         timestamp stays current when memory recall is the only step of \
          a turn before the LLM starts streaming"
     );
 }

@@ -829,20 +829,21 @@ fn send_notification_schema_exposes_optional_app_id() {
     );
 }
 
-/// A wake spends the subscription, and the description used to say only the
+/// A delivery spends the subscription, and the description used to say only the
 /// opposite case: "the subscription STAYS LIVE, so do not register it again",
 /// which is true of a user message and the exact reverse of what a delivery
 /// needs. That was the nearest matching instruction a model read at delivery
 /// time, and on 2026-08-06 a live thread duly narrated a re-arm it never
 /// performed.
 ///
-/// The two-wake fork this used to pin is gone with the attached shape (a user
-/// message no longer wakes anything, it just runs a turn), but the hazard is
-/// not: a bare "do not register it again" anywhere near the delivery case
-/// re-creates it. So the assertion is that the spent-and-resubscribe statement
-/// is present AND that the do-not-register clause carries its own scope.
+/// The two-delivery fork this used to pin is gone with the attached shape (a
+/// user message no longer re-opens anything, it just runs a turn), but the
+/// hazard is not: a bare "do not register it again" anywhere near the delivery
+/// case re-creates it. So the assertion is that the spent-and-resubscribe
+/// statement is present AND that the do-not-register clause carries its own
+/// scope.
 #[test]
-fn await_event_description_says_a_wake_spends_the_subscription() {
+fn await_event_description_says_a_delivery_spends_the_subscription() {
     let tools = get_default_tools();
     let tool = tools
         .iter()
@@ -851,8 +852,8 @@ fn await_event_description_says_a_wake_spends_the_subscription() {
     let d = &tool.description;
 
     assert!(
-        d.contains("THE SUBSCRIPTION IS SPENT once it wakes you"),
-        "a wake consumes the wait, and that has to be stated:\n{d}"
+        d.contains("THE SUBSCRIPTION IS SPENT once it delivers"),
+        "a delivery consumes the wait, and that has to be stated:\n{d}"
     );
     assert!(
         d.contains("call this again before that turn ends"),
@@ -870,7 +871,7 @@ fn await_event_description_says_a_wake_spends_the_subscription() {
 }
 
 /// The arming lookback is only useful if the model knows to read it. It is a
-/// REPORT, not a wake: the subscription watches forward, so a match named in
+/// REPORT, not a delivery: the subscription watches forward, so a match named in
 /// the result will never arrive as a turn, and a model that skims to
 /// "Subscribed" ends the turn with the thing unhandled. That is precisely the
 /// 2026-08-06 failure, one layer up.
@@ -904,10 +905,10 @@ fn await_event_description_says_an_already_happened_match_is_reported_not_delive
     );
     assert!(
         d.contains("WATCHES FORWARD ONLY"),
-        "why a reported match will never wake it:\n{d}"
+        "why a reported match will never reach it:\n{d}"
     );
     assert!(
-        d.contains("report, not a wake"),
+        d.contains("report, not a delivery"),
         "the model owes the report an action inside this turn:\n{d}"
     );
 }

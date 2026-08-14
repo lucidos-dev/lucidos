@@ -96,9 +96,8 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::engine::agent_session::resume::THREAD_WORKTREE_ID_LEN;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
-use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir};
+use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir, SHORT_THREAD_ID_LEN};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::types::AgentSession;
 

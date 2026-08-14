@@ -7,6 +7,7 @@ pub mod openai;
 pub mod provider;
 pub mod provider_build;
 pub mod provider_selection;
+pub mod reasoning;
 pub mod routing;
 pub mod tool_names;
 pub mod tools;
@@ -30,6 +31,10 @@ pub use provider_build::{
     ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES,
 };
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
+// `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and
+// its only caller is `RoutingProvider`, inside this module. Anything outside
+// `llm` wanting to know a model's tiers wants `supported_efforts`.
+pub use reasoning::{supported_efforts, EFFORT_LADDER};
 pub use routing::RoutingProvider;
 pub use tools::{
     get_default_tools, get_image_generation_tool, get_navigate_ui_tool, get_notification_tool,

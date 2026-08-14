@@ -6,11 +6,9 @@ import { clearNotifications, psql } from './db-helpers';
 /** Send a notification through the script-facing endpoint that powers the
  *  `lucidos notify` CLI. Same shape as `send_notification` from the chat LLM.
  *
- *  `tap` is the structured discriminated union — engine API enforces the same
- *  shape as the SDK `Tap` type. This helper deliberately accepts `unknown` for
- *  the field so the e2e suite can probe both well-formed and (in future
- *  negative tests) malformed payloads without the type-checker rejecting
- *  fixture shapes the engine itself will validate. */
+ *  `tap` is the structured discriminated union, and the engine API enforces the
+ *  SDK `Tap` shape. This helper takes `unknown` for the field so the suite can
+ *  post a malformed payload the engine is meant to reject. */
 async function postNotification(
   page: Page,
   body: {
@@ -29,20 +27,19 @@ async function postNotification(
   expect(res.ok(), `POST /api/v1/notifications -> ${res.status()}`).toBeTruthy();
 }
 
-/** Seed a chat thread with `exchanges` message/response pairs, with USER
- *  messages long enough that the thread overflows the viewport (a seeded chat
- *  response body doesn't render — chat response text comes from streamed
- *  events, not a bare ResponseGenerated — so height has to come from the
- *  messages, which always render). Inserts directly into the event store +
- *  projection (no LLM round-trips), so the test is deterministic. Returns the
- *  thread id and the FIRST MessageReceived event id — the deep-link target. The
- *  thread is loaded LAZILY by the frontend (events fetched on focus), which is
- *  precisely the path the deep-link bug bit. */
+/** Seed a chat thread with `exchanges` message/response pairs. The USER
+ *  messages carry the height: a seeded chat response body does not render,
+ *  since response text comes from streamed events rather than a bare
+ *  ResponseGenerated. Inserts straight into the event store and projection, so
+ *  the test is deterministic with no LLM round-trips. Returns the thread id and
+ *  the first and last MessageReceived event ids, which are the deep-link
+ *  targets. The frontend loads the thread LAZILY, fetching events on focus,
+ *  which is the path the deep-link bug bit. */
 function seedTallChatThread(exchanges: number): { threadId: string; firstEventId: string; lastEventId: string } {
   const threadId = randomUUID();
   const base = Date.now();
-  // ~1 KB of wrapped text per message → each exchange is a few hundred px, so a
-  // handful of them push the first exchange far above the fold when at-bottom.
+  // ~1 KB of wrapped text per message, so a handful of exchanges push the first
+  // one far above the fold.
   const longText = 'This is seeded message text used to make the thread tall. '.repeat(16);
   const stmts: string[] = [];
   let firstEventId = '';
@@ -89,15 +86,14 @@ test.describe('Notification detail does not auto-open', () => {
       message: 'A new thing happened',
     });
 
-    // Bell badge bumps — sanity check the SSE landed (otherwise the
-    // detail-closed assertion below is vacuous).
+    // The bell badge bumps, which proves the SSE landed. Without that the
+    // detail-closed assertion below would be vacuous.
     await expect(page.locator('.notifications-bell:visible .badge').first()).toHaveText('1', { timeout: 5_000 });
 
-    // Wait-then-check: Playwright's auto-retrying assertions PASS on the
-    // first poll the condition holds, so `toHaveCount(0, { timeout })`
-    // returns instantly when the detail is already closed — useless for
-    // proving absence over a window. Sleep then assert once so a delayed
-    // opener that flips the overlay inside the window is actually caught.
+    // Wait-then-check. Playwright's auto-retrying assertions pass on the first
+    // poll the condition holds, so `toHaveCount(0, { timeout })` returns
+    // instantly against an already-closed detail. Sleep, then assert once, so a
+    // delayed opener inside the window is caught.
     await page.waitForTimeout(500);
     await expect(page.locator('.notification-detail-body')).toHaveCount(0);
   });
@@ -106,7 +102,7 @@ test.describe('Notification detail does not auto-open', () => {
     await navigateToApp(page);
     await ensureMobileView(page, 'content');
 
-    // Switch to the notifications panel via the bell — same path the user takes.
+    // Switch to the notifications panel via the bell, the path the user takes.
     await clickVisibleElement(page, '.notifications-bell');
     await expect(
       page.locator('.empty-state:has-text("No"), .notification-item').first(),
@@ -124,8 +120,8 @@ test.describe('Notification detail does not auto-open', () => {
       page.locator('.notification-item:has-text("Heads up 2")').first(),
     ).toBeVisible({ timeout: 5_000 });
 
-    // Same wait-then-check as scenario 1 — Playwright's auto-retry would
-    // pass instantly against an already-zero count.
+    // Same wait-then-check as scenario 1: auto-retry would pass instantly
+    // against an already-zero count.
     await page.waitForTimeout(500);
     await expect(page.locator('.notification-detail-body')).toHaveCount(0);
   });
@@ -138,10 +134,9 @@ test.describe('Notifications infinite scroll', () => {
   });
 
   test('scrolling the list loads older pages beyond the first', async ({ page }) => {
-    // Seed more than one page (PAGE_SIZE = 15) of notifications with distinct,
-    // strictly-decreasing created_at timestamps so cursor pagination is
-    // deterministic — no same-instant ties at the page boundary that could
-    // make the `before` cursor skip or repeat a row.
+    // Seed more than one page (PAGE_SIZE = 15), with distinct and strictly
+    // decreasing created_at timestamps. A same-instant tie at the page boundary
+    // would let the `before` cursor skip or repeat a row.
     const TOTAL = 30;
     psql(
       `INSERT INTO notifications (id, title, message, read, created_at) ` +
@@ -153,7 +148,7 @@ test.describe('Notifications infinite scroll', () => {
     await navigateToApp(page);
     await ensureMobileView(page, 'content');
 
-    // Open the notifications panel via the bell — same path the user takes.
+    // Open the notifications panel via the bell, the path the user takes.
     await clickVisibleElement(page, '.notifications-bell');
 
     // Count only physically-visible rows: the inactive dual-render layout copy
@@ -167,16 +162,15 @@ test.describe('Notifications infinite scroll', () => {
         }).length;
       });
 
-    // First page renders exactly one PAGE_SIZE — the local poll samples the
-    // freshly-rendered 15 well before any async page-2 fetch could complete,
-    // so this also proves the list paginates instead of dumping all 30 at once.
+    // The first page renders exactly one PAGE_SIZE. The poll samples those 15
+    // well before an async page-2 fetch could land. So this also proves the
+    // list paginates instead of dumping all 30 at once.
     await expect.poll(visibleCount, { timeout: 10_000 }).toBe(15);
 
-    // Scroll the REAL scroll container (.content-pane-body) to the bottom. The
-    // bug: the load-more trigger was bound to the inner .panel-content, which
-    // has no overflow and never scrolls — so the next page never loaded and the
-    // list stayed stuck at the first 15. Scroll inside the poll so multi-page
-    // lists keep advancing each iteration.
+    // Scroll the REAL scroll container, `.content-pane-body`. The inner
+    // `.panel-content` has no overflow and never scrolls, so a load-more
+    // trigger bound there never fires. Scroll inside the poll so a multi-page
+    // list keeps advancing each iteration.
     await expect
       .poll(
         async () => {
@@ -216,17 +210,16 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
   });
 
   test('Open thread from the notifications panel lands on the source event, not the thread bottom', async ({ page }) => {
-    // Regression: from the in-app notifications panel, opening a notification's
-    // thread used to scroll to the BOTTOM instead of the deep-linked event when
-    // the thread was not already focused. Focusing an unfocused thread lazily
-    // loads its events; the scroll-to-bottom that fires on the eventsLoaded
-    // transition overrode the deep-link's scrollIntoView.
+    // Focusing an unfocused thread lazily loads its events, and the
+    // scroll-to-bottom on the eventsLoaded transition used to override the
+    // deep-link's scrollIntoView. So opening the thread landed on the bottom
+    // rather than the linked event.
     seeded = seedTallChatThread(8);
     const { threadId, firstEventId } = seeded;
 
-    // Load the app with NO thread focused — the broken path. (Already-focused
-    // threads have their events in the DOM, so the deep-link scroll resolves
-    // synchronously and the bug never bit them.)
+    // Load the app with NO thread focused, which is the broken path. An
+    // already-focused thread has its events in the DOM, so its deep-link scroll
+    // resolves synchronously.
     await navigateToApp(page);
 
     await postNotification(page, {
@@ -249,9 +242,9 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     await ensureMobileView(page, 'thread');
     await waitForExchangeCount(page, 8, 15_000);
 
-    // Precondition: the seeded thread must overflow the viewport, otherwise the
-    // assertion below can't distinguish "scrolled to the event" from "scrolled
-    // to the bottom" (a short thread shows the first event either way).
+    // Precondition: the seeded thread must overflow the viewport. A short one
+    // shows the first event either way, so the assertion below could not tell
+    // "scrolled to the event" from "scrolled to the bottom".
     const scrollable = await page.evaluate(() => {
       const els = document.querySelectorAll('.thread-content');
       for (const el of els) {
@@ -262,9 +255,8 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     });
     expect(scrollable, 'seeded thread must overflow the viewport for this test to discriminate').toBeTruthy();
 
-    // The fix: the FIRST exchange (the deep-link target) is scrolled into view.
-    // Pre-fix this never became true — the events-load scroll-to-bottom left the
-    // first exchange above the fold.
+    // The FIRST exchange, the deep-link target, is scrolled into view. Before
+    // the fix the events-load scroll-to-bottom left it above the fold.
     await page.waitForFunction((eid) => {
       const els = document.querySelectorAll(`[data-event-id="${eid}"]`);
       const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -278,36 +270,22 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
   });
 
   test('deep-link overrides a saved scroll position on an unfocused thread', async ({ page }) => {
-    // Regression (the reported "toast opens the thread but doesn't scroll to the
-    // event unless it's already focused" bug): a deep-link to a thread that has
-    // a SAVED scroll position used to land on the saved offset instead of the
-    // source event whenever the thread was not already focused. Focusing an
-    // unfocused thread re-runs useScrollMemory, whose restore observer (created
-    // AFTER scrollToEventAndPulse's) fired last and snapped back to the saved
-    // offset. Already-focused threads don't re-run useScrollMemory — which is
-    // exactly why the scroll worked when the thread was already focused and not
-    // otherwise. The path is shared by every surface (inbox detail panel,
-    // in-app toast, push), so the inbox detail panel reproduces it deterministically.
+    // Focusing an unfocused thread re-runs useScrollMemory, whose restore
+    // observer is created AFTER scrollToEventAndPulse's. It therefore fired
+    // last and snapped back to the saved offset, so a deep-link landed there
+    // instead of on the source event. An already-focused thread does not re-run
+    // useScrollMemory, which is why the scroll worked only in that case. Every
+    // surface shares the path (inbox detail panel, in-app toast, push), and the
+    // detail panel reproduces it deterministically.
     seeded = seedTallChatThread(16);
     const { threadId, lastEventId } = seeded;
 
     await navigateToApp(page);
 
-    // Pre-seed a saved scroll near the TOP (a small positive offset — "user
-    // scrolled up to read history last time"). A POSITIVE offset is what
-    // exercises the bug: useScrollMemory restores it via a MutationObserver
-    // created AFTER scrollToEventAndPulse's, so its restore fires LAST and snaps
-    // back over the deep-link's scroll. (A saved offset of exactly 0 restores
-    // synchronously and loses the race, so it doesn't reproduce — the bug is the
-    // observer-driven restore.) Without the fix the bottom-most deep-link target
-    // never enters the viewport.
-    //
-    // A bare offset, not the `100:999` this used to seed. The suffix was a
-    // REVISION stamp that kept the position from being retired for being older
-    // than the thread; positions are no longer retired at all, so the stamp is
-    // inert and seeding one would only suggest a mechanism that is gone.
-    // `parseSavedScroll` still reads an old stamped value offset-first, which is
-    // why a browser carrying one keeps its place across the change.
+    // Pre-seed a saved scroll near the TOP. A POSITIVE offset is what exercises
+    // the bug, since the observer-driven restore is what snaps back over the
+    // deep-link's scroll. An offset of exactly 0 restores synchronously and
+    // loses the race, so it does not reproduce.
     await page.evaluate((tid) => {
       localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100');
     }, threadId);
@@ -329,10 +307,8 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     await ensureMobileView(page, 'thread');
     await waitForExchangeCount(page, 16, 15_000);
 
-    // The deep-link target (last exchange, near the bottom) is scrolled into
-    // view, NOT the restored saved offset (top). Pre-fix this stayed false: the
-    // saved-scroll restore set scrollTop=0 a beat after scrollToEventAndPulse,
-    // leaving the last exchange far below the fold.
+    // The deep-link target (last exchange) is scrolled into view, NOT the
+    // restored saved offset near the top.
     await page.waitForFunction((eid) => {
       const els = document.querySelectorAll(`[data-event-id="${eid}"]`);
       const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -353,39 +329,32 @@ test.describe('Declarative Web Push payload', () => {
   });
 
   test('push payload is the Declarative Web Push envelope with absolute iOS navigate URL', async ({ page, baseURL }) => {
-    // Regression guard for the iOS-PWA push-tap navigation bug:
-    // Safari 18.5+ only handles push notifications declaratively (bypassing
-    // the SW push handler so it doesn't depend on `notificationclick`) when
-    // the on-wire payload conforms to the declarative envelope. Pre-fix,
-    // the engine emitted a flat `{title, body, ...}` payload; Safari fell
-    // back to legacy SW dispatch, which is the regression vector.
+    // Safari 18.5+ handles a push declaratively, bypassing the SW push handler,
+    // only when the on-wire payload conforms to the declarative envelope. A
+    // flat `{title, body, ...}` payload falls back to legacy SW dispatch, which
+    // is the iOS-PWA push-tap regression this guards.
     //
-    // We don't drive a real OS tap from Playwright (out of reach). The
-    // assertion that protects the iOS path is purely the on-wire shape —
-    // Safari does the rest if the envelope is right. The page-side
-    // dispatcher (handleHashLocation → dispatchDeepLink) is exercised below
-    // via window.location.hash since that's the same code path Safari
-    // triggers on tap.
+    // Playwright cannot drive a real OS tap, so the on-wire shape is the whole
+    // assertion: Safari does the rest if the envelope is right. The page-side
+    // dispatcher (handleHashLocation, dispatchDeepLink) is exercised below via
+    // the same URL Safari lands on.
 
-    // Register a synthetic device + push subscription so the engine fan-out
-    // has a target and writes to push_log (the test-mode stub records under
-    // the `e2e-test-hooks` feature). The push_test_log path skips subs with
-    // no device_id (rows can't be attributed for assertions), so we insert a
-    // device row first and bind the subscription to it. NOTE: don't navigate
-    // to the app first — `navigateToApp` would register THIS browser as a
-    // device and start a presence heartbeat, making it an "active" candidate.
-    // The engine's PresenceCheck would then suppress the push (rightly so —
-    // it's the user IS looking at the page rule), masking our payload shape
-    // assertion. We hit the API directly until the assertions are recorded.
+    // Register a synthetic device and push subscription so the fan-out has a
+    // target and writes to push_log. The push_test_log path skips a
+    // subscription with no device_id, so the device row is inserted first.
+    //
+    // Do NOT navigate to the app before this: `navigateToApp` registers THIS
+    // browser as a device and starts a presence heartbeat, and PresenceCheck
+    // then suppresses the push, masking the payload-shape assertion. Hit the
+    // API directly until the assertions are recorded.
     const deviceId = `e2e-declarative-${Date.now()}`;
     psql(
       `INSERT INTO devices (id, name, user_agent, push_enabled) ` +
         `VALUES ('${deviceId}', 'e2e-declarative', 'e2e-test-ua', true)`,
     );
-    // Clear device_presence so no stale row (from a previous serial test in
-    // this project that called navigateToApp) counts as an active candidate
-    // and suppresses the push. e2e workspace is the right scope for this —
-    // Playwright projects run serially against a single workspace DB.
+    // Clear device_presence so no stale row from an earlier test counts as an
+    // active candidate and suppresses the push. Clearing the whole table is in
+    // scope here: Playwright projects run serially against one workspace DB.
     psql(`DELETE FROM device_presence`);
     expect(baseURL, 'Playwright baseURL is needed to seed the subscription scope').toBeTruthy();
     const scopeUrl = new URL('/', baseURL!).toString();
@@ -401,11 +370,10 @@ test.describe('Declarative Web Push payload', () => {
     });
     expect(subRes.ok(), `POST /api/v1/push/subscribe -> ${subRes.status()}`).toBeTruthy();
 
-    // Use a UUID-formatted but synthetic thread/event id — focusThreadOrBootstrap
-    // surfaces a "Thread not found" toast for unknown ids, which is fine.
-    // The assertions we care about are the engine-side payload shape and the
-    // page-side mark-read dispatch, both of which fire regardless of whether
-    // the deep-link target actually resolves to a thread row.
+    // A UUID-formatted but synthetic thread/event id. focusThreadOrBootstrap
+    // surfaces a "Thread not found" toast, which is fine: the engine-side
+    // payload shape and the page-side mark-read dispatch both fire whether or
+    // not the target resolves to a thread row.
     const fakeThreadId = '00000000-0000-4000-8000-000000000001';
     const fakeEventId = '00000000-0000-4000-8000-000000000002';
 
@@ -426,32 +394,31 @@ test.describe('Declarative Web Push payload', () => {
     const body = (await res.json()) as { notification_id: string };
     const notificationId = body.notification_id;
 
-    // PresenceCheck has zero candidates (device_presence cleared above) so
-    // push fan-out is immediate — no deadline to wait through.
+    // PresenceCheck has zero candidates (device_presence cleared above), so the
+    // push fan-out is immediate, with no deadline to wait through.
     const entry = await expectPushSent(page, notificationId, { timeoutMs: 5000 });
     expect(entry.payload, 'push_log row must carry the recorded payload bytes').toBeTruthy();
     const payload = JSON.parse(entry.payload!) as Record<string, unknown>;
 
     // (1) Declarative envelope: top-level `web_push: 8030` magic plus a
-    //     `notification` object — Safari 18.5+ keys off these to bypass the SW.
+    //     `notification` object. Safari 18.5+ keys off these to bypass the SW.
     expect(payload.web_push).toBe(8030);
     expect(payload.notification).toBeTruthy();
     const notif = payload.notification as Record<string, unknown>;
     expect(notif.title).toBe('Claude is asking');
     expect(notif.body).toBe('tap me');
 
-    // (2) Tag stamped from notification_id so OS-level dedup works the same
-    //     as the SW's prior `tag: data.notification_id`.
+    // (2) Tag stamped from notification_id, so OS-level dedup matches the SW's
+    //     own `tag: data.notification_id`.
     expect(notif.tag).toBe(notificationId);
 
-    // (3) iOS navigate URL — a CROSS-DOCUMENT absolute query URL built from
-    //     the subscription's stored service-worker scope. Safari's
-    //     declarative-push handler reuses an already-open PWA window on tap; a
-    //     same-document (hash-only) navigation is NOT applied to it (WebKit just
-    //     focuses the window, the URL never updates, the deep link silently
-    //     no-ops). A query string forces a real navigation, and making it
-    //     absolute avoids relying on WebKit/APNs to accept a query-only relative
-    //     value while still preserving the workspace scope.
+    // (3) iOS navigate URL: a CROSS-DOCUMENT absolute query URL built from the
+    //     subscription's stored service-worker scope. Safari's declarative-push
+    //     handler reuses an already-open PWA window on tap, and a hash-only
+    //     navigation is not applied to it. WebKit focuses the window, the URL
+    //     never updates, and the deep link no-ops. A query string forces a real
+    //     navigation; making it absolute avoids relying on WebKit or APNs to
+    //     accept a query-only relative value.
     const navigateUrl = notif.navigate as string;
     expect(navigateUrl.startsWith(`${scopeUrl}?`), `iOS navigate must be an absolute scoped query URL, got ${navigateUrl}`).toBeTruthy();
     expect(navigateUrl).toContain(`notification=${notificationId}`);
@@ -459,10 +426,10 @@ test.describe('Declarative Web Push payload', () => {
     expect(navigateUrl).toContain(`event=${fakeEventId}`);
     expect(navigateUrl).toContain('tap=');
 
-    // (4) data.* mirrors the SW-side flat fields it replaces — Chrome's
-    //     notificationclick reads them off event.notification.data. data.navigate
-    //     is the HASH form (warm `client.navigate()` = no reload), carrying the
-    //     SAME params as the iOS query URL — only the `?` vs `#` prefix differs.
+    // (4) data.* carries the flat fields Chrome's notificationclick reads off
+    //     event.notification.data. data.navigate is the HASH form (a warm
+    //     `client.navigate()`, so no reload), carrying the SAME params as the
+    //     iOS query URL: only the prefix differs, `?` against `#`.
     const data = notif.data as Record<string, unknown>;
     expect(data.notification_id).toBe(notificationId);
     expect(data.thread_id).toBe(fakeThreadId);
@@ -475,25 +442,22 @@ test.describe('Declarative Web Push payload', () => {
       to: { target: 'thread', id: fakeThreadId, event_id: fakeEventId },
     });
 
-    // (5) Page-side dispatch contract: when iOS navigates the PWA window to the
-    //     query navigate URL (a cross-document load), the cold-start /
-    //     resume hash router runs handleHashLocation → dispatchDeepLink, which
-    //     reads the query params and calls markReadOptimistic. Drive the exact
-    //     URL Safari would land on. (We deferred navigation until now so the
-    //     test browser didn't count as an active device during the
-    //     PresenceCheck above.)
+    // (5) Page-side dispatch contract. When iOS navigates the PWA window to the
+    //     query navigate URL, the cold-start hash router runs
+    //     handleHashLocation then dispatchDeepLink. That reads the query params
+    //     and calls markReadOptimistic. Drive the exact URL Safari would land
+    //     on. Navigation waited until now so the test browser did not count as
+    //     an active device during the PresenceCheck above.
     await gotoWithRetry(page, navigateUrl);
     // Confirm the SPA actually mounted (so useStartup's cold-start hash router
     // runs and reads the query params). The deep-link targets a fake thread, so
-    // a "Thread not found" toast is expected — but mark-read fires regardless.
+    // a "Thread not found" toast is expected, and mark-read fires regardless.
     await waitForVisibleInput(page);
 
-    // Wait for the engine to receive POST /api/v1/notification/read and flip
-    // the row. mark-read is fire-and-forget from the page, so poll the DB
-    // directly — surfacing "Thread not found" in the UI shouldn't block this.
-    // `psql -t` returns ` t` for true and ` f` for false (tuples-only mode,
-    // leading whitespace from the column alignment); exact match avoids a
-    // future text column accidentally matching the 't' substring.
+    // Wait for the engine to take POST /api/v1/notification/read and flip the
+    // row. mark-read is fire-and-forget from the page, so poll the DB directly.
+    // `psql -t` returns ` t` for true and ` f` for false, and the exact match
+    // keeps a future text column from matching the 't' substring.
     await expect.poll(
       () => {
         const row = psql(

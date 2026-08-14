@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/lucidos-build-slot",
     "crates/lucidos-engine",
     "crates/lucidos-gateway",
     "crates/lucidos-app",

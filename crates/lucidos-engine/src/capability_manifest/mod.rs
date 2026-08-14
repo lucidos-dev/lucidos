@@ -50,8 +50,18 @@
 //!
 //! This note used to argue that parity was unreachable because `await_event`
 //! ended the turn and a CLI invocation had no turn to park. ADR 0049 retired
-//! that shape (a subscription holds nothing, and the wake is an ordinary new
-//! turn), which is exactly what made the CLI verbs possible.
+//! that shape (a subscription holds nothing, and its delivery is an ordinary
+//! new turn), which is exactly what made the CLI verbs possible.
+//!
+//! **`lucidos build-slot` is absent for a different reason**, and it is also a
+//! decision rather than drift. A *build slot* is HOST state, not workspace
+//! state: the pool is a directory of file locks under `$HOME`, shared by every
+//! workspace on the machine (ADR 0070). The verb takes no domain argument and
+//! reaches no engine. It must work with no engine running at all, which is the
+//! case this manifest cannot express. Every domain here materialises as an
+//! HTTP call to one workspace, so generating this one would build exactly the
+//! dependency the design removes. No LLM tool and no SDK facade either: an app
+//! iframe runs no builds.
 
 use crate::llm::provider::ToolDefinition;
 use serde_json::{Map, Value};

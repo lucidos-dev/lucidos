@@ -5,7 +5,8 @@ import { getPreferences, setPreference, isTransientFetchError } from '../../api/
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
-import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
+import { REASONING_LEVELS, DEFAULT_CHAT_MODEL } from '../models';
+import { clampEffortFor } from './models';
 import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
@@ -605,7 +606,7 @@ export function currentChatReasoningEffort(): string {
 
 export async function setCurrentModel(model: string): Promise<void> {
   const oldEffort = reasoningEffort.value;
-  const clamped = clampReasoningEffort(oldEffort, model);
+  const clamped = clampEffortFor(oldEffort, model);
   await savePreference('chat_model', model, () => { currentModel.value = model; });
   if (clamped !== oldEffort) {
     await setReasoningEffort(clamped);
@@ -727,7 +728,7 @@ export async function loadPreferences(): Promise<void> {
     if (t !== lastAppliedTheme) applyTheme(t);
     applyFontFamily(currentFontFamily());
     currentModel.value = currentChatModel();
-    reasoningEffort.value = clampReasoningEffort(currentChatReasoningEffort(), currentModel.value);
+    reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
     selectedCodingAgent.value = currentCodingAgentDefault();
     // LAST, deliberately: the three applies above write properties the remote

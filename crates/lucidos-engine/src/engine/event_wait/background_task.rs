@@ -8,22 +8,22 @@
 //! `BackgroundBashCompleted` and then pushes a synthetic prompt onto the parked
 //! session's `msg_tx`, so the agent resumes and reads the result. That path has
 //! one branch it deliberately cannot take, stated in its own comment: it skips
-//! the wake when there is "a chat-mode background bash with no CC session at
+//! the push when there is "a chat-mode background bash with no CC session at
 //! all". A chat thread has no parked subprocess to push to.
 //!
-//! So a chat thread's only wake was an `await_event` the model had to remember
+//! So a chat thread's only way back was an `await_event` the model had to remember
 //! to arm, and nothing pointed at that pairing. On 2026-08-09 a release thread
 //! spawned Phase A with `run_bash_background`, drained it a few times, and
 //! ended its turn with a status message. Phase A finished five minutes later
 //! and emitted `BackgroundBashCompleted` with nobody subscribed. The thread sat
 //! idle for five hours until the user asked whether the release had happened.
 //!
-//! # Why a subscription rather than a second wake path
+//! # Why a subscription rather than a second re-entry path
 //!
 //! Mirroring the coding-agent `msg_tx` push would be a second delivery
 //! mechanism with its own one-shot, timeout and loop semantics to get right,
 //! and it would be invisible: the user would see an idle thread that happens to
-//! wake up later. An *event wait* is already the engine's answer to "re-open
+//! come back to life later. An *event wait* is already the engine's answer to "re-open
 //! this thread when X happens". Arming one reuses its one-shot gate, its
 //! explicit deadline, its caps, the subscription indicator the user can see,
 //! and the boot rebuild that survives a restart. Nothing here is new machinery;
@@ -34,16 +34,16 @@
 //! * **One wait, every uncovered task.** The `on:` list carries one entry per
 //!   task rather than one wait per task, so a turn that spawned three builds
 //!   spends one live-wait slot and one consecutive-subscription count, not
-//!   three. Any entry matching wakes the thread, which is what is wanted: the
-//!   turn that wakes re-runs this tail and re-arms for whatever is still going.
+//!   three. Any entry matching re-opens the thread, which is what is wanted: the
+//!   re-entered turn re-runs this tail and re-arms for whatever is still going.
 //! * **Conditioned on `task_id`, always.** A wait subscribes across threads (it
 //!   is how a thread watches another thread's work), so an unconditioned
-//!   `BackgroundBashCompleted` would wake this thread on any background task
+//!   `BackgroundBashCompleted` would re-open this thread on any background task
 //!   finishing anywhere in the workspace.
 //! * **Coverage, not equality.** The agent's own duplicate refusal compares
 //!   `on:` lists exactly. Here that is the wrong test: a model that armed
 //!   `BackgroundBashCompleted{task_id: X}` is already watching X, and arming a
-//!   second wait for it would wake the thread twice for one completion. So
+//!   second wait for it would deliver one completion to the thread twice. So
 //!   coverage is decided with [`EventSubscription::matches`] against the
 //!   payload the event will actually carry, which is the same predicate the
 //!   dispatcher will use.
@@ -67,8 +67,8 @@ const BACKGROUND_BASH_COMPLETED: &str = "BackgroundBashCompleted";
 ///
 /// The watchdog kills the child at its deadline, and the completion event is
 /// emitted after that, so a wait expiring exactly at the deadline could lose
-/// the race with the work it exists to observe. Generous on purpose: waking
-/// late costs the whole wait, waking early costs one turn.
+/// the race with the work it exists to observe. Generous on purpose: expiring
+/// late costs one turn, expiring early costs the whole wait.
 const DEADLINE_MARGIN: Duration = Duration::minutes(5);
 
 /// Prefix on the synthetic `tool_use_id`, so an engine-armed wait is
@@ -111,7 +111,7 @@ impl LucidosEngine {
 
         // Now the watermark, and BEFORE the authoritative registry read below.
         // The catch-up scan in `commit_wait` is `sequence > watermark`, so a
-        // completion landing at or below it can never wake this wait: reading
+        // completion landing at or below it can never match this wait: reading
         // the watermark afterwards would arm for a task and then miss the very
         // event it was armed for, and the thread would sit until timeout. The
         // gap is not hypothetical, it spans the subscription-count query below,
@@ -140,7 +140,7 @@ impl LucidosEngine {
 
         let live = self.live_waits.for_thread(thread_id).await;
         // Engine-armed waits COUNT toward the consecutive cap, deliberately. A
-        // turn woken by one of these can spawn another background task and end
+        // turn re-entered by one of these can spawn another background task and end
         // again, and without the count that loop has no bound at all. Counting
         // stops it at the same ten the model gets, after which the thread goes
         // quiet, which is exactly today's behaviour and so no regression.
@@ -224,8 +224,8 @@ impl LucidosEngine {
 pub(super) enum ArmingPlan<'a> {
     /// Arm one wait over these tasks. Never empty.
     Arm(Vec<&'a RunningTaskHandle>),
-    /// Every running task is already watched, so arming again would wake the
-    /// thread twice for one completion. Not a refusal: the thread IS covered.
+    /// Every running task is already watched, so arming again would deliver one
+    /// completion to the thread twice. Not a refusal: the thread IS covered.
     NothingUncovered,
     /// A cap says no, and the thread will therefore go quiet with work still
     /// running. Carries the reason for the log, because this is the failure
@@ -282,12 +282,12 @@ pub(super) fn plan_wait<'a>(
     }
 }
 
-/// Whether a live wait would already wake on this task's completion.
+/// Whether a live wait would already fire on this task's completion.
 ///
 /// Runs the dispatcher's own predicate against the *matchable payload* the
 /// event will carry, the thread id included, so "covered" means the wait
 /// genuinely fires rather than merely looking similar. An unconditioned `BackgroundBashCompleted` entry therefore
-/// counts as covering every task, which is correct: it will wake on the first
+/// counts as covering every task, which is correct: it will fire on the first
 /// of them.
 fn wait_covers_task(on: &[EventSubscription], task_id: &str, thread_id: Uuid) -> bool {
     let payload = crate::core::event_subscription::matchable_payload(

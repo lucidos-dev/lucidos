@@ -176,13 +176,22 @@ echo "[test-db] TEST_DATABASE_URL=postgres://lucidos:lucidos@localhost:$PG_PORT/
 
 cd "$PROJECT_DIR"
 
+# Run the suite under a *build slot* (ADR 0070). The wait wraps the cargo call
+# only, so Postgres is provisioned and the container is healthy before this
+# process starts occupying a slot. Degrades to a plain run without the
+# `lucidos` binary, and passes straight through when an outer wrapper (a `make
+# test` that already took one) marked the process tree as holding.
+SLOT="$PROJECT_DIR/scripts/with-build-slot.sh"
+
 # Safe array expansion: under `set -u`, "${arr[@]}" on an empty array is an
 # "unbound variable" error in bash 3.2 (macOS default). The +-form expands to
 # nothing when empty and to the quoted elements otherwise.
 if [ "$FULL" = "1" ]; then
     echo "[test] cargo test --locked -p lucidos-engine (full crate)"
-    cargo test --locked -p lucidos-engine ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+    "$SLOT" --label "engine tests (full)" -- \
+        cargo test --locked -p lucidos-engine ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 else
     echo "[test] cargo test --locked -p lucidos-engine --lib"
-    cargo test --locked -p lucidos-engine --lib ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+    "$SLOT" --label "engine tests" -- \
+        cargo test --locked -p lucidos-engine --lib ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 fi

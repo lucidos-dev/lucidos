@@ -112,12 +112,26 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     onScroll();
   }
 
+  /** `riding()`, plus the round that records the reader ON the live edge.
+   *
+   *  The tests above ask only what the listeners make of an input, and the
+   *  follow's flag answers that without any snapshot. The two focus cases ask
+   *  what the transcript then DOES, and the platform-scroll correction is gated
+   *  on having measured the reader at the edge beforehand (`anchorAtLiveEdge`,
+   *  taken at the end of every scroll and resize round). Without this round
+   *  both of them would pass by writing nothing, for the wrong reason. */
+  function ridingAndAnchored() {
+    const r = riding();
+    r.onScroll();
+    return r;
+  }
+
   it('attaches to the container, and the releases to window', () => {
     const el = makeContainer();
     const { detachGestures } = makeScrollObservers(el);
 
     expect(Object.keys(el.listeners).sort()).toEqual(
-      ['keydown', 'pointerdown', 'pointermove', 'touchmove', 'wheel'],
+      ['focusin', 'keydown', 'pointerdown', 'pointermove', 'touchmove', 'wheel'],
     );
     // The release goes on `window`: a drag that ends with the pointer outside
     // the transcript would otherwise leave the press recorded forever.
@@ -180,6 +194,122 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     el.fire('keydown', { key: ' ', target: answerButton });
     platformScrollsTo(el, 900, onScroll);
 
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('but LEAVES the reader where that key scrolled them, since it is still theirs', () => {
+    // The other half, and the one the platform-scroll correction made visible.
+    // A scroll key the focused control does not consume still scrolls the
+    // transcript, because the browser scrolls the nearest scrollable ancestor,
+    // and the choice-card seeding parks focus on a button INSIDE the transcript
+    // by design. So a reader answering a question and then paging back through
+    // the reply is in exactly this state. Not a gesture (the ride survives,
+    // asserted above), but not the platform either: the correction has to stand
+    // down or keyboard scrolling is undone the instant it happens. Codex named
+    // it P1 in `/harden`, 2026-08-13.
+    const { el, onScroll } = ridingAndAnchored();
+
+    el.fire('keydown', { key: 'PageUp', target: { nodeName: 'BUTTON' } });
+    platformScrollsTo(el, 900, onScroll);
+
+    expect(el.scrollTop).toBe(900);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('and answers the platform again once that keypress is four frames old', () => {
+    // A window, like every other answer to "was that scroll ours". A PageUp four
+    // frames ago says nothing about the keyboard adjusting the offset now.
+    const { el, onScroll } = ridingAndAnchored();
+
+    el.fire('keydown', { key: 'PageUp', target: { nodeName: 'BUTTON' } });
+    vi.advanceTimersByTime(200);
+    platformScrollsTo(el, 900, onScroll);
+
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('does NOT count FOCUS landing inside it, and keeps the reader where it went', () => {
+    // The other way the container scrolls with nobody writing `scrollTop`: the
+    // browser reveals a focused control that is off screen, for Tab, Shift+Tab,
+    // a screen reader moving the cursor, or any `focus()` without
+    // `preventScroll`. It is a NAVIGATION rather than a gesture, so the reader
+    // keeps the lit toggle AND the place the browser took them to.
+    //
+    // Both halves are asserted, because the ride surviving is worth nothing if
+    // the correction then writes them back: that is exactly what happened
+    // before the `focusin` stamp, and Tab appeared to do nothing while the
+    // control it moved to sat off screen with an invisible ring. Found by the
+    // Codex reviewer in `/harden`, 2026-08-13.
+    const { el, onScroll } = ridingAndAnchored();
+    const buttonInAnOlderTurn = { nodeName: 'BUTTON' };
+
+    el.fire('focusin', { target: buttonInAnOlderTurn });
+    platformScrollsTo(el, 400, onScroll);
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(el.scrollTop).toBe(400);
+  });
+
+  it('but the armed follow still carries them back on the next GROWTH round', () => {
+    // The limit of what a reveal buys, stated so nobody reads the two cases
+    // above as more than they are. The correction stands down for a reveal;
+    // `honourGrowth` does not, because ARMED AND LIVE is the whole of what
+    // riding the live edge means and only a GESTURE takes it away. So on a
+    // streaming thread a Tab reveal survives its own scroll event and the next
+    // token carries the reader back, exactly as it did before any of this.
+    //
+    // Deliberately not "fixed" by retiring the follow on a focus, which was the
+    // obvious symmetry with the up chevron and turn stepping. Focus is not
+    // always the reader's: `seedChoiceCardFocus` moves it onto an arriving
+    // card's default choice, and a card can arrive inside a submit's live
+    // claim, so retiring here would take the ride away from a reader who
+    // touched nothing. That is the exact class the gesture term exists to
+    // refuse. The way off a ride while streaming stays what it has always
+    // been: scroll, or press the toggle.
+    const { el, onScroll, onResize } = ridingAndAnchored();
+
+    el.fire('focusin', { target: { nodeName: 'BUTTON' } });
+    platformScrollsTo(el, 400, onScroll);
+    expect(el.scrollTop).toBe(400);
+
+    el.scrollHeight = 3100;   // the next token
+    onResize();
+
+    expect(el.scrollTop).toBe(2600);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('and leaves them on the reveal for as long as the thread is IDLE', () => {
+    // The other side of the same line, and the one that matters for the case
+    // the reveal marking was added for: nothing is streaming, so nothing writes,
+    // and the reader stays on the control they tabbed to for as long as they
+    // like. Growth on an idle thread is the transcript finishing its own
+    // rendering (`followIsCarrying`), so it carries nobody.
+    const { el, onScroll, onResize } = ridingAndAnchored();
+    setThreadLive(false);
+
+    el.fire('focusin', { target: { nodeName: 'BUTTON' } });
+    platformScrollsTo(el, 400, onScroll);
+
+    el.scrollHeight = 3100;   // a late image decoding, a card mounting
+    onResize();
+
+    expect(el.scrollTop).toBe(400);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('and answers the platform again once the focus reveal is four frames old', () => {
+    // The stamp is a WINDOW, like every other answer to "was that scroll ours":
+    // a focus move four frames ago says nothing about a scroll now, and if it
+    // did, one Tab would exempt the rest of the thread from the correction.
+    const { el, onScroll } = ridingAndAnchored();
+
+    el.fire('focusin', { target: { nodeName: 'BUTTON' } });
+    vi.advanceTimersByTime(200);
+    platformScrollsTo(el, 400, onScroll);
+
+    expect(el.scrollTop).toBe(2500);   // carried back to the live edge
     expect(followingLiveEdge.value).toBe(true);
   });
 

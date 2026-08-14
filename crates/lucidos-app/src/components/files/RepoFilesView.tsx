@@ -163,7 +163,9 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
           onClick={() => openRepoFilePreview(f.path, 'diff')}
         >
           <FileTypeIcon path={f.path} className="file-icon" />
-          <span class="file-name">{f.path}</span>
+          {/* `file-path`, not the tree's bare `file-name`: this row carries the
+              whole path, which wraps rather than ellipsising (components.css). */}
+          <span class="file-name file-path">{f.path}</span>
           <DiffStatsInline additions={fileStats[i].additions} deletions={fileStats[i].deletions} />
           <span class={`change-badge change-badge-${f.status}`}>
             {changeBadgeLabel(f.status)}

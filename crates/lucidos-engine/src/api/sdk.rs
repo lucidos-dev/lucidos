@@ -94,11 +94,12 @@ fn find_sdk_bundle() -> String {
     // Dev, resolved from the CHECKOUT rather than from a fixed number of `..`
     // hops above the binary. `paths::repo_root` walks `current_exe()`'s ancestors
     // for `scripts/web-dev.sh`, so it is independent of how deep the engine binary
-    // sits — which matters because the dev launcher publishes it to
-    // `target/<profile>/launch/<variant>/` (ADR 0022), two levels deeper than the
-    // exe-relative `../../` fallback below could reach. The gateway spawns engines
-    // with cwd = the WORKSPACE dir, so the cwd-relative reads never hit in the
-    // normal dev topology and this is the branch that actually serves the bundle.
+    // sits and of which top-level directory holds it. That matters because the dev
+    // launcher publishes it to `.launch/<profile>/<variant>/` (ADR 0022 + 0063), so
+    // the exe-relative `../../` fallback below bottoms out at `<repo>/.launch` and
+    // still cannot see the checkout root. The gateway spawns engines with cwd = the
+    // WORKSPACE dir, so the cwd-relative reads never hit in the normal dev topology
+    // and this is the branch that actually serves the bundle.
     if let Ok(root) = crate::paths::repo_root() {
         if let Ok(content) = std::fs::read_to_string(root.join(SDK_REL)) {
             return content;
@@ -214,11 +215,18 @@ mod tests {
     /// An app's `<body>` must carry the type scale's body step. Two ways to get
     /// this wrong, and the assert below covers both: leave the declaration off
     /// and unstyled app text falls to the raw root font-size (`1rem`, 18px at a
-    /// 112.5% UI scale), which nothing in the host shell renders at, so every
-    /// app reads a scale step larger than Lucidos with proportionally looser
-    /// line spacing on top (2026-08-05); write a raw `rem` and it ships an
-    /// off-scale size to every app, against the closed-set rule the host shell
-    /// follows (`.claude/rules/frontend.md`).
+    /// 112.5% UI scale), which is exactly `--font-size-xl`, a SECTION HEADING,
+    /// so every app reads a scale step larger than Lucidos with proportionally
+    /// looser line spacing on top (2026-08-05); write a raw `rem` and it ships
+    /// an off-scale size to every app, against the closed-set rule the host
+    /// shell follows (`.claude/rules/frontend-css.md`).
+    ///
+    /// The host's `body` in `styles/global/base.css` carries the same
+    /// declaration since 2026-08-13. It used to be deliberately absent, on the
+    /// theory that every host surface names its own token; What's New disproved
+    /// it. See `docs/code-review-priors.md` for the full history of all three
+    /// deletions, and `styles/__tests__/text-defaults-guard.test.ts` for the
+    /// host-side twin of this assert.
     #[test]
     fn iframe_body_is_sized_from_the_type_scale() {
         let rule = SDK_IFRAME_BASE_CSS
@@ -231,5 +239,50 @@ mod tests {
             "app <body> must default to the type scale's body step, not the raw \
              root font-size and not an off-scale rem. Found:\n{rule}"
         );
+    }
+
+    /// A control inherits NOTHING from `body`: the UA stylesheet applies the
+    /// `font` shorthand to it, which resets the family too. `input, textarea,
+    /// select` always named `--font-ui` here; `button` did not, so an app's
+    /// buttons painted in the system UI face while its own inputs painted in
+    /// the workspace font, inside the same app. Same defect the host shell had
+    /// at `.welcome-dismiss`, found by `e2e/type-scale.spec.ts` on 2026-08-13.
+    #[test]
+    fn iframe_controls_name_the_ui_font() {
+        for selector in ["button", "input, textarea, select"] {
+            let rule = rule_body(SDK_IFRAME_BASE_CSS, selector)
+                .unwrap_or_else(|| panic!("sdk_iframe.css must carry a `{selector} {{` rule"));
+            assert!(
+                rule.contains("font-family: var(--font-ui);"),
+                "`{selector}` must name --font-ui: a control inherits no family \
+                 from body, so without it the app paints in the UA face. \
+                 Found:\n{rule}"
+            );
+        }
+    }
+
+    /// Body of the top-level rule whose selector list is exactly `selector`.
+    ///
+    /// The naive `split("\nbutton {")` finds the wrong rule: `button` is also
+    /// the LAST member of the grouped `html, input, textarea, select, button`
+    /// font-feature-settings rule, whose final selector line reads exactly that
+    /// way. So a candidate is rejected only when what precedes it CONTINUES a
+    /// selector list, which is to say ends in a comma.
+    ///
+    /// Testing for a comma rather than for a preceding `}` is the load-bearing
+    /// choice: a rule in this sheet is very often preceded by a comment, so a
+    /// `}`-test would reject the real rule the moment anybody documented it,
+    /// and fail with "must carry a rule" about a rule sitting right there.
+    fn rule_body<'a>(css: &'a str, selector: &str) -> Option<&'a str> {
+        let needle = format!("\n{selector} {{");
+        let mut from = 0;
+        while let Some(rel) = css[from..].find(&needle) {
+            let at = from + rel;
+            if !css[..at].trim_end().ends_with(',') {
+                return css[at + needle.len()..].split('}').next();
+            }
+            from = at + needle.len();
+        }
+        None
     }
 }

@@ -8,23 +8,57 @@
     justify-content: flex-start;
 }
 
+/* The state's two quantities, named because the note under the row derives its
+   indent from them: the row's dot plus the gap after it is exactly where the
+   state word starts. On :root so the live style remote can retune them, and so
+   the note cannot drift off that column. */
+:root {
+    --system-status-dot: 0.5rem;
+    --system-status-gap: 0.5rem;
+    /* The space under the whole Connection block, wherever it ends: the row
+       when there is nothing to explain, the note when there is. Named because
+       the two both spend it, and a copy in the second would keep the old value
+       the moment the first is retuned. */
+    --system-status-pad-bottom: 0.625rem;
+}
+
 .system-status-row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.25rem 0 0.625rem;
+    gap: var(--system-status-gap);
+    /* The note takes the row's bottom padding when it is present, so the two
+       read as one block rather than as a line with something stuck under it. */
+    padding: 0.25rem 0 var(--system-status-pad-bottom);
     font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-primary);
 }
 
+.system-status-row.has-note {
+    padding-bottom: 0;
+}
+
 .system-status-row .status-dot {
-    width: 0.5rem;
-    height: 0.5rem;
+    width: var(--system-status-dot);
+    height: var(--system-status-dot);
 }
 
 .system-status-row .status-dot.disconnected {
     animation: progress-blink-red 0.6s ease-in-out infinite;
+}
+
+/* What the state means for the app, under the state itself. The row above says
+   which state it is and has said it in one word for as long as this page has
+   existed; a word is not a message, and this is the same sentence the Lucidos
+   menu's notice and the header's connection bar state (utils/connectionNotice.ts).
+   Quieter and lighter than the row, so it reads as the explanation rather than
+   as a second heading, and indented to the state word's own column. */
+.system-status-note {
+    margin: 0;
+    padding: 0 0 var(--system-status-pad-bottom) calc(var(--system-status-dot) + var(--system-status-gap));
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    color: var(--text-secondary);
 }
 
 .system-info-list {

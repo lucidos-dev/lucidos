@@ -26,11 +26,17 @@ if (typeof globalThis.cancelAnimationFrame === 'undefined') {
 import {
   awayFromBottom,
   clearPendingEventScroll,
+  followingLiveEdge,
   hasPendingEventScroll,
   makeScrollObservers,
   notAtTop,
+  readerGestureForTest,
   scrollToEventAndPulse,
   scrolledFromTop,
+  setActiveScrollElement,
+  setFollowLiveEdge,
+  setThreadLive,
+  stopFollowingBottom,
 } from '../scrollState';
 
 /** Enough DOM for `scrollToEventAndPulse` to arm a deep-link claim and then wait
@@ -67,6 +73,7 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
   const baseWidth = opts.width;
   const turns = [...opts.turns];
   let width = opts.width;
+  let clientHeight = opts.clientHeight;
   let scrollTop = 0;
 
   const heightOf = (i: number) => (turns[i] * baseWidth) / width;
@@ -78,22 +85,31 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
 
   const el: any = {
     parentElement: null,
-    clientHeight: opts.clientHeight,
     children: turns.map((_, i) => ({
       isConnected: true,
       getBoundingClientRect: () => ({ top: docTop(i) - scrollTop, height: heightOf(i) }),
     })),
     get clientWidth() { return width; },
+    get clientHeight() { return clientHeight; },
     get scrollHeight() { return docTop(turns.length); },
     get scrollTop() { return scrollTop; },
     set scrollTop(next: number) {
       const max = Math.max(0, el.scrollHeight - el.clientHeight);
       scrollTop = Math.max(0, Math.min(next, max));
     },
-    getBoundingClientRect: () => ({ top: 0, left: 0, width, height: opts.clientHeight }),
+    getBoundingClientRect: () => ({ top: 0, left: 0, width, height: clientHeight }),
 
     /** Resize the pane: everything re-wraps, and a shorter transcript clamps. */
     setWidth(next: number) { width = next; el.scrollTop = scrollTop; },
+    /** Rotate the device: BOTH dimensions of the box change at once, and the
+     *  new width re-wraps every turn. */
+    rotate(nextWidth: number, nextHeight: number) {
+      width = nextWidth;
+      clientHeight = nextHeight;
+      el.scrollTop = scrollTop;
+    },
+    /** The offset the live edge sits at, for the current geometry. */
+    liveEdge() { return Math.max(0, el.scrollHeight - el.clientHeight); },
     /** Streaming growth: the newest turn gets taller, the width does not change. */
     growLastTurn(px: number) { turns[turns.length - 1] += px; el.scrollTop = scrollTop; },
     /** A turn's top relative to the viewport top (negative once scrolled past). */
@@ -106,10 +122,19 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
  *  Halving the width to 400 doubles every turn to 7200px total. */
 const SIX_TURNS = { turns: [600, 600, 600, 600, 600, 600], width: 800, clientHeight: 600 };
 
+/** A phone-shaped transcript: six 600px turns in a 400px-wide, 800px-tall
+ *  viewport (3600px of transcript, live edge at 2800). Rotating to a 800px-wide,
+ *  400px-tall landscape halves every turn to 1800px total, live edge at 1400. */
+const PORTRAIT = { turns: [600, 600, 600, 600, 600, 600], width: 400, clientHeight: 800 };
+
 beforeEach(() => {
   awayFromBottom.value = false;
   notAtTop.value = false;
   scrolledFromTop.value = false;
+  stopFollowingBottom();
+  setThreadLive(false);
+  readerGestureForTest(null, false);
+  setActiveScrollElement(null);
 });
 
 describe('transcript reflow anchoring across a pane-width change', () => {
@@ -260,6 +285,28 @@ describe('transcript reflow anchoring across a pane-width change', () => {
     expect(awayFromBottom.value).toBe(true);
   });
 
+  it('holds the anchor across a rotation for a reader who armed nothing', () => {
+    // The unarmed half of the rotation rule, and the same answer the pane-width
+    // case above gives: a position is not a request, so being at the bottom when
+    // the phone turned buys nothing. The reader keeps the content they were on
+    // and the chevron offers them the ride down.
+    const el = makeTranscript(PORTRAIT);
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    el.scrollTop = el.liveEdge(); // 2800
+    onScroll();
+
+    el.rotate(800, 400);
+    onResize();
+    el.rotate(400, 800);
+    onResize();
+
+    expect(el.scrollTop).toBe(2600);
+    expect(el.scrollTop).not.toBe(el.liveEdge());
+    expect(awayFromBottom.value).toBe(true);
+  });
+
   it('re-anchors on every step of a drag, not just the first', () => {
     const el = makeTranscript(SIX_TURNS);
     const { onScroll, onResize } = makeScrollObservers(el);
@@ -273,6 +320,201 @@ describe('transcript reflow anchoring across a pane-width change', () => {
       el.setWidth(width);
       onResize();
       expect(el.turnTop(3)).toBeCloseTo(-100, 6);
+    }
+  });
+});
+
+/** Rotating the phone changes BOTH dimensions of the transcript's box, and the
+ *  new width re-wraps every line. For a reader on the live edge the two things
+ *  the anchor could preserve ("the child at the top of my viewport stays there"
+ *  and "the content still ends at the bottom of my screen") are one statement
+ *  before the rotation and two different ones after it. A reader who ASKED to be
+ *  kept at the bottom gets the second; everyone else keeps the child anchor.
+ *
+ *  Reported 2026-08-13: rotating and back again left the transcript short of the
+ *  edge with the toggle lit, because the child anchor was the only answer and
+ *  the follow's own write stands down on an idle thread. */
+describe('a rotation keeps the live edge for a reader who asked for it', () => {
+  /** Park at the live edge and press the toggle there, so arming writes nothing
+   *  and runs no tween. Leaves the thread IDLE, which is the case the growth
+   *  branch declines and this one must not. */
+  function armedAtTheEdge() {
+    const el = makeTranscript(PORTRAIT);
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.scrollTop = el.liveEdge(); // 2800
+    observers.onScroll();
+    setFollowLiveEdge(true);
+    expect(followingLiveEdge.value).toBe(true);
+    return { el, ...observers };
+  }
+
+  it('brings the reader back to the edge after a rotation and back, on an idle thread', () => {
+    const { el, onResize } = armedAtTheEdge();
+
+    // Landscape: every turn halves (1800px of transcript), and the browser's own
+    // clamp happens to land on the new edge.
+    el.rotate(800, 400);
+    onResize();
+    expect(el.scrollTop).toBe(1400);
+    expect(el.scrollTop).toBe(el.liveEdge());
+
+    // Back to portrait: the turns double again and nothing clamps, so this is
+    // the direction that discriminates. The child anchor would leave them at
+    // 2600, which is where the unarmed reader above ends up.
+    el.rotate(400, 800);
+    onResize();
+
+    expect(el.scrollTop).toBe(2800);
+    expect(el.scrollTop).toBe(el.liveEdge());
+    expect(awayFromBottom.value).toBe(false);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('leaves an armed reader who is parked in history exactly where they are', () => {
+    // The second term of the branch. An idle thread is one an armed reader may
+    // browse freely without losing the ride (`followIsCarrying`), so the lit
+    // toggle must not become a licence to yank them to the bottom the moment the
+    // phone turns.
+    const { el, onScroll, onResize } = armedAtTheEdge();
+
+    // Their OWN hand, because that is the only way an armed reader gets parked
+    // in history and keeps the ride. A scroll with no gesture behind it is the
+    // platform's, and the follow puts them straight back on the edge for one
+    // (`keepTheLiveEdge`); browsing is what this case is about.
+    readerGestureForTest(el);
+    el.scrollTop = 1000;
+    onScroll();
+    expect(followingLiveEdge.value).toBe(true); // browsing an idle thread keeps it
+    readerGestureForTest(null, false);          // and the coast lapses before the rotation
+
+    el.rotate(800, 400);
+    onResize();
+
+    expect(el.turnTop(1)).toBe(-400); // held on the same content
+    expect(el.scrollTop).toBe(700);
+    expect(el.scrollTop).not.toBe(el.liveEdge());
+  });
+
+  it('keeps the edge when only the HEIGHT changes, which re-wraps nothing', () => {
+    // The keyboard and the composer take height from the transcript without
+    // touching its width, and strand a reader on the edge in exactly the same
+    // way. There is no reflow to correct here, which is why the branch is gated
+    // on the box changing rather than on a re-wrap.
+    const { el, onResize } = armedAtTheEdge();
+
+    el.rotate(400, 500); // the soft keyboard takes 300px
+    onResize();
+
+    expect(el.scrollTop).toBe(3100);
+    expect(el.scrollTop).toBe(el.liveEdge());
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('stands down while a deep-link is still resolving, and keeps the ride', () => {
+    // A link owns the position for the WHOLE resolve window, not just from its
+    // landing, and most of that window has no tween in it: the thread is still
+    // loading and the target has not rendered. The reader is meanwhile wherever
+    // the outgoing thread left the shared container, so writing the live edge
+    // over a link in flight is both the wrong place and a guess. The ride
+    // survives it, because standing down is about the WRITE.
+    const restoreDom = installDeepLinkStubs();
+    vi.useFakeTimers();
+    try {
+      const { el, onResize } = armedAtTheEdge();
+      scrollToEventAndPulse('never-renders');
+      expect(hasPendingEventScroll()).toBe(true);
+
+      el.rotate(800, 400);
+      onResize();
+      el.rotate(400, 800);
+      onResize();
+
+      expect(el.scrollTop).toBe(2600); // the anchor's answer, as for an unarmed reader
+      expect(el.scrollTop).not.toBe(el.liveEdge());
+      expect(followingLiveEdge.value).toBe(true);
+    } finally {
+      clearPendingEventScroll();
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      restoreDom();
+    }
+  });
+
+  it('answers the same for content growth, because it is the same reader', () => {
+    // Same reader, same lit toggle, same position on the edge, and this time the
+    // box is untouched and the CONTENT grows. INVERTED on 2026-08-13, having
+    // asserted the opposite for a day: a rotation and an arriving question card
+    // are two ways of sliding the live edge out from under a rider who has not
+    // moved, and answering them differently painted the card with its options
+    // below the fold and the chevron up under a lit toggle.
+    //
+    // The stand-down this replaced came from 2026-08-11, which is a real report
+    // about a real reader: one who had SCROLLED UP to re-read a finished reply
+    // and was hauled back down by the next markdown reflow. That reader is still
+    // left alone, by the position term rather than by the liveness one (see the
+    // test below, and the `an IDLE thread moves an armed reader nowhere` block in
+    // `scroll-follow-the-live-edge.test.ts`).
+    const { el, onResize } = armedAtTheEdge();
+
+    el.growLastTurn(400);
+    onResize();
+
+    expect(el.scrollTop).toBe(3200);
+    expect(el.scrollTop).toBe(el.liveEdge());
+    expect(awayFromBottom.value).toBe(false);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('leaves an armed reader who scrolled off the edge alone when content grows', () => {
+    // The other side of the inverted test above, kept beside it so the two read
+    // as one rule. What decides is WHERE the reader is, never what kind of resize
+    // it was: a rider is kept on the edge, and a browser is left where they
+    // parked. Neither loses the ride.
+    const { el, onScroll, onResize } = armedAtTheEdge();
+
+    // Their OWN hand, for the same reason as the rotation case above: a scroll
+    // with no gesture behind it is the platform's, and `keepTheLiveEdge` puts
+    // them straight back on the edge for one.
+    readerGestureForTest(el);
+    el.scrollTop = 1000;
+    onScroll();
+    readerGestureForTest(null, false); // the coast lapses before the growth
+
+    el.growLastTurn(400);
+    onResize();
+
+    expect(el.scrollTop).toBe(1000);
+    expect(awayFromBottom.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('stands down for growth under an unresolved deep link too, and keeps the ride', () => {
+    // The deep-link term is inside `keepTheLiveEdge` rather than at each call
+    // site, so it has to hold for GROWTH exactly as it does for the rotation
+    // above. This is the ordinary shape of a notification tap: the thread is
+    // still rendering, so the transcript grows for a second while the link's
+    // target has not appeared yet, and there is no tween in that window to stand
+    // down for. A live-edge write there would carry the reader past the event
+    // they tapped before the link ever got to place them.
+    const restoreDom = installDeepLinkStubs();
+    vi.useFakeTimers();
+    try {
+      const { el, onResize } = armedAtTheEdge();
+      scrollToEventAndPulse('never-renders');
+      expect(hasPendingEventScroll()).toBe(true);
+
+      el.growLastTurn(400);
+      onResize();
+
+      expect(el.scrollTop).toBe(2800);
+      expect(el.scrollTop).not.toBe(el.liveEdge()); // 3200
+      expect(followingLiveEdge.value).toBe(true);
+    } finally {
+      clearPendingEventScroll();
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      restoreDom();
     }
   });
 });

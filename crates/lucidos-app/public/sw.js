@@ -396,13 +396,16 @@ self.addEventListener('push', (event) => {
         tap: raw && raw.tap,
       };
 
-  // App-icon badge (Badging API). The engine carries the workspace's current
-  // unread count in the TOP-LEVEL `app_badge` field (sibling of `web_push` /
+  // App-icon badge (Badging API). The engine carries the count THIS install
+  // should show in the TOP-LEVEL `app_badge` field (sibling of `web_push` /
   // `notification`, see build_push_payload). Mirror it onto the installed PWA
-  // icon so a CLOSED workspace PWA stays accurate on Chrome/Android — a
-  // per-workspace PWA badges ITS OWN workspace's unreads. iOS sets the badge
-  // natively from the same field without running this handler, so this is the
-  // non-iOS path. Best-effort + feature-gated; `0` clears it.
+  // icon so a CLOSED PWA stays accurate on Chrome/Android. Deliberately
+  // verbatim: how many workspaces the icon covers is the ENGINE's call, per
+  // subscription scope (`app_badge_for` in scheduler/push.rs), so a gateway
+  // install gets the cross-workspace total here without this handler knowing
+  // anything about other workspaces. iOS sets the badge natively from the same
+  // field without running this handler, so this is the non-iOS path.
+  // Best-effort + feature-gated; `0` clears it.
   const appBadge =
     raw && typeof raw.app_badge === 'number' ? raw.app_badge : null;
 

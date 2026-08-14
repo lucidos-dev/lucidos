@@ -20,6 +20,8 @@ const sharedCss: string = readFileSync(
   resolve(here, '../../../styles/global/shared-components.css'),
   'utf-8',
 );
+const drawerCss: string = readFileSync(resolve(here, '../../../styles/drawer.css'), 'utf-8');
+const pagesCss: string = readFileSync(resolve(here, '../../../styles/pages.css'), 'utf-8');
 const triggerDetails: string = readFileSync(
   resolve(here, '../../triggers/TriggerDetails.tsx'),
   'utf-8',
@@ -109,6 +111,44 @@ describe('Explainer: host-only, never served to app iframes', () => {
     // <Overlay>, whose machinery no iframe has, so advertising it would offer
     // apps a component they cannot build.
     expect(sharedCss).not.toMatch(/explainer/);
+  });
+});
+
+describe('Explainer: the icon never wraps away from its label', () => {
+  it('glues the button to the label with a word joiner', () => {
+    // A button is an atomic inline, and line breaking allows a break in front
+    // of one. A squeezed label therefore drops the glyph onto a line of its
+    // own, under the text. U+2060 WORD JOINER forbids that break.
+    expect(source).toMatch(/<span class="explainer-slot">\s*<button/);
+    expect(hostCss).toMatch(/\.explainer-slot::before \{\s*content:\s*'\\2060';/);
+  });
+
+  it('generates the joiner, so it stays out of the text and the accname', () => {
+    // A text node would land in `textContent`, in the accessible name of the
+    // label wrapping a checkbox row, and in a copied selection. It is a layout
+    // instruction, so only the line breaker should ever see it.
+    expect(source).not.toMatch(/\\u2060/);
+  });
+
+  it('keeps the slot a plain inline box, which is what exposes the joiner', () => {
+    // An inline-flex or inline-block slot is an atomic inline itself: the outer
+    // line breaker then sees one object and never reads the joiner, so the
+    // orphan comes straight back. This is the tidy-up that would undo the fix.
+    const rule = hostCss.match(/\.explainer-slot \{[\s\S]*?\n\}/);
+    expect(rule, 'found the .explainer-slot rule').not.toBeNull();
+    expect(rule![0]).toMatch(/display:\s*inline;/);
+    expect(rule![0]).toMatch(/line-height:\s*0;/);
+  });
+
+  it('puts the space before the icon on the slot, where a gap row zeroes it', () => {
+    // Wherever a row separates its children with a `gap`, the slot is the flex
+    // item. So the margin lives there, or the two stack up again.
+    expect(hostCss).toMatch(/\.explainer-slot \{[\s\S]*?margin-left:\s*0\.375rem/);
+    const btn = hostCss.match(/\.explainer-btn \{[\s\S]*?\n\}/);
+    expect(btn, 'found the .explainer-btn rule').not.toBeNull();
+    expect(btn![0]).not.toMatch(/margin-left/);
+    expect(drawerCss).toMatch(/\.thread-filter-option > \.explainer-slot \{\s*margin-left:\s*0;/);
+    expect(pagesCss).toMatch(/\.form-checkbox-row > \.explainer-slot \{\s*margin-left:\s*0;/);
   });
 });
 

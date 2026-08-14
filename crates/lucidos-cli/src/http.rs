@@ -83,6 +83,26 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
         .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
 }
 
+/// Like [`client`] but with an explicit response deadline, replacing reqwest's
+/// 30s default.
+///
+/// For a caller whose request is incidental to its real job, where a hung
+/// engine must cost seconds rather than half a minute. `build-slot` announces
+/// contention this way while a build waits. It exists so that caller does not
+/// hand-roll a third builder and drop the two default headers with it: an
+/// unattributed call is stamped `Api { mode: Human }` (ADR 0050), and one with
+/// no workspace assertion is served by whichever engine holds the port.
+pub(crate) fn client_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client, BoxError> {
+    reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .default_headers(default_headers_from_env())
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
+}
+
 /// HTTP client for the MCP permission server. Disables reqwest's default 30s
 /// blocking timeout because `/api/v1/internal/permission-prompt` waits for the
 /// user's click. With the default timeout, every prompt fails after 30s and
@@ -232,6 +252,65 @@ mod tests {
             drop(stream);
         });
         port
+    }
+
+    /// Accept one request, hand its raw text back, and answer 200.
+    fn spawn_capturing_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            );
+        });
+        (port, rx)
+    }
+
+    /// The deadline-carrying constructor sends the SAME two headers as the
+    /// other two, over the wire.
+    ///
+    /// It exists because a caller that wants a shorter timeout is exactly the
+    /// caller tempted to hand-roll its own builder. `build-slot`'s contention
+    /// announcement did, and shipped unattributed until review caught it: with
+    /// no origin token the engine stamps `Api { mode: Human }` (ADR 0050), and
+    /// with no workspace assertion a wrong port is served rather than refused.
+    #[test]
+    fn the_timeout_client_sends_the_same_headers_as_the_others() {
+        let _guard = env_lock().lock().unwrap();
+        let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
+        // SAFETY: process-wide env mutation gated by env_lock().
+        unsafe {
+            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, token);
+            std::env::set_var(ENV_WORKSPACE, "/Users/me/workspaces/dev");
+        }
+        let (port, rx) = spawn_capturing_server();
+        let sent = client_with_timeout(Duration::from_secs(5))
+            .expect("build")
+            .post(format!("http://127.0.0.1:{port}/x"))
+            .body("{}")
+            .send()
+            .is_ok();
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
+            std::env::remove_var(ENV_WORKSPACE);
+        }
+        assert!(sent, "the request must reach the server");
+
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("captured");
+        let lower = request.to_lowercase();
+        assert!(
+            lower.contains(HEADER_AGENT_ORIGIN_TOKEN) && request.contains(token),
+            "origin token missing from the wire: {request}"
+        );
+        assert!(
+            lower.contains(HEADER_TARGET_WORKSPACE) && request.contains("dev"),
+            "workspace assertion missing from the wire: {request}"
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ import { brandBadgeState, brandBadgeTooltip, BrandBadge } from './BrandBadge';
 import {
   restartRequired,
   engineVersionReady,
+  engineVersionPending,
+  engineRebuildWedged,
   engineBuilding,
   enginePackaged,
   updateAvailable,
@@ -51,6 +53,8 @@ describe('brandBadgeState / brandBadgeTooltip', () => {
   beforeEach(() => {
     restartRequired.value = false;
     engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     enginePackaged.value = false;
     updateAvailable.value = false;
@@ -137,6 +141,37 @@ describe('brandBadgeState / brandBadgeTooltip', () => {
     expect(brandBadgeState(0)).toBe('ready');
     expect(brandBadgeTooltip([])).toBe('Client update available');
   });
+
+  /** New code in source with nothing built behind it. A state of its own, and
+   *  the quietest of the three, because it is the one the user can do least
+   *  about. */
+  it('source ahead with nothing built shows the pending badge', () => {
+    engineVersionPending.value = true;
+    expect(brandBadgeState(0)).toBe('pending');
+    expect(brandBadgeTooltip([])).toBe('New code pending · tap to rebuild');
+  });
+
+  /** The tooltip must not promise a Rebuild the toast withholds, the same rule
+   *  the activity tooltip follows about promising details. */
+  it('a wedged rebuild says so instead of offering one', () => {
+    engineVersionPending.value = true;
+    engineRebuildWedged.value = true;
+    expect(brandBadgeState(0)).toBe('pending');
+    expect(brandBadgeTooltip([])).toBe('New code pending · no rebuild can deliver it');
+  });
+
+  it('ready wins over pending: something you can take now beats something unbuilt', () => {
+    engineVersionReady.value = true;
+    engineVersionPending.value = true;
+    expect(brandBadgeState(0)).toBe('ready');
+    expect(brandBadgeTooltip([])).toBe('New version available');
+  });
+
+  it('busy wins over pending: a build in flight may yet resolve it', () => {
+    engineVersionPending.value = true;
+    expect(brandBadgeState(1)).toBe('busy');
+    expect(brandBadgeTooltip([build])).toBe('Building new version · tap for details');
+  });
 });
 
 /** The reported bug, pinned across both halves that drifted apart: *"tap for
@@ -215,6 +250,8 @@ describe('BrandBadge', () => {
     engineRestarting.value = false;
     engineBuilding.value = false;
     engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    engineRebuildWedged.value = false;
     updateAvailable.value = false;
     enginePackaged.value = false;
     restartRequired.value = false;
@@ -269,6 +306,38 @@ describe('BrandBadge', () => {
     badgeButton()?.props.onClick?.({ stopPropagation: () => {} });
     expect(focusedPane.value).toBe('thread');
     expect(toasts.value.find((t) => t.key === BACKGROUND_ACTIVITY_TOAST_KEY)?.pane).toBe('thread');
+  });
+
+  /** The pending badge IS clickable, unlike the ready `!`. It has no home in the
+   *  Lucidos menu to fall through to (Restart would respawn the same engine),
+   *  and its toast is dismissable, so without a way back a persistent dot would
+   *  be something the user cannot resolve. */
+  it('is a clickable dot in the pending state, and re-opens the pending toast', () => {
+    engineVersionPending.value = true;
+    const badge = badgeButton();
+    expect(badge).toBeDefined();
+    expect(findByClass(BrandBadge(), 'brand-badge-dot')).toHaveLength(1);
+    let stopped = false;
+    badge?.props.onClick?.({ stopPropagation: () => { stopped = true; } });
+    expect(stopped).toBe(true);
+    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
+  });
+
+  /** The dot draws no glyph: the box is the mark. A `!` here would be a second
+   *  attention mark for the one state with nothing to act on. */
+  it('draws no glyph in the pending state', () => {
+    engineVersionPending.value = true;
+    expect(findByClass(BrandBadge(), 'brand-badge-spinner')).toHaveLength(0);
+  });
+
+  it('tints the dot when rebuilding is wedged, and re-opens the toast that says so', () => {
+    engineVersionPending.value = true;
+    engineRebuildWedged.value = true;
+    expect(findByClass(BrandBadge(), 'brand-badge-wedged')).toHaveLength(1);
+    badgeButton()?.props.onClick?.({ stopPropagation: () => {} });
+    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
+    expect(toast?.type).toBe('warning');
+    expect(toast?.action?.label).toBe('OK');
   });
 
   it('narrates a download with its byte progress', () => {

@@ -962,6 +962,29 @@ use crate::engine::thread_events::ActorMode;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
+/// The model registry the resolver clamps the effort against. Empty, so every
+/// id takes the same prefix heuristic `RoutingProvider` would use for a model
+/// with no row (`claude-*` and the unregistered placeholder ids these tests use
+/// alike). Tests that need a specific provider build their own.
+fn registry() -> crate::llm::ModelRegistry {
+    crate::llm::model_registry::empty()
+}
+
+/// A registry mapping one id to one provider, for the clamp cases.
+fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::ModelRegistry {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    let mut map = HashMap::new();
+    map.insert(
+        id.to_string(),
+        crate::llm::model_registry::ModelRouting {
+            provider,
+            context_window: None,
+        },
+    );
+    Arc::new(RwLock::new(map))
+}
+
 /// Coding-agent requests use the same HTTP `reasoning_effort` field for an
 /// explicit agent pick, but an omitted field means "fall through to agent
 /// settings/defaults". It must not be filled from the Lucidos chat preference:
@@ -978,6 +1001,7 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
 
     let (model, effort) = resolve_route_overrides(
         &pool,
+        &registry(),
         Some(true),
         None,
         None,
@@ -999,8 +1023,16 @@ async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
         .await
         .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, Some(true), None, None, None, Some("xhigh")).await;
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        &registry(),
+        Some(true),
+        None,
+        None,
+        None,
+        Some("xhigh"),
+    )
+    .await;
 
     assert_eq!(model, None);
     assert_eq!(effort.as_deref(), Some("xhigh"));
@@ -1018,7 +1050,8 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
         .await
         .unwrap();
 
-    let (model, effort) = resolve_route_overrides(&pool, None, None, None, None, None).await;
+    let (model, effort) =
+        resolve_route_overrides(&pool, &registry(), None, None, None, None, None).await;
 
     assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
     assert_eq!(effort.as_deref(), Some("high"));
@@ -1051,7 +1084,8 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
     .await
     .unwrap();
 
-    let (model, effort) = resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
+    let (model, effort) =
+        resolve_route_overrides(&pool, &registry(), None, Some(tid), None, None, None).await;
 
     assert_eq!(model.as_deref(), Some("thread-model"));
     assert_eq!(effort.as_deref(), Some("low"));
@@ -1090,7 +1124,8 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     .await
     .unwrap();
 
-    let (model, effort) = resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
+    let (model, effort) =
+        resolve_route_overrides(&pool, &registry(), None, Some(tid), None, None, None).await;
 
     assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
     assert_eq!(effort.as_deref(), Some("low"));
@@ -1114,6 +1149,7 @@ async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
 
     let (model, effort) = resolve_route_overrides(
         &pool,
+        &registry(),
         None,
         None,
         None,
@@ -1134,15 +1170,26 @@ async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
 #[tokio::test]
 async fn trigger_route_resolves_model_and_effort_independently() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+    // An adaptive Claude account model, so every tier is available and the
+    // clamp is a no-op: this test is about the two fields resolving
+    // independently, not about clamping (covered separately below).
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-5@default")
         .await
         .unwrap();
     crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
         .await
         .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, None, None, None, Some("gemini-3.5-flash"), None).await;
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        &registry(),
+        None,
+        None,
+        None,
+        Some("gemini-3.5-flash"),
+        None,
+    )
+    .await;
     assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
     assert_eq!(
         effort.as_deref(),
@@ -1150,14 +1197,79 @@ async fn trigger_route_resolves_model_and_effort_independently() {
         "account effort still applies"
     );
 
-    let (model, effort) = resolve_route_overrides(&pool, None, None, None, None, Some("max")).await;
+    let (model, effort) =
+        resolve_route_overrides(&pool, &registry(), None, None, None, None, Some("max")).await;
     assert_eq!(
         model.as_deref(),
-        Some("account-model"),
+        Some("claude-opus-5@default"),
         "account model still applies"
     );
     assert_eq!(effort.as_deref(), Some("max"));
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The resolved pair is clamped HERE, not only at the wire, so the effort a
+/// turn stamps on its events is the effort it actually sends.
+///
+/// The mismatch is manufactured by per-field resolution: the model comes from
+/// the request and the effort from the account preference, so nothing upstream
+/// pairs them. Left unclamped, the turn records `xhigh` for a local model,
+/// which the in-thread picker then displays as the thread's setting even though
+/// its dropdown offers no such tier, and which the next turn reads back as the
+/// thread's remembered effort.
+#[tokio::test]
+async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "xhigh")
+        .await
+        .unwrap();
+    let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
+
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        &registry,
+        None,
+        None,
+        None,
+        Some("muse-glimmer:30b-mlx"),
+        None,
+    )
+    .await;
+
+    assert_eq!(model.as_deref(), Some("muse-glimmer:30b-mlx"));
+    assert_eq!(
+        effort.as_deref(),
+        Some("high"),
+        "a local model cannot run xhigh, so the turn must not record that it did"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A coding-agent route is exempt: the effort belongs to Claude Code / Codex,
+/// whose models are not in the chat registry and whose drivers validate it
+/// themselves. Clamping it against a chat model would answer a question about
+/// the wrong agent, and `xhigh` is a perfectly good Codex tier.
+#[tokio::test]
+async fn a_coding_agent_effort_is_not_clamped_against_the_chat_registry() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
+
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        &registry,
+        Some(true),
+        None,
+        None,
+        None,
+        Some("xhigh"),
+    )
+    .await;
+
+    assert_eq!(model, None);
+    assert_eq!(effort.as_deref(), Some("xhigh"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -1189,13 +1301,13 @@ fn pre_emitted_message_cannot_also_answer_pending_question() {
     ));
 }
 
-/// Regression: an agent-driven child-completion wake (the `[CHILD THREAD
+/// Regression: an agent-driven child-completion re-entry (the `[CHILD THREAD
 /// COMPLETED] …` block fed through `notify_parent_of_child_completion` with
 /// `ActorMode::Agent`) must NOT be eligible to answer the parent's open
 /// question. Before the `mode == Human` guard it was, producing a bogus
 /// `UserQuestionAnswered { FreeText }` stamped with a `thread_link`/`child`
 /// actor and silently consuming the user's question. It must instead fall
-/// through to the injection fast-path (queued as `WakeFromChild`).
+/// through to the injection fast-path (queued as `ReentryFromEngine`).
 #[test]
 fn child_completion_wake_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(

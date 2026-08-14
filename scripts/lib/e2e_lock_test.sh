@@ -513,7 +513,7 @@ spawn_sleeper; eng2=$SLEEPER_PID       # the workspace engine: has its own kind
 SYNTHETIC_PS="$inside /Users/x/.local/bin/claude --settings /whatever/cc-settings.json
 $outside /Users/x/.local/bin/claude --settings /Users/x/other/cc-settings.json
 $mention /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: orphans under $E2E_WORKSPACE/.lucidos/worktrees/ survived 55 minutes
-$eng2 /Users/x/target/release/launch/e2e-test-hooks/lucidos-engine"
+$eng2 /Users/x/.launch/release/e2e-test-hooks/lucidos-engine"
 SYNTHETIC_CWD="$inside $E2E_WORKSPACE/.lucidos/worktrees/thread-abc
 $outside /Users/x/workspaces/dev/.lucidos/worktrees/thread-def
 $mention /Users/x/workspaces/dev/.lucidos/worktrees/thread-ghi

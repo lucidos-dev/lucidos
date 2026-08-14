@@ -1,6 +1,7 @@
-import { updateAvailable, engineBuilding, engineBuildDetail, engineNewVersionReady, embeddingModelStatus, tailscaleServeRun } from '../../store/store';
+import { updateAvailable, engineBuilding, engineBuildDetail, engineNewVersionReady, engineVersionPending, engineRebuildWedged, embeddingModelStatus, tailscaleServeRun } from '../../store/store';
 import { backgroundActivities, type BackgroundActivity } from '../../store/backgroundActivity';
 import { openBackgroundActivityToast } from '../../store/actions/backgroundActivity';
+import { openEngineVersionToast } from '../../store/actions/engine-update';
 import { focusPane } from '../../store/actions/pane';
 import { ReloadIcon } from '../shared/icons';
 
@@ -14,14 +15,24 @@ import { ReloadIcon } from '../shared/icons';
  *    bundle is available to refresh, shown as a single `!` attention mark. Not
  *    clickable itself; the click falls through to its host, which opens the
  *    Lucidos menu where the Refresh and Restart controls live.
+ *  - `pending`: new code exists in source with no version built behind it, shown
+ *    as a quieter dot. Clickable, and it re-opens the pending version toast,
+ *    which is where both the explanation and the Rebuild live. It is clickable
+ *    precisely BECAUSE that toast is dismissable: a persistent badge with no way
+ *    back to what it refers to would be a dot the user cannot resolve. Unlike
+ *    `ready` it has no home in the Lucidos menu to fall through to, since
+ *    Restart would respawn the same engine.
  *  - `none`: nothing to surface, and the badge is not rendered.
  *
- *  Busy wins over ready: a switch/refresh isn't offered until the work lands. */
-export type BrandBadgeState = 'busy' | 'ready' | 'none';
+ *  Ordered by how much the user can do about it. Busy wins over ready (a
+ *  switch/refresh isn't offered until the work lands), and ready wins over
+ *  pending (something you can take now beats something that isn't built). */
+export type BrandBadgeState = 'busy' | 'ready' | 'pending' | 'none';
 
 export function brandBadgeState(activityCount: number): BrandBadgeState {
   if (activityCount > 0) return 'busy';
   if (engineNewVersionReady() || updateAvailable.value) return 'ready';
+  if (engineVersionPending.value) return 'pending';
   return 'none';
 }
 
@@ -42,6 +53,16 @@ export function brandBadgeTooltip(activities: BackgroundActivity[]): string | un
   if (newVersion && update) return 'New version available · Client update available';
   if (newVersion) return 'New version available';
   if (update) return 'Client update available';
+  // Pending says what EXISTS, never what to press: "new code" is true whether or
+  // not a rebuild can turn it into a version, and the two differ only in what
+  // the toast behind the tap can offer. So the wedged variant drops the promise
+  // of details rather than describing a button that isn't there, on the same
+  // rule the activity tooltip above follows.
+  if (engineVersionPending.value) {
+    return engineRebuildWedged.value
+      ? 'New code pending · no rebuild can deliver it'
+      : 'New code pending · tap to rebuild';
+  }
   return undefined;
 }
 
@@ -69,10 +90,11 @@ export function BrandBadge() {
   if (state === 'ready') {
     return <span class="badge brand-badge" data-tooltip={tooltip}>!</span>;
   }
+  const pending = state === 'pending';
   return (
     <button
       type="button"
-      class="badge brand-badge brand-badge-action"
+      class={`badge brand-badge brand-badge-action${pending ? ' brand-badge-dot' : ''}${pending && engineRebuildWedged.value ? ' brand-badge-wedged' : ''}`}
       data-tooltip={tooltip}
       aria-label={tooltip}
       onClick={(e) => {
@@ -89,10 +111,15 @@ export function BrandBadge() {
         // status toast over the content pane. No-op on mobile, where the toast
         // spans the screen anyway.
         focusPane('thread');
-        openBackgroundActivityToast();
+        if (pending) openEngineVersionToast();
+        else openBackgroundActivityToast();
       }}
     >
-      <span class="brand-badge-spinner"><ReloadIcon /></span>
+      {/* Pending draws no glyph at all: the badge box IS the dot. The `!` is
+          spoken for by `ready`, and a second attention mark beside it would say
+          "act on this" about the one state where there is nothing to act on
+          yet. The tooltip and the toast carry the words. */}
+      {!pending && <span class="brand-badge-spinner"><ReloadIcon /></span>}
     </button>
   );
 }

@@ -45,11 +45,10 @@ async function clickThreadNav(page: Page, ariaLabel: 'Previous thread' | 'Next t
   }
 }
 
-/** Clear the prompt via the textarea's clear-X. The dedicated "Discard draft"
- *  button was removed — the clear-X (plus per-image remove X) is the discard
- *  affordance now. For a never-sent compose draft, emptying the text auto-
- *  discards it (updateCompose routes an empty patch through discardCompose); for
- *  an active thread it's a local clear of the follow-up text, no confirm. */
+/** Clear the prompt via the clear-X in the composer's prompt row, which is the
+ *  discard affordance. Emptying a never-sent compose draft auto-discards it,
+ *  since updateCompose routes an empty patch through discardCompose. On an
+ *  active thread it is a local clear of the follow-up text, with no confirm. */
 async function clearDraft(page: Page): Promise<void> {
   if (!await clickVisibleElement(page, 'button.prompt-clear')) {
     throw new Error('Clear button not visible');
@@ -81,52 +80,40 @@ test.describe('Per-thread drafts', () => {
     const composeInput = await waitForVisibleInput(page);
     await expect(composeInput).toHaveValue('');
 
-    // Back to THIS thread, BY ID. Not "the first visible real thread row": the
-    // e2e workspace is shared and `clearAllThreads()` truncates only the
-    // thread_summaries projection, so a coding-agent session still running from
-    // an earlier spec re-inserts its row mid-test with `last_activity = NOW()`
-    // and outranks ours. The old positional click then landed on that foreign
-    // thread and this test reported the resulting empty textarea as a lost
-    // draft. See `clickThreadRow` and the session-8 entry in
-    // docs/plans/2026-06-27-mobile-webkit-shard-contention.md.
+    // Back to THIS thread, BY ID, never "the first visible real thread row".
+    // The e2e workspace is shared and `clearAllThreads()` truncates only the
+    // thread_summaries projection. So a coding-agent session still running from
+    // an earlier spec can re-insert its row with `last_activity = NOW()` and
+    // outrank ours. See `clickThreadRow`.
     await openThreadDrawer(page);
     await clickThreadRow(page, threadId);
     await ensureOnThreadPane(page);
 
-    // Thread draft restored. The timeout is the suite's default `expect` timeout
-    // (30s, playwright.config.ts) — NOT an explicit 5s. On the contended nightly
-    // the mobile-webkit textarea hydration can lag behind a WebContent
-    // starvation freeze (the documented emulation paint stall — see
-    // docs/e2e-test-decisions.md "mobile-webkit navigation wedge"); that is a
-    // slow-but-correct restore that should pass, not flake-then-pass-on-retry.
-    // A genuine clobber/not-stored bug leaves the draft empty FOREVER, so it
-    // still fails loudly even at 30s — the longer wait sharpens the signal, it
-    // does not mask one. (The explicit 5s here was the sole reason draft 65
-    // surfaced as a retry-recovered flake on 2026-06-28; the draft restores
-    // correctly, just slower than 5s under starvation.)
+    // Thread draft restored. The timeout is the suite's default `expect`
+    // timeout (30s, playwright.config.ts), NOT an explicit 5s. On the contended
+    // nightly the mobile-webkit textarea hydration can lag behind a WebContent
+    // starvation freeze (docs/e2e-test-decisions.md, "mobile-webkit navigation
+    // wedge"). That is a slow-but-correct restore and should pass. A genuine
+    // clobber or not-stored bug leaves the draft empty FOREVER, so the longer
+    // wait sharpens the signal rather than masking one.
     const threadInput = await waitForVisibleInput(page);
     // IDENTITY BEFORE VALUE. An assertion about "the draft" says nothing if the
-    // app parked us on a different thread, and a wrong-thread landing must never
-    // again be reported as a lost draft — that misreading is what sent five
-    // nightly runs and a whole investigation after a nonexistent product bug.
-    // Polls (the restore re-renders), so a slow-but-correct switch still passes.
+    // app parked us on a different thread. A wrong-thread landing must never be
+    // reported as a lost draft. Polls, since the restore re-renders, so a
+    // slow-but-correct switch still passes.
     await expect(threadInput).toHaveAttribute('data-thread-id', threadId);
     try {
       await expect(threadInput).toHaveValue('thread draft text');
     } catch (assertErr) {
-      // Classify the failure FACE so a future nightly flake self-diagnoses,
-      // instead of re-opening the multi-session "which face is it?" guessing
-      // (the drafts:65 saga — docs/plans/2026-06-27-mobile-webkit-shard-contention.md
-      // chased six unit-level fixes blind because the live failure was never
-      // classified). The textarea binds to the local composeDrafts signal, so an
-      // empty textarea after the full 30s is NOT a transient paint stall. Query
-      // the PERSISTED draft of the thread we ASSERTED ON (the line above proved
-      // it is the one we typed into — querying the *restored* id was the bug that
-      // produced the bogus NOT-STORED verdict) to split the two faces:
-      //   • persisted === the draft → CLOBBER: stored server-side but wiped from
-      //     (or never re-synced into) the local signal — a product clear-path bug.
-      //   • persisted === ''        → NOT-STORED: the PUT never landed — a
-      //     fill()→updateCompose event race, or a failed/never-fired PUT.
+      // Classify the failure FACE so a future nightly flake self-diagnoses. The
+      // textarea binds to the local composeDrafts signal, so an empty textarea
+      // after the full 30s is NOT a transient paint stall. Query the PERSISTED
+      // draft of the thread ASSERTED ON above, never the restored id, to split
+      // the two faces:
+      //   • persisted === the draft: CLOBBER, stored server-side but wiped from
+      //     the local signal, a product clear-path bug.
+      //   • persisted === '': NOT-STORED, the PUT never landed. Either a
+      //     fill() to updateCompose race, or a failed PUT.
       let persisted: string;
       try {
         persisted = psql(`SELECT compose_text FROM thread_summaries WHERE thread_id = '${threadId}'`);
@@ -185,9 +172,9 @@ test.describe('Per-thread drafts', () => {
     await input.fill('return to me');
     await newThread(page);
 
-    // Open drawer and click the saved compose draft — el.click() via evaluate
-    // bypasses touch-event routing under hasTouch (which can swallow clicks
-    // on Preact onClick handlers in Chromium mobile emulation)
+    // Open the drawer and click the saved compose draft. el.click() via
+    // evaluate bypasses touch-event routing under hasTouch, which can swallow
+    // clicks on Preact onClick handlers in Chromium mobile emulation.
     await openThreadDrawer(page);
     const savedRow = page.locator('.compose-draft-row:visible .thread-row-title', { hasText: 'return to me' });
     await expect(savedRow).toBeVisible({ timeout: 5_000 });
@@ -213,8 +200,8 @@ test.describe('Per-thread drafts', () => {
 
     // Dual-layout-safe: a raw `.first().click()` resolves to the offscreen
     // layout's nav button, which the visible thread-pane-body intercepts on
-    // mobile (pointer-events) — clickThreadNav uses a synthetic el.click that
-    // fires the handler regardless. (Was failing on mobile + mobile-webkit.)
+    // mobile. clickThreadNav uses a synthetic el.click that fires the handler
+    // regardless.
     await clickThreadNav(page, 'Previous thread');
     await expect(promptInput).toHaveAttribute('data-thread-id', activeId, { timeout: 5_000 });
   });
@@ -266,9 +253,9 @@ test.describe('Per-thread drafts', () => {
     // Switch to compose so the thread's draft is saved
     await newThread(page);
 
-    // Open drawer — THIS thread's row carries a "Draft" badge. Scoped to our own
-    // row: a foreign thread's row can outrank ours in the drawer (see
-    // `threadRowFor`), and "some real row has a Draft badge" is not the claim.
+    // Open the drawer: THIS thread's row carries a "Draft" badge. Scoped to our
+    // own row, since a foreign thread's row can outrank ours in the drawer (see
+    // `threadRowFor`).
     await openThreadDrawer(page);
     const draftIndicator = page.locator(`${threadRowFor(threadId)}:visible .draft-indicator`).first();
     await expect(draftIndicator).toBeVisible({ timeout: 5_000 });
@@ -339,9 +326,9 @@ test.describe('Per-thread drafts', () => {
     const input = await waitForVisibleInput(page);
     await input.fill('compose only draft');
 
-    // Navigate to the thread (away from compose) via drawer so the compose
-    // draft is no longer focused — only then is it shown in Drafts on desktop.
-    // By id, not by position — see `clickThreadRow`.
+    // Navigate to the thread through the drawer so the compose draft is no
+    // longer focused. Only then does desktop show it in Drafts. By id, not by
+    // position, per `clickThreadRow`.
     await openThreadDrawer(page);
     await clickThreadRow(page, threadId);
     await ensureOnThreadPane(page);
@@ -357,8 +344,8 @@ test.describe('Per-thread drafts', () => {
   test('compose draft falls back to "New thread" when text is empty', async ({ page }) => {
     await navigateToApp(page);
 
-    // Save an image-only style draft by typing then deleting (proxy for
-    // image-only — this test only exercises the title fallback path)
+    // Save an image-only style draft by typing then deleting. This test only
+    // exercises the title fallback path.
     const input = await waitForVisibleInput(page);
     await input.fill('temporary');
     await input.fill('');
@@ -389,7 +376,7 @@ test.describe('Per-thread drafts', () => {
     const restored = await waitForVisibleInput(page);
     await expect(restored).toHaveValue('about to be discarded', { timeout: 5_000 });
 
-    // Clear the text — emptying a never-sent compose draft auto-discards it
+    // Clear the text: emptying a never-sent compose draft auto-discards it.
     await clearDraft(page);
 
     // Textarea is empty
@@ -417,24 +404,24 @@ test.describe('Per-thread drafts', () => {
     const clearBtn = page.locator('button.prompt-clear:visible');
     await expect(clearBtn).toHaveCount(1);
 
-    // Clear the follow-up text — for an active thread this is a local clear that
-    // keeps the thread intact. Must not attempt to delete the thread server-side
-    // (which would 409 with "thread is active — use archive instead").
+    // Clear the follow-up text. For an active thread this is a local clear that
+    // keeps the thread intact, never a server-side delete. That would 409 on an
+    // active thread and point at archive instead.
     await clearDraft(page);
 
     const cleared = await waitForVisibleInput(page);
     await expect(cleared).toHaveValue('', { timeout: 5_000 });
 
-    // No error toast — discard on an active thread is a local clear, not a delete.
+    // No error toast: discard on an active thread is a local clear, not a delete.
     await expect(page.locator('.toast-error')).toHaveCount(0, { timeout: 1_000 });
 
-    // User stays on the active thread — placeholder is the follow-up one,
-    // not the compose-view "What can I help with?". Asserting placeholder also avoids
-    // the dual-layout-render trap (desktop and mobile copies coexist in DOM).
+    // The user stays on the active thread, so the placeholder is the follow-up
+    // one, not the compose view's. Asserting the placeholder also avoids the
+    // dual-layout-render trap, where desktop and mobile copies coexist.
     await expect(cleared).toHaveAttribute('placeholder', 'Post a follow up…');
 
-    // Reload — followup draft must NOT come back from the server projection,
-    // and the textarea is still the follow-up one (thread not tombstoned).
+    // Reload: the follow-up draft must NOT come back from the server
+    // projection, and the textarea is still the follow-up one.
     await page.reload();
     await navigateToApp(page);
     const reloaded = await waitForVisibleInput(page);
@@ -445,10 +432,9 @@ test.describe('Per-thread drafts', () => {
   test('Compose Send does not leave a stale draft row that resurrects on reload', async ({ page }) => {
     await navigateToApp(page);
 
-    // Type a compose draft, navigate away to establish so it pushes to the server.
-    // Prefix kept short — drawer titles cap at 40 chars (threadTitle.MAX_LEN), and
-    // the longer 'compose-send-cleanup' prefix produced a 41-char unique string
-    // whose final char was sliced off in the row title, breaking hasText match.
+    // Type a compose draft, then navigate away so it pushes to the server. The
+    // prefix is kept short because drawer titles cap at 40 chars
+    // (threadTitle.MAX_LEN), and a sliced title breaks the hasText match.
     const input = await waitForVisibleInput(page);
     const draftText = uniqueMessage('csc');
     await input.fill(draftText);
@@ -468,10 +454,10 @@ test.describe('Per-thread drafts', () => {
     await sendMessage(page, draftText);
     await waitForResponse(page);
 
-    // Reload — the compose draft id is different from the new thread id, so the
+    // Reload. The compose draft id differs from the new thread id, so the
     // backend's MessageReceived hard-delete (`WHERE id == thread_id`) cannot
-    // match it. The frontend must explicitly tombstone the compose draft on
-    // Send; otherwise the row resurrects in the panel after reload.
+    // match it. The frontend must tombstone the compose draft on Send, or the
+    // row resurrects in the panel after reload.
     await page.reload();
     await navigateToApp(page);
     await openThreadDrawer(page);
@@ -497,12 +483,9 @@ test.describe('Per-thread drafts', () => {
   });
 
   test('thread draft fills the textarea even when it is focused before composeText loads', async ({ page }) => {
-    // Bug: when focusIfNeeded grabs focus on initial mount before
-    // loadAllThreads resolves, the previous "skip sync while focused" guard
-    // suppressed the eventual composeText overwrite. Result: the textarea
-    // stayed blank while the drawer label and clear-X still reflected the
-    // saved draft. Reproduction: focus the textarea immediately after
-    // reload, then assert the persisted text reaches it anyway.
+    // focusIfNeeded can grab focus on initial mount before loadAllThreads
+    // resolves. The persisted text must still reach the textarea, so focus it
+    // immediately after reload and then assert.
     await navigateToApp(page);
 
     const msg = uniqueMessage('draft-focused-reload');
@@ -516,24 +499,21 @@ test.describe('Per-thread drafts', () => {
     await navigateToApp(page);
 
     const reloadedInput = await waitForVisibleInput(page);
-    // Focus before the composeText assertion — production race where the
-    // textarea was focused first and the older guard stuck on userTyping.
+    // Focus before the composeText assertion, reproducing the race where the
+    // textarea is focused first.
     await reloadedInput.focus();
     await expect(reloadedInput).toHaveValue('persists with focus', { timeout: 10_000 });
-    // The clear-X is gated on composeText.length > 0; if the text were missing
-    // but the draft state still showed, this button would be the visible
-    // artifact users reported.
+    // The clear-X is gated on composeText.length > 0, so it is the visible
+    // artifact when the text is missing while the draft state still shows.
     const clearBtn = page.locator('button.prompt-clear:visible');
     await expect(clearBtn).toHaveCount(1);
   });
 
   test('compose draft survives page reload — same thread id, not a new one', async ({ page }) => {
-    // Bug: ensureFocusedComposeThread allocated a UUID and set focusedThreadId
-    // but never wrote it to localStorage. On reload, focusedThreadId restored
-    // to null and the next keystroke allocated a fresh UUID — landing the
-    // user on a brand-new compose pane with the previous draft orphaned
-    // server-side. Fix: setFocusedThread persists the id so the same draft
-    // resumes after reload.
+    // setFocusedThread must persist the id ensureFocusedComposeThread
+    // allocates. Without that, reload restores focusedThreadId to null, the
+    // next keystroke allocates a fresh UUID, and the previous draft is orphaned
+    // server-side.
     await navigateToApp(page);
 
     const composeInput = await waitForVisibleInput(page);
@@ -554,20 +534,18 @@ test.describe('Per-thread drafts', () => {
     await navigateToApp(page);
 
     const reloadedInput = await waitForVisibleInput(page);
-    // Same thread id — without the fix this would be empty (focusedThreadId
-    // null because the id was never persisted) and a fresh keystroke would
-    // allocate a new UUID.
+    // Same thread id. Without the persisted id this is empty and a fresh
+    // keystroke allocates a new UUID.
     await expect(reloadedInput).toHaveAttribute('data-thread-id', beforeReloadId, { timeout: 10_000 });
     // Same draft text, still in the same compose row.
     await expect(reloadedInput).toHaveValue('compose persists across reload');
   });
 
   test('focused compose draft renders the compose view, not a thread header', async ({ page }) => {
-    // Focusing a composing draft from the drawer must keep the centered
-    // compose layout — same as a brand-new compose page. No thread header
-    // (renaming an unsent draft is meaningless), no "No messages" body, and
-    // the prompt input stays vertically centered until Send promotes the
-    // draft to an active thread.
+    // Focusing a composing draft from the drawer must keep the centered compose
+    // layout, exactly as a brand-new compose page does. No thread header, since
+    // renaming an unsent draft is meaningless. No "No messages" body, and the
+    // prompt input stays centered until Send promotes the draft.
     await navigateToApp(page);
 
     const input = await waitForVisibleInput(page);
@@ -606,9 +584,9 @@ test.describe('Per-thread drafts', () => {
   });
 
   test('Filter control is always present and opens an empty Drafts view with no drafts', async ({ page }) => {
-    // beforeEach cleared all threads, so there are zero drafts. Unlike the old
-    // per-view toggles (which hid when empty), the unified Filter control is
-    // always present; picking the Drafts view opens it to its own empty state.
+    // beforeEach cleared all threads, so there are zero drafts. The Filter
+    // control is always present, and picking the Drafts view opens it to its
+    // own empty state.
     await navigateToApp(page);
     await openThreadDrawer(page);
 

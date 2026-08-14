@@ -71,7 +71,7 @@ impl EventStore {
                 SELECT e.id, e.event_type, e.payload, e.created, e.thread_id, e.sequence
                 FROM events e
                 WHERE e.thread_id IN (SELECT thread_id FROM recent_threads)
-                  AND e.event_type IN ('MessageReceived', 'Thinking', 'ThoughtStreamed', 'MemorySearched', 'ResponseGenerated', 'ResponseCanceled', 'ResponseAborted', 'ResponseFailed', 'TextStreamed', 'ToolCalled', 'ToolResult')
+                  AND e.event_type IN ('MessageReceived', 'Thinking', 'ThoughtStreamed', 'MemorySearched', 'MemoryRecalled', 'ResponseGenerated', 'ResponseCanceled', 'ResponseAborted', 'ResponseFailed', 'TextStreamed', 'ToolCalled', 'ToolResult')
                   AND e.created < $2
                 ORDER BY e.created ASC, e.sequence ASC
                 "#,
@@ -95,7 +95,7 @@ impl EventStore {
                 SELECT e.id, e.event_type, e.payload, e.created, e.thread_id, e.sequence
                 FROM events e
                 WHERE e.thread_id IN (SELECT thread_id FROM recent_threads)
-                  AND e.event_type IN ('MessageReceived', 'Thinking', 'ThoughtStreamed', 'MemorySearched', 'ResponseGenerated', 'ResponseCanceled', 'ResponseAborted', 'ResponseFailed', 'TextStreamed', 'ToolCalled', 'ToolResult')
+                  AND e.event_type IN ('MessageReceived', 'Thinking', 'ThoughtStreamed', 'MemorySearched', 'MemoryRecalled', 'ResponseGenerated', 'ResponseCanceled', 'ResponseAborted', 'ResponseFailed', 'TextStreamed', 'ToolCalled', 'ToolResult')
                 ORDER BY e.created ASC, e.sequence ASC
                 "#,
             )

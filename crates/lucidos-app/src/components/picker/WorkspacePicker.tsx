@@ -67,7 +67,7 @@ import {
 } from '../../utils/bindMode';
 // Shared with the in-app workspace switcher, so a dot means the same thing in
 // the menu as it does here.
-import { workspaceState, workspaceStateLabel, type WorkspaceState } from '../../utils/workspaceState';
+import { workspaceFaultNote, workspaceState, workspaceStateLabel, type WorkspaceState } from '../../utils/workspaceState';
 import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 import {
   applyRestoreFile,
@@ -850,6 +850,9 @@ export function WorkspacePicker() {
             {v.data.map((w) => {
               const state = workspaceState(w);
               const running = state === 'healthy' || state === 'booting';
+              // Non-null for the one state that is a fault, which is also the
+              // one the dot draws in red. See `workspaceFaultNote`.
+              const fault = workspaceFaultNote(w);
               return (
                 <li class="ws-picker-row" key={w.id}>
                   {renamingId.value === w.id ? (
@@ -899,7 +902,11 @@ export function WorkspacePicker() {
                       class="ws-picker-open"
                       role="button"
                       tabIndex={0}
-                      aria-label={state === 'unhealthy' ? `Retry ${w.name}` : `Open ${w.name}`}
+                      // The row's own label, and with it the ONLY thing a screen
+                      // reader hears here: an `aria-label` replaces the element's
+                      // content, so the fault note rendered inside would go
+                      // unread if it were not folded in.
+                      aria-label={fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`}
                       onClick={() => openOrRetry(w, state)}
                       onKeyDown={(e) => {
                         // Only the row itself opens on Enter/Space — a keydown
@@ -912,14 +919,18 @@ export function WorkspacePicker() {
                         }
                       }}
                     >
-                      {/* aria-label mirrors data-tooltip (same pattern as the unread badge
-                          below): the dot is the ONLY surface for `last_error`, and
-                          data-tooltip is hover-only, so without this the error text is
-                          unreachable by assistive tech. */}
+                      {/* The dot keeps its hover tooltip for every state, since
+                          that is where the label lives when the row says nothing.
+                          Its `aria-label` is the fallback for the same reason,
+                          and it steps aside for the fault note below: with the
+                          error rendered as text in this row, labelling the dot
+                          with it too has a screen reader read the same sentence
+                          twice. */}
                       <span
                         class={`ws-picker-dot ws-picker-dot-${state}`}
                         data-tooltip={workspaceStateLabel(w)}
-                        aria-label={workspaceStateLabel(w)}
+                        aria-label={fault ? undefined : workspaceStateLabel(w)}
+                        aria-hidden={fault ? 'true' : undefined}
                       />
                       <span class="ws-picker-name">{w.name}</span>
                       {/* The address is normally invisible, and normally that's
@@ -1084,6 +1095,19 @@ export function WorkspacePicker() {
                           </Overlay>
                         </div>
                       </div>
+                      {/* What the red dot means, in words, on the row it is
+                          about. The dot was the only surface carrying
+                          `last_error`, and it is a 0.625rem disc with a
+                          hover-only tooltip, so on a phone (and on any pointer
+                          that did not happen to land on it) a workspace could be
+                          broken and say nothing about it.
+
+                          LAST child, so it wraps onto its own line UNDER the row
+                          rather than pushing the actions off it: the dot, name
+                          and action columns every other row shares are
+                          untouched, and only a faulty row is taller, by exactly
+                          the line that explains it. */}
+                      {fault && <p class="ws-picker-row-note">{fault}</p>}
                     </div>
                   )}
                 </li>

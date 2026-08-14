@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.27.0 — 2026-08-14
+
+### Added
+
+- **Build slots.** A machine-wide pool of permits caps how many heavy builds run at once across every checkout and worktree on the host. `lucidos build-slot <command>` waits for a free permit, runs the build, and frees it on exit or on death, with `--status` naming the current holders and `--set-capacity` setting the number. Make targets, the test harness and the engine's own background rebuild all take a slot.
+- **The communication-surface gallery, under Settings > System.** Every way Lucidos speaks to you on one page, rendered against realistic content: toasts in each type, both banners, and the confirm, prompt and progress dialogs. Nothing on the page performs an operation.
+- **A connection notice under the header.** When the connection goes bad, a bar below the header row states what is wrong in a sentence, in the same words the Lucidos menu uses.
+- **Cross-workspace app-icon badging.** A gateway install badges its icon with the unread total from every workspace it serves, not only the one on screen.
+- **A toast placement picker, under Settings > Debugging.** Compare four shapes for where a toast appears: full-width top, full-width bottom, a centred card, and per-pane columns. The choice is per device.
+
+### Changed
+
+- An event wait's delivery is described by what arrived: the transcript card reads "Event arrived", followed by the event type, and the arming row reads "matched".
+- The model picker offers exactly the reasoning levels the chosen model's provider supports, and an effort the provider does not accept is dropped rather than raised.
+- The toast for an engine version that exists only in source can be dismissed, and the version row badges for it. The dismissal is remembered per announced version.
+- A workspace row in the picker that has lost its connection states the error on its own line, under the name.
+- Settings > System reads out the connection state and what it means, beside the dot.
+- Seven glyphs in the host chrome are drawn from the Lucidos icon set rather than the system emoji font: the trigger chip, the System actor, You, the API caller and both chat marks.
+
+### Fixed
+
+- A turn cannot end with work still open and nothing arranged to re-open the thread, so a watch the assistant says it is holding is actually held.
+- The transcript stays at the live edge while a reply grows, while a pane resizes, and while the on-screen keyboard opens, for a reader who has not scrolled away.
+- A deep link holds the row it lands on, including in a thread that is still working and while the app scrolls elsewhere.
+- Tabbing to a control that is off screen brings it into view and keeps the reader on it.
+- Page Up, Page Down, Home and End scroll the transcript while a control has focus.
+- The progress dialog takes focus, traps it while it is open, and returns it on close.
+- A click inside an overlay that opens a second overlay no longer closes the first.
+- Two writers committing at the same moment both succeed; the one that loses the race retries instead of returning an internal error.
+- Spawning several coding agents at once gives each its own branch.
+- A build reports the commit it actually compiled, so the version row cannot show a stale one.
+- Dismissing a version toast on one device closes it on the others.
+- The connection reads as down whenever the engine stops, not only on a workspace switch.
+- A trigger fire's model and reasoning effort appear in the route popover for the turn it ran.
+- The Canvas pane's title and chevrons sit centred on the header row, with the content actions painting above them.
+- A chevron at the edge of the header's clip keeps its whole focus ring.
+- The header's focus wash fades its tint, leaving the box behind it solid.
+- The Files preview and the changed-file list show the whole path.
+- The inline file editor's toolbar is right-aligned, and Save is available only when there are unsaved changes.
+- The packaged Mac app can reach the camera.
+- The traffic lights are re-placed before a resize is displayed.
+- An info icon stays on the line with the label it belongs to.
+- Row icons, the apps glyph in search and the release notes in What's New all sit on the type scale.
+- On a phone, the transcript's scroll thumb rests below the title bar's fade.
+- A choice card's reveal arrow says the card is the app's own.
 ## v0.26.5 — 2026-08-12
 
 ### Added

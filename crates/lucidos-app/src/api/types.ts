@@ -175,6 +175,13 @@ export interface ModelInfo {
    *  / Gemini / local model is treated as 200k until this is set. */
   context_window: number | null;
   created_at: string;
+  /** Reasoning tiers this model actually supports, derived by the engine from
+   *  the row's provider and id (`llm::reasoning::supported_efforts`) and the
+   *  SAME set `RoutingProvider` clamps a request onto. The picker filters
+   *  `REASONING_LEVELS` against this rather than guessing from the id, which is
+   *  what let it offer a local model a tier its server rejected. Optional only
+   *  for an engine predating the field. */
+  reasoning_efforts?: string[];
 }
 
 export interface ModelsListResponse {

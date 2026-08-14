@@ -115,6 +115,22 @@ fragile bandaid. Special cases layered on shared infrastructure are a sign the
 fix isn't deep enough — prefer generalizing the underlying mechanism over
 adding special cases.
 
+**Prose.** Flag writing in the diff that breaks `.claude/rules/prose.md` in a way
+no script can see. `scripts/check-prose.sh` already covers the four measurable
+limits, so do **not** re-report a long sentence or an over-long comment block.
+This angle owns the rest:
+
+- An imperative step over 20 words (the gate's 25 is the *descriptive* limit).
+- Passive voice where the agent is known.
+- A noun cluster of more than 3 words.
+- Filler: "it is worth noting", "importantly", emphasis that only restates.
+- The wrong shape: prose doing a list's job, or a list doing a table's.
+- A comment doing another file's job. A rejected alternative belongs in
+  `docs/adr/`, and what the code used to do belongs in the commit message.
+
+Report against the rule and name the shorter form, the same way the
+private-data angle names the placeholder.
+
 **Private-data leak.** Flag any private/personal/company-internal data the diff
 introduces into a **shipping** file (everything except `docs/plans/**` and
 `WORKSPACES.md` ships verbatim to the public mirror — test fixtures and comments

@@ -1,8 +1,8 @@
 //! Parent to its own child: the one privileged cross-thread write.
 //!
 //! Child to parent already works end to end (ADR 0011): every child terminal
-//! fires a typed `ChildThreadCompleted` on the parent and a wake that resumes
-//! the parent's turn. This module is the other direction, and it is
+//! fires a typed `ChildThreadCompleted` on the parent and a re-entry that
+//! resumes the parent's turn. This module is the other direction, and it is
 //! deliberately not an any-to-any address space. A thread can address its own
 //! **direct** children and nothing else: no sibling edge, no grandchild edge,
 //! no cross-workspace edge.
@@ -495,7 +495,7 @@ impl crate::engine::LucidosEngine {
     ///
     /// Returns an **ack**, not the child's turn. The child's outcome arrives
     /// later, the way every child outcome does: as a `ChildThreadCompleted`
-    /// card on the parent plus a wake.
+    /// card on the parent plus a re-entry.
     ///
     /// ## Why it must not await the child's turn
     ///
@@ -505,7 +505,7 @@ impl crate::engine::LucidosEngine {
     /// the send). This runs inside the **parent's own agentic loop**, so
     /// awaiting would park the parent for the child's entire run, and while it
     /// is parked the child can complete, firing a `ChildThreadCompleted` on the
-    /// parent and injecting a wake into the parent's still-running turn, ahead
+    /// parent and injecting a re-entry into the parent's still-running turn, ahead
     /// of the tool result the parent is waiting for.
     ///
     /// That is exactly the asymmetry with the mirror image,
@@ -737,7 +737,7 @@ impl crate::engine::LucidosEngine {
     /// `PreEmittedOrigin::Message`, never `EngineReentry`: a redirect from the
     /// parent is a real message the child should acknowledge with its own
     /// `CodingAgentPromptSent` / `UserPromptInjected`, not a silent engine
-    /// re-entry like a child's completion waking its parent.
+    /// re-entry like a child's completion re-opening its parent.
     async fn pre_emit_follow_up(
         self: &std::sync::Arc<Self>,
         child_thread_id: Uuid,

@@ -465,7 +465,7 @@ describe('groupIntoExchanges — answer/resolution routing across an intervening
 describe('groupIntoExchanges — response continuation after a mid-flight ChildThreadCompleted', () => {
   // Real thread 4d193da8: the parent is mid-response when a spawned sub-thread
   // finishes. The engine injects the child summary into the running loop as a
-  // WakeFromChild (no new request_event_id — the turn keeps the originating
+  // ReentryFromEngine (no new request_event_id: the turn keeps the originating
   // MR's id) and emits ChildThreadCompleted as a timeline boundary. Every step
   // AFTER the boundary still carries the turn's req_id, so without moving the
   // redirect they group back into the pre-completion exchange — which sits

@@ -49,7 +49,7 @@ pub(crate) fn meta_with_cancel_actor(
 /// child outcome; `SupersededByFollowup` renders neutrally and is excluded
 /// from the parent-callback terminal set, because the work is not abandoned,
 /// it continues in the very next turn (`event_bus/parent_callback.rs`). Mislabel
-/// it and the parent wakes with a false "child canceled" card and may spawn a
+/// it and the parent is re-entered with a false "child canceled" card and may spawn a
 /// replacement for a child that is still working.
 ///
 /// Drains the flag on read, like `meta_with_cancel_actor` drains the actor and
@@ -130,15 +130,15 @@ where
 #[derive(Debug)]
 pub(crate) enum InjectedPromptGroup {
     UserText(Vec<InjectedPrompt>),
-    /// One engine wake, kept out of any batch. Named for the LAYOUT rather than
-    /// the source, because every engine wake gets the same one: its
+    /// One engine re-entry, kept out of any batch. Named for the LAYOUT rather
+    /// than the source, because every engine re-entry gets the same one: its
     /// exchange-starter is already on the wire, so the text is projected inline
-    /// and no `UserPromptInjected` is emitted. Which wake it is stays on
+    /// and no `UserPromptInjected` is emitted. Which re-entry it is stays on
     /// [`InjectedPromptKind`], which is what the log line reads.
     Standalone(InjectedPrompt),
 }
 
-/// Keep each engine wake as a standalone user-channel block, but batch
+/// Keep each engine re-entry as a standalone user-channel block, but batch
 /// contiguous user/agent/engine text prompts so one injection window becomes
 /// one LLM user message. Each original prompt still emits its own
 /// UserPromptInjected audit event at append time.
@@ -147,7 +147,7 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
     let mut user_batch = Vec::new();
 
     for prompt in prompts {
-        if prompt.kind.is_engine_wake() {
+        if prompt.kind.is_engine_reentry() {
             if !user_batch.is_empty() {
                 groups.push(InjectedPromptGroup::UserText(std::mem::take(
                     &mut user_batch,
@@ -389,25 +389,25 @@ pub(crate) async fn append_injected_prompts_to_messages(
             InjectedPromptGroup::Standalone(prompt) => {
                 // An empty block is a provider 400 ("all messages must have
                 // non-empty content"), and it would carry nothing anyway. The
-                // callers are supposed to keep an empty wake off this path
+                // callers are supposed to keep an empty re-entry off this path
                 // entirely (see `is_attached_event_wake` in `chat/process`);
                 // this is the backstop that turns a future slip into a dropped
                 // no-op rather than a failed turn.
                 if prompt.text.trim().is_empty() {
                     crate::log!(
-                        "[Inject] Dropped an empty engine wake {:?} on thread {}",
+                        "[Inject] Dropped an empty engine re-entry {:?} on thread {}",
                         prompt.kind,
                         thread_id
                     );
                     continue;
                 }
                 crate::log!(
-                    "[Inject] Engine wake {:?} (spawning_event {:?}) into active thread {}",
+                    "[Inject] Engine re-entry {:?} (spawning_event {:?}) into active thread {}",
                     prompt.kind,
                     prompt.spawning_event_id,
                     thread_id
                 );
-                // Engine wakes are text-only, so there is nothing to pin.
+                // Engine re-entries are text-only, so there is nothing to pin.
                 messages.push(Message {
                     role: "user".to_string(),
                     content: MessageContent::Text(prompt.text),
@@ -598,8 +598,8 @@ pub(crate) fn build_intent_tools() -> Vec<ToolDefinition> {
     // reason than recursion: an intent sub-loop runs INSIDE the caller's turn
     // and returns a string, so a subscription registered here outlives the only
     // thing that wanted it. It would be recorded against the OUTER thread and
-    // wake it, hours later, with an event nobody on that thread ever asked to
-    // wait for. (Before subscriptions became non-blocking this was refused for
+    // re-open it, hours later, with an event nobody on that thread ever asked
+    // to wait for. (Before subscriptions became non-blocking this was refused for
     // a different reason, a park with no turn to end; that one is gone, this
     // one is not.)
     let mut tools: Vec<_> = get_default_tools()
@@ -1121,6 +1121,63 @@ pub(crate) const QUESTION_REASK_INSTRUCTION: &str = "Your previous `ask_user_que
 /// spent. Pure so the bound is unit-testable without driving the whole loop.
 pub(crate) fn should_force_question_reask(ask_failed_last_iter: bool, reask_forced: usize) -> bool {
     ask_failed_last_iter && reask_forced < MAX_QUESTION_REASK
+}
+
+/// How many times one turn may be sent back for leaving work open with nothing
+/// to re-open the thread. One, and the bound matters more here than for the
+/// re-ask above. A model that answers the nudge and still leaves the list open
+/// has made a choice. Asking twice would only spend a round to hear it again.
+/// After this the turn finalizes and `settle_open_todos` records the items as
+/// `Abandoned`, exactly as it did before this gate existed.
+pub(crate) const MAX_TODO_WAKE_NUDGE: usize = 1;
+
+/// The forcing instruction for a turn that would end with open todo work and no
+/// wake. `open_items` is stated because it is the fact the model is about to
+/// contradict, and a count is cheaper to act on than "some".
+///
+/// The three options are deliberately equal in weight. Arming, settling and
+/// handing back are each correct in their own case. A nudge leaning on one
+/// would teach the model to reach for it reflexively. Leaning on `todo_write`
+/// in particular would buy silence by clearing the evidence.
+///
+/// It supplies no sentence for the model to repeat at the user. That is the
+/// mistake `APPLY_VERIFY_DEV_ADDENDUM` made, whose ready-made negative sentence
+/// got quoted back as a finding with the check behind it never run. See
+/// `docs/plans/2026-08-10-the-agent-checks-state-instead-of-assuming-it.md`.
+pub(crate) fn todo_wake_nudge_instruction(open_items: usize) -> String {
+    format!(
+        "STOP, do not finish this turn yet. Your todo list still has {open_items} unfinished \
+         item(s), and NOTHING will re-open this thread: you hold no event-wait subscription and \
+         no background task is running. No wake is scheduled, whatever your answer says. Do one \
+         of these three now, then finish: (1) call `await_event` if that work is waiting on \
+         something happening in Lucidos, so the thread re-opens when it does; (2) call \
+         `todo_write` to mark what is done as completed, and to drop what you are no longer \
+         doing; (3) hand back to the user, deciding for yourself how to say that you are not \
+         watching for anything. Whichever you choose, do not tell the user you are watching, \
+         monitoring, or will report back, unless you armed a subscription in this turn."
+    )
+}
+
+/// Decide whether the no-tool-calls termination branch must send the turn back
+/// for leaving work open that nothing will wake it to finish.
+///
+/// `open_items` is `None` when the probe could not run. That is UNKNOWN rather
+/// than a count of zero, and unknown does not nudge (`.claude/rules/rust.md`).
+/// The direction is the one that rule asks for. A database blip must not add a
+/// round to every chat turn, and the settle asks again at the terminator.
+///
+/// `covered` is true when a live *event wait* or an unfinished background task
+/// will re-open the thread. Either means the agent parked rather than walked
+/// away, the same split `settle_open_todos` makes between `Waiting` and
+/// `Abandoned`.
+///
+/// Pure so every arm is testable without an engine behind it.
+pub(crate) fn should_nudge_unwatched_turn(
+    open_items: Option<usize>,
+    covered: bool,
+    nudges_forced: usize,
+) -> bool {
+    matches!(open_items, Some(n) if n > 0) && !covered && nudges_forced < MAX_TODO_WAKE_NUDGE
 }
 
 /// What the generic consecutive-call circuit breaker should do given the

@@ -30,6 +30,20 @@ describe('toastLayout', () => {
     expect(toastLayout(false, 0.002)).toBe('split');
     expect(toastLayout(false, 0.998)).toBe('split');
   });
+
+  // TEMPORARY, with the shape comparison it serves (docs/temporary-measures.md).
+  it('collapses to one column for every cross-pane placement', () => {
+    for (const placement of ['top-bleed', 'bottom-bleed', 'card'] as const) {
+      expect(toastLayout(false, 0.4, placement)).toBe('single');
+      expect(toastLayout(false, 0, placement)).toBe('single');
+      expect(toastLayout(true, 0.4, placement)).toBe('single');
+    }
+  });
+
+  it('keeps the per-pane split under the pane placement', () => {
+    expect(toastLayout(false, 0.4, 'pane')).toBe('split');
+    expect(toastLayout(false, 0, 'pane')).toBe('content-only');
+  });
 });
 
 describe('toastColumns', () => {

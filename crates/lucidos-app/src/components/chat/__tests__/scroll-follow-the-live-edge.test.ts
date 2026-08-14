@@ -22,6 +22,8 @@ import {
   honourAnchoredMutation,
   isFollowScroll,
   isNavigationScroll,
+  markNavigationScroll,
+  markRevealScroll,
   makeScrollObservers,
   readerGestureForTest,
   resumeFollowingBottom,
@@ -34,75 +36,56 @@ import {
   stopFollowingBottom,
 } from '../scrollState';
 
-/** "Go to the bottom" means "and keep me there until I say otherwise", and ONLY
- *  the down chevron says it.
+/** The follow toggle is a STANDING ask: take me to the live edge and keep me
+ *  there until I say otherwise. This file pins its duration (growth honours it,
+ *  and only the reader's own scroll retires it) and, against it, the one-shot
+ *  reaction every submit gets. A submit arms nothing.
  *
- *  The reader still owns the transcript's scroll position, and the app still
- *  moves it only when the reader asks. What this file pins down is the DURATION
- *  of the chevron's ask (it arms a standing follow, growth honours it, and only
- *  the reader's own scroll retires it) and, against it, the ONE-SHOT reaction
- *  every SUBMIT gets: a glide to the live edge for a reader already riding it,
- *  and otherwise a landing that rests the turn they acted on with its TOP on the
- *  landing line. A submit arms nothing. A send and an answer used to, and the
- *  blocks below that read "arms nothing" are where that inverted.
- *
- *  Its mirror is `scroll-resize-never-follows.test.ts`, which pins the other
- *  half: growth moves an UNARMED reader zero pixels, including one who happens
- *  to be sitting exactly at the live edge. Being at the bottom is a position,
- *  not a request, and that distinction is the whole point of both files. */
+ *  Its mirror is `scroll-resize-never-follows.test.ts`: growth moves an UNARMED
+ *  reader zero pixels, including one sitting exactly at the live edge. A
+ *  position is not a request, and that is the whole point of both files.
+ *  Rationale: ADR 0064. */
 
-/** How tall the agent status line is in this fake: one row of a turn header. The
- *  landing does not aim at it, so no expected offset in this file is derived from
- *  it; what it stands for is the row that has to end up IN VIEW under the landed
- *  turn, and the marker of a turn the agent has taken. */
+/** How tall the agent status line is in this fake. No expected offset is derived
+ *  from it: it stands for the row that must end up IN VIEW under the landed
+ *  turn. */
 const STATUS_LINE_HEIGHT = 28;
 
-/** The landing line: how far below the transcript's top a landed turn's top comes
- *  to rest. `turnLandingClearancePx` reads `.chat-exchange`'s computed
- *  `scroll-margin-top` and falls back to this when there is no layout to ask,
- *  which is every test here except the one that mocks `getComputedStyle`. So an
- *  expected offset in this file is a turn's top minus this. */
-/*  Every landing expectation here is a turn top minus that clearance, and it is
- *  only REACHABLE when the container can scroll that far, which in the app means
- *  a turn with a screenful of real transcript under it: a reply that has streamed
- *  past a screenful, or any turn that is not the last. Nothing is reserved to
- *  make it reachable. The fake has no layout, so its `scrollHeight` is set by
- *  hand and stands for whichever of the two cases a test is about: leave headroom
- *  past the turn for the line, and don't for the reveal branch. */
+/** The landing line: how far below the transcript's top a landed turn's top
+ *  comes to rest. `turnLandingClearancePx` reads `.chat-exchange`'s computed
+ *  `scroll-margin-top` and falls back to this with no layout to ask, which is
+ *  every test here except the one mocking `getComputedStyle`.
+ *
+ *  The line is only REACHABLE when the container can scroll that far, so each
+ *  test sets `scrollHeight` by hand for the case it is about: headroom past the
+ *  turn for the line, none for the reveal branch. */
 const LANDING_CLEARANCE = 8;
 
 /** A `.thread-content` stand-in that clamps `scrollTop` the way a browser does,
- *  counts writes (so a jump that happens to land where the reader already was
- *  still fails a no-scroll assertion), and can hold user-message panels and
- *  question cards whose rects follow the scroll position, which is what the
- *  send's and the answer's landings measure.
+ *  counts writes, and holds the panels and cards a landing measures. Counting
+ *  writes is what fails a jump landing where the reader already was.
  *
- *  `panels` are given in SCROLL coordinates (`top` from the top of the content);
- *  their viewport rect is derived from the live `scrollTop` on every read, so a
- *  tween measuring them per frame sees a moving target exactly as it would in a
- *  browser. */
+ *  `panels` are given in SCROLL coordinates (`top` from the top of the content).
+ *  Their rect is derived from the live `scrollTop` on every read, so a tween
+ *  measuring per frame sees a moving target, as in a browser. */
 function makeEl(opts: {
   scrollTop: number;
   scrollHeight: number;
   clientHeight?: number;
   panels?: Array<{ top: number; height: number }>;
-  /** How many `.chat-exchange` turns the transcript holds. Defaults to ONE,
-   *  which is what an ordinary transcript has and what every test about the
-   *  follow's behaviour assumes without saying so. `0` is the brand-new thread:
-   *  a compose view showing the welcome message, or a promoted thread whose
-   *  first optimistic row has not rendered yet. A submit asks nothing of a
-   *  transcript with no conversation in it (see `hasSomewhereToLand`), so the
-   *  count is not decoration. */
+  /** How many `.chat-exchange` turns the transcript holds. Defaults to ONE, the
+   *  ordinary transcript every follow test assumes. `0` is the brand-new
+   *  thread: a compose view showing the welcome message, or a promoted thread
+   *  whose first optimistic row has not rendered. */
   turns?: number;
 }) {
   const panels: any[] = [];
   const questionCards: any[] = [];
   const permissionCards: any[] = [];
   const turns: any[] = [];
-  /** An inline style declaration the module is free to write to, kept so a test
-   *  can assert that it does not: nothing here publishes a custom property onto
-   *  the transcript any more, and the TAIL ROOM that used to is the thing the
-   *  guard below exists to keep out. */
+  /** An inline style declaration the module may write to, kept so a test can
+   *  assert that it does not. Nothing publishes a custom property onto the
+   *  transcript: the tail-room guard below is what keeps it that way. */
   const styleProps = new Map<string, string>();
   const el: any = {
     parentElement: null,
@@ -111,8 +94,7 @@ function makeEl(opts: {
       setProperty: (name: string, value: string) => { styleProps.set(name, value); },
       getPropertyValue: (name: string) => styleProps.get(name) ?? '',
     },
-    /** The transcript's last element child. The turns array is in DOM order, so
-     *  its tail is the newest turn. */
+    /** The turns array is in DOM order, so its tail is the newest turn. */
     get lastElementChild() { return turns[turns.length - 1] ?? null; },
     clientWidth: 800,
     clientHeight: opts.clientHeight ?? 500,
@@ -135,28 +117,19 @@ function makeEl(opts: {
               : []
     ),
     /** Render one more user message, the way an optimistic send row arrives.
-     *  `visible` false models a panel with no box, which is what a queued
-     *  follow-up folded into its closed disclosure group has.
+     *  `visible: false` models a panel with no box: a queued follow-up folded
+     *  into its closed disclosure group.
      *
-     *  It adds a TURN as well, because a user message is rendered inside a
-     *  `.chat-exchange` and a transcript showing one is not an empty one. That
-     *  matters for a brand-new thread, whose transcript holds no turn when the
-     *  send is made and one a render later.
+     *  It adds a TURN too, since a user message renders inside a
+     *  `.chat-exchange`. The turn is given the ROW's own rect, which is the
+     *  DOM's answer. A turn renders as `[initiator panel, response panel?]`, so
+     *  the exchange's top IS the row's top. A turn parked at 0 while its row sat
+     *  lower would let a landing aimed at the wrong element pass.
      *
-     *  The turn is given the ROW's own rect, because that is the geometry the
-     *  landing measures and the DOM's answer for it: a turn renders as
-     *  `[initiator panel, response panel?]`, so the exchange's top IS its user
-     *  message row's top. A turn parked at 0 while its row sat further down would
-     *  let a landing that aims at the wrong element pass.
-     *
-     *  And the turn arrives WITH its agent status line, because that is what the
-     *  app does: the optimistic row and the "Requesting" response panel under it
-     *  are one commit. `status: false` is the turn that never gets one, which is
-     *  the queued follow-up (its "Queued" tag lives in its own bubble) and the
-     *  frame before the response panel mounts; `mountStatusLine` covers the
-     *  second half of that. The landing does not aim at the status line, so this
-     *  is fixture realism rather than a target: what it pins is that the row the
-     *  landing puts on the line has the status line in view underneath it. */
+     *  The turn arrives WITH its agent status line, as the app commits the row
+     *  and its "Requesting" panel together. `status: false` is the turn that
+     *  never gets one: the queued follow-up, and the frame before the response
+     *  panel mounts. */
     addUserMessage(p: { top: number; height: number; visible?: boolean; status?: boolean }) {
       const turn = makeTurn(p.top, p.height);
       const panel: any = {
@@ -185,20 +158,15 @@ function makeEl(opts: {
       const rect = panel.getBoundingClientRect();
       return mountStatusLine(panel.turn, rect.bottom + el.scrollTop);
     },
-    /** Render a question card: a `.question-body` carrying the card's tool-use id
-     *  inside the `.initiator-panel` that is the answer's landing target. The two
-     *  are given DIFFERENT rects (the body is inset inside the panel) so a test
-     *  landing on the panel cannot pass by measuring the body instead. The turn
-     *  around them carries a status line like any other, since the agent resumes
-     *  under the card the reader answered. */
+    /** Render a question card: a `.question-body` carrying the card's tool-use
+     *  id inside the `.initiator-panel` that is the answer's landing target. */
     addQuestionCard(p: { toolUseId: string; top: number; height: number; status?: boolean }) {
       return addCard(questionCards, 'data-tool-use-id', p.toolUseId, p);
     },
     /** Render a permission-shaped card: a `.permission-body` carrying the card's
      *  REQUEST id, inside the same `.initiator-panel` a question card sits in.
-     *  One shape for all three (the coding-agent tool permission, the command
-     *  guard, the MCP tool consent), because all three render this body through
-     *  `PermissionBodyShell` and decide through one hook. */
+     *  One shape covers all three, since the coding-agent tool permission, the
+     *  command guard and the MCP tool consent share `PermissionBodyShell`. */
     addPermissionCard(p: { requestId: string; top: number; height: number; status?: boolean }) {
       return addCard(permissionCards, 'data-request-id', p.requestId, p);
     },
@@ -211,11 +179,10 @@ function makeEl(opts: {
       if (p.status !== false) mountStatusLine(turn, p.top + p.height);
       return turn;
     },
-    /** The live→answered swap, as Preact actually performs it: `QuestionBody`
-     *  returns a DIFFERENT component once the answer lands, so the body node is
-     *  unmounted and a new one mounted, while the `.initiator-panel` around it is
-     *  the same vnode in the same position and is REUSED. So the panel object is
-     *  carried over, and only the body is replaced. */
+    /** The live to answered swap, as Preact performs it. `QuestionBody` returns
+     *  a DIFFERENT component once the answer lands, so the body node is
+     *  remounted while the `.initiator-panel` around it is REUSED. The panel
+     *  object is therefore carried over and only the body is replaced. */
     answerQuestionCard(card: { body: any; panel: any }) {
       card.body.isConnected = false;
       questionCards.splice(questionCards.indexOf(card.body), 1);
@@ -258,10 +225,8 @@ function makeEl(opts: {
 
   /** The shared body of `addQuestionCard` / `addPermissionCard`: a card body
    *  carrying `value` under `attr`, inside the `.initiator-panel` that is the
-   *  landing target. The two are given DIFFERENT rects (the body is inset inside
-   *  the panel) so a test landing on the panel cannot pass by measuring the body
-   *  instead. The turn around them carries a status line like any other, since
-   *  the agent resumes under the card the reader resolved. */
+   *  landing target. Body and panel are given DIFFERENT rects, so a test landing
+   *  on the panel cannot pass by measuring the body instead. */
   function addCard(
     into: any[],
     attr: string,
@@ -322,16 +287,14 @@ function atBottom(el: any) {
   return el._scrollTop;
 }
 
-/** The follow is module state, so a test that armed it would otherwise leak into
- *  the next one. Retiring it is the same call `focusThread` makes when the reader
- *  opens another thread, not a test-only hatch.
+/** The follow is module state, so a test that armed it would leak into the next
+ *  one. Retiring it is the call `focusThread` makes on opening another thread,
+ *  not a test-only hatch.
  *
- *  It also puts the thread in its LIVE state, because that is what every test in
- *  this file except the idle-scroll pair is about: a reader with a reply in
- *  flight. The disarm asks whether the agent is live (`setThreadLive`, written by
- *  `ChatExchange` from the last turn's status), so a file-wide default of `false`
- *  would silently make every disarm test pass for the wrong reason. The tests
- *  that care about idle say so explicitly. */
+ *  It also puts the thread in its LIVE state, which is what every test here
+ *  except the idle-scroll pair is about. The disarm asks whether the agent is
+ *  live, so a file-wide default of `false` would make every disarm test pass
+ *  for the wrong reason. Tests that care about idle say so explicitly. */
 function resetFollow() {
   stopFollowingBottom();
   setActiveScrollElement(null);
@@ -343,13 +306,11 @@ function resetFollow() {
 /** THE READER'S OWN SCROLL: their hand on the transcript, the position it left
  *  it at, and the event that follows a frame later.
  *
- *  Both halves are required, and that is the contract this file is mostly
- *  about. A scroll retires the follow only when a GESTURE is behind it, because
- *  the position alone cannot tell a flick from the iOS keyboard resizing the
- *  container or a backgrounded app being resumed, and those were retiring a
- *  follow the reader had armed and never touched. So writing `scrollTop` and
- *  calling `onScroll` WITHOUT this helper now models exactly that: the platform
- *  moving the container, which deliberately retires nothing.
+ *  Both halves are required. A scroll retires the follow only when a GESTURE is
+ *  behind it: the position alone cannot tell a flick from the iOS keyboard
+ *  resizing the container (ADR 0064). So writing `scrollTop` and calling
+ *  `onScroll` WITHOUT this helper models the platform moving the container,
+ *  which deliberately retires nothing.
  *
  *  Every kind of reader scroll is one call: a wheel notch, a scrollbar drag, a
  *  touch flick and its momentum, a scroll key. The signal does not distinguish
@@ -365,9 +326,6 @@ describe('the follow toggle arms a standing follow', () => {
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   it('keeps the reader at the live edge as the reply keeps growing, not just once', () => {
-    // The gap this closes. The chevron used to be a one-shot jump: it landed the
-    // reader at the bottom and the next chunk stranded them above it again, so
-    // following a streaming reply meant tapping it over and over.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -385,9 +343,9 @@ describe('the follow toggle arms a standing follow', () => {
   });
 
   it('leaves a reader who never pressed it alone under exactly the same growth', () => {
-    // The crux. This reader is at the identical position as the one above and
-    // gets the identical growth, and is not moved a pixel, because following is
-    // an explicit request and not a proximity to the bottom.
+    // The crux: the identical position and the identical growth as the test
+    // above, and not a pixel of movement. Following is an explicit request, not
+    // a proximity to the bottom.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -403,12 +361,10 @@ describe('the follow toggle arms a standing follow', () => {
   });
 
   it('is not retired by its own trailing scroll event, even once content has grown past it', () => {
-    // A scrollTop write fires its scroll event a frame LATER, and by then a
+    // A scrollTop write fires its scroll event a frame LATER. By then a
     // streaming thread has often grown, so the container reads as off the live
-    // edge when the handler runs. Position, not proximity, is what tells the
-    // follow's own write from the reader's gesture: growth changes scrollHeight
-    // and never scrollTop, so the container is still exactly where the follow
-    // left it.
+    // edge. Position, not proximity, tells the follow's own write from the
+    // reader's gesture: growth changes scrollHeight and never scrollTop.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -457,11 +413,10 @@ describe('the follow toggle arms a standing follow', () => {
   });
 
   it('survives everything that is not a scroll: a card resolving, expanding a turn', () => {
-    // Only a scroll retires the follow. A card resolving swaps content under the
-    // reader and a disclosure grows it, and neither is the reader saying they
-    // want to be somewhere else. (A card the READER resolved arms the follow in
-    // its own right now; what this pins is that the resolution's reflow does not
-    // retire one already armed, however it was armed.)
+    // Only a scroll retires the follow. A card resolving swaps content under
+    // the reader and a disclosure grows it, and neither is the reader saying
+    // they want to be somewhere else. What this pins is that the resolution's
+    // reflow does not retire a follow already armed, however it was armed.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -484,12 +439,9 @@ describe('the chevron navigates and arms nothing', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** THE INVERSION for the chevron. It armed the follow on landing while it was
-   *  the only affordance that could, which left the mode with no visible state,
-   *  no way off but scrolling, and no way ON for a reader already at the live
-   *  edge, since the chevron is hidden exactly there. The follow has a button of
-   *  its own now, so the chevron is a navigation like the up chevron and turn
-   *  stepping: it takes the reader to the bottom and stops. */
+  /** The chevron is a navigation like the up chevron and turn stepping: it
+   *  takes the reader to the bottom and stops. The follow has a button of its
+   *  own. Why the chevron must not arm one: ADR 0064. */
 
   it('takes the reader to the live edge, and the next token leaves them there', () => {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
@@ -509,8 +461,6 @@ describe('the chevron navigates and arms nothing', () => {
   });
 
   it('the animated form arms nothing either, once its glide lands', () => {
-    // The arming used to happen in `onDone`, so a tween superseded mid-flight
-    // never armed. There is nothing left to arm in either form.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -631,26 +581,18 @@ describe('the follow toggle is the whole of the follow\'s controls', () => {
  * **Only the READER retires a follow, and only with their hand on the
  * transcript or on a chevron.**
  *
- * The retirement used to be read off the POSITION alone: a container that had
- * moved away from our last write had, it was reasoned, been moved by the
- * reader, because content growth changes `scrollHeight` and never `scrollTop`.
- * That premise covers growth and nothing else, and three things move the
- * container with no gesture behind them, all reported from an iOS PWA on
- * 2026-08-11:
+ * The question is asked of the INPUT, never of the position. Three things move
+ * the container with no gesture behind them:
  *
- *   - the soft keyboard opening or closing, which rewrites `--app-height`,
- *     resizes the transcript under the reader, and lets WebKit adjust the
- *     offset asynchronously through the ~350ms animation;
- *   - an app backgrounded and resumed, where the PWA restores an offset nobody
- *     wrote;
+ *   - the soft keyboard opening or closing, which rewrites `--app-height` and
+ *     lets WebKit adjust the offset through its ~350ms animation;
+ *   - an app backgrounded and resumed onto an offset nobody wrote;
  *   - the full response / steps toggle, whose anchor correction is a write of
  *     ours made from a position we could not stamp in advance.
  *
- * Each retired a follow the reader had armed and never touched, while a reply
- * was streaming, which is the one moment the feature is worth anything. So the
- * question is asked of the INPUT now. These tests are the two directions of
- * that: the platform moves the container and the ride survives, the reader
- * moves it and the ride ends.
+ * Why the position alone cannot answer it: ADR 0064. These tests are the two
+ * directions: the platform moves the container and the ride survives, the
+ * reader moves it and the ride ends.
  */
 describe('a scroll retires the follow only when the READER made it', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
@@ -672,9 +614,8 @@ describe('a scroll retires the follow only when the READER made it', () => {
 
   it('survives the iOS keyboard opening under a streaming reply', () => {
     // The keyboard takes ~300px of viewport, so the transcript shrinks and the
-    // reader is left well above the live edge. Then WebKit adjusts the offset
-    // itself, asynchronously, which is the scroll event that used to read as a
-    // flick. No finger has touched the transcript in any of it.
+    // reader is left well above the live edge. WebKit then adjusts the offset
+    // itself. No finger has touched the transcript in any of it.
     const { el, onScroll, onResize } = riding();
 
     el.clientHeight = 200;
@@ -687,10 +628,10 @@ describe('a scroll retires the follow only when the READER made it', () => {
 
   it('survives the keyboard closing again', () => {
     // Each step is the resize AND an offset WebKit adjusted on its own, off the
-    // live edge. The offset is what makes this test say anything: a resize
-    // alone runs `honourGrowth`, which writes the live edge and re-stamps the
-    // hold, so `atEdge` and `tookOver` would both answer "not the reader"
-    // before the gesture term was ever consulted.
+    // live edge. The offset is what makes this test say anything. A resize
+    // alone runs `honourGrowth`, which re-stamps the hold, so `atEdge` and
+    // `tookOver` would answer "not the reader" before the gesture term is
+    // consulted.
     const { el, onScroll, onResize } = riding();
 
     for (const clientHeight of [200, 260, 340, 420, 500]) {
@@ -785,10 +726,9 @@ describe('a scroll retires the follow only when the READER made it', () => {
   });
 
   it('lets the coast lapse, so a scroll long after the flick is the platform again', () => {
-    // The other end of the window, and the half that keeps it a WINDOW rather
-    // than a latch: a flick five seconds ago says nothing about a scroll now,
-    // and if it did, the keyboard opening after any earlier scroll would retire
-    // the follow all over again.
+    // The half that keeps it a WINDOW rather than a latch. A flick five seconds
+    // ago says nothing about a scroll now. If it did, the keyboard opening after
+    // any earlier scroll would retire the follow all over again.
     const { el, onScroll } = riding();
 
     readerGestureForTest(el);
@@ -801,12 +741,11 @@ describe('a scroll retires the follow only when the READER made it', () => {
 
   it('does not read a PRESS inside the transcript as a scroll', () => {
     // Answering a question, granting a permission, expanding a turn: each is a
-    // press on a control INSIDE the transcript, and each changes content, which
-    // is exactly the combination this module documents as keeping the follow.
-    // Arming attribution on the press would put a 1.2s window over every one of
-    // them, so only MOVEMENT arms it. Modelled here the way the listeners see
-    // it: a press records no movement, so the signal stays cold and the content
-    // change that follows is attributed to the app.
+    // press on a control INSIDE the transcript, and each changes content. That
+    // combination keeps the follow. Arming attribution on the press would put a
+    // 1.2s window over every one of them, so only MOVEMENT arms it. Modelled as
+    // the listeners see it: a press records no movement, so the signal stays
+    // cold and the content change is attributed to the app.
     const { el, onScroll } = riding();
 
     readerGestureForTest(el, false); // pressed, and never moved
@@ -831,17 +770,231 @@ describe('a scroll retires the follow only when the READER made it', () => {
   });
 });
 
+/**
+ * **And the follow PUTS THEM BACK, which is the other half of that rule.**
+ *
+ * The block above pins that a platform scroll does not RETIRE the ride. That
+ * alone is half a rule (ADR 0064). Every write answering something the reader
+ * did NOT do runs off the ResizeObserver, and a platform scroll resizes
+ * nothing. WebKit's keyboard adjust lands AFTER the last resize round by
+ * construction, so the reader waited for the next GROWTH.
+ *
+ * These are the same movements as the block above, asserting the POSITION its
+ * cases say nothing about. Three states must NOT be corrected: a gesture, an
+ * armed reader parked in history, and a live-thread flick, which retires the
+ * ride instead.
+ */
+describe('the follow puts the reader back when the PLATFORM moves them', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** An armed reader riding a live thread, WITH the anchor snapshot taken.
+   *
+   *  `riding()` above stops one event short of the app. Each of the glide's
+   *  `scrollTop` writes fires a scroll event a frame later, and that event
+   *  records the reader on the live edge. The correction is gated on that
+   *  snapshot, so a test that never delivers the event tests the wrong
+   *  state. */
+  function ridingAndAnchored() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setThreadLive(true);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    observers.onScroll();          // the glide's own trailing event
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  /** THE PLATFORM'S OWN SCROLL: the container somewhere nobody here wrote it,
+   *  and the event that follows.
+   *
+   *  The wait is the load-bearing half. A scroll arriving within
+   *  `NAV_SCROLL_EVENT_WINDOW_MS` of one of the app's own writes is that write's
+   *  own event (`isNavigationScroll`), and the correction stands down for it.
+   *  This models the opposite case. WebKit adjusts the offset through the
+   *  keyboard's ~350ms animation and an app resume arrives after minutes away,
+   *  neither within four frames of anything we did. */
+  function platformScrollsTo(el: { scrollTop: number }, top: number, onScroll: () => void) {
+    vi.advanceTimersByTime(200);
+    el.scrollTop = top;
+    onScroll();
+  }
+
+  it('puts them back after the iOS keyboard adjusts the offset on its own', () => {
+    // The keyboard takes ~300px of viewport, which IS a resize and is handled.
+    // WebKit then adjusts the offset through its ~350ms animation, with no
+    // resize behind it and nothing after it.
+    const { el, onScroll, onResize } = ridingAndAnchored();
+
+    el.clientHeight = 200;
+    onResize();
+    expect(el.scrollTop).toBe(2800);  // the resize round still carries them
+
+    platformScrollsTo(el, 1400, onScroll);  // and then WebKit moves them, later
+
+    expect(el.scrollTop).toBe(2800);
+    expect(followingLiveEdge.value).toBe(true);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('puts them back after an app resume restores an offset nobody wrote', () => {
+    // Nothing observes the transcript while the app is away. The resume arrives
+    // as one scroll event at a position nobody here wrote, with no resize after
+    // it at all.
+    const { el, onScroll } = ridingAndAnchored();
+
+    platformScrollsTo(el, 0, onScroll);
+
+    expect(el.scrollTop).toBe(2500);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('does it on an IDLE thread too, because the platform moves them either way', () => {
+    // No liveness term, exactly as the box-change branch takes none. A finished
+    // reply is the most likely thing to be read with the keyboard raised and
+    // dismissed. Waiting for the next turn is no answer while the toggle says
+    // the reader is being kept at the bottom.
+    const { el, onScroll } = ridingAndAnchored();
+    setThreadLive(false);
+
+    platformScrollsTo(el, 0, onScroll);
+
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('leaves the reader where their own GESTURE put them on an idle thread', () => {
+    // The term that makes this the complement of the disarm rather than a fight
+    // with it. On an idle thread a flick keeps the ride deliberately, and the
+    // reader is browsing: writing them back would undo the scroll they just made
+    // and make the lit toggle unusable on a finished thread.
+    const { el, onScroll } = ridingAndAnchored();
+    setThreadLive(false);
+
+    readerScrollsTo(el, 900, onScroll);
+
+    expect(el.scrollTop).toBe(900);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('keeps leaving them there when the platform moves them again afterwards', () => {
+    // The at-the-edge term, which is what stops the correction reaching an armed
+    // reader parked up in history. Their own scroll recorded them OFF the edge,
+    // so the next platform scroll has no edge to restore them to.
+    const { el, onScroll } = ridingAndAnchored();
+    setThreadLive(false);
+    readerScrollsTo(el, 900, onScroll);
+
+    readerGestureForTest(null, false);  // the coast lapses: this one is the platform
+    platformScrollsTo(el, 400, onScroll);
+
+    expect(el.scrollTop).toBe(400);
+  });
+
+  it('does not undo the reader flicking away from a LIVE reply', () => {
+    // The disarm wins that one, and having won it there is no follow left for
+    // the correction to act on. Both halves are asserted, because a correction
+    // that ran before the disarm would read identically at the flag.
+    const { el, onScroll } = ridingAndAnchored();
+
+    readerScrollsTo(el, 900, onScroll);
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(el.scrollTop).toBe(900);
+  });
+
+  it('writes once, and its own trailing scroll event writes nothing', () => {
+    // `markHeldScroll` stamps the position read back AFTER the write. The event
+    // this fires a frame later therefore reads as unmoved, and the correction
+    // cannot chase itself.
+    const { el, onScroll } = ridingAndAnchored();
+
+    platformScrollsTo(el, 0, onScroll);   // the fake counts the platform's move as a write too
+    expect(el.writes).toBe(2);
+
+    onScroll();         // the correction's own event, arriving a frame later
+
+    expect(el.writes).toBe(2);
+    expect(el.scrollTop).toBe(2500);
+  });
+
+  it('moves an UNARMED reader nowhere, however the platform scrolls them', () => {
+    // A position is not a request, here as everywhere else. This reader was
+    // sitting exactly at the live edge and never pressed anything.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000, clientHeight: 500 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);
+    onScroll();          // records them on the edge, as a growth round would
+    el.writes = 0;
+
+    platformScrollsTo(el, 900, onScroll);
+
+    expect(el.scrollTop).toBe(900);
+    expect(el.writes).toBe(1);   // only the platform's own move
+  });
+
+  it("leaves a NAVIGATION of the app's own where it put the reader", () => {
+    // The fourth term. Every navigation writes through `markNavigationScroll`:
+    // `useScrollMemory` restoring a thread on open, its reset to the top for a
+    // position that cannot be honoured, the up chevron, turn stepping. Each is
+    // the app putting the reader somewhere, which is neither a gesture nor the
+    // platform. Without the term the correction undoes them on the write's own
+    // trailing event, and the navigation becomes a no-op.
+    const { el, onScroll } = ridingAndAnchored();
+
+    markNavigationScroll(el, 0);
+    onScroll();
+
+    expect(el.scrollTop).toBe(0);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it("leaves a REVEAL of the app's own alone, though it writes no scrollTop", () => {
+    // The navigation shape that stamps nothing by itself: `choiceCardNav`'s
+    // arrow-key step reveals the next option with `scrollIntoView`, so the
+    // platform picks the offset and no `scrollTop` write exists to mark. The
+    // keydown lands on the choice BUTTON too, so no gesture is recorded either.
+    // Left unmarked it is indistinguishable from the keyboard adjusting the
+    // offset, and the correction takes the stepped-to option back off screen.
+    // `markRevealScroll` is what makes it a navigation like the rest.
+    const { el, onScroll } = ridingAndAnchored();
+
+    vi.advanceTimersByTime(200);   // long past any write of ours
+    el.scrollTop = 900;            // the platform's reveal, offset its own choice
+    markRevealScroll(el);          // and the app saying it asked for one
+    onScroll();
+
+    expect(el.scrollTop).toBe(900);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('and stops deferring to it once the window has passed', () => {
+    // What keeps it a WINDOW rather than a latch. A navigation four frames ago
+    // says nothing about a scroll now. If it did, the keyboard adjusting after
+    // any earlier chevron tap would go uncorrected for the rest of the thread.
+    const { el, onScroll } = ridingAndAnchored();
+
+    markNavigationScroll(el, 0);
+    platformScrollsTo(el, 0, onScroll);
+
+    expect(el.scrollTop).toBe(2500);
+  });
+});
+
 describe('scrolling an IDLE thread keeps the follow', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** Two acts produce an identical scroll event, and the disarm has to tell them
-   *  apart. Scrolling away from a reply IN FLIGHT means "stop dragging me".
-   *  Scrolling on an IDLE thread is browsing: nothing is moving, nothing is
-   *  dragging anybody, and going back to re-read a turn before writing the next
-   *  message is not a decision about how the next reply should behave. It
-   *  silently was one until the disarm learned to ask, and the reader paid for it
-   *  at their next submit. */
+  /** Two acts produce an identical scroll event, and the disarm has to tell
+   *  them apart. Scrolling away from a reply IN FLIGHT means "stop dragging
+   *  me". Scrolling on an IDLE thread is browsing: nothing is dragging anybody,
+   *  and re-reading a turn before writing the next message is no decision about
+   *  how the next reply should behave. */
 
   function armedThenScrolledUp(live: boolean) {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
@@ -905,12 +1058,11 @@ describe('scrolling an IDLE thread keeps the follow', () => {
 
   it('a SUBMIT makes the thread live, so scrolling away after it still disarms', () => {
     // The gap the status cannot cover. Answering a card leaves the last turn on
-    // `awaiting-answer`, which is NOT an active status, until the engine's
-    // resumed status arrives over SSE a round trip later. Read off the status
-    // alone the thread is idle for that whole window, so a reader who answered
-    // and then fled the reply would keep their follow and be hauled back the
-    // moment it resumed. A submit is by definition an act the agent is expected
-    // to respond to, so it marks the thread live itself.
+    // `awaiting-answer`, which is NOT active, until the resumed status arrives
+    // over SSE a round trip later. The thread reads as idle for that whole
+    // window, so a reader who answered and then fled would keep their follow.
+    // A submit is an act the agent is expected to answer, so it marks the
+    // thread live itself.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -932,15 +1084,12 @@ describe('scrolling an IDLE thread keeps the follow', () => {
   });
 
   it('keeps that claim while the THREAD PROJECTION is still catching up', () => {
-    // The regression that shipped on 2026-08-10 and was reported the same day.
-    // The live term needs the projection to agree, and the projection is the slow
-    // half: the client's `meta.status` only advances when a per-event aggregate
-    // carrying `running` arrives, which is seconds after the send. So the render
-    // right after a submit writes `false` while the agent is on its way, and
-    // `setThreadLive` used to clear the claim on any write, in either direction.
-    // That destroyed the claim in the one window it exists for, and the reader
-    // who submitted and then fled kept the follow. Intermittent in the wild,
-    // because it depended on the scroll landing inside the gap.
+    // The live term needs the projection to agree, and the projection is the
+    // slow half. The client's `meta.status` only advances when a per-event
+    // aggregate carrying `running` arrives, seconds after the send. So the
+    // render right after a submit writes `false` while the agent is on its way.
+    // A `setThreadLive` clearing the claim on any write would destroy it in the
+    // one window it exists for.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onScroll } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -958,12 +1107,12 @@ describe('scrolling an IDLE thread keeps the follow', () => {
   });
 
   it('a submit that is never answered LETS GO of that claim', () => {
-    // The claim has to expire rather than stand until something contradicts it,
-    // because the thing that would contradict it may never come: a Continue
-    // whose POST fails, or a decision the engine never answers, leaves the last
-    // turn's status exactly as it was, so `ChatExchange`'s effect never re-runs
-    // and never writes `false`. Left standing, the claim would quietly cost the
-    // reader their follow the next time they browsed this idle thread.
+    // The claim has to expire rather than stand until contradicted, because the
+    // contradiction may never come. A Continue whose POST fails, or a decision
+    // the engine never answers, leaves the last turn's status as it was. So
+    // `ChatExchange`'s effect never re-runs and never writes `false`. Left
+    // standing, the claim would cost the reader their follow the next time they
+    // browsed this idle thread.
     const nowSpy = vi.spyOn(performance, 'now');
     let clock = 1_000_000;
     nowSpy.mockImplementation(() => clock);
@@ -991,18 +1140,15 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** The other half of the block above, and the half that was missing until
-   *  2026-08-11. The disarm asked whether the agent was live; the WRITE did not.
-   *  So the reader kept the ride when they scrolled an idle thread, exactly as
-   *  promised, and was then written back to the live edge by the next thing that
-   *  changed the transcript's height. On an idle thread that is the transcript
-   *  finishing its own rendering: markdown settling, an image decoding, a card
-   *  mounting. Reported from a session parked on a question card, which is idle
-   *  by every measure this module has (`awaiting-answer` is not an active
-   *  status), while reading a reply that had already finished.
+  /** The other half of the block above: the WRITE asks whether the agent is
+   *  live, exactly as the disarm does. Without it, a reader who scrolled an idle
+   *  thread keeps the ride, then is written back to the live edge by the next
+   *  height change. On an idle thread that is the transcript finishing its own
+   *  rendering: markdown settling, an image decoding, a card mounting.
    *
-   *  ARMED and CARRYING are the two states this pins apart. Nothing here retires
-   *  anything: the toggle stays lit and the ride resumes on its own. */
+   *  ARMED and CARRYING are the two states this pins apart (ADR 0064). Nothing
+   *  here retires anything: the toggle stays lit and the ride resumes on its
+   *  own. */
 
   function armedThenScrolledUpOnAnIdleThread() {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
@@ -1029,8 +1175,7 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
 
   it('leaves them alone across round after round of it', () => {
     // One round could pass on a stale stamp or a coincidence. A finished reply
-    // settles over several frames, and every one of them used to move the
-    // reader.
+    // settles over several frames, and every one of them must answer the same.
     const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
 
     for (const height of [3400, 4000, 9000]) {
@@ -1042,9 +1187,9 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
   });
 
   it('still shows them the chevron, so they can go back themselves', () => {
-    // Standing down from the WRITE is not standing down from the signals: the
-    // reader is off the live edge and has to be told, or the one way back is
-    // gone along with the ride that used to carry them.
+    // Standing down from the WRITE is not standing down from the signals. The
+    // reader is off the live edge and has to be told, or their one way back
+    // goes with the ride.
     const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
 
     el.scrollHeight = 4000;
@@ -1069,18 +1214,16 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
   });
 
   it('carries them on the WAKE itself, without waiting for a second resize', () => {
-    // The ordering the two signals actually arrive in. The mutation that wakes a
-    // thread (the new turn's row mounting) fires the ResizeObserver inside its
-    // own frame, while `ChatExchange` publishes the new status from a Preact
-    // effect, which is deferred to a task AFTER that frame. So `honourGrowth`
-    // sees the waking resize while this module still reads idle, and stands
-    // down for the one round that mattered.
+    // The order the two signals arrive in. The mutation that wakes a thread
+    // fires the ResizeObserver inside its own frame. `ChatExchange` publishes
+    // the new status from a Preact effect, deferred to a task AFTER that frame.
+    // So `honourGrowth` sees the waking resize while this module still reads
+    // idle.
     //
-    // Modelled exactly that way: the growth and its resize land FIRST, the
-    // liveness arrives after. A streaming reply hides this by resizing again a
-    // moment later; a coding-agent turn resuming its subprocess does not, and
-    // sits on its mounted row for fifteen to twenty seconds. Reported by the
-    // Codex reviewer, 2026-08-11.
+    // Modelled that way: the growth and its resize land FIRST, the liveness
+    // after. A streaming reply hides this by resizing again a moment later. A
+    // coding-agent turn resuming its subprocess does not, and sits on its
+    // mounted row for fifteen to twenty seconds.
     const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
 
     el.scrollHeight = 4000;  // the waking turn's row mounts
@@ -1094,23 +1237,21 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
 
   it('acts on the EDGE only, so a repeated live signal writes nothing', () => {
     // Only a WAKE describes new content. `ChatExchange` re-runs its effect
-    // whenever its derived liveness changes, and a `true` that says what the
-    // module already knew is not a second turn arriving. The distinction has to
-    // be pinned from the armed side, where both answers are visible: the first
-    // `true` carries the reader, and a second must move them zero pixels, or
-    // every later render would re-assert the live edge over wherever the reader
-    // had got to.
+    // whenever its derived liveness changes, and a `true` repeating what the
+    // module already knew is not a second turn arriving. Pinned from the armed
+    // side, where both answers are visible. The first `true` carries the
+    // reader. A second must move them zero pixels, or every later render
+    // re-asserts the live edge over wherever they had got to.
     const { el, onScroll } = armedThenScrolledUpOnAnIdleThread();
 
     setThreadLive(true);        // the wake: the round the observer missed
     expect(el.scrollTop).toBe(2500);
 
-    // Now put the container somewhere the follow did not: with NO gesture
-    // behind it, which is the iOS keyboard / app-resume case the follow
-    // deliberately survives (the setup's own scroll is retired first, or its
-    // coast would still be counting as the reader's and this live move would
-    // disarm). Armed, live, and off the stamp is exactly the state a
-    // re-asserting signal would trample.
+    // Now put the container somewhere the follow did not, with NO gesture
+    // behind it: the iOS keyboard / app-resume case the follow survives. The
+    // setup's own scroll is retired first, or its coast would still count as
+    // the reader's. Armed, live, and off the stamp is the state a re-asserting
+    // signal would trample.
     readerGestureForTest(null, false);
     el.scrollTop = 1200;
     onScroll();
@@ -1124,10 +1265,9 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
   });
 
   it('carries them for a SUBMIT before any status says the thread is live', () => {
-    // The gap the submit's own claim covers, checked from this side too: the
-    // write has to run through the seconds between the submit and the
-    // projection catching up, or the reader would submit and watch the reply
-    // grow in below them.
+    // The gap the submit's own claim covers, from this side too. The write runs
+    // through the seconds before the projection catches up, or the reader
+    // watches the reply grow in below them.
     const { el, onResize } = armedThenScrolledUpOnAnIdleThread();
 
     followContinuedThread();  // marks the thread live by itself
@@ -1139,13 +1279,171 @@ describe('an IDLE thread moves an armed reader nowhere', () => {
   });
 });
 
+describe('an IDLE thread keeps an armed reader who never left the edge', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** The block above's other half. Those tests are all one reader: an armed one
+   *  who SCROLLED UP on a quiet thread and must be left where they parked. This
+   *  block is the reader who never moved, and a rider who has not moved is
+   *  exactly who the lit toggle is for.
+   *
+   *  A thread PARKS the instant the agent asks a question:
+   *  `waiting_for_user_answer` is quiescent, so `exchangeMarksThreadLive` says
+   *  idle. The card therefore arrives on a thread this module reads as doing
+   *  nothing. Standing the write down for every armed reader mounts that card
+   *  UNDER a rider on the live edge, with its options below the fold.
+   *
+   *  WHERE THE READER IS decides, never what kind of resize it was (ADR 0064).
+   *  See `keepTheLiveEdge`, whose box-change and platform-scroll twins are in
+   *  `scroll-reflow-anchor.test.ts`. */
+
+  function armedAtTheEdgeOnAnIdleThread() {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);              // 2500
+    observers.onScroll();      // the transcript records them ON the edge
+    setFollowLiveEdge(true);   // arming from the edge writes nothing, runs no tween
+    setThreadLive(false);      // and the thread parks on the question it just asked
+    expect(followingLiveEdge.value).toBe(true);
+    el.writes = 0;
+    return { el, ...observers };
+  }
+
+  it('keeps them on the edge when a question card mounts under them', () => {
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 3400;  // the card, its options and their descriptions
+    onResize();
+
+    expect(el.scrollTop).toBe(2900);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('keeps them there across round after round of it', () => {
+    // A card does not arrive in one round: the panel mounts, the options lay
+    // out, the composer swaps into answer mode. Every round has to answer the
+    // same, or the reader ends up short of the edge by whichever one did not.
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    for (const [height, edge] of [[3400, 2900], [3600, 3100], [4000, 3500]]) {
+      el.scrollHeight = height;
+      onResize();
+      expect(el.scrollTop).toBe(edge);
+    }
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('does it in the resize round itself, so nothing is painted short of the edge', () => {
+    // Why this is not merely a position assertion. The ResizeObserver runs
+    // after layout and before paint, so a write from `onResize` is invisible.
+    // A rescue running from a Preact effect a task later is a painted frame at
+    // the wrong place followed by a jump. Nothing may be needed after the
+    // resize returns.
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 3400;
+    onResize();
+
+    expect(el.scrollTop).toBe(el.scrollHeight - el.clientHeight);
+    expect(el.writes).toBe(1);
+  });
+
+  it('needs no wake, and a later wake then moves them nowhere', () => {
+    // Answering is what wakes the thread, and by then the reader is already on
+    // the edge, so `honourWake`'s replay has nothing to do. It must not be the
+    // thing that gets them there: that replay is a task late by construction.
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 3400;
+    onResize();
+    expect(el.scrollTop).toBe(2900);
+    el.writes = 0;
+
+    setThreadLive(true);
+
+    expect(el.scrollTop).toBe(2900);
+  });
+
+  it('lets go the moment they scroll off the edge, and keeps the ride', () => {
+    // The line between this block and the one above it, walked in one test. The
+    // same reader, one flick apart: on the edge they are held there, off it they
+    // are left alone. Neither loses the lit toggle.
+    const { el, onScroll, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 3400;
+    onResize();
+    expect(el.scrollTop).toBe(2900);
+
+    readerScrollsTo(el, 1500, onScroll);
+    el.writes = 0;
+
+    el.scrollHeight = 4000;
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(1500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('defers to an anchor correction that moved them off the edge first', () => {
+    // A REVEAL is growth too, so the growth branch runs for one and must not
+    // undo `withScrollAnchor`'s correction. Expanding a turn's steps grows every
+    // turn ABOVE the reader. The correction holds them on the content they were
+    // reading, which takes them off the live edge.
+    //
+    // Nothing here knows about reveals. The correction WRITES the container, and
+    // its scroll event is dispatched before the resize one in the same frame.
+    // So `recordAnchor` has already answered "off the edge" when growth asks.
+    //
+    // The correction ANNOUNCES itself through `honourAnchoredMutation`, which
+    // carries the held stamp. Without that, a gesture-less scroll reads as the
+    // platform moving the reader, and `keepTheLiveEdge` writes them straight
+    // back to the edge. Modelled with no gesture on purpose: the ride has to
+    // survive a correction the app made.
+    const { el, onScroll, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 5000;   // the steps unfold, above the reader and below
+    el.scrollTop = 3700;      // and the correction holds them on their own turn
+    honourAnchoredMutation(el);
+    onScroll();
+    el.writes = 0;
+
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(3700);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('moves an UNARMED reader on the edge zero pixels under the same growth', () => {
+    // Being at the bottom is a position, not a request. The whole of
+    // `scroll-resize-never-follows.test.ts` says so; it is repeated here because
+    // this block is the one that could take it away.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);
+    onScroll();
+    setThreadLive(false);
+    el.writes = 0;
+
+    el.scrollHeight = 3400;
+    onResize();
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(2500);
+    expect(awayFromBottom.value).toBe(true);
+  });
+});
+
 describe('the toggle remembers the last press as a seed', () => {
   /** The seed is what a thread with NO reading position starts as, and the only
-   *  state the toggle can show in the compose view, which has no transcript.
-   *  What it must never be is a mirror of the follow: a scroll retiring the ride
-   *  on THIS thread is not the reader revising a standing preference, and a
-   *  single accidental flick would otherwise turn it off for every future
-   *  thread. */
+   *  state the toggle can show in the transcript-less compose view. It must
+   *  never mirror the follow. A scroll retiring the ride on THIS thread is not
+   *  the reader revising a standing preference. One accidental flick would
+   *  otherwise turn it off for every future thread. */
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); setFollowLiveEdge(false); });
 
@@ -1201,20 +1499,19 @@ describe('the toggle remembers the last press as a seed', () => {
 });
 
 describe('a reveal inside the transcript never retires the follow', () => {
-  /** ONLY A SCROLL MAY DISARM. A collapse, an unfold, and the two
-   *  transcript-wide turn controls are clicks on a control, and the reader who
-   *  made one asked for more of the turn rather than for less of the ride.
+  /** ONLY A SCROLL MAY DISARM. A collapse, an unfold and the two turn controls
+   *  are clicks on a control. The reader who made one asked for more of the
+   *  turn, not for less of the ride.
    *
    *  They move the container all the same. `withScrollAnchor` pins the turn the
-   *  click was on and writes the correction itself, and the two turn controls are
-   *  transcript-wide, so every turn BELOW the anchored one grows too and the
-   *  correction lands the reader short of the live edge. That looked exactly like
-   *  the reader scrolling away, and retired a follow nobody touched.
+   *  click was on and writes the correction itself. The turn controls are
+   *  transcript-wide, so every turn BELOW the anchored one grows too. The
+   *  correction then lands the reader short of the live edge, which reads
+   *  exactly like the reader scrolling away.
    *
-   *  The fake reproduces the shape rather than the DOM: `honourAnchoredMutation`
+   *  The fake reproduces the shape rather than the DOM. `honourAnchoredMutation`
    *  is the entry point `withScrollAnchor` calls right after its own write, and
-   *  the write is modelled by moving `_scrollTop` without counting it, since the
-   *  app made it. */
+   *  that write is modelled by moving `_scrollTop` without counting it. */
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
@@ -1240,12 +1537,9 @@ describe('a reveal inside the transcript never retires the follow', () => {
   });
 
   it('puts an armed reader ON the live edge at once, not over a tween', () => {
-    // A tween was tried here and is what the reader reported: the reveal grows
-    // every turn above them too, so they were left a screenful short of the
-    // live edge and the transcript then scrolled itself down. This write lands
-    // in the same frame the caller unfreezes, before the paint the mutation
-    // causes, and it keeps the newest content, which is what a riding reader is
-    // looking at, exactly where it already was. See `honourAnchoredMutation`.
+    // The write lands in the same frame the caller unfreezes, before the paint
+    // the mutation causes, so the newest content stays exactly where it was.
+    // See `honourAnchoredMutation`. The rejected tween is in ADR 0064.
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1293,21 +1587,18 @@ describe('a reveal inside the transcript never retires the follow', () => {
 });
 
 describe('coming back to a thread resumes the follow it was left with', () => {
-  /** The follow is one global that `focusThread` retires on every open, so the
-   *  request used to end the moment the reader looked at another thread: they
-   *  came back to the pixel offset the transcript had when they walked away, with
-   *  everything the agent produced meanwhile below them. The request is recorded
-   *  per thread as a reading position now (`hooks/useScrollMemory.ts`), and this
-   *  is the entry point that resumes it. What that file pins is the RECORDING;
-   *  what this pins is that resuming produces a real follow and not a one-shot
-   *  landing at the bottom. */
+  /** The follow is one global that `focusThread` retires on every open. So the
+   *  request is recorded per thread as a reading position
+   *  (`hooks/useScrollMemory.ts`), and this is the entry point that resumes it.
+   *  That file pins the RECORDING. This pins that resuming produces a real
+   *  follow rather than a one-shot landing at the bottom. */
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   it('lands on the live edge the thread has NOW, and keeps riding it', () => {
     // `.thread-content` is one element reused across threads, so on arrival it
-    // holds the OUTGOING thread's offset: arming without writing would leave the
-    // reader sitting there until the next growth round.
+    // holds the OUTGOING thread's offset. Arming without writing would leave
+    // the reader sitting there until the next growth round.
     const el = makeEl({ scrollTop: 300, scrollHeight: 20000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1325,10 +1616,9 @@ describe('coming back to a thread resumes the follow it was left with', () => {
 
   it('writes as the app, so the mobile header and the render window stand down', () => {
     // Opening a thread at the top of the rendered slice is inside the window
-    // expansion's margin by construction, and the same reasoning applies to a
-    // write the reader did not make with their finger. The restore goes through
-    // `markFollowScroll`, which is `markNavigationScroll` plus the follow's own
-    // position stamp.
+    // expansion's margin by construction. So is any write the reader did not
+    // make with their finger. The restore goes through `markFollowScroll`:
+    // `markNavigationScroll` plus the follow's own position stamp.
     const el = makeEl({ scrollTop: 300, scrollHeight: 20000 });
     setActiveScrollElement(el);
 
@@ -1364,8 +1654,8 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   it('arms without moving the reader a pixel, and rides the next growth', () => {
-    // The whole point: the reader stays on the event the link took them to, and
-    // the toggle is lit, so the thread waking up carries them as it always did.
+    // The reader stays on the event the link took them to. The toggle is lit,
+    // so the thread waking up carries them.
     const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1388,24 +1678,36 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
     expect(el.scrollTop).toBe(20500);
   });
 
-  it('declines while the agent is LIVE, because the landing just ended the ride', () => {
-    // A link into a streaming thread is a request to be at ONE place, and
-    // `scrollToSelectorAndPulse` retires the follow for exactly that reason. This
-    // runs afterwards, so arming here would undo the decision.
+  it('is what a LIVE thread gets too: the agent decides nothing here', () => {
+    // The landing does end the ride, but liveness is the wrong way to ask
+    // whether it has happened. The guard is `deepLinkHasResolved()`, so the
+    // branch reads no `_threadLive` at all: same call, live thread, same result
+    // as the idle one above.
+    //
+    // The landed-link guard itself is pinned in `hooks/useScrollMemory.test.ts`
+    // ("a deep-link claiming the open mid-restore"), which has the DOM harness
+    // to resolve a real link. This file is DOM-free, so faking a resolve here
+    // would need a seam letting a test claim a landing no link made.
     const el = makeEl({ scrollTop: 6000, scrollHeight: 20000 });
+    const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
     setThreadLive(true);
 
     resumeFollowingBottom(el, 'in-place');
 
-    expect(followingLiveEdge.value).toBe(false);
+    expect(followingLiveEdge.value).toBe(true);
     expect(el.scrollTop).toBe(6000);
+    // And being live, the very next growth carries them: the ride is real, not
+    // a lit toggle over nothing.
+    el.scrollHeight = 21000;
+    onResize();
+    expect(el.scrollTop).toBe(20500);
   });
 
   it('leaves an ALREADY ARMED follow and its held stamp alone', () => {
     // A link into the thread the reader is already in retires nothing, so there
     // is no request to resume. Re-arming would clear the stamp `isFollowScroll`
-    // reads, which is what decides whether this thread's reading position is
+    // reads. That stamp decides whether this thread's reading position is
     // recorded as the live edge or as an offset.
     const el = makeEl({ scrollTop: 100, scrollHeight: 20000 });
     setActiveScrollElement(el);
@@ -1439,15 +1741,12 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   it('lands the reader who sent FROM the live edge, once their turn renders', () => {
-    // The reported bug, and the ordinary case: sending from the bottom is what
-    // most sends are. Being at the live edge WHEN THE SUBMIT IS MADE says nothing
-    // about where the turn will sit, because the submit is what appends it. The
-    // reader was left on the top of their own message with the status line below
-    // the fold and nothing to take them there.
+    // The ordinary case: most sends are made from the bottom. Being at the live
+    // edge WHEN THE SUBMIT IS MADE says nothing about where the turn will sit,
+    // because the submit is what appends it.
     //
-    // The two halves of the fixture are the whole point, and the old fake had
-    // them the wrong way round: park at the live edge, submit, and only THEN
-    // grow the transcript with the turn.
+    // The fixture's ordering is the whole point: park at the live edge, submit,
+    // and only THEN grow the transcript with the turn.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1468,10 +1767,9 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('still writes nothing when that turn is already ON the landing line', () => {
-    // The other half, and where the deleted at-the-live-edge branch was RIGHT: a
-    // reader whose new turn already sits at the top of the viewport has nowhere
-    // to go. Reached by measuring the target rather than by predicting it, which
-    // is the difference that makes the case above work.
+    // A reader whose new turn already sits at the top of the viewport has
+    // nowhere to go. Reached by measuring the target rather than predicting it,
+    // which is the difference that makes the case above work.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1491,10 +1789,9 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('arms nothing, so the reply streaming in leaves that reader where they are', () => {
-    // THE INVERSION. A send used to arm the standing follow, and the reader who
-    // sent from the live edge was then carried down through the whole reply.
-    // Riding is the chevron's request now, so the same reader is left at the
-    // bottom of what they can see and the chevron is their way down.
+    // Riding is the follow toggle's request, not the send's (ADR 0064). The
+    // reader who sent from the live edge is left at the bottom of what they can
+    // see, and the chevron is their way down.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1530,14 +1827,12 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('glides so the message is the TOP thing in the viewport', () => {
-    // What a send actually asks, and what the whole screen under the message is
-    // for: the agent status line one row down says the turn was taken, and the
-    // reply then streams into the space rather than into the fold. The landing
-    // used to rest that status line on the container's BOTTOM edge, which
-    // answered the first half and spent the entire viewport doing it.
+    // What the whole screen under the message is for: the agent status line one
+    // row down says the turn was taken, and the reply then streams into the
+    // space rather than into the fold.
     //
-    // Anchored on an ELEMENT either way. A scrollHeight target would land at 2900
-    // here, which is past the whole turn and hides the very thing they wrote.
+    // Anchored on an ELEMENT. A scrollHeight target would land at 2900 here,
+    // past the whole turn, hiding the very thing they wrote.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1558,16 +1853,12 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('lands as soon as the ROW renders, without waiting for the response panel', () => {
-    // The landing used to hold until the turn's status line was in the DOM,
-    // because that row WAS the target and the response panel can mount a commit
-    // or two after the row it belongs to, so a landing aimed while it was missing
-    // stopped one row short (reported 2026-08-10: "it scrolls to weird place or
-    // to end of message, but not to agent response header").
+    // The response panel can mount a commit or two after the row it belongs to.
+    // A landing that waited for the status line stopped one row short.
     //
-    // The target is the turn's own TOP now, which is fixed the instant the row
-    // renders, so there is nothing left to wait for and the wait is gone. The
-    // status line arrives into the viewport underneath, wherever in the sequence
-    // it turns up.
+    // The target is the turn's own TOP, fixed the instant the row renders, so
+    // there is nothing to wait for. The status line arrives into the viewport
+    // underneath, wherever in the sequence it turns up.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1589,16 +1880,14 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('a QUEUED follow-up is only REVEALED, never chased to the live edge', () => {
-    // Fire a second message while the first reply is still running and it lands
-    // as the newest turn, with nothing under it but the transcript's own bottom
-    // padding, so the landing line is out of reach.
+    // A second message fired while the first reply runs lands as the newest
+    // turn. Nothing sits under it but the transcript's own bottom padding, so
+    // the landing line is out of reach.
     //
-    // So the ask changes rather than being clamped. Asking for the line anyway
-    // and letting the browser cut it short is a decision by accident: it drags
-    // the reader to the live edge for a turn that cannot get to the top, taking
-    // them off the reply they are watching to gain nothing. The modest ask is to
-    // SHOW the turn, which here stops short of the live edge by the trailing room
-    // the transcript reserves for the prompt dissolve.
+    // The ask changes rather than being clamped. Asking for the line anyway
+    // drags the reader to the live edge for a turn that cannot reach the top,
+    // gaining nothing. The modest ask is to SHOW the turn, which stops short of
+    // the live edge by the trailing room the transcript reserves.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1620,12 +1909,12 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('still lands on the line when the container falls a rounded pixel short', () => {
-    // At the BOUNDARY, where a turn is within a rounding error of a screenful,
-    // the two sides of "can the container reach the line" are effectively the
-    // same number and `scrollHeight` is an integer while the turn's own top is
-    // fractional. An exact test would flip there for reasons no reader can see,
-    // and flipping is not a small difference: the other branch lands the turn a
-    // whole padding-bottom lower. `LANDING_REACH_SLACK_PX` is what absorbs it.
+    // At the BOUNDARY a turn is within a rounding error of a screenful. Both
+    // sides of "can the container reach the line" are then the same number.
+    // `scrollHeight` is an integer while the turn's own top is fractional, so an
+    // exact test flips there for reasons no reader can see. Flipping is not a
+    // small difference: the other branch lands the turn a whole padding-bottom
+    // lower. `LANDING_REACH_SLACK_PX` absorbs it.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1643,11 +1932,10 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('moves NOBODY for a queued follow-up that is already on screen', () => {
-    // The point of asking to REVEAL rather than to land: with the first message
-    // resting on the landing line and its reply still filling less than a screen,
-    // the queued bubble renders in the room that is left and is visible where the
-    // reader already is. Nothing is owed, so nothing is written, and the message
-    // they sent FIRST stays where its own landing put it, at the top.
+    // The point of asking to REVEAL rather than to land. The first message rests
+    // on the landing line and its reply fills less than a screen. The queued
+    // bubble renders in the room left over and is already visible. Nothing is
+    // owed, so nothing is written, and the first message stays at the top.
     const el = makeEl({ scrollTop: 2000, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1666,19 +1954,18 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('a lapsed landing does not block the NEXT submit', () => {
-    // The deadline is wall-clock, and the growth branch is the only thing that
-    // was checking it, so a landing whose turn never becomes addressable sat on
-    // `_pendingLanding` for as long as nothing grew. The reader's next submit
-    // then returned early without installing its own resolver: it never landed.
-    // Found by the Codex reviewer, 2026-08-10. The turn that never answers is the
-    // second and subsequent queued follow-up, which folds into a CLOSED
-    // disclosure group and so has no box at all.
-    // The second submit is a CARD, which resolves at submit time and glides
-    // immediately: it never reaches the growth branch, so a stale pending
-    // landing is the only thing that can stop it. That is what makes this the
-    // shape that reproduces. A second SEND would be rescued by luck, because the
-    // stale resolver is `awaitsNewTurn(lastUserMessage)` and the newer row
-    // happens to satisfy it.
+    // The deadline is wall-clock and only the growth branch checks it. So a
+    // landing whose turn never becomes addressable sits on `_pendingLanding`
+    // for as long as nothing grows. The reader's next submit must not then
+    // return early without installing its own resolver.
+    //
+    // The turn that never answers is the second and later queued follow-up,
+    // which folds into a CLOSED disclosure group and has no box. The second
+    // submit is a CARD, resolving at submit time and gliding immediately. It
+    // never reaches the growth branch, so a stale pending landing is the only
+    // thing that can stop it. A second SEND would be rescued by luck: the stale
+    // resolver is `awaitsNewTurn(lastUserMessage)`, which the newer row
+    // satisfies.
     const nowSpy = vi.spyOn(performance, 'now');
     let clock = 1_000_000;
     nowSpy.mockImplementation(() => clock);
@@ -1701,13 +1988,12 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('stops clear of the chrome at the top, by the clearance the turn asks for', () => {
-    // The transcript's top edge is not clear space: the desktop fade band and the
-    // floating up-chevron sit over it, and on mobile the app header and the
-    // sticky thread-title row do. A turn landed flush against that edge would be
-    // half under them. The turn names the room it needs as `scroll-margin-top`
-    // (chat/response.css), which is the SAME line a deep link and ⌘↑/⌘↓ turn
-    // stepping come to rest on, and the landing reads the resolved px, which is
-    // what this stands in for.
+    // The transcript's top edge is not clear space: the desktop fade band and
+    // the floating up-chevron sit over it, and on mobile the app header and the
+    // sticky thread-title row do. A turn landed flush against that edge would
+    // be half under them. The turn names the room it needs as
+    // `scroll-margin-top` (chat/response.css), the SAME line a deep link and
+    // ⌘↑/⌘↓ turn stepping rest on. The landing reads the resolved px.
     const styles = vi.fn(() => ({ scrollMarginTop: '24px' }));
     (globalThis as any).getComputedStyle = styles;
     try {
@@ -1747,10 +2033,8 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('then holds still, so the reply grows in UNDER the turn it landed', () => {
-    // THE INVERSION. The landing used to be the first half of a ride: it put the
-    // reader on their own turn and the follow then dragged them down through the
-    // reply. The landing is the whole reaction now, so the turn stays exactly
-    // where the glide left it and the answer arrives beneath it.
+    // The landing is the WHOLE reaction, not the first half of a ride: the turn
+    // stays exactly where the glide left it and the answer arrives beneath it.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1797,11 +2081,10 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('stops the glide the moment the reader scrolls, rather than dragging them back', () => {
-    // The cancel and the tween must not disagree. This used to come free from the
-    // follow's disarm, because the send had armed one; with a submit arming
-    // nothing the landing carries its own position stamp and its own cancel. A
-    // chevron tap's tween, which arms nothing until it lands, still reaches its
-    // target as it always has.
+    // The cancel and the tween must not disagree. A submit arms nothing, so the
+    // landing carries its own position stamp and its own cancel rather than
+    // taking them from the follow's disarm. A chevron tap's tween still reaches
+    // its target.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1820,10 +2103,9 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('is cancelled by a gesture made BEFORE the message renders, so it never runs', () => {
-    // The pending phase has written nothing yet, so there is no write to read the
-    // reader's gesture against: the stamp the submit takes at call time is what
-    // makes their flick in that window cancel the landing rather than be
-    // overridden by it a frame later.
+    // The pending phase has written nothing, so there is no write to read the
+    // gesture against. The stamp the submit takes at call time is what lets a
+    // flick in that window cancel the landing.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onScroll, onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1842,11 +2124,10 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('holds the glide on its last measured target when the turn leaves the layout', () => {
-    // Nothing cancels a tween when the reader opens another thread mid-glide, and
-    // a detached node reports an all-zero rect. Measured against the container's
-    // own top that reads as a target ABOVE where the reader is, so the glide
-    // would turn round and haul the newly-opened thread backwards, over whatever
-    // else had just positioned it.
+    // Nothing cancels a tween when the reader opens another thread mid-glide,
+    // and a detached node reports an all-zero rect. Against the container's own
+    // top that reads as a target ABOVE the reader, so the glide would turn
+    // round and haul the newly-opened thread backwards.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -1868,12 +2149,10 @@ describe('sending a message lands the turn at the top of the viewport', () => {
   });
 
   it('LAPSES and moves nobody when the message has no box to land on', () => {
-    // THE INVERSION. The second and later queued follow-ups fold into a CLOSED
-    // disclosure group, so the message the reader just sent has no rect. Past the
-    // deadline that landing used to fall back to the live edge, because the send
-    // had armed a follow that had to be honoured; with no arming there is nothing
-    // to honour, and a turn with no box is not something to show them anyway.
-    // So the landing lapses and the reader is not moved.
+    // The second and later queued follow-ups fold into a CLOSED disclosure
+    // group, so the message the reader just sent has no rect. A submit arms
+    // nothing, so past the deadline there is no follow to honour, and a turn
+    // with no box is nothing to show them. The landing lapses (ADR 0064).
     const nowSpy = vi.spyOn(performance, 'now');
     let clock = 1_000_000;
     nowSpy.mockImplementation(() => clock);
@@ -1905,8 +2184,8 @@ describe('sending a message lands the turn at the top of the viewport', () => {
 
   it('is not cancelled by the reflow correction while the landing is still pending', () => {
     // A width change re-wraps the transcript and the anchor correction writes
-    // scrollTop to hold the reader on the same content. That is the app, not the
-    // reader, and the growth branch is standing down for the pending landing, so
+    // scrollTop to hold the reader on the same content. That is the app, not
+    // the reader. The growth branch stands down for the pending landing, so
     // nothing else re-stamps the position the disarm compares against.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onScroll, onResize } = makeScrollObservers(el);
@@ -1955,31 +2234,23 @@ describe('a send moves nobody only when the turn is already at the landing line'
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   /** The block above is the send earning its keep. This block is the case where
-   *  the ask is already satisfied, and the point of keeping it is WHERE that is
-   *  now decided.
+   *  the ask is already satisfied, and the point is WHERE that is decided.
    *
-   *  It used to be two pre-emptive tests in `followSubmit`: "is the reader at the
-   *  live edge" and "does this transcript hold a turn and scroll room"
-   *  (`hasSomewhereToLand`). Both asked about the transcript AS IT STANDS in
-   *  order to predict where a turn that had not rendered would sit, and both got
-   *  the ordinary case wrong: a reader who sends from the bottom is at the live
-   *  edge when asked and one commit later has the new turn below the fold.
-   *  Reported twice on 2026-08-10.
-   *
-   *  Now there is ONE test and it is a measurement: `landOnOwnTurn` writes
-   *  nothing when its target is at or behind the current position, asked per
-   *  frame against the turn itself. Every case below reaches "moves nobody"
-   *  through it rather than by being recognised in advance. */
+   *  There is ONE test and it is a measurement. `landOnOwnTurn` writes nothing
+   *  when its target is at or behind the current position, asked per frame
+   *  against the turn itself. Every case below reaches "moves nobody" through
+   *  that measurement rather than by being recognised in advance. Why a
+   *  pre-emptive test cannot answer it: ADR 0064. */
 
   it('leaves the reader alone when their turn renders AT the top already', () => {
-    // The reported bug, in the order the two call sites actually fire for one
-    // send. `PromptInput.submit` runs first, from the compose view, where there
-    // is no transcript to resolve at all. `addPendingMessage` runs second, by
-    // which time the promoted thread has mounted an EMPTY one: it calls before
-    // writing `threadMap`, precisely so the optimistic row has not rendered.
+    // The order the two call sites fire in for one send. `PromptInput.submit`
+    // runs first, from the compose view, where there is no transcript to
+    // resolve. `addPendingMessage` runs second, by which time the promoted
+    // thread has mounted an EMPTY one: it calls before writing `threadMap`, so
+    // the optimistic row has not rendered.
     //
     // A brand-new thread's first turn IS the top of the transcript, so there is
-    // nowhere to take anybody, and the whole first reply then streams in below
+    // nowhere to take anybody. The whole first reply then streams in below
     // without moving them either.
     followSentMessage();
 
@@ -2005,13 +2276,10 @@ describe('a send moves nobody only when the turn is already at the landing line'
 
   it('lands the FIRST turn of a brand-new thread when there is content above it', () => {
     // The compose view renders the welcome message inside the same
-    // `.thread-content`, and on a short viewport it has real scroll room. That
-    // used to be answered with a pre-emptive "this transcript holds no turn, so
-    // there is nowhere to take anybody", which is the same mistake as the
-    // at-the-live-edge branch: it predicts where a turn that has not rendered
-    // will sit. The first turn of a brand-new thread renders below that welcome
-    // content exactly like any other turn renders below the conversation above
-    // it, and is owed the same landing.
+    // `.thread-content`, and on a short viewport it has real scroll room. A
+    // brand-new thread's first turn renders below that welcome content exactly
+    // as any other turn renders below the conversation above it. It is owed the
+    // same landing.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000, turns: 0 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2033,9 +2301,9 @@ describe('a send moves nobody only when the turn is already at the landing line'
 
   it('leaves the reader alone in an existing thread that fits on screen', () => {
     // Why the turn test cannot answer it either. There is a conversation here,
-    // but the reader is at its bottom because there is nowhere else to be, not
-    // because they chose to be, and what they just sent is already fully
-    // visible. The reply grows past the fold below them.
+    // but the reader is at its bottom because there is nowhere else to be.
+    // What they just sent is already fully visible, and the reply grows past
+    // the fold below them.
     const el = makeEl({ scrollTop: 0, scrollHeight: 400 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2052,7 +2320,7 @@ describe('a send moves nobody only when the turn is already at the landing line'
   it('does not retire a follow the reader had already armed', () => {
     // Declining to arm is not disarming. A rider's standing request is theirs
     // until they take it back, and a send is not them taking it back, whatever
-    // the transcript's geometry is when they make it.
+    // the transcript's geometry.
     const el = makeEl({ scrollTop: 0, scrollHeight: 400 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2071,10 +2339,10 @@ describe('answering a question card lands the same way', () => {
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
   /** Submitting an answer IS a send: the reader handed the agent something and
-   *  is owed the sight of it being picked up. Which of the three shapes they
-   *  used must not be something they can feel in the scroll, so this whole block
-   *  is the send's block above with the card in place of the message. The third
-   *  shape, typing the answer, is literally a send and rides `followSentMessage`.
+   *  is owed the sight of it being picked up. Which shape they used must not be
+   *  something they can feel in the scroll. So this block is the send's block
+   *  above with the card in place of the message. Typing the answer is
+   *  literally a send and rides `followSentMessage`.
    *
    *  Its mirror is the card ARRIVING, which is the agent's doing and moves
    *  nobody. That case lives in the `unmovedBy` block at the bottom of this
@@ -2095,8 +2363,8 @@ describe('answering a question card lands the same way', () => {
   });
 
   it('arms nothing, so the agent resuming underneath moves that reader 0px', () => {
-    // THE INVERSION. Answering armed the standing follow, so the resumed reply
-    // carried the reader down through it. It arms nothing now.
+    // Answering arms nothing, so the resumed reply does not carry the reader
+    // down through it (ADR 0064).
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2114,11 +2382,10 @@ describe('answering a question card lands the same way', () => {
   });
 
   it('glides so the answered card is the top thing in the viewport', () => {
-    // The same landing a send gets, for the same reason: the reader knows what
-    // they just answered, and what they are owed is the whole screen under it
-    // for the agent picking it up again. Anchored on the card's TURN, exactly as
-    // a send is anchored on its message's turn; a scrollHeight target would land
-    // at 2500 here, past the whole turn, and hide the thing they just answered.
+    // The same landing a send gets, for the same reason: the reader is owed the
+    // whole screen under what they answered, for the agent picking it up again.
+    // Anchored on the card's TURN, as a send is anchored on its message's turn.
+    // A scrollHeight target would land at 2500 here, past the whole turn.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2136,11 +2403,11 @@ describe('answering a question card lands the same way', () => {
 
   it('survives the answered body replacing the live one, because it holds the PANEL', () => {
     // Why the landing anchors on `.initiator-panel` rather than the
-    // `.question-body` inside it. Answering swaps `QuestionBody`'s live body for
-    // `AnsweredBody`, a different component, so Preact unmounts the body node a
-    // frame or two into the glide; the panel around it is the same vnode in the
-    // same position and is reused. Anchored on the body, this glide would go
-    // dead the moment the answer rendered and freeze wherever it had got to.
+    // `.question-body` inside it. Answering swaps `QuestionBody`'s live body
+    // for `AnsweredBody`, a different component, so Preact unmounts the body
+    // node a frame or two into the glide. The panel around it is the same vnode
+    // in the same position and is reused. Anchored on the body, this glide
+    // would go dead the moment the answer rendered.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2159,8 +2426,8 @@ describe('answering a question card lands the same way', () => {
   });
 
   it('then holds still, so the reply grows in under the card', () => {
-    // THE INVERSION, the answer's copy of it: the landing was the first half of a
-    // ride and is the whole reaction now.
+    // The answer's copy of the rule: the landing is the whole reaction, not the
+    // first half of a ride.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2230,23 +2497,10 @@ describe('nothing is reserved under the newest turn', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** THE TAIL ROOM IS GONE, removed 2026-08-12, and this is what stops it coming
-   *  back by accident. It was one viewport of `min-height` under the last turn,
-   *  measured here and applied in chat/response.css, so a submit could land that
-   *  turn's top on the landing line.
-   *
-   *  Three reports in two days, each a different reader meeting the same
-   *  screenful of air. A rider was carried INTO it, because the room extends the
-   *  scrollable range past where the content ends, so the bottom the follow
-   *  writes them to stopped being "the newest content at the bottom of the
-   *  screen" and became "the newest turn at the top, over reserved air": two
-   *  messages fired at a live coding-agent thread, and the second took the first
-   *  and its whole running reply off screen. Withholding the room from a rider
-   *  fixed that and bought worse, a layout that reads the follow flag, so every
-   *  failure to re-arm showed a screenful of blank as its symptom. And it arrived
-   *  MID-TURN either way, since a queued follow-up grows no reply and only
-   *  qualified once the agent picked it up, growing the transcript by a screen in
-   *  one step under a reader riding it.
+  /** NO TAIL ROOM IS PUBLISHED, and this block is what stops it coming back by
+   *  accident. It was one viewport of `min-height` under the last turn,
+   *  measured here and applied in chat/response.css. That let a submit land the
+   *  turn's top on the landing line. Why it was withdrawn: ADR 0064.
    *
    *  What the landing does instead is measure: see the reveal branch in
    *  `landOnOwnTurn`, covered by the queued-follow-up tests above. */
@@ -2266,10 +2520,9 @@ describe('nothing is reserved under the newest turn', () => {
       setActiveScrollElement(el);
       el.addUserMessage({ top: 2900, height: 120 });
 
-      // The three moments that used to write the property, and the two edges are
-      // named because they were once a rule of their own: the toggle changes no
-      // element's size, so the room had to be republished from the arm and the
-      // retire by hand.
+      // The three moments a tail-room property would be written from. Both
+      // toggle edges are named: the toggle changes no element's size, so a room
+      // would need republishing from the arm and the retire by hand.
       onResize();
       expect(roomOn(el)).toBe('');
       setFollowLiveEdge(true);
@@ -2308,23 +2561,20 @@ describe('a submit made while already riding the live edge goes to the bottom', 
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** The landing above is for a reader who had scrolled away: it shows them the
-   *  agent taking what they submitted, with the reply growing underneath. A
-   *  reader who is already RIDING the live edge asked for the opposite, and asked
-   *  for it as a standing request: keep me at the bottom. Landing them on their
-   *  own turn puts them off the bottom with the chevron on and the reply below
-   *  the fold, which is the state they armed the follow to never be in.
+  /** The landing above is for a reader who had scrolled away. A reader already
+   *  RIDING the live edge asked for the opposite, as a standing request: keep me
+   *  at the bottom. Landing them on their own turn puts them off the bottom with
+   *  the reply below the fold, the state they armed the follow to avoid.
    *
-   *  This is the ONE branch a submit did not change, and it is the whole of what
-   *  a submit and the standing follow still have to do with each other: the
-   *  submit SERVES a request the chevron made, and never makes one.
+   *  This is the whole of what a submit and the standing follow have to do with
+   *  each other. The submit SERVES a request the toggle made, and never makes
+   *  one.
    *
-   *  Armed but off the live edge is an ordinary state rather than a corner. The
-   *  growth branch stands down while a tween owns the scroll, so a reply that
-   *  streams entirely during a glide leaves the reader parked above the bottom
-   *  with the follow still armed and no growth left to carry them out of it.
-   *  `ridingButParked` reproduces exactly that, and the reader's next submit is
-   *  made from there. */
+   *  Armed but off the live edge is an ordinary state. The growth branch stands
+   *  down while a tween owns the scroll. A reply streaming entirely during a
+   *  glide therefore leaves the reader parked above the bottom, follow still
+   *  armed. `ridingButParked` reproduces that, and the next submit is made from
+   *  there. */
   function ridingButParked(el: any) {
     atBottom(el);
     setFollowLiveEdge(true); // the reader arms the follow, at the live edge
@@ -2391,8 +2641,8 @@ describe('a submit made while already riding the live edge goes to the bottom', 
   });
 
   it('lands on the bottom the transcript has when the glide ENDS', () => {
-    // The target is re-read per frame, so a reply still streaming during the
-    // glide is tracked rather than leaving the reader one screen short of it.
+    // The target is re-read per frame (ADR 0065), so a reply still streaming
+    // during the glide is tracked rather than left one screen short.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2474,9 +2724,9 @@ describe('a submit made while already riding the live edge goes to the bottom', 
   });
 
   it('a glide that already LANDED does not suppress the next submit', () => {
-    // The "leave a live-edge glide alone" guard must describe a tween in flight
-    // and not one that finished, or the flags a completed glide left behind
-    // would answer for it and the next submit would move nobody.
+    // The "leave a live-edge glide alone" guard must describe a tween in
+    // flight, not one that finished. Otherwise the flags a completed glide left
+    // behind answer for it, and the next submit moves nobody.
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2550,11 +2800,10 @@ describe('a submit made while already riding the live edge goes to the bottom', 
   });
 
   it('a permission decision LANDS an unarmed reader on the card it decided', () => {
-    // THE INVERSION, and the largest one. `followResolvedPermission` called
-    // itself "the one submit that ARMS NOTHING" and moved a reader who was
-    // following nothing zero pixels, so deciding a card resumed the agent below
-    // the fold with nothing on screen saying so. It is a submit like the others
-    // now: the turn they decided goes to the top, with the resumed reply under it.
+    // A permission decision is a submit like the others: the turn they decided
+    // goes to the top, with the resumed reply under it. Moving an unarmed
+    // reader zero pixels would resume the agent below the fold with nothing on
+    // screen saying so.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2596,12 +2845,12 @@ describe('Continue after an abort is a submit too', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
 
-  /** The fourth submit, and the one that used to move nobody at all, not even a
-   *  reader who was riding. Its turn does not exist when the button is pressed:
-   *  the continuation renders as a fresh `ContinuationStarted` exchange, over
-   *  SSE, after the POST. So it takes the send's deferred landing with a
-   *  different notion of the turn it is waiting for, a `.chat-exchange` that is
-   *  not the one that was last, since a continuation renders no user message. */
+  /** The fourth submit. Its turn does not exist when the button is pressed: the
+   *  continuation renders as a fresh `ContinuationStarted` exchange, over SSE,
+   *  after the POST. So it takes the send's deferred landing with a different
+   *  notion of the turn it waits for. That turn is a `.chat-exchange` other
+   *  than the one that was last, since a continuation renders no user
+   *  message. */
 
   it('lands on the continuation turn\'s status line once it renders', () => {
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
@@ -2683,21 +2932,21 @@ describe('Continue after an abort is a submit too', () => {
 });
 
 /** Every submit, driven from the SAME starting state through the SAME four
- *  branches, so "one reaction everywhere" is checked rather than asserted four
- *  times in four dialects. The blocks above are each surface's own story (what
- *  its turn is, when it renders, what it falls back to); this is the matrix.
+ *  branches. One reaction everywhere is then checked rather than asserted four
+ *  times in four dialects. The blocks above are each surface's own story. This
+ *  is the matrix.
  *
- *  The geometry is shared on purpose: whichever surface it is, the turn the
- *  reader acted on spans 2400..2700, so every landing in the table lands on 2392,
- *  its top minus the clearance. A surface that answered differently would be
- *  doing something the others are not. */
+ *  The geometry is shared on purpose. Whichever surface it is, the turn the
+ *  reader acted on spans 2400..2700, so every landing in the table is 2392: its
+ *  top minus the clearance. A surface answering differently is doing something
+ *  the others are not. */
 const SUBMIT_SURFACES: Array<{
   name: string;
   /** Render what must be on screen BEFORE the submit, at `top`. The two deferred
    *  submits render nothing: their turn does not exist yet. */
   arrange: (el: any, top?: number) => void;
-  /** Make the submit, then, for a deferred surface, render the turn it waits for
-   *  at `top` and give the growth branch the round it lands on. */
+  /** Make the submit. For a deferred surface, render the turn it waits for at
+   *  `top` and give the growth branch the round it lands on. */
   submit: (el: any, onResize: () => void, top?: number) => void;
 }> = [
   {
@@ -2745,12 +2994,11 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
   }
 
   it('branch 1, the turn is already at the landing line: writes nothing', () => {
-    // A thread that fits on screen, with the turn at the top of it, which is the
-    // only way a short transcript can actually be laid out. The landing measures
-    // its target, finds it at or behind the reader, and writes nothing. There is
-    // no pre-emptive "this thread is too short" test any more, and there must not
-    // be: the same test asked one commit earlier is what left a reader who sent
-    // from the bottom of a long thread staring at their own message.
+    // A thread that fits on screen, with the turn at its top, which is the only
+    // way a short transcript can be laid out. The landing measures its target,
+    // finds it at or behind the reader, and writes nothing. There must be no
+    // pre-emptive "this thread is too short" test: asked one commit earlier, it
+    // strands a reader who sent from the bottom of a long thread.
     const el = makeEl({ scrollTop: 0, scrollHeight: 400 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -2839,8 +3087,8 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
   beforeEach(() => { resetFollow(); });
   afterEach(() => { resetFollow(); });
 
-  /** Each of these growths had a `scrollToBottom()` call site before the pin was
-   *  removed, so each is a regression test against the pin coming back. */
+  /** Each of these growths is a regression test against the force-pin coming
+   *  back (ADR 0064). */
   function unmovedBy(grow: (el: any) => void) {
     const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
@@ -2871,35 +3119,32 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
 
   it('a question card ARRIVING moves nobody, though answering it would', () => {
     // The exact mirror of the block above. Answering is the reader producing
-    // content at the bottom; being asked is the agent producing it, and the two
-    // must not be confused just because the same element is involved.
+    // content at the bottom, being asked is the agent producing it. The same
+    // element being involved must not confuse the two.
     unmovedBy((el) => {
       el.addQuestionCard({ toolUseId: 'q1', top: 2700, height: 300 });
       el.scrollHeight = 3300;
     });
   });
 
-  /** Why this stays a source scan and not a behavioural test: the failure is a
-   *  NEW store action reaching for the live edge to "make sure you see it", and
-   *  no behavioural test can fail for a call site it does not know exists. Five
-   *  modules under `store/actions` carried such a call before the pin was
-   *  removed. A site that genuinely must arm the follow will fail here: say why
-   *  at the site and list it below rather than weakening the scan. */
+  /** Why this stays a source scan and not a behavioural test. The failure is a
+   *  NEW store action reaching for the live edge. No behavioural test fails for
+   *  a call site it does not know exists. A site that genuinely must arm the
+   *  follow fails here: say why at the site and list it below, rather than
+   *  weakening the scan. */
   it('no store action outside the send path reaches for the live edge', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const ACTIONS_DIR = resolve(here, '../../../store/actions');
-    /** The sanctioned callers, per module. `chat.ts` owns the send's own call;
-     *  `threads.ts` retires the follow when the reader opens another thread.
-     *  Every other submit has NO sanctioned store-action caller at all, and the
-     *  reason is the same one three times: the store action is the TRANSPORT,
-     *  which also carries decisions nobody watched happen, while the reader's own
-     *  tap lives in the component. The two card-submitted answers call
-     *  `followAnsweredQuestion` from `QuestionCard` / `PromptInput` and
-     *  `answerThreadQuestion` in `chat-claude-code.ts` deliberately does not; the
-     *  three permission-shaped cards call `followResolvedPermission` from
-     *  `PermissionCard` and `store/actions/permissions.ts` does not; Continue
-     *  calls `followContinuedThread` from `chat-exchange-parts.tsx` and the
-     *  `continueThread` API client does not. */
+    /** The sanctioned callers, per module. `chat.ts` owns the send's own call
+     *  and `threads.ts` retires the follow when the reader opens another
+     *  thread. Every other submit has NO sanctioned store-action caller, for
+     *  the same reason three times: the store action is the TRANSPORT, carrying
+     *  decisions nobody watched happen, while the reader's own tap lives in the
+     *  component. So each is called from its card, never from its transport:
+     *
+     *  - `followAnsweredQuestion` from `QuestionCard` / `PromptInput`
+     *  - `followResolvedPermission` from `PermissionCard`
+     *  - `followContinuedThread` from `chat-exchange-parts.tsx` */
     const ALLOWED: Record<string, string[]> = {
       'chat.ts': ['followSentMessage'],
       'threads.ts': ['stopFollowingBottom'],
@@ -2921,16 +3166,14 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
 
   /** The follow has exactly TWO arming sites, and this is what says so. Both go
    *  through the private `armFollowOn`, so the scan reads its callers inside
-   *  `scrollState.ts` rather than trusting the module header's prose: the follow
-   *  toggle (the reader making the request) and the resume (replaying one they
-   *  made in this thread earlier, which can only ever be a toggle request, since
-   *  only the toggle records one).
+   *  `scrollState.ts` rather than trusting prose. They are the follow toggle
+   *  (the reader making the request) and the resume, which replays a request
+   *  made in this thread earlier. Only the toggle can record one.
    *
-   *  The chevrons are named explicitly as NON-arming, because that is the change
-   *  most likely to be undone by someone reading `scrollToBottomAnimated` and
-   *  thinking "go to the bottom" obviously means "and stay". It does not, and
-   *  the reason is in the module header: one button cannot be go-there,
-   *  stay-here and stop-staying at once. */
+   *  The chevrons are named as NON-arming, since that is the rule most likely
+   *  to be undone. A reader of `scrollToBottomAnimated` may assume "go to the
+   *  bottom" means "and stay". It does not: one button cannot be go-there,
+   *  stay-here and stop-staying at once (ADR 0064). */
   it('only the follow toggle and the resume arm the follow', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const source: string = readFileSync(resolve(here, '../scrollState.ts'), 'utf8');
@@ -2959,26 +3202,22 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
   });
 
   /** The scan above pins the ARMING sites inside the module. This one pins the
-   *  two entry points that let the reading position record and resume a follow,
-   *  and it has to reach the whole tree rather than `store/actions` alone,
-   *  because neither belongs to a store action at all.
+   *  two entry points that let the reading position record and resume a follow.
+   *  It reaches the whole tree rather than `store/actions` alone, because
+   *  neither belongs to a store action.
    *
-   *  `resumeFollowingBottom` re-arms a follow the reader is not making right now,
-   *  which is safe for exactly one reason: it fires only for a thread whose
-   *  RECORDED reading position is the live edge, so only for a thread the reader
-   *  armed themselves. A second caller would lose that guarantee and become a
-   *  third arming point the rule above exists to prevent. `onFollowArmed`
-   *  deliberately broadcasts the arm and not the retirement, which is what lets
-   *  `focusThread` retire the follow without erasing the record of it; a second
-   *  subscriber would be a second thing acting on half a lifecycle.
+   *  `resumeFollowingBottom` re-arms a follow the reader is not making now,
+   *  which is safe for one reason: it fires only for a thread whose RECORDED
+   *  reading position is the live edge. A second caller would lose that
+   *  guarantee and become a third arming point. `onFollowArmed` broadcasts the
+   *  arm and not the retirement, which lets `focusThread` retire the follow
+   *  without erasing the record of it.
    *
    *  It matches a CALL shape rather than a bare mention, unlike the scan above.
-   *  That scan wants the wider net, because a store action that so much as
-   *  imports an arming entry point is already reaching for the live edge. These
-   *  two are the opposite: they are the mechanism the follow's own lifetime is
-   *  built from, so the modules that participate in it name them in prose while
-   *  calling neither, and `focusThread`'s comment naming `onFollowArmed` is
-   *  exactly the explanation a future reader needs there. */
+   *  That scan wants the wider net: a store action so much as importing an
+   *  arming entry point is already reaching for the live edge. These two are
+   *  the mechanism the follow's lifetime is built from, so participating
+   *  modules name them in prose while calling neither. */
   it('only the reading position records and resumes a follow', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const SRC_DIR = resolve(here, '../../..');

@@ -8,8 +8,9 @@ import {
   patchThreadModelOverride,
 } from '../../store/threadModelSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
-import { chatModelOptions, loadChatModels } from '../../store/actions/models';
-import { availableReasoningLevels, clampReasoningEffort } from '../../store/models';
+import {
+  chatModelOptions, clampEffortFor, loadChatModels, reasoningLevelsFor,
+} from '../../store/actions/models';
 import { LUCIDOS_AGENT_LABEL, displayModelName } from '../../store/thread-events';
 import { LucidosMarkIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
@@ -86,7 +87,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   const effortValue = perDraft
     ? resolveReasoningEffort(threadId)
     : resolveActiveThreadReasoningEffort(threadId);
-  const effortOptions = availableReasoningLevels(modelValue);
+  const effortOptions = reasoningLevelsFor(modelValue);
   const currentModelLabel = displayModelName(modelValue);
   const currentEffortLabel =
     effortOptions.find((l) => l.value === effortValue)?.label ?? effortValue;
@@ -118,8 +119,10 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   }
 
   function pickModel(value: string, label: string) {
-    // Keep the effort valid for the newly picked model, whichever store we write.
-    const clamped = clampReasoningEffort(effortValue, value);
+    // Keep the effort valid for the newly picked model, whichever store we
+    // write. The new model may support fewer tiers than the old one, and an
+    // effort left behind would be clamped by the engine anyway, silently.
+    const clamped = clampEffortFor(effortValue, value);
     const patch = clamped !== effortValue ? { model: value, reasoningEffort: clamped } : { model: value };
     if (perDraft) {
       // Per-draft override (persisted via the debounced compose PUT), or the

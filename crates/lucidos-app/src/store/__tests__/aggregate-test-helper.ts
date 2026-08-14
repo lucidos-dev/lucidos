@@ -74,7 +74,7 @@ const START_EVENTS: ReadonlySet<string> = new Set([
  *  `preserving_verdict("'running'")`, so they revive a thread that drifted to
  *  idle/waiting but never one carrying a verdict. */
 const ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
-  'TextStreamed', 'ThoughtStreamed', 'ToolCalled', 'ToolResult', 'MemorySearched',
+  'TextStreamed', 'ThoughtStreamed', 'ToolCalled', 'ToolResult', 'MemoryRecalled',
   'CodingAgentTextStreamed', 'CodingAgentThoughtStreamed',
   'CodingAgentToolCalled', 'CodingAgentToolResult',
 ]);

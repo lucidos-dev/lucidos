@@ -43,11 +43,11 @@ fn thread_event_type_name_extraction() {
             "ThoughtStreamed",
         ),
         (
-            ThreadEvent::MemorySearched {
+            ThreadEvent::MemoryRecalled {
                 results: 5,
                 queries: vec!["birthday".into()],
             },
-            "MemorySearched",
+            "MemoryRecalled",
         ),
         (
             ThreadEvent::ToolCalled {
@@ -346,13 +346,20 @@ fn transient_event_serializes() {
     );
 }
 
-/// Legacy persisted-row replay: any row that slipped into the events table
-/// before the T7 rename must still deserialize via the `#[serde(alias)]`
-/// declarations on the new variant names.
+/// Legacy persisted-row replay: any row written under a name we have since
+/// renamed must still deserialize via the `#[serde(alias)]` declarations on the
+/// new variant names, and must report the CANONICAL name from `event_type()` so
+/// every downstream list keyed on that string keeps matching. Most of these
+/// come from the T7 rename batch; `MemorySearched` is the 2026-08-12 split of
+/// the automatic pre-turn recall away from the `memory` tool's own search.
 #[test]
-fn t7_legacy_names_deserialize_via_alias() {
+fn legacy_event_names_deserialize_via_alias() {
     let cases: &[(&str, &str)] = &[
         (r#"{"type":"Thinking","text":"hmm"}"#, "ThoughtStreamed"),
+        (
+            r#"{"type":"MemorySearched","results":3,"queries":["birthday"]}"#,
+            "MemoryRecalled",
+        ),
         (r#"{"type":"Retrying","reason":"r"}"#, "LlmCallRetried"),
         (
             r#"{"type":"TextStreaming","text":"t"}"#,
@@ -412,7 +419,8 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"Thinking","text":"hmm"}"#,
         r#"{"type":"Thinking","text":"ctx","context_tokens":1000,"context_messages":5,"trimmed":true}"#,
         r#"{"type":"MemorySearched","results":3}"#,
-        r#"{"type":"MemorySearched","results":5,"queries":["birthday","date of birth"]}"#,
+        r#"{"type":"MemoryRecalled","results":3}"#,
+        r#"{"type":"MemoryRecalled","results":5,"queries":["birthday","date of birth"]}"#,
         r#"{"type":"ToolCalled","name":"x","args":{}}"#,
         r#"{"type":"ToolResult","name":"x","result":"ok"}"#,
         // TodoListWritten — empty + full list, all three statuses

@@ -586,9 +586,25 @@ where
 }
 
 // Model registry types
+
+/// A registry row plus what the engine derives about it. Flattened, so the wire
+/// shape is the `Model` row's own fields with the derived ones alongside.
+///
+/// `reasoning_efforts` exists so the Lucidos Agent picker filters against the
+/// tiers the engine will actually send rather than deriving its own answer from
+/// the model id. Both used to derive it separately and disagreed, which is how
+/// a local model was offered a tier its server rejected. See
+/// `llm::reasoning::supported_efforts`, the single source of truth.
+#[derive(Serialize)]
+pub struct ModelInfo {
+    #[serde(flatten)]
+    pub model: Model,
+    pub reasoning_efforts: &'static [&'static str],
+}
+
 #[derive(Serialize)]
 pub struct ModelsListResponse {
-    pub models: Vec<Model>,
+    pub models: Vec<ModelInfo>,
 }
 
 #[derive(Deserialize)]

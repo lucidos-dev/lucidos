@@ -1,12 +1,25 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { chatModels, configuredProviders } from '../store';
-import { chatModelOptions, isProviderConfigured, parseContextWindow } from './models';
+import {
+  chatModelOptions,
+  clampEffortFor,
+  isProviderConfigured,
+  modelReasoningEfforts,
+  parseContextWindow,
+  reasoningLevelsFor,
+} from './models';
 import { formatContextWindow } from '../../utils/formatTokens';
 import { MODELS } from '../models';
 import { displayModelName } from '../thread-events/exchange';
 import type { ModelInfo } from '../../api/types';
 
-function model(id: string, label: string, enabled = true, provider = 'anthropic'): ModelInfo {
+function model(
+  id: string,
+  label: string,
+  enabled = true,
+  provider = 'anthropic',
+  reasoning_efforts?: string[],
+): ModelInfo {
   return {
     id,
     label,
@@ -16,8 +29,12 @@ function model(id: string, label: string, enabled = true, provider = 'anthropic'
     enabled,
     context_window: null,
     created_at: '2026-01-01T00:00:00Z',
+    ...(reasoning_efforts ? { reasoning_efforts } : {}),
   };
 }
+
+/** What the engine serves for a `provider = local` row. */
+const LOCAL_TIERS = ['none', 'low', 'medium', 'high'];
 
 afterEach(() => {
   chatModels.value = { status: 'not-loaded' };
@@ -72,6 +89,68 @@ describe('chatModelOptions', () => {
     chatModels.value = { status: 'loaded', data: [model('gpt', 'GPT', true, 'openai')] };
     configuredProviders.value = [];
     expect(chatModelOptions()).toEqual([]);
+  });
+});
+
+// The picker's half of the fix. `reasoningLevelsFor` / `clampEffortFor` are the
+// ONLY way a Lucidos Agent surface should ask "what does this model support?",
+// so the engine's answer is used wherever it exists and the id-shape heuristic
+// is reached only when there is none.
+describe('modelReasoningEfforts', () => {
+  it('returns the registry answer for a loaded model', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [model('muse-glimmer:30b-mlx', 'Muse', true, 'local', LOCAL_TIERS)],
+    };
+    expect(modelReasoningEfforts('muse-glimmer:30b-mlx')).toEqual(LOCAL_TIERS);
+  });
+
+  it('cannot answer before the registry loads, or after it fails', () => {
+    chatModels.value = { status: 'not-loaded' };
+    expect(modelReasoningEfforts('muse-glimmer:30b-mlx')).toBeUndefined();
+    chatModels.value = { status: 'loading' };
+    expect(modelReasoningEfforts('muse-glimmer:30b-mlx')).toBeUndefined();
+    chatModels.value = { status: 'failed', error: 'nope' };
+    expect(modelReasoningEfforts('muse-glimmer:30b-mlx')).toBeUndefined();
+  });
+
+  it('cannot answer for an id with no row, or an engine predating the field', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [model('a', 'A', true, 'local', LOCAL_TIERS), model('older', 'Older')],
+    };
+    // A saved chat_model naming a model the user has since deleted.
+    expect(modelReasoningEfforts('deleted-model')).toBeUndefined();
+    // A row served without the field.
+    expect(modelReasoningEfforts('older')).toBeUndefined();
+  });
+});
+
+describe('reasoningLevelsFor / clampEffortFor', () => {
+  it('offers only what the engine says the model supports', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [model('muse-glimmer:30b-mlx', 'Muse', true, 'local', LOCAL_TIERS)],
+    };
+    expect(reasoningLevelsFor('muse-glimmer:30b-mlx').map((l) => l.value)).toEqual(LOCAL_TIERS);
+  });
+
+  // The reported bug, at the layer the user touches: switching to this model
+  // with the account effort at xhigh must land on a tier its server accepts.
+  it('snaps xhigh onto the closest tier a local model supports', () => {
+    chatModels.value = {
+      status: 'loaded',
+      data: [model('muse-glimmer:30b-mlx', 'Muse', true, 'local', LOCAL_TIERS)],
+    };
+    expect(clampEffortFor('xhigh', 'muse-glimmer:30b-mlx')).toBe('high');
+    expect(clampEffortFor('max', 'muse-glimmer:30b-mlx')).toBe('high');
+  });
+
+  it('falls back to the id-shape heuristic when the registry cannot answer', () => {
+    chatModels.value = { status: 'not-loaded' };
+    // Pre-load, a GPT-5.6 id still gets its full set so the picker is usable.
+    expect(reasoningLevelsFor('gpt-5.6-sol').map((l) => l.value)).toContain('max');
+    expect(clampEffortFor('max', 'gpt-5.4')).toBe('xhigh');
   });
 });
 

@@ -42,7 +42,7 @@ describe('releaseRowIsOpen', () => {
   it('opens nothing when the running release has no section of its own', () => {
     // A RELEASE bump ahead of its changelog entry. Marking the newest instead
     // would state something untrue about what is running.
-    expect(releaseRowIsOpen('0.26.3', isRunning('0.26.3', '0.27.0'), {})).toBe(false);
+    expect(releaseRowIsOpen('0.26.3', isRunning('0.26.3', '9.9.9'), {})).toBe(false);
   });
 });
 
@@ -77,7 +77,7 @@ describe('stripReleaseHeading', () => {
   // the offered row prints its version a second time as an h2 inside its body.
 
   it('takes the heading off and keeps its date', () => {
-    const notes = `## v0.27.0 ${EM_DASH} 2026-09-01\n\n### Added\n\n- the new thing\n`;
+    const notes = `## v9.9.9 ${EM_DASH} 2026-09-01\n\n### Added\n\n- the new thing\n`;
     expect(stripReleaseHeading(notes)).toEqual({
       date: '2026-09-01',
       body: '### Added\n\n- the new thing',
@@ -111,19 +111,19 @@ describe('offeredRelease', () => {
   it('carries the OFFERED version and the notes that came with it', () => {
     // The whole point of the row: these notes describe the release being
     // offered, which postdates the binary whose changelog the list below shows.
-    const offered = offeredRelease('0.27.0', '### Added\n\n- the new thing');
-    expect(offered).toEqual({ version: '0.27.0', date: null, notes: '### Added\n\n- the new thing' });
+    const offered = offeredRelease('9.9.9', '### Added\n\n- the new thing');
+    expect(offered).toEqual({ version: '9.9.9', date: null, notes: '### Added\n\n- the new thing' });
   });
 
   it('strips the heading the manifest ships, so the version is not printed twice', () => {
-    const offered = offeredRelease('0.27.0', `## v0.27.0 ${EM_DASH} 2026-09-01\n\n- the new thing`);
-    expect(offered).toEqual({ version: '0.27.0', date: '2026-09-01', notes: '- the new thing' });
+    const offered = offeredRelease('9.9.9', `## v9.9.9 ${EM_DASH} 2026-09-01\n\n- the new thing`);
+    expect(offered).toEqual({ version: '9.9.9', date: '2026-09-01', notes: '- the new thing' });
   });
 
   it('renders no row when the notes were nothing but a heading', () => {
     // Same reasoning as a notes-free manifest: an Available row that expands
     // onto an empty body is an affordance that opens onto nothing.
-    expect(offeredRelease('0.27.0', `## v0.27.0 ${EM_DASH} 2026-09-01\n`)).toBe(null);
+    expect(offeredRelease('9.9.9', `## v9.9.9 ${EM_DASH} 2026-09-01\n`)).toBe(null);
   });
 
   it('renders no row when there is no update to describe', () => {
@@ -134,6 +134,6 @@ describe('offeredRelease', () => {
     // An affordance that opens onto nothing is worse than no affordance. It must
     // NOT fall back to the installed changelog: that would show the notes for
     // the version already running under a heading naming a different one.
-    expect(offeredRelease('0.27.0', null)).toBe(null);
+    expect(offeredRelease('9.9.9', null)).toBe(null);
   });
 });

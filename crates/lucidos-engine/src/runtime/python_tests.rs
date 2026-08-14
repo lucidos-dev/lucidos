@@ -159,11 +159,11 @@ async fn test_staging_non_data_writes_go_to_workspace() {
     assert!(ws.join("scratch.txt").exists());
 }
 
-/// Regression: the staging preamble matched the `data` prefix without a
-/// trailing separator, so a SIBLING whose name merely starts with it was
-/// treated as a `data/` write and diverted into the staging tree. The
-/// committer copies only `<staging>/data` back before deleting that tree, so
-/// those writes were silently discarded while `run_python` reported success.
+/// Regression: a `data` prefix match without a trailing separator treats a
+/// SIBLING like `database.json` as a `data/` write, and diverts it into the
+/// staging tree. The committer copies only `<staging>/data` back before
+/// deleting that tree, so the write is silently discarded while `run_python`
+/// reports success.
 ///
 /// The sibling names below are the three real shapes: a file (`database.json`),
 /// a directory (`datasets/`), and an underscore variant (`data_backup/`).
@@ -211,15 +211,10 @@ async fn test_staging_data_prefixed_siblings_are_not_diverted() {
 
 // ── scripts execute in place ───────────────────────────────────────────
 //
-// Regression coverage for the 2026-07-29 `notary-verdict-watch` incident:
-// `execute_script`'s `.py` branch used to slurp the on-disk script into a
-// String and hand it to `execute_with_env`, which writes a COPY to
-// `.lucidos/exhaust/<uuid>/script.py` and runs that. `__file__` then pointed
-// into the exhaust dir, so every `__file__`-relative sibling path resolved to
-// a phantom `.lucidos/exhaust/<sibling>` — reads returned defaults, writes
-// created the phantom dir, and nothing errored. The trigger withheld a release
-// publish claiming no DMG approval existed while the approval sat in the real
-// `data/triggers/notary-verdict-watch/state/`.
+// A `.py` script must run from where it lives. Running a COPY out of
+// `.lucidos/exhaust/<uuid>/` points `__file__` into the exhaust dir, so every
+// `__file__`-relative sibling path resolves to a phantom neighbour: reads
+// return defaults, writes create the phantom dir, and nothing errors.
 
 /// Create a realistic script-trigger layout inside `ws`:
 /// `data/triggers/<slug>/scripts/run.py` holding `body`. Returns the script's
@@ -381,8 +376,8 @@ async fn execute_file_shapes_errors_like_run_script() {
     assert!(err.contains("ValueError: kaboom"), "got: {err}");
 }
 
-/// Env vars reach an in-place script the same way they reach a string-code one
-/// — `execute_script` injects `LUCIDOS_*`, `CRED_*`, `OAUTH_*`, and the trigger
+/// Env vars reach an in-place script the same way they reach a string-code one.
+/// `execute_script` injects `LUCIDOS_*`, `CRED_*`, `OAUTH_*`, and the trigger
 /// event vars through exactly this argument.
 #[tokio::test]
 async fn execute_file_applies_env_vars() {
@@ -409,10 +404,9 @@ async fn execute_file_applies_env_vars() {
     assert_eq!(out.trim(), "NotaryVerdictReceived");
 }
 
-/// The two paths must stay distinct: `run_python`-style string execution has no
-/// file on disk, so its `__file__` legitimately IS the exhaust copy, and that
-/// copy is the only record of what ran. A refactor that "unifies" them by
-/// making string code run from somewhere else would drop that audit copy.
+/// The two paths must stay distinct. `run_python`-style string execution has no
+/// file on disk, so its `__file__` legitimately IS the exhaust copy. That copy
+/// is the only record of what ran, and unifying the two paths would drop it.
 #[tokio::test]
 async fn execute_with_env_still_runs_from_the_exhaust_copy() {
     let dir = tempdir().unwrap();
@@ -435,12 +429,11 @@ async fn execute_with_env_still_runs_from_the_exhaust_copy() {
     );
 }
 
-/// `python_bin()` + `ensure_venv()` are the public API the
-/// `run_python_background` chat tool needs to hand a venv-rooted python
-/// invocation off to `BackgroundBashRegistry::spawn` — without these,
-/// the background tool can't see the per-workspace venv. Pin both as
-/// public + working together so a refactor that hides one or the other
-/// trips this test instead of breaking the LLM-facing surface.
+/// `python_bin()` and `ensure_venv()` are the public API the
+/// `run_python_background` chat tool needs, to hand a venv-rooted python
+/// invocation to `BackgroundBashRegistry::spawn`. Without them the background
+/// tool cannot see the per-workspace venv. Pin both as public and working
+/// together, so hiding either trips this test rather than the LLM surface.
 #[tokio::test]
 async fn ensure_venv_makes_python_bin_executable() {
     let dir = tempdir().unwrap();
@@ -477,28 +470,21 @@ async fn ensure_venv_makes_python_bin_executable() {
     );
 }
 
-/// Regression: a hung subprocess (e.g. `urllib.request.urlopen` to a
-/// dead host with no timeout) used to park the agent loop forever
-/// because (a) the loop didn't race execute_tool against cancel, and
-/// (b) even when the future was dropped, tokio's Child does NOT kill
-/// its OS child on drop unless `kill_on_drop(true)` is set.
+/// Regression: a hung subprocess parks the agent loop forever unless two
+/// things hold. The loop must race `execute_tool` against cancel, and the
+/// Command must set `kill_on_drop(true)`, because tokio's `Child` does not
+/// kill its OS child on drop.
 ///
-/// This test pins (b): drop the execute() future via tokio::select!
-/// against a cancel, then verify the python child has actually
-/// exited (no zombie). Uses a marker file as the witness — if the
-/// subprocess survives the drop, it overwrites the marker after
-/// `time.sleep(2)`; if it was SIGKILL'd, the marker keeps its initial
-/// content. We check after 3s (longer than the python sleep) so a
-/// surviving child has had time to expose itself.
+/// This test pins the second. Drop the `execute()` future against a cancel,
+/// then check the python child actually exited. The marker file is the
+/// witness: a surviving subprocess overwrites it after `time.sleep(2)`, a
+/// SIGKILLed one leaves the initial content. The read happens after 3s, so a
+/// survivor has had time to expose itself.
 ///
-/// The cancel fires on the marker APPEARING, not on a fixed timer. A
-/// 500 ms head start was enough on an idle machine and not on a loaded
-/// one: under a full-suite run a cold interpreter had not reached step 1
-/// yet, so the marker never existed and the test failed at the read with
-/// `NotFound` (observed 2026-08-04, on a host where venv creation alone
-/// took 12 s). That failure measured host speed, not `kill_on_drop`.
-/// Waiting for the witness asserts the real property, and the python
-/// `sleep(2)` still leaves a wide margin before step 3 could run.
+/// The cancel fires on the marker APPEARING, not on a fixed timer. A fixed
+/// head start measures host speed instead. On a loaded host a cold interpreter
+/// has not reached step 1, so the marker never exists and the read fails with
+/// `NotFound`.
 #[tokio::test]
 async fn execute_kills_subprocess_when_future_dropped() {
     let dir = tempdir().unwrap();
@@ -515,9 +501,8 @@ async fn execute_kills_subprocess_when_future_dropped() {
         m = marker_str,
     );
 
-    // Pre-warm the venv so the cancel below races the actual subprocess
-    // and not the one-time venv creation (which can take a couple seconds
-    // on a fresh tempdir).
+    // Pre-warm the venv so the cancel below races the actual subprocess, not
+    // the one-time venv creation, which takes seconds on a fresh tempdir.
     runtime.execute("print('warmup')").await.expect("warmup");
 
     let token = tokio_util::sync::CancellationToken::new();
@@ -561,25 +546,22 @@ async fn execute_kills_subprocess_when_future_dropped() {
 
 // ── the hard execution ceiling ─────────────────────────────────────────
 //
-// Regression coverage for the 2026-08-07 incident: the synchronous python
-// path had no timeout at all, so a fixture generator with a runaway loop
-// spun at 100% CPU for 20 minutes until the user noticed and killed the OS
-// process by hand. `run_bash` had bounded its child since forever, and so
-// had the `.sh` half of the very same scheduled-script path; only python
-// was unbounded, while three sibling tool descriptions and the
-// `running-python` knowhow all promised a 300s ceiling that did not exist.
+// The synchronous python path must be bounded. Unbounded, a runaway loop
+// spins at 100% CPU until someone kills the OS process by hand. Three sibling
+// tool descriptions and the `running-python` knowhow all promise a 300s
+// ceiling.
 //
 // Every test here injects a short ceiling via `with_execution_timeout`. The
 // real one is 300s and a suite that waited it out is a suite nobody runs.
 
-/// Longer than any injected ceiling in this file by a wide margin, so a run
-/// that returns quickly can only have been killed, never have finished.
+/// Longer than any injected ceiling in this file by a wide margin. A run that
+/// returns quickly can only have been killed, never have finished.
 const RUNAWAY_SLEEP_SECS: u64 = 60;
 
 /// Create a runtime whose venv is already built, then shorten its ceiling.
 /// Venv creation is deliberately NOT covered by the timeout, but on a cold
-/// tempdir it can take seconds, and a test measuring the ceiling must not be
-/// measuring that instead.
+/// tempdir it takes seconds. A test measuring the ceiling must not measure
+/// that instead.
 async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> PythonRuntime {
     let runtime = PythonRuntime::new(workspace.to_path_buf()).unwrap();
     runtime.execute("print('warmup')").await.expect("warmup");
@@ -587,8 +569,8 @@ async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> Pytho
 }
 
 /// The ceiling the rest of the system quotes. `llm/tools/exec.rs` states it in
-/// three tool descriptions and `system-knowhow/running-python.md` puts it in
-/// the pick-your-tool table; a change here that leaves those alone puts the
+/// three tool descriptions, and `system-knowhow/running-python.md` puts it in
+/// the pick-your-tool table. A change here that leaves those alone puts the
 /// docs back to describing a mechanism that does not exist.
 #[test]
 fn the_default_ceiling_is_the_300s_the_docs_promise() {
@@ -608,9 +590,9 @@ fn the_default_ceiling_is_the_300s_the_docs_promise() {
 }
 
 /// The headline property: a script that outruns the ceiling comes back as an
-/// ordinary `Err`, promptly, instead of hanging the turn. The message has to
-/// name the ceiling and point at the escape hatch, because this error is the
-/// exact moment an agent needs to learn `run_python_background` exists.
+/// ordinary `Err`, promptly, instead of hanging the turn. The message names the
+/// ceiling and points at the escape hatch. This error is the exact moment an
+/// agent needs to learn `run_python_background` exists.
 #[tokio::test]
 async fn sync_execution_is_bounded_by_the_hard_ceiling() {
     let dir = tempdir().unwrap();
@@ -717,11 +699,9 @@ async fn a_timed_out_staged_run_leaves_data_untouched() {
     );
 }
 
-/// An in-place script gets the same ceiling. An unbounded trigger script is
-/// the same hazard as an unbounded `run_python`, and the `.sh` branch of the
-/// very same `execute_script` dispatch (engine_impl/scripts.rs) has spent a
-/// 300s budget all along, so leaving `.py` unbounded was an asymmetry rather
-/// than a decision.
+/// An in-place script gets the same ceiling. An unbounded trigger script is the
+/// same hazard as an unbounded `run_python`. The `.sh` branch of the same
+/// `execute_script` dispatch has spent a 300s budget all along.
 #[tokio::test]
 async fn an_in_place_script_gets_the_ceiling_too() {
     let dir = tempdir().unwrap();
@@ -803,13 +783,11 @@ async fn a_timeout_leaves_a_note_in_the_exhaust_dir() {
 }
 
 // -----------------------------------------------------------------
-// truncate_python_error — context-trim tests.
+// truncate_python_error, context-trim tests.
 //
-// Real-world cases from a live `dev` thread, 9d44e81c-….
-// The agent there returned ~30-line ModuleNotFoundError
-// tracebacks for every retry; the relevant signal is the exception
-// line + the user frame, so the truncator must always preserve
-// those.
+// A retried import failure returns a 30-line ModuleNotFoundError
+// traceback every time. The signal is the exception line and the
+// user frame, so the truncator must always preserve those two.
 // -----------------------------------------------------------------
 
 use super::truncate_python_error;
@@ -887,9 +865,8 @@ fn long_traceback_keeps_first_and_last_frame_plus_exception() {
 
 #[test]
 fn short_traceback_under_budget_returns_verbatim() {
-    // Three frames — under the 4-frame threshold — should pass
-    // through untouched even though the byte count crosses the
-    // line-count budget (none of the lines are long).
+    // Three frames, under the 4-frame threshold, pass through untouched even
+    // though the byte count crosses the line-count budget.
     let tb = "Traceback (most recent call last):\n\
               \x20 File \"a.py\", line 1, in <module>\n    f()\n\
               \x20 File \"b.py\", line 2, in f\n    g()\n\
@@ -967,16 +944,13 @@ fn empty_stderr_returns_empty() {
 
 #[test]
 fn exception_preserved_when_last_frame_has_no_source_line() {
-    // Regression: tracebacks from frozen importlib._bootstrap,
-    // C-extension boundaries, or some re-raise paths can land the
-    // exception line at exactly `last_file + 1` (no indented
-    // source line between the last frame and the exception). The
-    // exception MUST still be preserved — it's the single most
-    // actionable line.
+    // Regression: frozen importlib._bootstrap, C-extension boundaries and
+    // some re-raise paths land the exception line at exactly `last_file + 1`,
+    // with no indented source line before it. The exception MUST still be
+    // preserved: it is the single most actionable line.
     //
-    // Use 40 frames so we exceed the 30-line budget and the
-    // truncator engages. Each File line, no indented code line
-    // between frames (mimicking frozen importlib._bootstrap).
+    // Use 40 frames so we exceed the 30-line budget and the truncator
+    // engages. Each File line, no indented code line between frames.
     let mut tb = String::from("Traceback (most recent call last):\n");
     for i in 0..40 {
         tb.push_str(&format!(
@@ -1018,17 +992,16 @@ fn module_not_found_realistic_shape() {
 
 // ── agent-origin shim: auto-token forwarding ────────────────────────────
 //
-// Regression coverage for the chip-mislabel incident (`dec8a433-…`): the
-// Lucidos agent POSTed `/api/v1/changes/<id>/apply` via raw
-// `urllib.request.urlopen` without the agent-origin token, so the
-// resulting `ChangeApplied` event stamped `Api { mode: Human }` and the
-// timeline rendered the apply as "You". The shim installed by
-// `install_agent_origin_shim` (a `.pth`-loaded `_lucidos_agent_origin`
-// module, NOT `sitecustomize.py` — Homebrew Python shadows that) patches
-// `http.client.HTTPConnection.request` so that any urllib / requests /
-// urllib3 / http.client call to `localhost:LUCIDOS_API_PORT` auto-attaches
-// the token + source thread headers. These tests pin the patched behaviour
-// end-to-end by running real Python against a real local TCP listener.
+// A Lucidos agent that POSTs the engine over raw `urllib.request.urlopen`
+// carries no agent-origin token. The resulting event then stamps
+// `Api { mode: Human }` and the timeline renders it as "You".
+//
+// `install_agent_origin_shim` patches `http.client.HTTPConnection.request`, so
+// any urllib, requests, urllib3 or http.client call to
+// `localhost:LUCIDOS_API_PORT` auto-attaches the token and source thread
+// headers. It is a `.pth`-loaded `_lucidos_agent_origin` module, NOT a
+// `sitecustomize.py`, which Homebrew Python shadows. These tests pin the
+// patched behaviour end-to-end against a real local TCP listener.
 
 /// Read the raw HTTP request bytes off a localhost listener and return
 /// the lowercased header set. Closes on the first request — enough to
@@ -1068,9 +1041,8 @@ async fn capture_one_request_headers(
 
 /// With both LUCIDOS_AGENT_ORIGIN_TOKEN and LUCIDOS_API_PORT set, a raw
 /// `urllib.request.urlopen(http://localhost:PORT/...)` from a Lucidos
-/// subprocess automatically carries the agent-origin token and the
-/// spawning thread id — the exact path the incident agent took, now
-/// covered.
+/// subprocess automatically carries the agent-origin token and the spawning
+/// thread id.
 #[tokio::test]
 async fn agent_origin_shim_forwards_token_on_urllib_request_to_engine_port() {
     let dir = tempdir().unwrap();
@@ -1120,23 +1092,18 @@ print('done')
     );
 }
 
-/// Inert when the agent-origin token env var is missing — pip installs
-/// to PyPI, ad-hoc localhost calls, and any non-Lucidos use of this venv
-/// must not have headers injected. Without this gate, raw `python -m pip
-/// install ...` from outside a subprocess context would leak the
-/// non-existent token (no crash, but the silent permissiveness is a bad
-/// default).
+/// Inert when the agent-origin token env var is missing. Pip installs to PyPI,
+/// ad-hoc localhost calls, and any non-Lucidos use of this venv must not have
+/// headers injected.
 ///
-/// Test integrity: when `cargo test` runs from a Lucidos subprocess (CC),
-/// the engine has already stamped `LUCIDOS_AGENT_ORIGIN_TOKEN` and
-/// `LUCIDOS_API_PORT` into the env. `tokio::process::Command::env` adds
-/// vars without clearing the inherited set, so the python child would
-/// inherit them and the sitecustomize WOULD install — the assertion
-/// would still pass only because the listener's random port mismatches
-/// the inherited engine port. To pin the real "no token = no patch"
-/// guarantee, pass explicit empty-string overrides; the shim's
-/// gate (`if _TOKEN and _PORT:`) treats empty strings as falsy and
-/// skips the patch.
+/// Test integrity: when `cargo test` runs from a Lucidos subprocess, the engine
+/// has already stamped `LUCIDOS_AGENT_ORIGIN_TOKEN` and `LUCIDOS_API_PORT` into
+/// the env. `tokio::process::Command::env` adds vars without clearing the
+/// inherited set, so the python child would inherit them and the shim WOULD
+/// install. The assertion would then pass only because the listener's random
+/// port mismatches the inherited engine port. So pass explicit empty-string
+/// overrides: the shim's gate (`if _TOKEN and _PORT:`) treats an empty string
+/// as falsy and skips the patch.
 #[tokio::test]
 async fn agent_origin_shim_does_not_forward_token_when_env_missing() {
     let dir = tempdir().unwrap();
@@ -1177,11 +1144,10 @@ print('done')
     );
 }
 
-/// Strict-port gate: a Lucidos subprocess that happens to call a
-/// non-engine localhost service (the user's own dev server on a different
-/// port) must NOT receive the engine's token. Leaking a per-engine-startup
-/// secret to arbitrary localhost listeners is bad hygiene even though
-/// they would ignore the header — pin the gate so a future "any localhost"
+/// Strict-port gate: a Lucidos subprocess calling a non-engine localhost
+/// service must NOT receive the engine's token. Leaking a per-engine-startup
+/// secret to arbitrary localhost listeners is bad hygiene, even though they
+/// would ignore the header. Pin the gate so a future "any localhost"
 /// relaxation lands here first.
 #[tokio::test]
 async fn agent_origin_shim_does_not_forward_token_on_non_engine_port() {
@@ -1227,19 +1193,17 @@ print('done')
     );
 }
 
-/// Host-independent regression for the Homebrew-Python shadow bug: a
-/// `sitecustomize.py` earlier on `sys.path` (Homebrew ships one in its stdlib
-/// dir) shadows the venv's by single-module-name resolution, so a
-/// `sitecustomize.py`-based shim never ran and `urllib` calls landed as "You".
-/// We now load via a `.pth` import, which `site` execs for EVERY `.pth`
-/// regardless of any competing `sitecustomize`. This test plants a no-op
-/// `sitecustomize.py` on `PYTHONPATH` (earlier than the venv site-packages),
-/// proving the shadow is active, and asserts the token is STILL forwarded.
+/// Host-independent regression for the Homebrew-Python shadow bug. A
+/// `sitecustomize.py` earlier on `sys.path` shadows the venv's own by
+/// single-module-name resolution, and Homebrew ships one in its stdlib dir.
+/// A `sitecustomize.py`-based shim therefore never runs. We load via a `.pth`
+/// import instead, which `site` execs for EVERY `.pth` regardless of any
+/// competing `sitecustomize`.
 ///
-/// Against the old `sitecustomize.py` mechanism this assertion fails (the
-/// plant wins and our shim never runs) — it is the durable reproduction the
-/// original test could only catch on a machine that happened to ship a
-/// shadowing `sitecustomize`.
+/// The test plants a no-op `sitecustomize.py` on `PYTHONPATH`, earlier than
+/// the venv site-packages. That proves the shadow is active, and the token is
+/// STILL forwarded. It is the durable reproduction, where the original test
+/// only caught this on a host that shipped a shadowing `sitecustomize`.
 #[tokio::test]
 async fn agent_origin_shim_survives_shadowing_sitecustomize() {
     let dir = tempdir().unwrap();

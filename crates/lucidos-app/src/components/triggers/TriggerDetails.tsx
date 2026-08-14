@@ -4,8 +4,10 @@ import {
   closeTriggerForm,
   submitTrigger,
 } from '../../store/actions/triggers';
-import { chatModelOptions, loadChatModels } from '../../store/actions/models';
-import { availableReasoningLevels, clampReasoningEffort, REASONING_LEVELS } from '../../store/models';
+import {
+  chatModelOptions, clampEffortFor, loadChatModels, reasoningLevelsFor,
+} from '../../store/actions/models';
+import { REASONING_LEVELS } from '../../store/models';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
 import type { EventSubscription, SideEffectCategory, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
@@ -369,7 +371,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       REASONING_LEVELS.find(l => l.value === reasoningEffort.value)?.label ?? reasoningEffort.value;
     return [
       { value: '', label: `Default (${accountLabel})` },
-      ...availableReasoningLevels(effectiveModel),
+      ...reasoningLevelsFor(effectiveModel),
     ];
   })();
 
@@ -380,7 +382,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   function handleModelChange(next: string) {
     setModel(next);
     if (triggerEffort) {
-      setTriggerEffort(clampReasoningEffort(triggerEffort, next || currentModel.value));
+      setTriggerEffort(clampEffortFor(triggerEffort, next || currentModel.value));
     }
   }
 

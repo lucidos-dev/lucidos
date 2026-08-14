@@ -3,9 +3,8 @@
  *
  * Draft text / images / mode pick live in the sibling `composeDrafts` signal
  * (see `store/composeDrafts.ts`). `threadMap[id].meta.state` is the lifecycle
- * marker (composing → active → discarded → archived); the draft signal moves
- * separately so per-keystroke writes don't ripple through every threadMap
- * subscriber. Mutations go through:
+ * marker. The draft signal moves separately, so per-keystroke writes do not
+ * ripple through every threadMap subscriber. Mutations go through:
  *   - updateCompose(id, patch)         — optimistic local + debounced PUT
  *   - startComposeIfNeeded(id, mode)   — POST /threads (idempotent)
  *   - discardCompose(id)               — DELETE /threads/:id, state→discarded
@@ -62,14 +61,14 @@ function scopeEquals(a: Scope, b: Scope): boolean {
   return true;
 }
 
-/** Apply a picked compose destination: set the channel (global `inputMode` +
- *  the composing draft's `mode`, mirroring the retired segmented-control
- *  `setMode`) and, for coding targets, the scope. Each write is guarded so a
- *  same-value re-pick (the Dropdown fires onChange on every click, including
- *  the already-selected option) is a no-op — no signal-identity churn, no
- *  debounced compose PUT, no SSE fan-out. The draft patch only applies to a
- *  focused composing thread — once active, the channel is locked server-side
- *  and the picker is hidden anyway. */
+/** Apply a picked compose destination: set the channel (global `inputMode` plus
+ *  the composing draft's `mode`) and, for coding targets, the scope.
+ *
+ *  Each write is guarded so a same-value re-pick is a no-op, with no
+ *  signal-identity churn, no debounced compose PUT and no SSE fan-out. The
+ *  Dropdown fires onChange on every click, the already-selected option
+ *  included. The draft patch only applies to a focused composing thread: once
+ *  active, the channel is locked server-side and the picker is hidden. */
 export function applyDestination(threadId: string | null, d: ComposeDestination): void {
   const mode: ComposeMode = d.kind === 'coding' ? 'claude_code' : 'lucidos';
   const modeType = mode === 'claude_code' ? 'coding_agent' : 'do';
@@ -85,19 +84,18 @@ export function applyDestination(threadId: string | null, d: ComposeDestination)
   // pending slot.
   if (d.kind === 'coding') {
     // Update the localStorage last-used scope seed (persisted by effects.ts) so
-    // the NEXT new draft / the fresh compose view starts from this target. This
-    // is leak-safe: `resolveScope` reads `selectedScope` ONLY for the no-draft
-    // compose view — an existing draft resolves its OWN stored scope — so this
-    // write can't move another draft (the bug the per-draft design fixed).
+    // the NEXT new draft starts from this target. Leak-safe: `resolveScope`
+    // reads `selectedScope` ONLY for the no-draft compose view, an existing
+    // draft resolving its OWN stored scope, so this cannot move another draft.
     if (!scopeEquals(selectedScope.value, d.scope)) {
       selectedScope.value = d.scope;
     }
     const current = getComposeSelectionOverride(threadId).scope;
     if (!current || !scopeEquals(current, d.scope)) {
       patchComposeSelection(threadId, { scope: d.scope });
-      // A scope change with no accompanying mode change wouldn't otherwise fire a
-      // compose PUT — persist the per-draft scope, and mark locally-edited so a
-      // stale loadAllThreads snapshot can't revert it (mirrors updateComposeSelection).
+      // A scope change with no mode change would otherwise fire no compose PUT.
+      // Persist the per-draft scope, and mark locally-edited so a stale
+      // loadAllThreads snapshot cannot revert it.
       if (threadId) {
         markLocallyEdited(threadId);
         schedulePush(threadId);
@@ -123,56 +121,55 @@ export function currentComposeMode(): ComposeMode {
 }
 
 /** Debounce window between keystrokes and the server PUT. Short enough that a
- *  peer device sees the change within a normal eye-blink; long enough that a
- *  continuous typist doesn't flood the engine + SSE fan-out per character. */
+ *  peer device sees the change within an eye-blink. Long enough that a
+ *  continuous typist does not flood the engine and SSE fan-out per character. */
 const DEBOUNCE_MS = 250;
 
 const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-/** Thread ids with a pending PUT — covers the entire window from "optimistic
- *  local write committed" through "server PUT acked", including the 250ms
- *  debounce. SSE and loadAllThreads consult this set to avoid clobbering a
- *  local change the server hasn't seen yet. The debounce window matters on
- *  iOS PWA: PHPicker dismissal fires visibilitychange (→ loadAllThreads) at
- *  roughly the same instant as the file input's change event, so without
- *  covering the debounce, a freshly attached image is overwritten by the
- *  server's stale empty array before the PUT even goes out. */
+/** Thread ids with a pending PUT. Covers the whole window from the optimistic
+ *  local write to the server PUT's ack, the debounce included. SSE and
+ *  loadAllThreads consult this set to avoid clobbering a local change the
+ *  server has not seen yet.
+ *
+ *  Covering the DEBOUNCE matters on an iOS PWA. PHPicker dismissal fires
+ *  visibilitychange, and so loadAllThreads, at roughly the same instant as the
+ *  file input's change event. Without it, a freshly attached image is
+ *  overwritten by the server's stale empty array before the PUT goes out. */
 export const pendingComposePuts = new Set<string>();
 
 /** Per-thread timestamp of the last local compose mutation (Date.now()).
- *  loadAllThreads / ensureThread* capture their own request start time and
- *  consult this map: if the thread was edited *after* the GET started, the
- *  response is by definition stale wrt compose state and the overwrite is
- *  skipped. Without this, a stale GET issued before the user's photo attach
- *  but whose response lands AFTER pushNow's PUT clears `pendingComposePuts`
- *  silently overwrites the optimistic image with the server's pre-PUT
- *  snapshot — preview appears, then disappears. Stays set forever (no
- *  expiry); cross-device sync still works because legitimate refreshes
- *  capture a request time AFTER the last local edit. */
+ *  loadAllThreads and ensureThread* capture their own request start time and
+ *  consult this map. A thread edited AFTER the GET started makes the response
+ *  stale for compose state, so the overwrite is skipped.
+ *
+ *  Without it, a GET issued before the user's photo attach, yet landing after
+ *  pushNow's PUT clears `pendingComposePuts`, overwrites the optimistic image.
+ *  Stays set forever, with no expiry. Cross-device sync still works, a
+ *  legitimate refresh capturing a request time after the last local edit. */
 export const composeEditedAt = new Map<string, number>();
 
-/** Per-thread timestamp of the last compose PUT *settling* (Date.now()),
- *  stamped in pushNow's finally. Closes the inverse of the `composeEditedAt`
- *  hole: when the edit happened BEFORE a stale GET started (so
- *  `composeEditedAt` is older than the GET's request time) but the debounced
- *  PUT only settled AFTER the GET started, the GET's server snapshot was read
- *  before the PUT committed — yet by the time its response lands
- *  `pendingComposePuts` is already cleared. upsertThread consults this map and
- *  skips the overwrite when a PUT settled AT OR AFTER the GET went out. Without
- *  it, the "thread draft persists when switching to compose and back" flow
- *  intermittently blanks the restored draft (drafts.spec.ts:65). Stays set
- *  forever (no expiry); cross-device sync still works because a legitimate
- *  later refresh captures a request time AFTER the last local PUT settled. */
+/** Per-thread timestamp of the last compose PUT settling (Date.now()), stamped
+ *  in pushNow's finally. Closes the inverse of the `composeEditedAt` hole: an
+ *  edit made BEFORE a stale GET started, whose debounced PUT settled only
+ *  AFTER. The GET's server snapshot was read before the PUT committed, yet
+ *  `pendingComposePuts` is already cleared by the time its response lands.
+ *
+ *  upsertThread consults this map and skips the overwrite when a PUT settled at
+ *  or after the GET went out. Stays set forever, with no expiry. Cross-device
+ *  sync still works, a legitimate later refresh capturing a request time after
+ *  the last local PUT settled. */
 export const composePutSettledAt = new Map<string, number>();
 
 /** Per-thread SERVER-time watermark captured at the last local compose edit:
  *  the newest `thread_summaries.last_activity` this device had seen for the
- *  thread at that moment (`meta.updatedAt`). Stamped together with
- *  `composeEditedAt` by `markLocallyEdited`, and what makes a *superseded
- *  draft* decidable WITHOUT ever comparing a client clock to a server clock —
- *  both sides of the test (`draftIsSuperseded`) are server timestamps. Absent =
- *  this device never authored the draft, so there is no reference point and
- *  nothing can supersede it (the existing clear paths own that case). */
+ *  thread (`meta.updatedAt`). Stamped with `composeEditedAt` by
+ *  `markLocallyEdited`.
+ *
+ *  It makes a *superseded draft* decidable without ever comparing a client
+ *  clock to a server clock, both sides of `draftIsSuperseded` being server
+ *  timestamps. Absent means this device never authored the draft, so there is
+ *  no reference point and nothing can supersede it. */
 export const composeEditWatermark = new Map<string, string>();
 
 /** What the server holds for a thread's draft — the compose fields the
@@ -188,20 +185,19 @@ export interface ServerDraft {
  *  snapshot, and a `ThreadComposeChanged` broadcast. Absent = never heard, so
  *  nothing is known.
  *
- *  It is the second half of the supersede rule, and the half that keeps a
- *  RE-TYPE safe when this device hadn't yet seen the submission: if the server
- *  still holds our draft, our PUT landed AFTER the submission cleared compose,
- *  so the draft is deliberate new work rather than the submission itself.
- *  Server-event ordering alone cannot tell those apart — the watermark is stale
- *  in exactly that case.
+ *  It is the second half of the supersede rule. It is also the half that keeps
+ *  a RE-TYPE safe when this device had not yet seen the submission. A server
+ *  still holding our draft proves our PUT landed AFTER the submission cleared
+ *  compose. The draft is then new work, not the submission itself. Server-event
+ *  ordering alone cannot tell those apart, the watermark being stale in exactly
+ *  that case.
  *
- *  Deliberately NOT written from thread events, even though the projection
- *  clears the compose fields in the same transaction as `MessageReceived`: an
- *  event can be *delivered* long after it was written (a lagging stream, a
- *  throttled tab, replay on wake), so it is no evidence of what the server holds
- *  NOW — and letting a late one overwrite a newer PUT ack would re-open the very
- *  hole this map closes. Only a report the server made about its CURRENT compose
- *  state counts. */
+ *  **Deliberately NOT written from thread events**, even though the projection
+ *  clears the compose fields in the same transaction as `MessageReceived`. An
+ *  event can be delivered long after it was written, so it is no evidence of
+ *  what the server holds NOW. Letting a late one overwrite a newer PUT ack
+ *  would re-open the hole this map closes. Only a report the server made about
+ *  its CURRENT compose state counts. */
 export const serverDraft = new Map<string, ServerDraft>();
 
 /** Record a server report of the thread's stored draft. Copies the hash array:
@@ -211,21 +207,21 @@ export function noteServerDraft(threadId: string, text: string, imageHashes: rea
   serverDraft.set(threadId, { text, imageHashes: [...imageHashes] });
 }
 
-/** This device's knowledge of each thread's *compose epoch* (`docs/glossary.md`):
- *  how many times a submission has consumed the thread's compose slot. Echoed on
- *  every compose PUT so the engine can refuse a write composed before a
- *  submission that has since landed, which is what stops a stalled draft PUT
- *  from resurrecting the text a send already consumed.
+/** This device's knowledge of each thread's *compose epoch*
+ *  (`docs/glossary.md`): how many times a submission has consumed the thread's
+ *  compose slot. Echoed on every compose PUT, so the engine can refuse a write
+ *  composed before a submission that has since landed. That stops a stalled
+ *  draft PUT from resurrecting text a send already consumed.
  *
- *  Absent = never heard, so the PUT goes out unfenced. That is the honest
+ *  Absent means never heard, so the PUT goes out unfenced. That is the honest
  *  reading of "we do not know", and it matches how the engine treats a missing
  *  epoch. Learned from three places, all of them the engine reporting its own
- *  state: a thread-summary snapshot, a `ThreadComposeChanged` broadcast, and the
- *  `412` that refuses a stale write. */
+ *  state: a thread-summary snapshot, a `ThreadComposeChanged` broadcast, and
+ *  the `412` that refuses a stale write. */
 const composeEpoch = new Map<string, number>();
 
 /** Record an engine report of the thread's compose epoch. Monotonic: a frame
- *  delayed past a newer one must not walk the value backwards, which would make
+ *  delayed past a newer one must not walk the value backwards. That would make
  *  the next write fail a fence it had already cleared. */
 export function noteComposeEpoch(threadId: string, epoch: number | undefined): void {
   if (typeof epoch !== 'number') return;
@@ -241,20 +237,21 @@ export function _composeEpochForTesting(threadId: string): number | undefined {
 
 function markLocallyEdited(threadId: string): void {
   composeEditedAt.set(threadId, Date.now());
-  // `.peek()`, not `.value`: this runs from input/event handlers on the
-  // keystroke path, and subscribing the caller to `threadMap` here would wake
-  // every threadMap consumer per character (the whole reason draft text lives
-  // outside threadMap in the first place).
+  // `.peek()`, not `.value`. This runs from input handlers on the keystroke
+  // path, and subscribing the caller to `threadMap` here would wake every
+  // threadMap consumer per character. That is why draft text lives outside
+  // threadMap at all.
   composeEditWatermark.set(threadId, threadMap.peek().get(threadId)?.meta.updatedAt ?? '');
 }
 
 /** The composer content a persisted event represents, or `null` when the event
  *  is not something the user's composer submitted. A deliberately CLOSED set:
- *  a sent message, and the two question answers that can carry typed text (the
- *  free-form answer path never emits `MessageReceived` — chat/process/run.rs
- *  reroutes typed text straight to `UserQuestionAnswered`). Agent- and
- *  engine-authored entries — `UserPromptInjected` above all — are NOT user
- *  submissions and must never supersede a draft. */
+ *  a sent message, and the two question answers that can carry typed text. The
+ *  free-form answer path emits no `MessageReceived`, chat/process/run.rs
+ *  rerouting typed text straight to `UserQuestionAnswered`.
+ *
+ *  Agent- and engine-authored entries, `UserPromptInjected` above all, are NOT
+ *  user submissions and must never supersede a draft. */
 function submittedUserInput(event: StoredEvent): { text: string; imageHashes: string[] } | null {
   if (event.type === 'MessageReceived') {
     return { text: event.text ?? '', imageHashes: event.user_image_hashes ?? [] };
@@ -273,24 +270,23 @@ function sameHashes(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((h, i) => h === b[i]);
 }
 
-/** True when this device's draft is **superseded** — the server no longer holds
- *  it, AND its exact content (trimmed text + image hashes) went out as a
- *  submitted user input whose server `created` is strictly newer than the
- *  draft's edit watermark.
+/** True when this device's draft is **superseded**. Two conditions. The server
+ *  no longer holds it. And its exact content went out as a submitted user
+ *  input whose server `created` is strictly newer than the edit watermark.
  *
- *  Content match ALONE is deliberately not enough: the user must stay free to
- *  post the same text many times. Two independent things make a re-type safe.
- *  Ordering covers the ordinary case — the watermark captured on the re-type
- *  already sits at/after the earlier submission's `created`, and the comparison
- *  is strict `>`. The server-state check covers the case ordering CANNOT see:
- *  if a peer submitted while this device was behind, the watermark is stale and
- *  the late event looks newer, but our own PUT then re-wrote the text
- *  server-side — so a server that still holds our draft is proof the draft
- *  post-dates the submission and is new work, not the thing that was sent.
+ *  **Content match ALONE is deliberately not enough**: the user must stay free
+ *  to post the same text many times. Two independent things make a re-type
+ *  safe. Ordering covers the ordinary case, the watermark captured on the
+ *  re-type already sitting at or after the earlier submission's `created`.
  *
- *  Cheap by construction: the O(1) early-outs reject every thread without a
+ *  The server-state check covers the case ordering CANNOT see. A peer
+ *  submitting while this device was behind leaves the watermark stale, so the
+ *  late event looks newer. Our own PUT then re-wrote the text server-side, so a
+ *  server still holding our draft proves the draft post-dates the submission.
+ *
+ *  Cheap by construction. The O(1) early-outs reject every thread without a
  *  locally-authored, server-cleared draft before the event scan, so nothing
- *  walks history on the keystroke path (never called from `updateCompose`). */
+ *  walks history on the keystroke path. */
 export function draftIsSuperseded(
   threadId: string,
   opts?: { writeRefused?: boolean },
@@ -299,17 +295,16 @@ export function draftIsSuperseded(
   if (draftIsEmpty(draft)) return false;
   const watermark = composeEditWatermark.get(threadId);
   if (watermark === undefined) return false;
-  // A write of ours is in flight (or still inside the debounce), so what the
-  // server holds is not yet knowable — every other compose guard yields to this
+  // A write of ours is in flight, or still inside the debounce, so what the
+  // server holds is not yet knowable. Every other compose guard yields to this
   // set for the same reason.
   //
-  // `writeRefused` is the one case where that uncertainty is already resolved:
-  // the engine answered our in-flight write with a stale-epoch `412`, which says
-  // both that it did NOT apply the write and that a submission consumed the
-  // slot. Without the opt-out this whole rule is DEAD on that path, because a
-  // write is in flight for the entire life of `pushNow` by construction, and a
-  // draft the user already sent from another device would be re-pushed by the
-  // retry as a live draft on every device.
+  // `writeRefused` is the one case where that uncertainty is already resolved.
+  // The engine answered our in-flight write with a stale-epoch `412`. That
+  // says both that it did NOT apply the write and that a submission consumed
+  // the slot. Without the opt-out this rule is DEAD on that path, a write in
+  // flight for the whole life of `pushNow` by construction. A draft the user
+  // already sent from another device would then be re-pushed by the retry.
   if (!opts?.writeRefused && pendingComposePuts.has(threadId)) return false;
   const text = draft.text.trim();
   const onServer = serverDraft.get(threadId);
@@ -336,12 +331,13 @@ export function draftIsSuperseded(
   return false;
 }
 
-/** Drop a draft the thread's own history proves was already submitted. Self-
- *  guarding, so any inbound path can fire it without pre-checking; it is the
- *  ACTIVE half of the supersede rule, for the paths that carry no compose-clear
- *  of their own — most importantly event replay on wake / SSE reconnect, where
- *  `loadAllThreads` runs BEFORE the missed messages arrive, so the
- *  empty-snapshot guard had no evidence to go on yet. */
+/** Drop a draft the thread's own history proves was already submitted.
+ *  Self-guarding, so any inbound path can fire it without pre-checking.
+ *
+ *  It is the ACTIVE half of the supersede rule, for the paths carrying no
+ *  compose-clear of their own. Event replay on wake or SSE reconnect matters
+ *  most: `loadAllThreads` runs BEFORE the missed messages arrive, so the
+ *  empty-snapshot guard has no evidence to go on yet. */
 export function clearSupersededDraft(
   threadId: string,
   opts?: { writeRefused?: boolean },
@@ -361,21 +357,22 @@ export function clearSupersededDraft(
 }
 
 /** True when this device holds UNSENT work for the thread: a non-empty draft it
- *  locally authored, whose content has NOT since been submitted. The shared
- *  invariant guard for every INBOUND compose EMPTY-clear path: the bulk
- *  `loadAllThreads` empty snapshot (`stageDraftFromApi`), an empty SSE
+ *  locally authored, whose content has NOT since been submitted.
+ *
+ *  The shared guard for every INBOUND compose EMPTY-clear path. Those are the
+ *  bulk `loadAllThreads` empty snapshot (`stageDraftFromApi`), an empty SSE
  *  `ThreadComposeChanged` (`applyRemoteCompose`), and the SSE `MessageReceived`
- *  echo's clear (thread-sync). Such a draft is the user's unsent intent and must
- *  never be blanked by an inbound echo/snapshot — only a send/discard FROM THIS
- *  DEVICE, or the proof that the draft has already been submitted, clears it.
- *  (`upsertThread` guards the distinct NON-empty stale overwrite with the
- *  `composeEditedAt` / `composePutSettledAt` / `pendingComposePuts` timestamps,
- *  not this helper.) `composeEditedAt` is stamped by `markLocallyEdited` and
- *  never cleared, so a server-ORIGINATED draft (present but never edited here)
- *  returns false and stays clearable by a genuine remote clear — and, without
- *  the supersede half, a locally-authored one would have stayed UNclearable
- *  forever, which is how a draft submitted from another device lived on here
- *  for hours (docs/plans/2026-07-28-superseded-compose-drafts.md). */
+ *  echo's clear (thread-sync). **Such a draft is the user's unsent intent and
+ *  must never be blanked by an inbound echo or snapshot.** Only a send or
+ *  discard FROM THIS DEVICE clears it, or proof that it was already submitted.
+ *  `upsertThread` guards the distinct NON-empty stale overwrite with the
+ *  timestamp maps above, not with this helper.
+ *
+ *  `composeEditedAt` is stamped by `markLocallyEdited` and never cleared. So a
+ *  server-ORIGINATED draft returns false and stays clearable by a genuine
+ *  remote clear. Without the supersede half, a locally-authored one would stay
+ *  UNclearable forever
+ *  (docs/plans/2026-07-28-superseded-compose-drafts.md). */
 export function hasUnsentLocalDraft(threadId: string): boolean {
   return composeEditedAt.has(threadId)
     && !draftIsEmpty(getDraft(threadId))
@@ -383,11 +380,11 @@ export function hasUnsentLocalDraft(threadId: string): boolean {
 }
 
 /** Single entry point for compose mutations from the UI. Optimistic local
- *  apply then debounced server PUT. A composing thread that ends up empty
- *  after the patch is auto-discarded — never-sent + no content would
- *  otherwise render as a ghost row titled "Empty draft". updatedAt is
- *  intentionally left alone: typing a draft is not "activity" the drawer
- *  should surface; the backend's last-activity allowlist agrees. */
+ *  apply, then debounced server PUT. A composing thread left empty by the patch
+ *  is auto-discarded: never sent and with no content, it would otherwise render
+ *  as a ghost row titled "Empty draft". updatedAt is deliberately left alone,
+ *  typing a draft being no activity the drawer should surface. The backend's
+ *  last-activity allowlist agrees. */
 export function updateCompose(threadId: string, patch: ComposePatch): void {
   markLocallyEdited(threadId);
   // Patch the draft first so the rollback path (state→composing on DELETE
@@ -406,14 +403,14 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
 }
 
 /** Single entry point for a per-draft dropdown selection change (model,
- *  reasoning, coding agent, coding-agent model/effort). A real `threadId`
- *  patches the keyed override, marks the thread locally-edited (so a stale
- *  loadAllThreads snapshot can't revert the pick — same guard as text), and
- *  schedules the debounced compose PUT that carries the selection to the DB. A
- *  `null`/`undefined` id (fresh compose, no draft yet) writes only the pending
- *  slot; it's transferred + persisted when the draft is created. Scope has its
- *  own entry point (`applyDestination`) because it also updates the localStorage
- *  last-used seed. */
+ *  reasoning, coding agent, coding-agent model and effort).
+ *
+ *  A real `threadId` patches the keyed override and schedules the debounced
+ *  compose PUT. It also marks the thread locally-edited, so a stale
+ *  loadAllThreads snapshot cannot revert the pick. A `null` id (fresh compose,
+ *  no draft yet) writes only the pending slot, transferred and persisted when
+ *  the draft is created. Scope has its own entry point (`applyDestination`),
+ *  because it also updates the localStorage last-used seed. */
 export function updateComposeSelection(
   threadId: string | null,
   patch: ComposeSelectionOverride,
@@ -442,27 +439,25 @@ export function applyRemoteCompose(
   },
 ): void {
   if (!threadMap.value.has(threadId)) return;
-  // The server just told us what it holds — record it whether or not we apply
-  // the payload locally (the empty branch below may keep a local draft). The
-  // caller already dropped our own echo and any in-flight local write, so this
-  // is a peer's report. A frame delayed past a later PUT ack of ours could
-  // still overwrite newer knowledge; that residual is accepted and self-heals
-  // (the server keeps the text, so the next snapshot re-stages it) — see
-  // `docs/code-review-priors.md` § Frontend for why the obvious guard is worse.
+  // The server just told us what it holds, so record it whether or not the
+  // payload is applied locally. The caller already dropped our own echo and any
+  // in-flight local write, so this is a peer's report. A frame delayed past a
+  // later PUT ack of ours could still overwrite newer knowledge. That residual
+  // is accepted and self-heals, the server keeping the text. See
+  // `docs/code-review-priors.md` for why the obvious guard is worse.
   noteServerDraft(threadId, fields.text, fields.image_hashes);
   if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
-    // A remote EMPTY snapshot must never clear a non-empty draft this device
-    // authored — the SSE mirror of stageDraftFromApi's guard (thread-loading.ts).
-    // The only emitter is the compose PUT handler; a PUT that fired before the
-    // device-id header was available broadcasts origin=None, which bypasses the
-    // SSE self-echo suppression (thread-sync.ts only suppresses a PRESENT origin)
-    // and lands here. Without this, that own/non-attributable empty echo blanks
-    // the just-typed draft — the value='' face of drafts.spec.ts:65 (see
-    // docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md). Gate on
-    // hasUnsentLocalDraft so a server-ORIGINATED draft (never edited here) is
-    // still clearable by a genuine peer clear, and so is a locally-authored one
-    // the thread's history shows was already submitted; the kept draft is
-    // local-view only. The same guard covers the selection — a draft with
+    // **A remote EMPTY snapshot must never clear a non-empty draft this device
+    // authored.** The SSE mirror of stageDraftFromApi's guard
+    // (thread-loading.ts). The only emitter is the compose PUT handler. A PUT
+    // fired before the device-id header was available broadcasts origin=None,
+    // which bypasses the SSE self-echo suppression and lands here (see
+    // docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md).
+    //
+    // Gate on hasUnsentLocalDraft. A server-ORIGINATED draft then stays
+    // clearable by a genuine peer clear, as does a locally-authored one the
+    // thread's history shows was already submitted. The kept draft is
+    // local-view only. The same guard covers the selection: a draft with
     // genuinely unsent work keeps its picks.
     if (hasUnsentLocalDraft(threadId)) return;
     clearDraft(threadId);
@@ -490,15 +485,13 @@ function mutateThreadMeta(threadId: string, patch: Partial<ThreadMeta>): void {
 
 // --- Compose drafts: type locally, deliver durably ---
 //
-// A draft lives ONLY in the `composeDrafts` signal (see this file's header:
-// server-only compose state, no localStorage), so the server is its storage and
-// the debounced PUT is the only thing that gets it there. That makes delivery the
-// one thing that can still lose the user's text, and on an installed iOS PWA it
-// goes wrong for reasons that say nothing about the request: WebKit aborts every
-// in-flight fetch when it suspends the page, and the tunnel to the engine drops
-// on any radio change. The old code toasted each failure (unkeyed, so they
-// stacked into a permanent wall), never retried, and let the draft die with the
-// next eviction. Mirrors `pendingPreferenceWrites` in ./preferences.ts.
+// A draft lives ONLY in the `composeDrafts` signal. The server is its storage,
+// and the debounced PUT is the only thing that gets it there. Delivery is
+// therefore the one thing that can still lose the user's text. On an installed
+// iOS PWA it goes wrong for reasons that say nothing about the request: WebKit
+// aborts every in-flight fetch when it suspends the page, and the tunnel to the
+// engine drops on any radio change. Mirrors `pendingPreferenceWrites` in
+// ./preferences.ts.
 
 /** Threads whose latest draft the engine has not accepted, re-sent on the next
  *  resume / reconnect. See `docs/glossary.md` § Undelivered compose draft.
@@ -537,18 +530,14 @@ const composePushFailures = createFailureCounter(3, () => {
 });
 
 /** The engine answered about this thread. Both answers land here, accepted and
- *  refused alike, because both prove the engine is reachable: the unreachable
- *  banner has to be retracted whichever way the queue drained, or it keeps
- *  insisting nothing is getting through while the rejection card next to it says
+ *  refused alike, because both prove the engine is reachable. The unreachable
+ *  banner must be retracted whichever way the queue drained, or it keeps
+ *  insisting nothing is getting through while the rejection card says
  *  otherwise.
  *
  *  It can settle unconditionally because compose writes for one thread are
- *  serialized (see `runComposePushes`): the answer always belongs to the newest
- *  intent, since no newer attempt can have started while this one was running.
- *  Before that, two attempts could overlap and complete out of order, so an
- *  outcome had to prove it was still the latest (`latestComposePushSeq`) before
- *  it was allowed to speak. Serializing removed the overlap rather than the
- *  need to reason about it. */
+ *  serialized (see `runComposePushes`). The answer always belongs to the newest
+ *  intent, no newer attempt having started while this one ran. */
 function settleComposeDelivered(threadId: string): void {
   composePushFailures.recordSuccess();
   undeliveredComposeDrafts.delete(threadId);
@@ -628,17 +617,17 @@ export function _resetUndeliveredComposeDraftsForTesting(): void {
 const runningComposePushes = new Set<string>();
 
 /** Threads that owe another compose write once the running one settles. A set,
- *  not a queue: successive intents COALESCE, because the write re-reads the
- *  draft when it finally goes out, so the only thing worth remembering is that
- *  one more write is owed. */
+ *  not a queue: successive intents COALESCE. The write re-reads the draft when
+ *  it goes out, so the only thing worth remembering is that one more is
+ *  owed. */
 const owedComposePushes = new Set<string>();
 
 /** How many times one runner cycle re-issues after a stale-epoch refusal before
  *  giving up and parking the draft. A refusal means a submission consumed the
  *  slot, so the retry carries a strictly newer epoch and normally lands first
- *  try. The bound exists for the pathological case (a peer submitting over and
- *  over while we write), where spinning would be worse than waiting for the
- *  next resume flush. */
+ *  try. The bound exists for the pathological case: a peer submitting over and
+ *  over while we write. Spinning there is worse than waiting for the next
+ *  resume flush. */
 const MAX_STALE_EPOCH_RETRIES = 2;
 
 function schedulePush(threadId: string): void {
@@ -656,19 +645,18 @@ function schedulePush(threadId: string): void {
 /** Issue the thread's owed compose write, one at a time.
  *
  *  **Compose writes for one thread are serialized.** At most one PUT is in
- *  flight; an intent raised while one is running is recorded as owed and issued
- *  when that one settles, re-reading the draft at that moment. So "last write
- *  wins" means the last *intent* wins, which is what the rest of this file has
- *  always assumed.
+ *  flight. An intent raised while one is running is recorded as owed and issued
+ *  when that one settles, re-reading the draft at that moment. So last-write-
+ *  wins means the last INTENT wins, which is what the rest of this file
+ *  assumes.
  *
- *  Before this, `pushNow` fired straight off the debounce and a PUT slower than
- *  250ms simply overlapped the next one. Overlapping writes can be APPLIED out
- *  of order, and on a stalled link that is how a pre-send draft ends up stored
- *  after the message that consumed it: the send goes through, the engine clears
- *  compose, the older write lands last and puts the draft back, and the next
- *  resync stages that stale revision into the composer. The engine's compose
- *  epoch refuses such a write outright; serializing is the other half, and the
- *  half that also keeps two ordinary keystroke writes from landing backwards. */
+ *  Overlapping writes can be APPLIED out of order. On a stalled link that is
+ *  how a pre-send draft ends up stored after the message that consumed it. The
+ *  send goes through and the engine clears compose. The older write lands last
+ *  and puts the draft back, and the next resync stages that stale revision into
+ *  the composer. The engine's compose epoch refuses such a write outright.
+ *  Serializing is the other half, and the half that also keeps two ordinary
+ *  keystroke writes from landing backwards. */
 function runComposePushes(threadId: string): void {
   owedComposePushes.add(threadId);
   if (runningComposePushes.has(threadId)) return;
@@ -687,17 +675,16 @@ function runComposePushes(threadId: string): void {
       runningComposePushes.delete(threadId);
       owedComposePushes.delete(threadId);
       // Release ONLY when nothing newer is queued. An edit made during the last
-      // PUT scheduled a fresh debounce; dropping the flag here would advertise
-      // "the engine has seen our latest intent" while a later write is still
-      // pending, which is exactly what every consumer of this set reads it to
-      // mean.
+      // PUT scheduled a fresh debounce. Dropping the flag would then claim the
+      // engine has seen our latest intent while a later write is pending. That
+      // claim is what every consumer of this set reads it to mean.
       if (!pendingTimers.has(threadId)) pendingComposePuts.delete(threadId);
     }
   })();
 }
 
-/** When the next push has the same array as the last one we synced, send
- *  `null` so the server's COALESCE preserves and skips the SSE re-broadcast. */
+/** Last image-hash array synced per thread. An unchanged array sends `null`, so
+ *  the server's COALESCE preserves it and skips the SSE re-broadcast. */
 const lastSyncedImageHashes = new Map<string, string[]>();
 
 function imageHashesUnchanged(threadId: string, current: string[]): boolean {
@@ -766,9 +753,9 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
       // nothing. Recording it is what lets the supersede rule below see past
       // its own "the server still has our text" re-type protection.
       noteServerDraft(threadId, '', []);
-      // Give that rule its say before re-issuing, because the submission may
-      // have BEEN this draft, sent from another device, and the retry would
-      // then put the sent message back as a live draft on every device.
+      // Give that rule its say before re-issuing. The submission may have BEEN
+      // this draft, sent from another device. The retry would then put the sent
+      // message back as a live draft on every device.
       if (clearSupersededDraft(threadId, { writeRefused: true })) return;
       if (staleRetries < MAX_STALE_EPOCH_RETRIES) {
         await pushNow(threadId, staleRetries + 1);
@@ -817,12 +804,11 @@ function cancelPendingPush(threadId: string): void {
   dropUndeliveredComposeDraft(threadId);
 }
 
-/** Idempotent: POST /threads with `{id, mode}`. No-op if the thread is
- *  already in threadMap (server is also idempotent on the same `{id, mode}`,
- *  but skipping the round-trip on the hot path matters for first-keystroke
- *  latency). Inserts an optimistic composing entry so the UI has somewhere
- *  to write before the server ack lands, plus a draft entry holding the
- *  user's mode pick. */
+/** Idempotent: POST /threads with `{id, mode}`. No-op if the thread is already
+ *  in threadMap. The server is idempotent on the same `{id, mode}` too, but
+ *  skipping the round trip matters for first-keystroke latency. Inserts an
+ *  optimistic composing entry, so the UI has somewhere to write before the ack
+ *  lands, plus a draft entry holding the user's mode pick. */
 export async function startComposeIfNeeded(threadId: string, mode: ComposeMode): Promise<void> {
   if (threadMap.value.has(threadId)) return;
   const next = new Map(threadMap.value);
@@ -851,17 +837,17 @@ function rollbackOptimistic(threadId: string): void {
   next.delete(threadId);
   threadMap.value = next;
   // The optimistic row is inserted with `eventsLoaded: true`, so a wake or an
-  // SSE resync during the `ensureThreadStarted` window can refresh it and record
-  // a verdict against it. Removing the row owes those maps the same cleanup as
+  // SSE resync during the `ensureThreadStarted` window can record a verdict
+  // against it. Removing the row owes those maps the same cleanup as
   // `sendMessage`'s rollback: nothing will ever fetch this thread again.
   forgetThreadEventsFailures(threadId);
   clearDraft(threadId);
 }
 
-/** In-flight POST /threads promises keyed by thread id. Callers that need
- *  the row to exist server-side before issuing their own request (image
- *  blob upload — only attach path that fires synchronously, no debounce
- *  to hide the race) consult this via `awaitThreadStarted`. */
+/** In-flight POST /threads promises keyed by thread id. Callers needing the row
+ *  to exist server-side before issuing their own request consult this via
+ *  `awaitThreadStarted`. Image blob upload is the one attach path that fires
+ *  synchronously, with no debounce to hide the race. */
 const pendingThreadStarts = new Map<string, Promise<void>>();
 
 /** Resolve once the in-flight `POST /threads` for this id has settled.
@@ -881,13 +867,13 @@ export function ensureFocusedComposeThread(): string {
   if (id) return id;
   id = generateUuid();
   setFocusedThread(id);
-  // Seed THIS new draft's own stored selection: eager-copy the localStorage
-  // last-used scope so the draft carries a scope in its OWN override (resolveScope
-  // no longer falls back to the shared `selectedScope` for a real draft — that's
-  // the leak guard, so the new draft must own its scope), overlaid with any
-  // fresh-compose picks from the pending slot (a pending scope pick wins). Other
-  // fields stay unset and resolve to their account defaults. The seeded selection
-  // is persisted by the first keystroke's compose PUT (pushNow includes it).
+  // Seed THIS new draft's own stored selection. Eager-copy the localStorage
+  // last-used scope, so the draft carries a scope in its OWN override, then
+  // overlay any fresh-compose picks from the pending slot. A pending scope pick
+  // wins. The eager copy is required: `resolveScope` no longer falls back to
+  // the shared `selectedScope` for a real draft, which is the leak guard. Other
+  // fields stay unset and resolve to their account defaults. The seeded
+  // selection is persisted by the first keystroke's compose PUT.
   seedComposeSelection(id, { scope: selectedScope.value, ...takePendingComposeSelection() });
   // Inlined instead of focusThread(): that also fires loadThreadEvents and
   // (on mobile) navigateToPane, neither of which the draft path wants.
@@ -912,49 +898,44 @@ export function ensureFocusedComposeThread(): string {
   return id;
 }
 
-/** Prefill the compose input with a seeded prompt (today, the setup interview's
- *  sentence).
- *  Lazily focuses/creates a composing thread, then writes the text through the
- *  normal debounced compose path so it syncs to the textarea and persists like
- *  any typed draft. Replaces the WHOLE input — text AND any attached images —
- *  so the seeded prompt lands cleanly; a lingering attachment would otherwise
- *  ride along with an unrelated sentence (`image_hashes: []` is a no-op on a
- *  brand-new draft). Does NOT send — the user reviews/edits, picks a
- *  destination, and hits Send themselves. Returns the thread id the text
- *  landed on.
+/** Prefill the compose input with a seeded prompt, today the setup interview's
+ *  sentence. Lazily focuses or creates a composing thread. The text then goes
+ *  through the normal debounced compose path, so it syncs to the textarea and
+ *  persists like any typed draft.
  *
- *  Lands on whatever `ensureFocusedComposeThread` resolves, which is the FOCUSED
- *  thread when there is one, active threads included. A caller that must not
- *  write into an already-sent thread calls `dropNonComposingFocus()` first;
- *  `applySuggestion` does, and has to do it there rather than here because it
- *  reads the target before prefilling. */
+ *  Replaces the WHOLE input, text and any attached images, so the seeded prompt
+ *  lands cleanly. A lingering attachment would otherwise ride along with an
+ *  unrelated sentence. Does NOT send: the user reviews, picks a destination,
+ *  and hits Send. Returns the thread id the text landed on.
+ *
+ *  Lands on whatever `ensureFocusedComposeThread` resolves, which is the
+ *  FOCUSED thread when there is one, active threads included. A caller that
+ *  must not write into an already-sent thread calls `dropNonComposingFocus()`
+ *  first. `applySuggestion` does, and has to do it there rather than here,
+ *  because it reads the target before prefilling. */
 export function prefillCompose(text: string): string {
   const threadId = ensureFocusedComposeThread();
   updateCompose(threadId, { text, image_hashes: [] });
   return threadId;
 }
 
-/** Release the focus when it points at a thread that has already been sent, so
- *  the next `ensureFocusedComposeThread` allocates a fresh draft instead of
- *  returning the open thread.
+/** Release the focus when it points at a thread that has already been sent.
+ *  The next `ensureFocusedComposeThread` then allocates a fresh draft instead
+ *  of returning the open thread.
  *
- *  `ensureFocusedComposeThread` hands back the focused id whatever its state,
- *  which is right for typing (an active thread's composer writes a follow-up
- *  draft onto that thread) and wrong for anything that COMPOSES a new message on
+ *  `ensureFocusedComposeThread` hands back the focused id whatever its state.
+ *  That is right for typing, an active thread's composer writing a follow-up
+ *  draft onto that thread. It is wrong for anything that COMPOSES a message on
  *  the user's behalf. The setup interview is the sharp case: its header button
- *  is a permanent control, so it can be tapped with any thread focused, and
- *  without this it aimed the interview at whatever the user was looking at. On a
- *  coding-agent thread the engine's continuity lock rejected the send with a 409
- *  and `sendCompose`'s rollback left the thread rendering as a Lucidos Agent
- *  thread; on a chat thread the interview landed silently in an unrelated
- *  conversation. `handleNavigationRequest`'s `new-chat` branch drops focus for
- *  exactly this reason.
+ *  is permanent, so it can be tapped with any thread focused. Without this it
+ *  aims the interview at whatever the user was looking at.
+ *  `handleNavigationRequest`'s `new-chat` branch drops focus for this reason.
  *
- *  A focused DRAFT is left alone: replacing it in place (after the confirm) is
+ *  A focused DRAFT is left alone. Replacing it in place, after the confirm, is
  *  what a suggestion is supposed to do. `unfocusThread` rather than a bare
- *  `setFocusedThread(null)` so the coding-agent pending picks of the thread we
- *  are leaving are reset and the thread pane is revealed, which is how a mobile
- *  user tapping the header button gets taken to the conversation that starts. */
+ *  `setFocusedThread(null)`, so the leaving thread's coding-agent pending picks
+ *  are reset and the thread pane is revealed. That is how a mobile user tapping
+ *  the header button reaches the conversation that starts. */
 function dropNonComposingFocus(): void {
   const id = focusedThreadId.value;
   if (!id) return;
@@ -964,21 +945,20 @@ function dropNonComposingFocus(): void {
 
 /** Apply a suggested sentence to the compose input on the user's behalf.
  *
- *  Its one caller today is {@link startSetupInterview}; the welcome's starter
- *  suggestions, which is where the name comes from, were removed in favour of
- *  that single entry point. It stays a separate step because the interview
- *  reuses every part of it and only adds the send.
+ *  Its one caller today is {@link startSetupInterview}. It stays a separate
+ *  step because the interview reuses every part of it and only adds the send.
  *
  *  A suggested sentence is conversational, so the destination is forced to the
- *  Lucidos Agent (a coding-agent draft flips back to chat). It
- *  REPLACES the focused draft's whole input — text AND any attached images (via
- *  `prefillCompose`) — so if a non-empty draft is already in progress, confirm the
- *  override first (a click must never silently blow away typed text or attachments;
- *  declining keeps the draft untouched). The override is force-synced
- *  into the textarea via `requestPromptOverrideSync` because the normal
- *  compose→textarea sync skips a focused, non-empty input to protect in-flight
- *  typing — without the force the draft signal (and the drawer row) would update
- *  but the visible prompt would stay stale.
+ *  Lucidos Agent, a coding-agent draft flipping back to chat. It REPLACES the
+ *  focused draft's whole input, text and attached images, via
+ *  `prefillCompose`. A non-empty draft already in progress therefore needs the
+ *  override confirmed first, since a click must never blow away typed text.
+ *  Declining keeps the draft untouched.
+ *
+ *  The override is force-synced into the textarea via
+ *  `requestPromptOverrideSync`. The normal sync skips a focused, non-empty
+ *  input, to protect in-flight typing. Without the force, the draft signal
+ *  would update while the visible prompt stayed stale.
  *
  *  Returns true when the sentence was applied, false when the user declined the
  *  override. Does NOT send: that is `startSetupInterview`'s extra step. */
@@ -1003,24 +983,24 @@ export async function applySuggestion(text: string): Promise<boolean> {
 
 /** The message the setup-interview entry points send.
  *
- *  Deliberately an ordinary English sentence rather than a magic token: it lands
- *  in the transcript as the user's own message, so the mechanism is visible and
- *  they can retype or reword it later without the button. That is the
+ *  Deliberately an ordinary English sentence rather than a magic token. It
+ *  lands in the transcript as the user's own message, so the mechanism is
+ *  visible and they can reword it later without the button. That is the
  *  prompt-first side of `docs/philosophy.md` principle 3, applied to the one
  *  surface a newcomer meets first.
  *
- *  The phrase "help me get the most out of Lucidos" is load-bearing on the
- *  engine side: the chat system prompt's `SETUP_INTERVIEW_RULE` keys on it to
- *  route the turn at `load_knowhow('system-knowhow/setup-interview')`, and the
- *  knowhow's own frontmatter `description` repeats it for the retrieval path.
- *  All three are pinned together by
+ *  **The phrase "help me get the most out of Lucidos" is load-bearing.** The
+ *  chat system prompt's `SETUP_INTERVIEW_RULE` keys on it to route the turn at
+ *  `load_knowhow('system-knowhow/setup-interview')`. The knowhow's own
+ *  frontmatter `description` repeats it for the retrieval path. All three are
+ *  pinned together by
  *  `setup_interview_route_matches_the_frontend_seeded_prompt`, which reads THIS
- *  file, so reword the sentence freely but keep that clause.
+ *  file. Reword the sentence freely, but keep that clause.
  *
- *  "my work and my life" rather than "my work and my week" is deliberate: the
+ *  "my work and my life" rather than "my work and my week" is deliberate. The
  *  interview covers personal admin, training and learning on the same footing
- *  as a job (see `system-knowhow/setup-interview.md`, rung 1), and the sentence
- *  the user watches themselves send should not narrow it back down. */
+ *  as a job (see `system-knowhow/setup-interview.md`, rung 1). The sentence the
+ *  user watches themselves send should not narrow it back down. */
 export const SETUP_INTERVIEW_PROMPT =
   'Help me get the most out of Lucidos: interview me about my work and my life, '
   + 'then build me the apps and automations that fit, here in my workspace.';
@@ -1029,14 +1009,13 @@ export const SETUP_INTERVIEW_PROMPT =
  *
  *  Unlike {@link applySuggestion}, this does not stop at the draft. A first-run
  *  user staring at a prefilled box they did not write has to decide whether to
- *  send it, which is the hesitation the entry point exists to remove, so the
- *  click is the whole gesture. Nothing is hidden by sending: the seeded sentence
- *  is what appears in the transcript, on the same code path a typed message
- *  takes.
+ *  send it. That hesitation is what the entry point exists to remove, so the
+ *  click is the whole gesture. Nothing is hidden by sending: the seeded
+ *  sentence is what appears in the transcript, on the same code path a typed
+ *  message takes.
  *
- *  Reuses `applySuggestion` for the parts that are identical (force the Lucidos
- *  Agent destination, confirm before replacing a non-empty draft, force-sync the
- *  textarea), so the draft-protection rule cannot drift between the two.
+ *  Reuses `applySuggestion` for the identical parts, so the draft-protection
+ *  rule cannot drift between the two.
  *
  *  Returns true when the interview was sent, false when the user declined the
  *  draft override or no draft resolved. */
@@ -1070,12 +1049,12 @@ export async function discardCompose(threadId: string): Promise<void> {
   const restoreDraft = snapshotDraft(threadId);
   mutateThreadMeta(threadId, { state: 'discarded' });
   clearDraft(threadId);
-  // Drop the per-draft dropdown overrides too — a discarded draft is gone, and a
+  // Drop the per-draft dropdown overrides too. A discarded draft is gone, and a
   // stray entry would seed a future draft that happens to reuse the id.
   clearComposeSelection(threadId);
   lastSyncedImageHashes.delete(threadId);
-  // Pair with the push in ensureFocusedComposeThread — Back/Forward must not
-  // restore a discarded thread whose events would 404.
+  // Pairs with the push in ensureFocusedComposeThread. Back and Forward must
+  // not restore a discarded thread whose events would 404.
   removeThreadNavEntries(threadId);
   try {
     await deleteThread(threadId);
@@ -1099,20 +1078,19 @@ function isAlreadyGone(err: unknown): boolean {
 }
 
 /** The last thing a send owes the engine: one compose write carrying the
- *  cleared draft. Because writes are serialized, it is issued only after every
- *  earlier write for the thread has settled, which makes it the last one the
- *  engine applies, so a pre-send draft PUT can never be the resting state
- *  whichever order the engine happened to receive things in.
+ *  cleared draft. Writes are serialized, so this is issued only after every
+ *  earlier write for the thread has settled. It is therefore the last one the
+ *  engine applies, and a pre-send draft PUT can never be the resting state.
  *
- *  `sendCompose` calls this; `sendFollowup` reaches the same guarantee through
- *  its `updateCompose(id, {text: '', …})`, which clears the draft locally and
- *  schedules the same write. Two entry points rather than one because the
- *  follow-up path owes a local clear as well, and routing it through here too
- *  would schedule a second, redundant write.
+ *  `sendCompose` calls this. `sendFollowup` reaches the same guarantee through
+ *  its `updateCompose(id, {text: ''})`, which clears the draft locally and
+ *  schedules the same write. Two entry points rather than one, because the
+ *  follow-up path owes a local clear as well. Routing it through here too would
+ *  schedule a second, redundant write.
  *
  *  It goes through the ordinary debounced path rather than a bespoke request,
- *  so it re-reads the draft when it fires. That is what makes the awkward case
- *  right for free: type a new follow-up straight after sending, and this write
+ *  so it re-reads the draft when it fires. That makes the awkward case right
+ *  for free: type a new follow-up straight after sending, and this write
  *  carries the new text instead of an empty draft. */
 function pushClearedComposeAfterSend(threadId: string): void {
   schedulePush(threadId);
@@ -1136,17 +1114,17 @@ export async function sendCompose(
   if (!text.trim() && wireHashes.length === 0) return;
 
   cancelPendingPush(threadId);
-  // Bind here so sendMessage doesn't have to detect first-send vs follow-up
-  // (see frontend.md "Drafts Are Threads"). Every dropdown value is resolved
-  // from THIS draft's per-draft override (composeSelections), falling back to
-  // the current global default — never read straight off a global signal that
-  // another draft may have changed. Channel is locked from `opts.useCodingAgent`
-  // (which the caller resolved via effectiveSendMode) rather than the existing
-  // meta.channel: the latter was stamped at first-keystroke time from
-  // `currentComposeMode()` and goes stale the moment the user toggles. Without
-  // this lock, sendMessage reads the stale channel, ignores the explicit
-  // useCodingAgent option, and routes a coding-agent send through the Lucidos
-  // Agent (or vice versa).
+  // Bind here so sendMessage need not detect first-send from follow-up (see
+  // frontend.md "Drafts Are Threads"). Every dropdown value resolves from THIS
+  // draft's override in `composeSelections`, falling back to the global
+  // default. Never read straight off a global signal another draft may have
+  // changed.
+  //
+  // Channel is locked from `opts.useCodingAgent`, which the caller resolved via
+  // effectiveSendMode, rather than from the existing meta.channel. That was
+  // stamped at first-keystroke time and goes stale the moment the user toggles.
+  // Without the lock, sendMessage reads the stale channel and routes a
+  // coding-agent send through the Lucidos Agent, or the reverse.
   const scope = resolveScope(threadId);
   const boundRepoId = opts.useCodingAgent && scope.kind === 'external' ? scope.repoId : undefined;
   const boundCodingAgentKind = opts.useCodingAgent ? scope.kind : undefined;
@@ -1156,11 +1134,11 @@ export async function sendCompose(
   const boundChannel: ThreadMeta['channel'] = opts.useCodingAgent ? 'claude_code' : 'chat';
   const boundCodingAgent = opts.useCodingAgent ? resolveCodingAgent(threadId) : undefined;
   // The destination's NAME is part of the binding, not just its ids. The drawer
-  // row chips `meta.repoName` once the thread is started, and the engine only
-  // reports it (as `cc_repo_name`) a round trip later, so a promotion that bound
-  // the ids alone made the chip the draft row was already showing vanish and
-  // reappear. `scopeRepoName` is the same resolution the draft row used, so the
-  // two frames agree; the engine's answer overwrites it when it lands.
+  // row chips `meta.repoName` once the thread is started, and the engine
+  // reports it as `cc_repo_name` only a round trip later. Binding the ids alone
+  // therefore makes the chip vanish and reappear. `scopeRepoName` is the same
+  // resolution the draft row used, so the two frames agree. The engine's answer
+  // overwrites it when it lands.
   const boundRepoName = opts.useCodingAgent
     ? scopeRepoName(scope, loadedOr(repositories.value, []))
     : undefined;
@@ -1190,15 +1168,14 @@ export async function sendCompose(
   if (shouldFocus) setFocusedThread(threadId);
   try {
     // The chat POST needs the thread row to exist server-side, and on a
-    // first-send `POST /threads` may still be in flight: `ensureFocusedComposeThread`
-    // fires it without awaiting. Every optimistic local step above stays
-    // synchronous (the input must clear on the gesture), so this sits as late as
-    // possible, immediately before the only network call.
+    // first-send `POST /threads` may still be in flight.
+    // `ensureFocusedComposeThread` fires it without awaiting. Every optimistic
+    // local step above stays synchronous, since the input must clear on the
+    // gesture. So this sits as late as possible, before the network call.
     //
-    // Typing used to hide this: the draft PUT awaits the same promise in
-    // `pushNow`, and a human takes far longer than a POST to reach Send. Neither
-    // holds for a button that composes and sends in one gesture, and
-    // `cancelPendingPush` above has just dropped the PUT that was awaiting. A
+    // A button that composes and sends in one gesture is the case that needs
+    // it. Typing hides the race, the draft PUT awaiting the same promise in
+    // `pushNow`, and `cancelPendingPush` above has just dropped that PUT. A
     // failed start rejects here and lands in the catch below, which rolls the
     // draft back and rethrows for the caller to toast.
     await awaitThreadStarted(threadId);
@@ -1212,26 +1189,24 @@ export async function sendCompose(
       ccModelOverride,
       ccReasoningEffortOverride,
     });
-    // A compose-view pick is a one-shot intent: it has now been carried into this
-    // spawn's chat body, so consume the draft's per-draft selection. Without this
-    // the override would linger in `composeSelections` for a thread that is no
-    // longer composing. Follow-ups (sendFollowup) don't go through here — an
-    // active thread has no compose selection entry.
+    // A compose-view pick is a one-shot intent, now carried into this spawn's
+    // chat body, so consume the draft's selection. Without this the override
+    // would linger in `composeSelections` for a thread no longer composing.
+    // Follow-ups do not come through here: an active thread has no entry.
     clearComposeSelection(threadId);
     // Scheduled here, AFTER the send resolved and the selection was consumed,
-    // for two reasons. `cancelPendingPush` above dropped the debounced write and
-    // a write already in flight cannot be recalled, so without this the engine's
-    // last word on this thread's draft could be the pre-send text. And ordering
-    // it after `clearComposeSelection` is what keeps the write from carrying the
-    // draft's dropdown picks back onto a row whose `compose_selection` the
-    // MessageReceived projection has just set to NULL. A send that FAILS
-    // schedules nothing: it consumed no draft, so there is no stale write to
-    // out-order, and the rollback's restored text must stay put.
+    // for two reasons. `cancelPendingPush` above dropped the debounced write,
+    // and an in-flight write cannot be recalled. Without this the engine's last
+    // word could be the pre-send text. And ordering it after
+    // `clearComposeSelection` keeps the write from carrying the draft's picks
+    // back onto a row whose `compose_selection` the projection just set to
+    // NULL. A send that FAILS schedules nothing: it consumed no draft, so there
+    // is no stale write to out-order, and the restored text must stay put.
     pushClearedComposeAfterSend(threadId);
   } catch (err) {
-    // Roll back state. Restore text/images only if the user hasn't started
-    // typing into the now-empty textarea — overwriting fresh keystrokes
-    // would lose work the user can see they typed.
+    // Roll back state. Restore text and images only if the user has not started
+    // typing into the now-empty textarea. Overwriting fresh keystrokes would
+    // lose work the user can see they typed.
     mutateThreadMeta(threadId, { state: 'composing' });
     const current = getDraft(threadId);
     const restore: Partial<ComposeDraft> = {};
@@ -1243,12 +1218,11 @@ export async function sendCompose(
   }
 }
 
-/** Send a follow-up message in an already-active thread. Clears the local
- *  draft optimistically — the textarea is cleared synchronously by the input
- *  handler, but without a paired clear of the draft signal the textarea's
- *  useEffect resyncs the typed text on the next render and the "Discard
- *  draft" button stays visible. Mirrors the optimistic clear that sendCompose
- *  applies on the composing→active path. */
+/** Send a follow-up message in an already-active thread. Clears the local draft
+ *  optimistically. The input handler clears the textarea synchronously. Without
+ *  a paired clear of the draft signal, the textarea's useEffect resyncs the
+ *  typed text on the next render. The Discard draft button then stays visible.
+ *  Mirrors the optimistic clear sendCompose applies on promotion. */
 export async function sendFollowup(
   threadId: string,
   text: string,
@@ -1266,41 +1240,39 @@ export async function sendFollowup(
   await sendMessage(text, imageHashes, { ...opts, threadId, focus: opts?.focus ?? true });
 }
 
-/** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true` so
- *  the browser keeps the connection alive after the document tears down. The
- *  device-id header is critical: without it, the server's broadcast carries
- *  origin_device_id=None and other tabs/devices can't suppress the echo —
- *  potentially clobbering newer text that was typed elsewhere immediately
- *  after the close. */
+/** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true`, so
+ *  the browser keeps the connection alive after the document tears down.
+ *
+ *  **The device-id header is critical.** Without it the server's broadcast
+ *  carries origin_device_id=None, and other tabs cannot suppress the echo. That
+ *  can clobber newer text typed elsewhere right after the close. */
 function flushAllPending(): void {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const deviceId = typeof localStorage !== 'undefined' ? localStorage.getItem('lucidos-device-id') : null;
   if (deviceId) headers['x-lucidos-device-id'] = deviceId;
 
-  // Every thread holding an intent the engine has not seen. Two states now
-  // qualify, not one: a debounce still counting down (`pendingTimers`), and an
-  // intent whose debounce already fired but which is QUEUED behind a running
-  // write (`owedComposePushes`). The queued one has no timer, and before writes
-  // were serialized it did not exist at all: the newest text had already been
-  // dispatched as its own overlapping request. Flushing only the timers would
-  // therefore drop exactly the text this whole change is about, on exactly the
-  // link that produces it (a write hanging on a stalled connection while the
-  // user keeps typing, then the page is closed or iOS suspends it).
+  // Every thread holding an intent the engine has not seen. **Two states
+  // qualify, not one**: a debounce still counting down (`pendingTimers`), and
+  // an intent whose debounce fired but which is QUEUED behind a running write
+  // (`owedComposePushes`). The queued one has no timer. Flushing only the
+  // timers would drop the newest text on exactly the link that produces it: a
+  // write hanging on a stalled connection while the user keeps typing, then the
+  // page closing or iOS suspending it.
   const owed = new Set([...pendingTimers.keys(), ...owedComposePushes]);
   for (const timer of pendingTimers.values()) clearTimeout(timer);
   for (const threadId of owed) {
     const thread = threadMap.value.get(threadId);
     if (!thread) continue;
     const draft = getDraft(threadId);
-    // Include the per-draft selection so a dropdown pick made within the debounce
-    // window right before tab close isn't lost — parity with the text/images flush.
-    // Omit when empty so the backend COALESCE preserves the stored value.
+    // Include the per-draft selection, so a dropdown pick made inside the
+    // debounce window right before tab close is not lost. Omit when empty, so
+    // the backend COALESCE preserves the stored value.
     const selectionOverride = getComposeSelectionOverride(threadId);
     const selectionForFlush = Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
-    // Always emit the full array on tab close — hashes are tiny.
-    // Fenced like every other write. The page is unloading, so this is the last
-    // thing we can say; if a submission has since consumed the slot, the engine
-    // refusing it is exactly right.
+    // Always emit the full array on tab close: hashes are tiny. Fenced like
+    // every other write. The page is unloading, so this is the last thing we
+    // can say. If a submission has since consumed the slot, the engine refusing
+    // it is exactly right.
     const body = JSON.stringify({
       text: draft.text,
       image_hashes: draft.image_hashes,
@@ -1310,17 +1282,15 @@ function flushAllPending(): void {
     });
     if (body.length > 64 * 1024) {
       // Telemetry carve-out (.claude/rules/frontend.md): the tab is unloading,
-      // so any toast would never render. The next foreground page load will
-      // re-PUT this draft via the normal debounce path — no data loss, the
-      // draft is still in `composeDrafts` and gets retried as soon as the
-      // user types again or focuses the thread.
+      // so any toast would never render. The next foreground page load re-PUTs
+      // this draft via the normal debounce path. No data is lost, the draft
+      // still being in `composeDrafts` and retried on the next keystroke.
       console.warn(`[compose] keepalive body exceeds 64KB (${body.length}B) for ${threadId}; will retry on next foreground push`);
       continue;
     }
-    // `API` carries the gateway base prefix (`/<slug>/api/v1`); a bare
+    // `API` carries the gateway base prefix (`/<slug>/api/v1`). A bare
     // `/api/v1/...` would make the gateway read `api` as a workspace slug and
-    // 404 ("unknown workspace 'api'"), silently dropping the tab-close flush
-    // for every gateway-served workspace.
+    // 404, dropping the tab-close flush for every gateway-served workspace.
     fetch(`${API}/threads/${encodeURIComponent(threadId)}/compose`, {
       method: 'PUT',
       headers,

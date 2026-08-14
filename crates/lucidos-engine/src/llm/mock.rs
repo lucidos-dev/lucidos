@@ -38,10 +38,10 @@ pub const MOCK_AWAIT_EVENT_SENTINEL: &str = "MOCK_SUBSCRIBE_ON:";
 pub const MOCK_RUN_PYTHON_SENTINEL: &str = "MOCK_RUN_PYTHON:";
 
 /// What the mock says on any turn whose message array already carries the
-/// `await_event` call: the iteration right after it subscribes, and the woken
-/// turn later. Distinct from [`MOCK_RESPONSE`] so a test can tell those from a
+/// `await_event` call: the iteration right after it subscribes, and the
+/// re-entered turn later. Distinct from [`MOCK_RESPONSE`] so a test can tell those from a
 /// turn that never subscribed, without counting events.
-pub const MOCK_WOKE_RESPONSE: &str = "Woke up and finished the work.";
+pub const MOCK_REENTRY_RESPONSE: &str = "Picked the watch back up and finished the work.";
 
 /// A deterministic LLM provider for E2E testing.
 ///
@@ -225,7 +225,7 @@ impl LlmProvider for MockProvider {
         // and ends: this is the "subscribe, then finish" shape the real tool
         // description asks for.
         let body = if already_called(&messages, crate::llm::tool_names::AWAIT_EVENT) {
-            MOCK_WOKE_RESPONSE
+            MOCK_REENTRY_RESPONSE
         } else {
             MOCK_RESPONSE
         };

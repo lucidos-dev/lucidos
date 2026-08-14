@@ -11,8 +11,14 @@ import {
 // the reason in ContentHeaderActions).
 //
 // Real-ish numbers at the default 16px root: every header action is a
-// 2.25rem (36px) .icon-btn.header-icon (so is the ⋯ trigger and the bell), the
-// flex gap is 0.25rem (4px), and the leading zone is 3 buttons + 2 gaps ≈ 116px.
+// 2.25rem (36px) .icon-btn.header-icon (so is the ⋯ trigger and the bell) and
+// the flex gap is 0.25rem (4px).
+//
+// Most cases below feed `computeHeaderCollapse` a fixed leading width, which
+// exercises the linear fit on its own terms. Real callers never pass a measured
+// one: the centre box is CENTRED on the row, so they pass half of what it
+// leaves. The geometry that follows from that is what the non-overlap invariant
+// further down walks, clamp arm by clamp arm.
 const ICON = 36;
 const GAP = 4;
 const NAV = 116;
@@ -115,32 +121,94 @@ describe('computeHeaderCollapse', () => {
     expect(seen).toEqual([0, 2, 3, 4]);
   });
 
-  // ── The structural invariant the flex layout enforces, mirrored in math ──
-  // For every container width down to the point where nav + the MINIMAL icon
-  // row alone fill the region (below that the flex-shrink:0 zones themselves
-  // overflow — a state the pane minimum widths prevent and overflow:clip
-  // guards), the title zone's right edge must sit at least a gap left of the
-  // icon row, and the chosen collapse count must never be 1.
-  it('non-overlap invariant: the title zone right edge never crosses the icon row left edge', () => {
-    const input = appUiInput({ centreWidth: 260 });
-    const minSensible = input.leadingWidth + 2 * input.gapPx
-      + iconsRowWidth(input, input.actionWidths.length);
-    for (let w = 900; w >= minSensible; w -= 1) {
-      const { collapsed, titleEllipsized } = computeHeaderCollapse({ ...input, containerWidth: w });
+  // ── The structural invariant the centred box enforces, mirrored in math ──
+  // The title cluster is a fixed span centred on the row, its width the CSS
+  // clamp below (`.pane-header-content-title` in styles/panels/shell.css), and
+  // the actions are right-aligned at the row's trailing edge. So the box's
+  // right edge must stay at least a gap left of the cluster, at every container
+  // width and through all three arms of the clamp.
+  //
+  // The reserve is sized for the widest cluster this row can hold, so the two
+  // middle arms are slack by construction and the interesting one is the floor:
+  // there the box stops shrinking and the cluster keeps coming, which is the
+  // regime the collapse exists for.
+  const SPAN = 320;                    // --desktop-nav-span, 20rem
+  const MIN_SPAN = 128;                // --desktop-nav-min-span, 8rem
+  const RESERVE = 3 * ICON + 4 * GAP;  // --content-side-reserve
+
+  /** The rendered width of the centred box at a given container width: the CSS
+   *  clamp, in JS. */
+  function boxWidth(container: number): number {
+    return Math.min(Math.max(MIN_SPAN, container - 2 * RESERVE), SPAN);
+  }
+
+  it('non-overlap invariant: the centred box\'s right edge never reaches the icon row', () => {
+    const base = appUiInput({});
+    // Down to where even ⋯ + the bell cannot fit beside a box already on its
+    // min-span floor. That is ~296px here, well under the Canvas pane's own
+    // 360px floor (MIN_CONTENT_PANE_REM), so no reachable pane width is left
+    // out; below it nothing can hold the two apart and the box is clipped.
+    for (let w = 900; w >= 300; w -= 1) {
+      const centreWidth = boxWidth(w);
+      const input = {
+        ...base,
+        containerWidth: w,
+        centreWidth,
+        leadingWidth: Math.max(0, (w - centreWidth) / 2),
+      };
+      const { collapsed, titleEllipsized } = computeHeaderCollapse(input);
       expect(collapsed).not.toBe(1);
 
-      const iconsW = iconsRowWidth(input, collapsed);
-      // The icons are right-aligned (the flex:1 title zone absorbs all slack).
-      const iconsLeft = w - iconsW;
-      // The title zone spans from nav+gap to icons-gap; the rendered title is
-      // the natural width clamped to that zone (flex min-width:0 + ellipsis).
-      const zoneWidth = Math.max(0, w - input.leadingWidth - 2 * input.gapPx - iconsW);
-      const titleRight = input.leadingWidth + input.gapPx + Math.min(input.centreWidth, zoneWidth);
-      expect(titleRight).toBeLessThanOrEqual(iconsLeft - input.gapPx + 0.6);
+      const iconsLeft = w - iconsRowWidth(input, collapsed);
+      const boxRight = (w + centreWidth) / 2;
+      expect(boxRight, `container ${w}`).toBeLessThanOrEqual(iconsLeft - input.gapPx + 0.6);
 
-      // Ellipsis is reported only at the minimal icon state.
-      if (titleEllipsized) expect(collapsed).toBe(input.actionWidths.length);
+      // Nothing is clipped while the reserve still holds.
+      expect(titleEllipsized, `container ${w}`).toBe(false);
     }
+  });
+
+  it('the reserve holds the widest cluster the row can carry, so mid-widths never fold', () => {
+    // The claim --content-side-reserve is sized on: two context icons riding
+    // the row plus the bell, and the two gaps between them, plus the two gaps
+    // the fit model charges the centred box. A set of three or more folds whole
+    // (alwaysCollapseFrom), so nothing wider ever stands here.
+    const widest = appUiInput({ actionWidths: [ICON, ICON] });
+    expect(iconsRowWidth(widest, 0) + 2 * GAP).toBe(RESERVE);
+
+    // The clamp's middle arm: the box takes exactly what the two reserves
+    // leave, so the cluster has exactly the reserve and fits without folding.
+    for (const w of [400, 450, 500, 550]) {
+      const centreWidth = boxWidth(w);
+      expect(centreWidth, `container ${w} is off the middle arm`).toBe(w - 2 * RESERVE);
+      expect(computeHeaderCollapse({
+        ...widest,
+        containerWidth: w,
+        centreWidth,
+        leadingWidth: (w - centreWidth) / 2,
+        alwaysCollapseFrom: 3,
+      })).toEqual({ collapsed: 0, titleEllipsized: false });
+    }
+  });
+
+  it('folds on the min-span arm, where the box stops giving way', () => {
+    // A Canvas pane at its floor (360px) with two context actions: the box is
+    // pinned at MIN_SPAN, so the cluster would reach it and the icons go into ⋯
+    // instead. This is the whole reason the measurement survives the centring.
+    const w = 360;
+    const centreWidth = boxWidth(w);
+    expect(centreWidth).toBe(MIN_SPAN);
+    const input = {
+      ...appUiInput({ actionWidths: [ICON, ICON] }),
+      containerWidth: w,
+      centreWidth,
+      leadingWidth: (w - centreWidth) / 2,
+      alwaysCollapseFrom: 3,
+    };
+    expect(computeHeaderCollapse(input).collapsed).toBe(2);
+    // Unfolded it really would have reached the box: that is what it dodged.
+    const unfoldedClearance = (w - iconsRowWidth(input, 0)) - (w + centreWidth) / 2;
+    expect(unfoldedClearance).toBeLessThan(GAP);
   });
 
   // The thread pane's cluster has no permanent anchor: nothing after the

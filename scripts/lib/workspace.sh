@@ -1530,17 +1530,20 @@ select_cargo_lock_holders() {
 # docs/plans/2026-07-27-launch-binary-published-per-variant.md).
 #
 # So a completed build PUBLISHES its outputs into
-# `target/<profile>/launch/<variant>/`, and that is what every launch path uses.
+# `.launch/<profile>/<variant>/`, and that is what every launch path uses.
 # The directory is written only by completed builds of the same profile AND
 # feature variant, so it can neither hold another configuration's binary nor be
 # relinked mid-life by a co-located peer's build. Cargo keeps uplifting to
 # `target/<profile>/lucidos-engine`; nothing launches from it any more.
 #
-# Staying under `target/` is load-bearing: the engine resolves the checkout by
-# walking `current_exe()`'s ancestors for `scripts/web-dev.sh`
-# (`crates/lucidos-engine/src/paths.rs`), and ADR 0021's worktree refusal is a
-# pure path test on `LUCIDOS_ENGINE_BIN`. A workspace-local staging dir would
-# break the first and launder a worktree binary past the second.
+# Staying inside the CHECKOUT is load-bearing; staying inside `target/` is NOT
+# (ADR 0063, which is why the dir is `.launch/`). Two things depend on the
+# location and both need only "somewhere under the repo root": the engine
+# resolves the checkout by walking `current_exe()`'s ancestors for
+# `scripts/web-dev.sh` (`crates/lucidos-engine/src/paths.rs`), and ADR 0021's
+# worktree refusal is a pure path test on `LUCIDOS_ENGINE_BIN`. A
+# WORKSPACE-local staging dir would break the first and launder a worktree
+# binary past the second, which is what ADR 0022 ruled out.
 
 # Filesystem-safe component naming the cargo feature configuration the binaries
 # were built with: `plain` for a default build, else the requested features.
@@ -1567,10 +1570,30 @@ engine_build_profile() {
 }
 
 # Directory the launch binaries for a (profile, variant) pair are published to.
+#
+# Deliberately NOT under `target/`, and that is the whole point of the directory
+# (ADR 0022 originally put it at `target/<profile>/launch/<variant>`; ADR 0063
+# amending that records why). `cargo clean` removes `target/` wholesale, and the
+# launch dir is where the running system's `lucidos` CLI lives: the engine finds
+# it by walking up from its own exe (`find_lucidos_cli_dir`) and prepends that
+# dir to PATH for every spawned coding-agent session and trigger subprocess. So
+# a single `cargo clean` used to take the CLI out from under a running engine.
+# On 2026-08-13 the nightly orchestrator ran one inline, and for the next eight
+# hours every trigger that shells out to `lucidos` died with "No such file or
+# directory", while `run_coding_agent` could not spawn the child that would have
+# rebuilt it, because that spawn needs the same missing CLI.
+#
+# What ADR 0022 actually requires of this path is that it stay inside the
+# CHECKOUT, and a checkout-local dot-dir keeps both properties that depend on
+# it: `paths::repo_root_above` is a pure ancestor walk for the
+# `scripts/web-dev.sh` marker, so it resolves from any depth; and ADR 0021's
+# worktree refusal is a substring test for `/.lucidos/worktrees/`, which a
+# worktree's own `.launch/` still satisfies. A WORKSPACE-local dir would break
+# both, which is what that ADR ruled out.
 launch_bin_dir() {
     local profile="${1:-$(engine_build_profile)}"
     local variant="${2:-$(engine_build_variant_slug)}"
-    echo "$PROJECT_DIR/target/$profile/launch/$variant"
+    echo "$PROJECT_DIR/.launch/$profile/$variant"
 }
 
 # Publish one freshly built binary. Copies into the destination directory under
@@ -1697,15 +1720,29 @@ published_build_state() {
 # exactly the same build. lucidos-cli is built alongside the engine so the
 # `lucidos` binary is published next to `lucidos-engine`; lucidos-gateway
 # (ADR 0014) is the standalone front the dev launcher spawns.
+#
+# Runs under a *build slot* (ADR 0070), which is the ONE point every engine
+# build passes through: the e2e harness, a human `web-dev.sh -b`, and the
+# engine's own background rebuild, which reaches here via
+# `web-dev.sh --engine-build`. That last one already holds the checkout build
+# lock by the time it gets here, so the two are taken in the right order
+# without either knowing about the other.
+#
+# Bootstrapping is the degrade path doing its job: this build is what PRODUCES
+# the `lucidos` binary, so on a fresh checkout there is none and the wrapper
+# runs cargo unrestricted. Every later build finds it and takes a slot.
 run_engine_cargo_build() {
     local feature_args=()
     if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
         feature_args=(--features "$ENGINE_BUILD_FEATURES")
     fi
+    local slot="$PROJECT_DIR/scripts/with-build-slot.sh"
     if [ -n "${RELEASE:-}" ]; then
-        cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
+        "$slot" --label "engine build (release)" -- \
+            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
     else
-        cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
+        "$slot" --label "engine build" -- \
+            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
     fi
 }
 
@@ -1719,14 +1756,25 @@ run_engine_cargo_build() {
 locate_launch_binaries() {
     local variant
     variant="$(engine_build_variant_slug)"
-    local -a dirs=()
+    # `dirs` and `published` are parallel: entry i of `published` is "1" when
+    # dirs[i] is a launch dir this script publishes to, "" when it is cargo's
+    # shared uplift path. Tracked explicitly rather than pattern-matched out of
+    # the path, because a glob over the directory NAME has to be kept in step
+    # with `launch_bin_dir` by hand and silently stops matching when that moves.
+    # It did: the discriminator was `*/launch/*`, which no longer matches now
+    # that the published dir is `.launch/`, so every published launch would have
+    # printed the "no published engine binary yet" warning.
+    local -a dirs=() published=()
     if [ -n "${RELEASE:-}" ]; then
         dirs+=("$(launch_bin_dir release "$variant")" "$PROJECT_DIR/target/release")
+        published+=("1" "")
     fi
     dirs+=("$(launch_bin_dir debug "$variant")" "$PROJECT_DIR/target/debug")
+    published+=("1" "")
 
-    local dir
-    for dir in "${dirs[@]}"; do
+    local i dir
+    for i in "${!dirs[@]}"; do
+        dir="${dirs[$i]}"
         # BOTH must be there. A dir holding only the engine is a half-finished
         # build (its gateway publish failed, or someone ran `cargo build -p
         # lucidos-engine` alone); selecting it on the engine alone would pair a
@@ -1735,14 +1783,11 @@ locate_launch_binaries() {
         { [ -f "$dir/lucidos-engine" ] && [ -f "$dir/lucidos-gateway" ]; } || continue
         ENGINE_BIN="$dir/lucidos-engine"
         GATEWAY_BIN="$dir/lucidos-gateway"
-        case "$dir" in
-            */launch/*) ;;
-            *)
-                echo "WARNING: no published engine binary yet — launching from cargo's shared"
-                echo "         uplift path $dir, which every build variant in this checkout"
-                echo "         writes to. Run with -b to build and publish a pinned one."
-                ;;
-        esac
+        if [ -z "${published[$i]}" ]; then
+            echo "WARNING: no published engine binary yet. Launching from cargo's shared"
+            echo "         uplift path $dir, which every build variant in this checkout"
+            echo "         writes to. Run with -b to build and publish a pinned one."
+        fi
         return 0
     done
 

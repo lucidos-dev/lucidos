@@ -87,7 +87,7 @@ const wait_ = (over: Partial<Wait> = {}): Wait => ({
 });
 
 /** The hookless body, which is what the tests drive. The wait row holds no hook
- *  at all now that the jump has moved to the wake card, but the split stays: the
+ *  at all now that the jump has moved to the delivery card, but the split stays: the
  *  family's other three bodies keep theirs, and there is no jsdom here. */
 const step = (event: Wait) => eventWaitRowBody({ event });
 
@@ -116,7 +116,7 @@ describe('EventWaitRow', () => {
    *  subscription wore the same green check a finished tool call gets. A marker
    *  reports a fact; only the child-thread row shows a verdict, and that verdict
    *  is the child's. */
-  it.each(['waiting', 'woke', 'timed_out', 'canceled'] as const)(
+  it.each(['waiting', 'matched', 'timed_out', 'canceled'] as const)(
     'wears no step costume in the %s state',
     (state) => {
       const tree = step(wait_({ state }));
@@ -139,7 +139,7 @@ describe('EventWaitRow', () => {
    *  rather than by red: nothing failed either time. */
   it.each([
     ['waiting', 'waiting', 'live'],
-    ['woke', 'woke', 'arrived'],
+    ['matched', 'matched', 'arrived'],
     ['timed_out', 'timed out', 'lapsed'],
     ['canceled', 'stopped', 'halted'],
   ] as const)('reports the %s state as the word "%s"', (state, word, tone) => {
@@ -150,15 +150,19 @@ describe('EventWaitRow', () => {
   });
 
   /** A wait that resolved on its own keeps the same subject line, so the eye
-   *  reads one row rather than several phrasings. A wake swaps the subscription
+   *  reads one row rather than several phrasings. A match swaps the subscription
    *  list for the event that actually matched: one of the types it was watching
-   *  is now a specific thing that happened. */
+   *  is now a specific thing that happened.
+   *
+   *  **The word is `matched`, not "woke".** A delivery does not require an idle
+   *  thread, and the row cannot tell whether this one had been asleep, so it
+   *  states the thing that is true of the subscription in both lanes. */
   it.each([
-    ['woke', 'ChangeProposed'],
+    ['matched', 'ChangeProposed'],
     ['timed_out', 'timed out'],
   ] as const)('keeps the arming subject in the %s state', (state, note) => {
     const tree = step(
-      wait_({ state, matched_event_type: state === 'woke' ? 'ChangeProposed' : undefined }),
+      wait_({ state, matched_event_type: state === 'matched' ? 'ChangeProposed' : undefined }),
     );
     expect(findByRole(tree, 'event-wait-row')?.props['data-state']).toBe(state);
     expect(vnodeText(tree)).toContain('Set up an event wait:');
@@ -182,7 +186,7 @@ describe('EventWaitRow', () => {
   it('states an unresolved wait deadline without ticking', () => {
     expect(vnodeText(step(wait_()))).toContain('until ');
     // A resolved wait has no deadline left to state.
-    expect(vnodeText(step(wait_({ state: 'woke' })))).not.toContain('until ');
+    expect(vnodeText(step(wait_({ state: 'matched' })))).not.toContain('until ');
   });
 
   /** **An `await_event` timeout runs up to 24 hours**, so a deadline is
@@ -271,30 +275,31 @@ describe('EventWaitRow', () => {
   /** **The arming card carries no jump, by design.** It records the moment the
    *  wait was SET UP, and a link out of it to an event that landed hours later
    *  did not read as belonging to it (reported 2026-08-10). The jump lives on
-   *  the wake card, which IS the arrival. Naming the matched TYPE stays here,
-   *  since that says how this wait ended. */
+   *  the delivery card, which IS the arrival. Naming the matched TYPE stays
+   *  here, since that says how this wait ended. */
   it('links nowhere, even once it has a matched event', () => {
-    const woke = step(wait_({
-      state: 'woke',
+    const matched = step(wait_({
+      state: 'matched',
       matched_event_type: 'ChangeProposed',
       matched_event_id: 'evt-1',
     }));
-    expect(findByRole(woke, 'event-wait-jump')).toBeNull();
+    expect(findByRole(matched, 'event-wait-jump')).toBeNull();
     // The chip carries the jump on the two rows that HAVE one, so its link
     // variant is what would show up here if one grew back.
-    expect(findByClass(woke, 'event-name-link')).toBeNull();
-    expect(vnodeText(woke)).not.toContain('Go to event');
+    expect(findByClass(matched, 'event-name-link')).toBeNull();
+    expect(vnodeText(matched)).not.toContain('Go to event');
     // The matched type is still named.
-    expect(vnodeText(findByClass(woke, 'event-name'))).toBe('ChangeProposed');
+    expect(vnodeText(findByClass(matched, 'event-name'))).toBe('ChangeProposed');
   });
 
   /** The park never splits the transcript, and neither does a resolution that
-   *  WAKES the thread: an attached delivery resumes the same exchange, so a
+   *  RE-ENTERS the thread: an attached delivery resumes the same exchange, so a
    *  boundary would strand the waiting line above it and break the seamless
    *  resume the whole design exists for.
    *
    *  `EventWaitCanceled` is not in this list because a stop is the one
-   *  resolution with no wake, so there is no resume for a boundary to break.
+   *  resolution that re-enters nothing, so there is no resume for a boundary to
+   *  break.
    *  A user stop IS a boundary; see `eventWaitStopStartsExchange`. */
   it.each(['EventWaitStarted', 'EventWaitDelivered', 'EventWaitExpired'])(
     'a %s never starts an exchange',
@@ -303,7 +308,7 @@ describe('EventWaitRow', () => {
     },
   );
 
-  /** A stop has no wake, so there is no resume for a boundary to break, and the
+  /** A stop re-enters nothing, so there is no resume for a boundary to break, and the
    *  user's own stop is a thing they did to the thread at a moment. Every other
    *  cause is somebody acting inside a turn and stays a step there. */
   it.each([
@@ -338,20 +343,20 @@ describe('EventWaitRow', () => {
   });
 });
 
-/** The wake body, which is what a detached delivery looks like in the
- *  transcript now. The prose it replaces is still what the MODEL reads; this is
+/** The delivery body, which is what an arrived subscription event looks like in
+ *  the transcript. The prose it replaces is still what the MODEL reads; this is
  *  the same delivery addressed to the user, and since 2026-08-10 it is the same
  *  event row the wait above it uses. */
 describe('eventDeliveryBody', () => {
-  /** No handler by default: a wake whose event has nowhere to open is the
+  /** No handler by default: a delivery whose event has nowhere to open is the
    *  ordinary case, not the exception. `linked` opts into the jump. */
-  const wake = (over: Partial<Parameters<typeof eventDeliveryBody>[0]> = {}) =>
+  const delivery = (over: Partial<Parameters<typeof eventDeliveryBody>[0]> = {}) =>
     eventDeliveryBody({ eventType: 'CodingAgentIdled', opening: false, ...over });
   const linked = (over: Partial<Parameters<typeof eventDeliveryBody>[0]> = {}) =>
-    wake({ onOpenMatched: () => {}, ...over });
+    delivery({ onOpenMatched: () => {}, ...over });
 
   it('leads with the event name and keeps the payload folded', () => {
-    const tree = wake({ payloadJson: '{\n  "has_changes": true\n}' });
+    const tree = delivery({ payloadJson: '{\n  "has_changes": true\n}' });
     expect(vnodeText(tree)).toContain('CodingAgentIdled');
     // A <details> with no `open` prop: the payload is there, not shown.
     const disclosure = findByClass(tree, 'event-row-fold');
@@ -362,7 +367,7 @@ describe('eventDeliveryBody', () => {
   });
 
   it('drops the disclosure when there is nothing to expand', () => {
-    const tree = wake({ eventType: 'ReleaseTagged' });
+    const tree = delivery({ eventType: 'ReleaseTagged' });
     expect(vnodeText(tree)).toContain('ReleaseTagged');
     expect(findByClass(tree, 'event-row-fold')).toBeNull();
   });
@@ -372,21 +377,47 @@ describe('eventDeliveryBody', () => {
    *  to whichever kind gets edited next. The event name goes through the ONE
    *  chip atom, so a subscription and a delivery spell it the same way. */
   it('is an event row, with the name in the shared chip', () => {
-    const tree = wake({ eventType: 'ChangeProposed' });
+    const tree = delivery({ eventType: 'ChangeProposed' });
     const el = findByRole(tree, 'event-delivery');
     expect(String(el?.props.class)).toContain('event-row');
-    expect(el?.props['data-kind']).toBe('wake');
+    expect(el?.props['data-kind']).toBe('delivery');
     expect(vnodeText(findByClass(tree, 'event-name'))).toBe('ChangeProposed');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('delivered');
   });
 
   /** The arming reason lives on the `EventWaitStarted`, which is routinely
-   *  outside the loaded window by the time the wake lands. A row states no fact
-   *  its own event carries, so the wake names the event and stops. */
+   *  outside the loaded window by the time the delivery lands. A row states no
+   *  fact its own event carries, so the card names the event and stops. */
   it('claims no arming reason it cannot see', () => {
-    const tree = wake({ eventType: 'ChangeProposed' });
+    const tree = delivery({ eventType: 'ChangeProposed' });
     expect(vnodeText(tree)).not.toContain('Set up an event wait');
     expect(vnodeText(tree)).not.toContain('waiting');
+  });
+
+  /** **The card claims nothing about the thread's prior state**, which is the
+   *  same rule one step further: a delivery does not know whether the thread was
+   *  asleep. `await_event` does not hold the turn, so a wait routinely resolves
+   *  while an unrelated turn is running, and the engine then injects the
+   *  delivery into that live loop and tells the MODEL it arrived "while you were
+   *  working". The anchor starts an exchange either way, so this card is drawn
+   *  and its words printed whichever lane it took.
+   *
+   *  It read "Woke on <type>" until 2026-08-13, which was that claim. Pinned
+   *  over every event-wait surface rather than only this one, because "woke" is
+   *  the natural word for the mechanism when you are looking at the engine
+   *  instead of at one thread, and it is the arming row's state pill that would
+   *  quietly reintroduce it. See
+   *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`. */
+  it('says the event arrived, never that the thread woke', () => {
+    expect(vnodeText(delivery({ eventType: 'ChangeProposed' })))
+      .toContain('Event arrived: ChangeProposed');
+    const surfaces = [
+      delivery(),
+      linked(),
+      ...(['waiting', 'matched', 'timed_out', 'canceled'] as const)
+        .map((state) => step(wait_({ state, matched_event_type: 'ChangeProposed' }))),
+    ];
+    for (const tree of surfaces) expect(vnodeText(tree)).not.toMatch(/\bwok|\bwake/i);
   });
 
   /** **This card owns the jump**, moved here from the arming card on
@@ -409,7 +440,7 @@ describe('eventDeliveryBody', () => {
     expect(vnodeText(tree)).not.toContain('Go to event');
   });
 
-  /** **The bug, as the card renders it** (reported 2026-08-10). A wake on a
+  /** **The bug, as the card renders it** (reported 2026-08-10). A delivery of a
    *  `BackgroundBashCompleted` had nowhere to go, and the link went anyway: it
    *  pulsed the unrelated question card that happened to start the turn the
    *  completion landed in. No target now means no affordance, so the dead tap
@@ -418,7 +449,7 @@ describe('eventDeliveryBody', () => {
    *  It is also what a delivery with no recorded `event_id` renders, and what
    *  the card shows while the answer is still being resolved. */
   it('leaves the event name inert when there is nowhere to go', () => {
-    const tree = wake({ eventType: 'BackgroundBashCompleted' });
+    const tree = delivery({ eventType: 'BackgroundBashCompleted' });
 
     // Still named: the NAME is the answer to "why did this thread start
     // talking again", whether or not it can be opened.
@@ -446,8 +477,8 @@ describe('eventDeliveryBody', () => {
    *
    *  It keeps its NAME while it works, rather than swapping in an "Opening…"
    *  caption the way the old link did: the name is a fact the row states, not a
-   *  button label, and replacing it would delete the answer to "why did this
-   *  thread wake" for as long as the navigation takes. */
+   *  button label, and replacing it would delete the answer to "what arrived
+   *  here" for as long as the navigation takes. */
   it('reports the jump as pending and refuses a second tap', () => {
     const idle = findByRole(linked(), 'event-delivery-jump');
     expect(idle?.props.disabled).toBe(false);
@@ -461,7 +492,7 @@ describe('eventDeliveryBody', () => {
 
   /** A marker event carries `{}`, and a disclosure that opens onto an empty
    *  object is a worse affordance than no disclosure. Unserializable payloads
-   *  lose the payload only: the NAME still answers why the thread woke. */
+   *  lose the payload only: the NAME still answers what arrived. */
   it.each([
     ['null', null],
     ['undefined', undefined],
@@ -523,7 +554,7 @@ describe('triggerFiredBody', () => {
   });
 
   /** An event-driven run DOES carry its type, so it gets the same chip a wait's
-   *  subscription and a wake's delivery get.
+   *  subscription and a delivery's matched event get.
    *
    *  **Whether that chip is also the jump is decided upstream**, by whether the
    *  matched event turns out to live in a conversation at all (`eventHasTarget`).
@@ -544,7 +575,7 @@ describe('triggerFiredBody', () => {
     expect(findByRole(linkable, 'trigger-event-jump')).not.toBeNull();
   });
 
-  /** The same chip atom the wake card uses, so one event type is spelled one
+  /** The same chip atom the delivery card uses, so one event type is spelled one
    *  way wherever it appears, and the jump behaves identically on both rows. */
   it('makes the chip the jump, with no separate link beside it', () => {
     const tree = firedLinked({ invocation: eventFire });

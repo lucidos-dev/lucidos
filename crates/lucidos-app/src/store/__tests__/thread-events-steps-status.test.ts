@@ -613,11 +613,13 @@ describe('tool description from event', () => {
     expect(steps[0].description).not.toBe('Thinking');
   });
 
-  it('a text chunk with real content still resolves the Thinking row', () => {
-    // The gate is on VISIBLE content, not on text events as a class: the model
-    // saying something is genuine output and ends the thinking pass, so a tool
-    // call after it opens its own row below the prose rather than folding into a
-    // marker that sits above it.
+  it('prose before a tool call does not cost the pass its row, and the row lands below the prose', () => {
+    // The model narrating before it acts is the common shape, not the exception.
+    // Its text resolves the marker, so the arriving tool call finds nothing
+    // PENDING to name. If it opened a second row, every narrated pass would
+    // print "Thinking ✓" above the step it produced, which is the transcript the
+    // fold exists to prevent. The call claims the resolved marker instead, and
+    // the row moves below the prose that introduced it.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
       [2, { type: 'CodingAgentPromptSent', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
@@ -625,12 +627,83 @@ describe('tool description from event', () => {
       [4, { type: 'CodingAgentToolCalled', name: 'Grep', args: { pattern: 'Thinking' }, tool_use_id: 'tu-A', created: '2026-08-06T09:14:01Z' } as ThreadEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    const respSteps = exchangeResponseEvents(exchanges[0]).filter(
+    const respEvents = exchangeResponseEvents(exchanges[0]);
+    expect(respEvents.map(e => e.type)).toEqual(['text', 'step']);
+    const respSteps = respEvents.filter(
       (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
     );
-    expect(respSteps.map(s => s.description)).toEqual(['Thinking', "Search 'Thinking'"]);
-    expect(respSteps[0].outcome).toBe('success');
-    expect(respSteps[1].outcome).toBe('pending');
+    expect(respSteps.map(s => s.description)).toEqual(["Search 'Thinking'"]);
+    expect(respSteps[0].outcome).toBe('pending');
+    expect(respSteps[0].tool_use_id).toBe('tu-A');
+
+    const steps = exchangeSteps(exchanges[0]);
+    expect(steps.map(s => s.description)).toEqual(["Search 'Thinking'"]);
+  });
+
+  it('a narrated chat pass keeps its context counter on the row the call took over', () => {
+    // The counter is the whole reason the marker is worth claiming rather than
+    // dropping: the snapshot binds to the `Thinking` row (`bindSnapshotToStep`),
+    // and the engine emits it before the tool call, so the row the tool renames
+    // is the one carrying "how full was the context for this call".
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent, '2026-08-12T09:00:01Z');
+    handleEvent(map, 't', 3, { type: 'TextStreamed', text: 'Let me look at where it fires.' } as ThreadEvent, '2026-08-12T09:00:02Z');
+    handleEvent(map, 't', 4, {
+      type: 'ContextCaptured',
+      producer: 'main_llm',
+      model: 'claude-opus-5',
+      context_window: 1_000_000,
+      sections: [],
+      tools: [],
+      estimated_total_tokens: 69_000,
+    } as unknown as ThreadEvent, '2026-08-12T09:00:03Z');
+    handleEvent(map, 't', 5, { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' } } as ThreadEvent, '2026-08-12T09:00:04Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const respEvents = exchangeResponseEvents(exchanges[0]);
+    expect(respEvents.map(e => e.type)).toEqual(['text', 'step']);
+    const step = respEvents[1] as Extract<(typeof respEvents)[number], { type: 'step' }>;
+    expect(step.description).toBe('Run ls');
+    expect(step.outcome).toBe('pending');
+    expect(step.contextCapture?.estimated_total_tokens).toBe(69_000);
+  });
+
+  it('a second narrated pass opens its own row rather than reclaiming the first', () => {
+    // The claim is scoped to the pass that opened the marker: once a call has
+    // taken the row, it is no longer a `Thinking` row, so the next pass's call
+    // has nothing to reclaim and the transcript keeps one row per call.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent, '2026-08-12T09:00:01Z');
+    handleEvent(map, 't', 3, { type: 'TextStreamed', text: 'First, the index.' } as ThreadEvent, '2026-08-12T09:00:02Z');
+    handleEvent(map, 't', 4, { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' } } as ThreadEvent, '2026-08-12T09:00:03Z');
+    handleEvent(map, 't', 5, { type: 'ToolResult', name: 'run_bash', result: 'ok' } as ThreadEvent, '2026-08-12T09:00:04Z');
+    handleEvent(map, 't', 6, { type: 'ThoughtStreamed', text: 'Context: 200 tokens, 3 messages' } as ThreadEvent, '2026-08-12T09:00:05Z');
+    handleEvent(map, 't', 7, { type: 'TextStreamed', text: 'Now the renderer.' } as ThreadEvent, '2026-08-12T09:00:06Z');
+    handleEvent(map, 't', 8, { type: 'ToolCalled', name: 'run_bash', args: { command: 'pwd' } } as ThreadEvent, '2026-08-12T09:00:07Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const respEvents = exchangeResponseEvents(exchanges[0]);
+    expect(respEvents.map(e => e.type)).toEqual(['text', 'step', 'text', 'step']);
+    const steps = exchangeSteps(exchanges[0]);
+    expect(steps.map(s => s.description)).toEqual(['Run ls', 'Run pwd']);
+  });
+
+  it('a tool call does not reclaim a marker left unfinished by a dead turn', () => {
+    // `unfinished` says the turn died mid-pass. Whatever runs after that is not
+    // that pass continuing, so the marker keeps its own row and its own verdict.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
+    handleEvent(map, 't', 2, { type: 'CodingAgentPromptSent', text: 'go' } as ThreadEvent, '2026-08-12T09:00:01Z');
+    handleEvent(map, 't', 3, { type: 'ResponseAborted', reason: 'engine restart' } as ThreadEvent, '2026-08-12T09:00:02Z');
+
+    const aborted = groupIntoExchanges(map.get('t')!.events)[0];
+    const marker = exchangeSteps(aborted, /* isLast */ false)[0];
+    expect(marker).toMatchObject({ description: 'Thinking', outcome: 'unfinished' });
   });
 
   it('a pass that answers in text keeps its Thinking row, which is where its counter lives', () => {

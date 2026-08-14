@@ -53,7 +53,7 @@ export function ConfirmDialog() {
   return (
     <Overlay
       open
-      onClose={() => resolve(false)}
+      onClose={() => resolve(state.acknowledge === true)}
       panelClass="confirm-dialog"
       panelRole="dialog"
       ariaModal
@@ -77,7 +77,11 @@ export function ConfirmDialog() {
           </div>
         )}
         <div class="confirm-actions">
-          {state.extraAction && (
+          {/* An acknowledgement has no Cancel: there is nothing to decline, and
+              a second button meaning the same as the first reads as a choice
+              the user does not have. Escape and an outside click still work,
+              and `resolve(true)` below is why they mean "read it". */}
+          {!state.acknowledge && state.extraAction && (
             <button
               class="confirm-btn confirm-btn-cancel confirm-btn-extra"
               onClick={() => {
@@ -89,9 +93,11 @@ export function ConfirmDialog() {
             </button>
           )}
           <div class="confirm-actions-right">
-            <button class="confirm-btn confirm-btn-cancel" onClick={() => resolve(false)}>
-              {cancelLabel}
-            </button>
+            {!state.acknowledge && (
+              <button class="confirm-btn confirm-btn-cancel" onClick={() => resolve(false)}>
+                {cancelLabel}
+              </button>
+            )}
             <button
               ref={okBtnRef}
               class={`confirm-btn ${state.variant === 'default' ? 'confirm-btn-ok-default' : 'confirm-btn-ok'}`}

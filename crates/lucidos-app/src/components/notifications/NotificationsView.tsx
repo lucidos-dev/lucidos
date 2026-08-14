@@ -18,7 +18,7 @@ import { loadedOr, type Loadable, type Notification } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { ListSkeletonOf, useSkeleton, SkText } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
 /** The Loadable the Notifications view renders for a given filter — the single
@@ -145,7 +145,14 @@ export function NotificationsView() {
  *  placeholder via the Sk* leaves; with a real `n` it renders normally. The
  *  prop is optional only to support the skeleton call; the real call site
  *  passes it. In skeleton mode it renders a non-interactive `<div>` (no click
- *  handler), mirroring the three lines (emoji + title, summary, time). */
+ *  handler), mirroring the three lines (title, summary, time).
+ *
+ *  The row carries NO icon. It wore a 📋 clipboard until 2026-08-13, which was
+ *  the last colour emoji in this pane and said nothing: every row in the
+ *  Notifications list is a notification, so a per-row glyph only restated the
+ *  pane it was already inside. Unread state is carried by `.notification-item.unread`.
+ *  Its `<SkBlock>` stand-in went with it, since a skeleton mirrors the real row
+ *  by construction and a shimmer dot standing in for nothing is a hole. */
 function NotificationRow({ n }: { n?: Notification }) {
   const sk = useSkeleton();
   const date = n ? new Date(n.created_at) : null;
@@ -155,9 +162,6 @@ function NotificationRow({ n }: { n?: Notification }) {
   const body = (
     <>
       <div class="title notification-title">
-        <SkBlock w="1rem" h="1rem" circle>
-          <span class="trigger-icon">📋</span>
-        </SkBlock>
         <SkText w="9rem">{n?.title}</SkText>
       </div>
       <SkText class="notification-summary" as="div" w="16rem">

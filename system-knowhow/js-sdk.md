@@ -1,6 +1,6 @@
 ---
 name: Lucidos JavaScript SDK
-description: API reference for the `lucidos` JS SDK that app UIs call: the data, events, proxy, oauth, triggers, apps, preferences, notifications, threads, ui and sse namespaces, plus the component classes and theme variables apps style with.
+description: API reference for the `lucidos` JS SDK that app UIs call: the data, events, proxy, apiUrl, oauth, triggers, apps, preferences, notifications, threads, ui and sse namespaces, plus the component classes and theme variables apps style with.
 ---
 
 # Lucidos JavaScript SDK
@@ -42,7 +42,7 @@ What each piece does — include only what you need:
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body inherits the root font-size (the user's UI scale), matching Lucidos. | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
@@ -547,9 +547,72 @@ const res = await lucidos.proxy('vertex').fetch(
 | Emit a domain event, or query the event store (domain AND engine events) | `lucidos.events.*` |
 | Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'anthropic' \| 'local').fetch(...)` — no `apis.json` needed |
 | Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
-| Hit the engine's own `/api/v1/*` | Plain `fetch` (same origin, no proxy needed) |
+| Hit an engine endpoint no SDK method covers | `fetch(lucidos.apiUrl('/<suffix>'))`. Same origin, no proxy needed, but the URL **must** be built with `apiUrl`: a hand-written `/api/v1/…` is a 404. See § `lucidos.apiUrl` directly below. |
 
 If the iframe needs a model provider the engine already has, use its built-in proxy name above — no config. For any other external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
+
+## lucidos.apiUrl
+
+```ts
+lucidos.apiUrl(suffix: string): string   // synchronous, returns URL
+```
+
+Builds an absolute URL onto the engine's `/api/v1` surface, carrying the
+**workspace address** (the `/<slug>` path prefix) this app is served under.
+Pass the path *after* `/api/v1`.
+
+```js
+// The endpoint has no SDK method, so build the URL rather than writing one.
+const res = await fetch(lucidos.apiUrl('/notifications'), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ title: 'Done', message: 'Import finished.' }),
+});
+```
+
+**Reach for it only when no SDK method covers the endpoint.** `lucidos.data.*`,
+`lucidos.events.*`, `lucidos.threads.*` and the rest already resolve the prefix,
+and they carry the timeout, error shape and response parsing this raw `fetch`
+does not.
+
+### Why a hand-written `/api/v1/…` does not work
+
+An app iframe is served at `/<workspace>/app/<app-id>/`, and the engine's HTTP
+surface lives at `/<workspace>/api/v1/…`. Both of the URLs an author reaches for
+first resolve somewhere else:
+
+| Written in JS | Resolves to | Answer |
+|---|---|---|
+| `new URL('api/v1/events/query', document.baseURI)` | `/<workspace>/app/<app-id>/api/v1/events/query` | `404` |
+| `fetch('/api/v1/events/query')` | `/api/v1/events/query` | `404 unknown workspace 'api'` |
+
+The relative form fails because **an app iframe has no `<base href>`**. The SPA
+shell gets one stamped in (`<base href="/<workspace>/">`), an app page does not,
+so `document.baseURI` is the app's own directory and every relative path hangs
+off it. The root-absolute form fails because the gateway reads the **first path
+segment as a workspace name**, and there is no workspace called `api`.
+
+**Markup is rewritten on the way out, runtime JS is not.** This is the
+non-obvious part, and it is why the boilerplate in § Setup works at all: the
+engine rewrites root-absolute `src` / `href` **attributes** in the HTML it
+serves, so the `<script src="/api/v1/sdk.js">` sitting in the app's
+`index.html` reaches the browser as
+`<script src="/<workspace>/api/v1/sdk.js">`. Nothing does that for a string your
+JavaScript builds at runtime. **The same `/api/v1/…` string is correct in markup
+and broken in JS.**
+
+`apiUrl` derives the prefix the way the SDK derives it internally: the
+`<base href>` when the document has one, otherwise everything before `/app/` in
+the path. Don't re-derive it in app code, and never hardcode a slug: the
+workspace name is not the app's to know. (`lucidos.configure({ baseUrl })` is
+the one override, for an app hosted outside the engine.)
+
+**The failure mode is silence.** A wrong URL is a plain 404, so an app that
+wraps the call in a `try` / `catch`, warns to the console and falls back to a
+second data source goes on looking healthy: it renders plausible, stale numbers
+and nothing on screen changes. That is how this survived weeks in a real app.
+If a fetch of yours has a fallback path, surface the failure in the UI as well
+as the console.
 
 ## lucidos.oauth — OAuth Token Access
 
@@ -920,14 +983,14 @@ interface NotificationListResult {
 
 ### Tap shapes — examples
 
-The SDK only exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating a notification from app code goes through the engine HTTP API directly (`POST /api/v1/notifications` — same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce):
+The SDK only exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating a notification from app code goes through the engine HTTP API directly (`POST /api/v1/notifications`, the same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce). This is the ordinary case for § `lucidos.apiUrl`: build the URL with it rather than writing `/api/v1/notifications` into the `fetch`, which 404s from an app iframe.
 
 ```js
 // Default: open the inbox detail showing the message body. Use this for any
 // info-only notification too ("OAuth completed", "Build succeeded") — every
 // notification is openable; there is no separate passive kind. For ephemeral
 // status that should NOT land in the inbox at all, use a plain `showToast`.
-await fetch('/api/v1/notifications', {
+await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -938,7 +1001,7 @@ await fetch('/api/v1/notifications', {
 });
 
 // Navigate to a panel.
-await fetch('/api/v1/notifications', {
+await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -949,7 +1012,7 @@ await fetch('/api/v1/notifications', {
 });
 
 // Navigate to a thread, optionally scroll-and-pulse a specific event row.
-await fetch('/api/v1/notifications', {
+await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -962,7 +1025,7 @@ await fetch('/api/v1/notifications', {
 });
 
 // Navigate to an app's UI.
-await fetch('/api/v1/notifications', {
+await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({

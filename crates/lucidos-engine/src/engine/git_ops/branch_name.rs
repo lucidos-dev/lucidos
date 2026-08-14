@@ -1,8 +1,8 @@
-//! Coding-agent branch naming: `lucidos-<agent>-<app|repo>-<name>-<slug>[-<n>]`.
+//! Coding-agent branch naming: `lucidos-<agent>-<app|repo>-<name>-<slug>-<id>`.
 //!
 //! Every branch an *agent session* creates is named for the thread that owns it,
 //! so `git branch -a` reads as a list of work rather than a wall of timestamps.
-//! Four segments, each earning its place:
+//! Five segments, each earning its place:
 //!
 //! - `lucidos` marks the branch as engine-created. It is the one segment every
 //!   consumer may match on, and in an *external repo* it is what tells the user
@@ -10,8 +10,15 @@
 //! - `<agent>` is [`CodingAgent::as_str`] (`claude-code` / `codex`), so the enum
 //!   stays the single source of truth and a third backend needs no naming work.
 //! - `<app|repo>-<name>` is the [`BranchScope`]: what the thread works on.
-//! - `<slug>` is the thread's name, kebab-cased, with `-2` / `-3` appended when
-//!   an earlier thread already took the name.
+//! - `<slug>` is the thread's name, kebab-cased. Readable, and nothing more: a
+//!   prompt's opening words are a terrible discriminator, because parallel
+//!   partitions of one job legitimately share them.
+//! - `<id>` is [`short_thread_id`], which is what makes the name unique. It is
+//!   the same short id the thread's worktree directory carries
+//!   (`thread-<id>`), so a branch and its worktree read as one pair.
+//!
+//! `-2` / `-3` is still appended when the whole name is somehow taken, which
+//! now means one thread minting twice rather than two threads colliding.
 //!
 //! Replaces the old `claude-code/<ts>-<uuid>` and
 //! `claude-code/app/<id>/<ts>-<uuid>` shapes (ADR 0004 had recorded the
@@ -19,7 +26,7 @@
 //! change for the reversal). Branches created under the old shapes are never
 //! renamed and keep working; `is_coding_agent_branch` recognises both.
 
-use super::{git_cmd, GIT_TIMEOUT};
+use super::{git_cmd, short_thread_id, GIT_TIMEOUT};
 use crate::core::slug::{slugify_kebab, truncate_slug};
 use crate::runtime::CodingAgent;
 use std::collections::HashSet;
@@ -83,17 +90,16 @@ pub(crate) fn is_coding_agent_branch(branch: &str) -> bool {
     branch.starts_with(LUCIDOS_BRANCH_PREFIX) || branch.starts_with(LEGACY_BRANCH_PREFIX)
 }
 
-/// Kebab-case a thread name into the slug segment, falling back to
-/// `thread-<8 hex>` when nothing survives slugification (an emoji-only or CJK
-/// title, or a thread with neither a title nor a first message yet).
-pub(crate) fn branch_slug(thread_name: &str, thread_id: Uuid) -> String {
+/// Kebab-case a thread name into the slug segment. Falls back to `thread` when
+/// nothing survives slugification: an emoji-only or CJK title, or a thread with
+/// neither a title nor a first message yet.
+///
+/// The fallback carries no id of its own. The base appends the thread's short
+/// id to every slug, so `thread-<id>` comes out of the two segments together.
+pub(crate) fn branch_slug(thread_name: &str) -> String {
     let s = truncate_slug(&slugify_kebab(thread_name), MAX_SLUG_CHARS);
     if s.is_empty() {
-        // `chars().take` rather than a byte slice, matching
-        // `slugify_trigger_name_with_fallback`: same rule, and the uuid's
-        // ASCII-ness should not be what keeps an index from panicking.
-        let short: String = thread_id.as_simple().to_string().chars().take(8).collect();
-        format!("thread-{short}")
+        "thread".to_string()
     } else {
         s
     }
@@ -103,20 +109,29 @@ pub(crate) fn branch_slug(thread_name: &str, thread_id: Uuid) -> String {
 /// repo. The scope name is slugified here rather than trusted: an app id is
 /// already kebab-case, but a registered repository's `name` is free text the
 /// user typed.
+///
+/// The trailing [`short_thread_id`] is what makes the result unique, so the
+/// numbering below is a fallback rather than the mechanism. Two threads cannot
+/// derive the same base however alike their prompts are.
 pub(crate) fn coding_agent_branch_base(
     agent: CodingAgent,
     scope: &BranchScope,
     slug: &str,
+    thread_id: Uuid,
 ) -> String {
     let (kind, name) = scope.segments();
     let name = truncate_slug(&slugify_kebab(name), MAX_SLUG_CHARS);
+    let id = short_thread_id(thread_id);
     // A scope whose name slugifies away entirely still gets its kind segment,
     // so the shape stays parseable and the slug can never abut the agent.
     if name.is_empty() {
-        format!("{LUCIDOS_BRANCH_PREFIX}{}-{kind}-{slug}", agent.as_str())
+        format!(
+            "{LUCIDOS_BRANCH_PREFIX}{}-{kind}-{slug}-{id}",
+            agent.as_str()
+        )
     } else {
         format!(
-            "{LUCIDOS_BRANCH_PREFIX}{}-{kind}-{name}-{slug}",
+            "{LUCIDOS_BRANCH_PREFIX}{}-{kind}-{name}-{slug}-{id}",
             agent.as_str()
         )
     }
@@ -148,6 +163,31 @@ pub(crate) fn pick_free_branch_name(
         }
     }
     format!("{base}-{unique_suffix}")
+}
+
+/// Did `git worktree add` fail because the branch name is already taken?
+///
+/// Three git messages, because git checks the name twice and can lose at
+/// either point:
+///
+/// - `a branch named 'x' already exists`, its own pre-flight check.
+/// - `'x' is already used by worktree at ...`, the branch exists and is
+///   checked out somewhere.
+/// - `cannot lock ref 'refs/heads/x'`, the ref transaction losing the race.
+///   Git's pre-flight check is itself a check-then-act, the very shape this
+///   module exists to survive. Under real contention it passes, and the
+///   transaction below it is what fails. The tail varies (`reference already
+///   exists`, or a `.lock` file another process holds) and both mean the same
+///   thing: somebody else is creating this exact ref right now.
+///
+/// Deliberately narrow otherwise. A retry only helps when a *different name*
+/// would succeed. So the other "already exists" git can emit here, the one
+/// about the worktree *path*, must not match: re-deriving the name would burn
+/// every attempt on a failure the name has nothing to do with.
+pub(crate) fn branch_name_is_taken(stderr: &str) -> bool {
+    (stderr.contains("a branch named") && stderr.contains("already exists"))
+        || stderr.contains("is already used by worktree at")
+        || stderr.contains("cannot lock ref 'refs/heads/")
 }
 
 /// List the local branches that could collide with `base`: `base` itself and
@@ -190,19 +230,19 @@ async fn existing_branches_for(repo_root: &Path, base: &str) -> Option<HashSet<S
 }
 
 /// Allocate a branch name for a fresh coding-agent session:
-/// `lucidos-<agent>-<app|repo>-<name>-<slug>`, numbered if the slug is taken.
+/// `lucidos-<agent>-<app|repo>-<name>-<slug>-<id>`, numbered if it is taken.
 ///
 /// Reads refs only; the branch itself is still created by the caller's
 /// `git worktree add -b` (or `create_sparse_app_worktree`), which keeps the
 /// `branch_created` bookkeeping the failure-path cleanup depends on honest.
 ///
-/// That leaves a millisecond-wide race: two spawns allocating the same name at
-/// the same instant both try `-b`, and the loser's `worktree add` fails with
-/// "a branch named 'x' already exists". That failure is loud, non-destructive
-/// and retryable (the spawn surfaces "resend the message to retry"), which is
-/// the direction to fail in. Closing it would mean creating the ref here and
-/// handing `worktree add` a pre-existing branch, which blurs "did this attempt
-/// create it" exactly where `cleanup_failed_spawn` needs the answer.
+/// **This is a proposal, not a reservation.** Nothing serializes the read here
+/// with the create later, so the answer can be stale by the time it is used.
+/// Two things stop that mattering. The name carries the thread's short id, so a
+/// sibling spawn is asking for a different name in the first place. And the
+/// caller retries: `FreshBranch::create_worktree` calls back in here when a
+/// create loses, and the fresh listing then sees the winner's branch. The
+/// create is the source of truth, this is only a good first guess.
 pub(crate) async fn allocate_coding_agent_branch(
     repo_root: &Path,
     agent: CodingAgent,
@@ -210,7 +250,7 @@ pub(crate) async fn allocate_coding_agent_branch(
     thread_name: &str,
     thread_id: Uuid,
 ) -> String {
-    let base = coding_agent_branch_base(agent, scope, &branch_slug(thread_name, thread_id));
+    let base = coding_agent_branch_base(agent, scope, &branch_slug(thread_name), thread_id);
     let existing = existing_branches_for(repo_root, &base).await;
     if existing.is_none() {
         log!(
@@ -232,31 +272,75 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A fixed id so the expected names below can be written out in full.
+    fn id() -> Uuid {
+        Uuid::parse_str("401a2d19-1111-2222-3333-444444444444").unwrap()
+    }
+
     #[test]
     fn base_carries_agent_and_scope() {
         assert_eq!(
             coding_agent_branch_base(
                 CodingAgent::ClaudeCode,
                 &BranchScope::Repo("Lucidos".into()),
-                "fix-auth-timeout"
+                "fix-auth-timeout",
+                id()
             ),
-            "lucidos-claude-code-repo-lucidos-fix-auth-timeout"
+            "lucidos-claude-code-repo-lucidos-fix-auth-timeout-401a2d19"
         );
         assert_eq!(
             coding_agent_branch_base(
                 CodingAgent::ClaudeCode,
                 &BranchScope::App("habit-tracker".into()),
-                "add-streaks"
+                "add-streaks",
+                id()
             ),
-            "lucidos-claude-code-app-habit-tracker-add-streaks"
+            "lucidos-claude-code-app-habit-tracker-add-streaks-401a2d19"
         );
         assert_eq!(
             coding_agent_branch_base(
                 CodingAgent::Codex,
                 &BranchScope::Repo("example-repo".into()),
-                "fix-auth"
+                "fix-auth",
+                id()
             ),
-            "lucidos-codex-repo-example-repo-fix-auth"
+            "lucidos-codex-repo-example-repo-fix-auth-401a2d19"
+        );
+    }
+
+    /// The whole point of the trailing id: two threads whose prompts open
+    /// identically, which is what parallel partitions of one job look like,
+    /// still derive different names before any ref is read.
+    #[test]
+    fn identical_prompts_from_different_threads_derive_different_names() {
+        let scope = BranchScope::Repo("lucidos".into());
+        let slug = branch_slug("you are one of six parallel partitions");
+        let a = coding_agent_branch_base(CodingAgent::ClaudeCode, &scope, &slug, Uuid::new_v4());
+        let b = coding_agent_branch_base(CodingAgent::ClaudeCode, &scope, &slug, Uuid::new_v4());
+        assert_ne!(a, b, "the thread id must separate two identical prompts");
+    }
+
+    /// The branch's id segment and the worktree directory's are the same
+    /// string, so `git branch -a` and `ls .lucidos/worktrees` pair up by eye.
+    #[test]
+    fn the_branch_id_matches_the_worktree_directory_id() {
+        let thread_id = Uuid::new_v4();
+        let workspace = std::path::Path::new("/tmp/does-not-need-to-exist");
+        let branch = coding_agent_branch_base(
+            CodingAgent::ClaudeCode,
+            &BranchScope::Repo("lucidos".into()),
+            "fix-auth",
+            thread_id,
+        );
+        let dir_name = format!("thread-{}", short_thread_id(thread_id));
+        assert!(
+            branch.ends_with(&format!("-{}", short_thread_id(thread_id))),
+            "branch {branch} must end in the short thread id"
+        );
+        assert!(
+            crate::engine::agent_session::resume::deterministic_worktree_path(workspace, thread_id)
+                .ends_with(&dir_name),
+            "worktree dir must carry the same short id as the branch"
         );
     }
 
@@ -283,25 +367,35 @@ mod tests {
             coding_agent_branch_base(
                 CodingAgent::ClaudeCode,
                 &BranchScope::Repo("日本語".into()),
-                "fix-thing"
+                "fix-thing",
+                id()
             ),
-            "lucidos-claude-code-repo-fix-thing"
+            "lucidos-claude-code-repo-fix-thing-401a2d19"
+        );
+    }
+
+    /// A title that slugifies away leaves the id to name the branch, and the
+    /// two segments compose into the `thread-<id>` this used to produce alone.
+    #[test]
+    fn a_title_that_slugifies_away_leaves_just_the_thread_id() {
+        assert_eq!(branch_slug("🎉🎉🎉"), "thread");
+        assert_eq!(branch_slug(""), "thread");
+        assert_eq!(branch_slug("!!!"), "thread");
+        assert_eq!(
+            coding_agent_branch_base(
+                CodingAgent::ClaudeCode,
+                &BranchScope::Repo("lucidos".into()),
+                &branch_slug("🎉🎉🎉"),
+                id()
+            ),
+            "lucidos-claude-code-repo-lucidos-thread-401a2d19"
         );
     }
 
     #[test]
-    fn slug_falls_back_to_the_thread_id_when_nothing_survives() {
-        let id = Uuid::parse_str("401a2d19-1111-2222-3333-444444444444").unwrap();
-        assert_eq!(branch_slug("🎉🎉🎉", id), "thread-401a2d19");
-        assert_eq!(branch_slug("", id), "thread-401a2d19");
-        assert_eq!(branch_slug("!!!", id), "thread-401a2d19");
-    }
-
-    #[test]
     fn slug_is_capped_at_a_word_boundary() {
-        let id = Uuid::new_v4();
         let long = "we should name our coding agent branches after the thread that owns them";
-        let slug = branch_slug(long, id);
+        let slug = branch_slug(long);
         assert!(slug.len() <= MAX_SLUG_CHARS, "slug too long: {slug}");
         assert!(!slug.ends_with('-'), "slug must not end on a dash: {slug}");
         assert_eq!(slug, "we-should-name-our-coding-agent-branches-after");
@@ -358,6 +452,41 @@ mod tests {
             pick_free_branch_name(base, Some(&existing), "abc123"),
             format!("{base}-abc123")
         );
+    }
+
+    /// Real stderr from `git worktree add`, since the predicate decides
+    /// whether a spawn retries or gives up.
+    #[test]
+    fn a_taken_branch_name_is_told_apart_from_every_other_failure() {
+        assert!(branch_name_is_taken(
+            "Preparing worktree (new branch 'lucidos-claude-code-repo-lucidos-fix')\n\
+             fatal: a branch named 'lucidos-claude-code-repo-lucidos-fix' already exists"
+        ));
+        assert!(branch_name_is_taken(
+            "fatal: 'lucidos-codex-repo-lucidos-fix' is already used by worktree at \
+             '/ws/.lucidos/worktrees/thread-401a2d19'"
+        ));
+        // What the race actually produces once git's own pre-flight check has
+        // been raced past, observed in `a_lost_branch_race_retries_until_it_wins`.
+        assert!(branch_name_is_taken(
+            "Preparing worktree (new branch 'lucidos-claude-code-repo-lucidos-fix')\n\
+             fatal: cannot lock ref 'refs/heads/lucidos-claude-code-repo-lucidos-fix': \
+             reference already exists"
+        ));
+        assert!(branch_name_is_taken(
+            "fatal: cannot lock ref 'refs/heads/lucidos-claude-code-repo-lucidos-fix': \
+             Unable to create '/repo/.git/refs/heads/lucidos-claude-code-repo-lucidos-fix.lock': \
+             File exists."
+        ));
+        // The worktree PATH already existing is a different problem, and no
+        // amount of re-deriving the branch name fixes it.
+        assert!(!branch_name_is_taken(
+            "fatal: '/ws/.lucidos/worktrees/thread-401a2d19' already exists"
+        ));
+        assert!(!branch_name_is_taken(
+            "fatal: invalid reference: origin/main"
+        ));
+        assert!(!branch_name_is_taken(""));
     }
 
     #[test]

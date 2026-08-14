@@ -5,8 +5,8 @@ import type { ComponentChildren } from 'preact';
  *
  *  Four kinds share it, because they all answer the same question ("what
  *  happened outside this thread") and used to answer it in four dialects: an
- *  *event wait* (armed, woken, expired, stood down), an *event wake* (a
- *  detached delivery), a *child thread* callback, and a *trigger* fire. Between
+ *  *event wait* (armed, matched, expired, stood down), an *event delivery*, a
+ *  *child thread* callback, and a *trigger* fire. Between
  *  them they carried four glyph vocabularies, three disclosure labels, and the
  *  event type as an accent chip in one place and prose in another. See
  *  `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.
@@ -33,18 +33,22 @@ import type { ComponentChildren } from 'preact';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'wake' | 'child' | 'trigger';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger';
 
 /** What the mark column says. Deliberately not the kind: the mark answers "did
  *  something arrive", which is the one question all four kinds share, so a
- *  woken wait and a trigger fire get the same glyph and are told apart by their
- *  subject and their state word. */
+ *  matched wait and a trigger fire get the same glyph and are told apart by
+ *  their subject and their state word. */
 export type EventRowMark = 'pending' | 'arrived' | 'returned';
 
-/** Monochrome and universally available, on purpose. An emoji here (the ⏰ the
- *  trigger panel uses for its chip) would render in colour and be the one loud
- *  thing in a column of muted marks, which is the step-icon mistake in a
- *  different hat. */
+/** Monochrome and universally available, on purpose. An emoji here would render
+ *  in colour and be the one loud thing in a column of muted marks, which is the
+ *  step-icon mistake in a different hat. It said "the ⏰ the trigger panel uses
+ *  for its chip" until 2026-08-13, when that chip's emoji became a drawn glyph
+ *  along with the last six in host chrome; the colour argument was never what
+ *  kept these three as TEXT, which is the actual claim. They are marks in a
+ *  column of prose, sized and coloured by the type around them, where an icon
+ *  would need a box. */
 const EVENT_ROW_MARK: Record<EventRowMark, string> = {
   pending: '○',
   arrived: '↓',
@@ -190,9 +194,9 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
 
 /** The event-type atom, in both of its forms.
  *
- *  Exported because a chip is not always a FACT: the wake card puts one in its
- *  subject ("Woke on `CodingAgentIdled`"), and one event type must not be
- *  spelled two ways depending on which line of the card it landed on.
+ *  Exported because a chip is not always a FACT: the delivery card puts one in
+ *  its subject ("Event arrived: `CodingAgentIdled`"), and one event type must
+ *  not be spelled two ways depending on which line of the card it landed on.
  *
  *  A plain function rather than a component, matching `eventRowBody` and for the
  *  same reason: there is no jsdom in the test infra, so the tests walk the vnode

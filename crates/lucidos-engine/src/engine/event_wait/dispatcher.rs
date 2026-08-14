@@ -1,10 +1,10 @@
-//! The **wake half** of the event-wait dispatcher: the bus subscriber, the
-//! deadline sweep, the boot rebuild, and the re-entry that actually wakes a
+//! The **re-entry half** of the event-wait dispatcher: the bus subscriber, the
+//! deadline sweep, the boot rebuild, and the re-entry that actually re-opens a
 //! subscribed thread.
 //!
 //! `super` holds the pure and queryable half (the matcher, the cache, the
 //! catch-up scan, the result builders). Everything here needs an
-//! `Arc<LucidosEngine>`, because a wake is a chat turn.
+//! `Arc<LucidosEngine>`, because a re-entry is a chat turn.
 //!
 //! # Three ways in, one way out
 //!
@@ -22,10 +22,10 @@
 //! 1. The wait is an event, so the record survives by construction.
 //! 2. [`LucidosEngine::rebuild_event_waits`] re-derives the cache at boot.
 //! 3. Each rebuilt wait re-runs its catch-up scan, so an event that landed
-//!    while the engine was down still wakes its thread. The same scan closes
+//!    while the engine was down still reaches its thread. The same scan closes
 //!    the live race between `EventWaitStarted` and the cache insert.
-//! 4. [`LucidosEngine::refire_unresolved_event_wakes`] re-drives a resolution
-//!    whose wake never ran, which is the one gap the first three leave: a crash
+//! 4. [`LucidosEngine::refire_unresolved_wait_reentries`] re-drives a resolution
+//!    whose re-entry never ran, which is the one gap the first three leave: a crash
 //!    after the resolution is persisted but before the turn re-entered.
 //! 5. **A teardown declines to resolve at all.** Once
 //!    `LucidosEngine::is_shutting_down` is true, all three resolution paths
@@ -35,7 +35,7 @@
 //!    restart still armed with a match already in the store, or past its own
 //!    deadline.
 //!
-//!    It is a restart mechanism because a wake is a chat TURN. Without the gate
+//!    It is a restart mechanism because a re-entry is a chat TURN. Without the gate
 //!    a match landing mid-teardown starts a fresh turn against an engine on its
 //!    way out: on 2026-08-07 one ran for fourteen seconds and was thrown away,
 //!    and because it became in-flight after the teardown pre-emit's snapshot it
@@ -44,7 +44,7 @@
 //!    actor half of that is fixed separately (`LucidosEngine::teardown_actor`),
 //!    and has to be: no flag read can close the window between the check and the
 //!    turn registering. This half is what stops the wasted turn, and leaves the
-//!    thread simply waking cleanly on the new engine instead.
+//!    thread simply re-entered cleanly on the new engine instead.
 
 use std::sync::Arc;
 
@@ -54,8 +54,8 @@ use uuid::Uuid;
 
 use super::{
     catch_up_from_watermark, emit_cancel, emit_delivery, emit_expiry, expired_waits,
-    is_awaitable_event, rebuild_live_waits, waits_matching, CancelWaitOutcome, EventWake,
-    EventWakeRequest, LiveWait, ResolutionEmitError, DEADLINE_SWEEP_INTERVAL,
+    is_awaitable_event, rebuild_live_waits, waits_matching, CancelWaitOutcome, LiveWait,
+    ResolutionEmitError, WaitReentry, WaitReentryRequest, DEADLINE_SWEEP_INTERVAL,
 };
 use crate::core::event_subscription::matchable_thread_payload;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
@@ -131,10 +131,10 @@ impl LucidosEngine {
     /// intact and the next engine's rebuild plus catch-up scan finds the same
     /// match (mechanisms 2 and 3 in the module doc).
     ///
-    /// Logged rather than silent: a wake held back is a thread that will not run
+    /// Logged rather than silent: a re-entry held back is a thread that will not run
     /// until the next boot, which is the sort of thing that should be findable
     /// in the log rather than inferred from a gap in a transcript.
-    fn shutdown_declines_wake(&self, site: &'static str) -> bool {
+    fn shutdown_declines_reentry(&self, site: &'static str) -> bool {
         if !self.is_shutting_down() {
             return false;
         }
@@ -153,7 +153,7 @@ impl LucidosEngine {
     /// way to archive a thread (the button, the cascade when a parent is
     /// archived, an agent tool) and this catches all of them at the one point
     /// they agree on, the persisted event. Leaving a wait live behind the
-    /// archive curtain would wake a thread the user considers closed.
+    /// archive curtain would re-open a thread the user considers closed.
     ///
     /// The other two causes are not derivable from an event and stay at their
     /// call sites, both of them explicit requests rather than consequences:
@@ -209,9 +209,9 @@ impl LucidosEngine {
             return;
         }
         // AFTER the emptiness check, so a teardown on a workspace with nothing
-        // armed says nothing, and one that really is holding a wake back says so
+        // armed says nothing, and one that really is holding a re-entry back says so
         // once per event it declined.
-        if self.shutdown_declines_wake("live match") {
+        if self.shutdown_declines_reentry("live match") {
             return;
         }
         let (event_type, payload) = match &emitted.typed {
@@ -251,7 +251,7 @@ impl LucidosEngine {
         let snapshot = self.live_waits.snapshot().await;
         for (wait_id, matched_index) in waits_matching(&snapshot, &event_type, &payload) {
             // The one-shot gate: whoever wins `take` owns the resolution, so a
-            // burst of matching events produces exactly one wake per wait.
+            // burst of matching events produces exactly one delivery per wait.
             let Some(wait) = self.live_waits.take(wait_id).await else {
                 continue;
             };
@@ -270,7 +270,7 @@ impl LucidosEngine {
         }
     }
 
-    /// Resolve one wait as delivered and wake its thread.
+    /// Resolve one wait as delivered and re-enter its thread.
     ///
     /// The caller must already have taken the wait out of the live-waits cache.
     pub(crate) async fn deliver_event_wait(
@@ -298,14 +298,14 @@ impl LucidosEngine {
         )
         .await
         {
-            Ok(wake) => self.queue_event_wake(wait.thread_id, wake),
+            Ok(reentry) => self.queue_wait_reentry(wait.thread_id, reentry),
             Err(e) => self.resolution_emit_failed(wait, "Delivery", e).await,
         }
     }
 
-    /// Resolve one wait as expired and wake its thread.
+    /// Resolve one wait as expired and re-enter its thread.
     ///
-    /// An expiry **wakes**: a silently dropped wait is a permanently stalled
+    /// An expiry **re-enters**: a silently dropped wait is a permanently stalled
     /// thread, which is strictly worse than the polling this replaces.
     pub(crate) async fn expire_event_wait(&self, wait: &LiveWait) {
         // The one moment a never-emitted event name is worth mentioning:
@@ -324,7 +324,7 @@ impl LucidosEngine {
             wait.thread_id,
         );
         match emit_expiry(&self.event_bus, wait, &never_seen).await {
-            Ok(wake) => self.queue_event_wake(wait.thread_id, wake),
+            Ok(reentry) => self.queue_wait_reentry(wait.thread_id, reentry),
             Err(e) => self.resolution_emit_failed(wait, "Expiry", e).await,
         }
     }
@@ -364,7 +364,7 @@ impl LucidosEngine {
                 // and the user gets Continue).
                 crate::log!(
                     "[EventWait] {} anchor emit failed for wait {} on thread {}: {}. \
-                     The wait is resolved but the thread will not wake until it is \
+                     The wait is resolved but the thread will not resume until it is \
                      continued or the engine restarts",
                     what,
                     wait.wait_id,
@@ -375,65 +375,65 @@ impl LucidosEngine {
         }
     }
 
-    /// Hand a resolved wait's wake to the consumer task.
+    /// Hand a resolved wait's re-entry to the consumer task.
     ///
     /// The channel hop is required rather than tidy: registration runs its
     /// catch-up scan inline (S7), so an `await_event` call can resolve a wait in
     /// the same breath, and awaiting the turn from there would make
-    /// `run_agentic_loop`'s future contain itself. See `EVENT_WAKE_RX`.
-    fn queue_event_wake(&self, thread_id: Uuid, wake: EventWake) {
+    /// `run_agentic_loop`'s future contain itself. See `WAIT_REENTRY_RX`.
+    fn queue_wait_reentry(&self, thread_id: Uuid, reentry: WaitReentry) {
         if let Err(e) = self
-            .event_wake_tx
-            .send(EventWakeRequest { thread_id, wake })
+            .wait_reentry_tx
+            .send(WaitReentryRequest { thread_id, reentry })
         {
             crate::log!(
-                "[EventWait] Wake channel closed, thread {} will not resume: {}",
+                "[EventWait] Re-entry channel closed, thread {} will not resume: {}",
                 thread_id,
                 e
             );
         }
     }
 
-    /// Drain the wake channel, running one chat turn per resolved wait. Started
+    /// Drain the re-entry channel, running one chat turn per resolved wait. Started
     /// once at boot, beside the other consumers.
-    pub fn start_event_wake_consumer(self: &Arc<Self>) {
-        let rx = crate::engine::EVENT_WAKE_RX.with(|cell| cell.borrow_mut().take());
+    pub fn start_wait_reentry_consumer(self: &Arc<Self>) {
+        let rx = crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            crate::log!("[EventWait] Wake receiver missing, consumer not started");
+            crate::log!("[EventWait] Re-entry receiver missing, consumer not started");
             return;
         };
         let engine = self.clone();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
-                // One task per wake: two threads woken by the same event must
+                // One task per re-entry: two threads re-entered by the same event must
                 // not serialize behind each other, and admission control (the
                 // Thread Queue, via `register_thread_queued`) is what bounds
                 // the concurrency, not this loop.
                 let engine = engine.clone();
-                tokio::spawn(async move { engine.resume_from_event_wake(req).await });
+                tokio::spawn(async move { engine.reenter_from_wait(req).await });
             }
-            crate::log!("[EventWait] Wake channel closed, consumer exiting");
+            crate::log!("[EventWait] Re-entry channel closed, consumer exiting");
         });
     }
 
     /// Re-enter the thread on the back of a resolved wait.
     ///
-    /// `PreEmittedOrigin::EventWake` is what keeps this from looking like
+    /// `PreEmittedOrigin::WaitReentry` is what keeps this from looking like
     /// something the user said: no `MessageReceived` is emitted, the turn's
     /// `request_event_id` is the anchor `emit_delivery` already wrote, and a
     /// thread that happens to be running injects it as
-    /// `InjectedPromptKind::WakeFromEvent` rather than starting a second turn.
+    /// `InjectedPromptKind::ReentryFromWait` rather than starting a second turn.
     ///
-    /// **A coding-agent thread is woken through the coding-agent lane**, which
+    /// **A coding-agent thread is re-entered through the coding-agent lane**, which
     /// is what makes `await_event` available to Claude Code and Codex at all.
     /// Passing `is_coding_agent` here picks the `msg_tx` route into a live
     /// session, or a fresh `--resume` when there is none, exactly as the
-    /// child-completion fan-in does. An unreadable row answers `false`: waking a
+    /// child-completion fan-in does. An unreadable row answers `false`: re-entering a
     /// coding-agent thread down the chat lane wastes a turn and is recoverable,
-    /// while waking a chat thread down the coding-agent lane would try to spawn
+    /// while re-entering a chat thread down the coding-agent lane would try to spawn
     /// a session for a thread that has no worktree.
-    async fn resume_from_event_wake(&self, req: EventWakeRequest) {
-        let EventWakeRequest { thread_id, wake } = req;
+    async fn reenter_from_wait(&self, req: WaitReentryRequest) {
+        let WaitReentryRequest { thread_id, reentry } = req;
         let is_coding_agent: bool =
             sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
                 .bind(thread_id)
@@ -442,7 +442,7 @@ impl LucidosEngine {
                 .unwrap_or_else(|e| {
                     crate::log!(
                         "[EventWait] Could not read is_coding_agent for thread {}: {} \
-                 (waking through the chat lane)",
+                 (re-entering through the chat lane)",
                         thread_id,
                         e
                     );
@@ -451,7 +451,7 @@ impl LucidosEngine {
                 .unwrap_or(false);
         if let Err(e) = self
             .process_message_with_steps(
-                &wake.text,
+                &reentry.text,
                 None,
                 None,
                 None,
@@ -469,7 +469,7 @@ impl LucidosEngine {
                 ActorMode::Agent,
                 None,
                 None,
-                Some(PreEmittedOrigin::EventWake(wake.anchor_event_id)),
+                Some(PreEmittedOrigin::WaitReentry(reentry.anchor_event_id)),
                 None,
                 None,
                 crate::engine::FollowUpUrgency::Normal,
@@ -477,7 +477,7 @@ impl LucidosEngine {
             .await
         {
             crate::log!(
-                "[EventWait] Wake turn failed for thread {}: {}",
+                "[EventWait] Re-entry turn failed for thread {}: {}",
                 thread_id,
                 e
             );
@@ -487,7 +487,7 @@ impl LucidosEngine {
             // safety net exists, so logging alone leaves the thread spinning
             // with no Continue affordance until the next restart's stale-settle
             // sweep. Same handling as the structurally identical
-            // `child_follow_up` wake.
+            // `child_follow_up` re-entry.
             self.event_bus
                 .emit_or_log(
                     BusEvent::Thread {
@@ -497,7 +497,7 @@ impl LucidosEngine {
                         },
                         meta: EventMeta::NONE,
                     },
-                    "[EventWait] ResponseFailed after a failed wake turn",
+                    "[EventWait] ResponseFailed after a failed re-entry turn",
                 )
                 .await;
         }
@@ -505,19 +505,19 @@ impl LucidosEngine {
 
     /// Resolve every wait whose deadline has passed. One tick of the sweep.
     ///
-    /// An expiry WAKES, so it is a chat turn like any other and needs the same
+    /// An expiry RE-ENTERS, so it is a chat turn like any other and needs the same
     /// teardown gate as the two match paths. The caller's loop already breaks on
     /// the flag, and that is not enough: it reads it once per tick, on a ten
     /// second interval, against a teardown that routinely takes longer than that
     /// (`shutdown_agent_sessions` alone polls for up to ten seconds). A tick that
     /// passes the loop check microseconds before `begin_teardown` still reaches
     /// the take below. Re-reading it here, immediately before the take, is what
-    /// makes the contract in `shutdown_declines_wake` true of every resolution
+    /// makes the contract in `shutdown_declines_reentry` true of every resolution
     /// path rather than of two out of three. The wait then stays armed past its
     /// deadline and `rebuild_event_waits` re-arms it on the next engine, whose
     /// own first sweep expires it (`rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down`).
     async fn sweep_expired_event_waits(self: &Arc<Self>) {
-        if self.shutdown_declines_wake("deadline sweep") {
+        if self.shutdown_declines_reentry("deadline sweep") {
             return;
         }
         let snapshot = self.live_waits.snapshot().await;
@@ -545,10 +545,10 @@ impl LucidosEngine {
     /// Declines during a teardown for the same reason the live match path does.
     /// The registration caller is the one this reaches: an `await_event` armed
     /// while the engine is going down would otherwise scan, find its match, and
-    /// wake the thread into a turn with seconds to live. The boot caller can
+    /// re-enter the thread into a turn with seconds to live. The boot caller can
     /// never see the flag set, since a fresh engine is not shutting down.
     pub(crate) async fn catch_up_event_wait(&self, wait: &LiveWait) {
-        if self.shutdown_declines_wake("catch-up scan") {
+        if self.shutdown_declines_reentry("catch-up scan") {
             return;
         }
         let hit = match catch_up_from_watermark(&self.pool, wait).await {
@@ -596,7 +596,7 @@ impl LucidosEngine {
     /// was mid-wait across the upgrade fails on its very next turn and there is
     /// no longer any code that would close the pair for it. Closing it is the
     /// whole of what is owed: a wait still unresolved is re-armed by
-    /// `rebuild_event_waits` as an ordinary subscription and wakes the thread
+    /// `rebuild_event_waits` as an ordinary subscription and re-enters the thread
     /// the new way, and a wait already resolved left its payload in events the
     /// thread reads anyway.
     ///
@@ -647,7 +647,7 @@ impl LucidosEngine {
     ///
     /// Returns how many waits were rebuilt. An expired one is rebuilt too
     /// rather than dropped: the deadline sweep resolves it on its next tick, so
-    /// a wait whose deadline passed while the engine was down wakes its thread
+    /// a wait whose deadline passed while the engine was down re-enters its thread
     /// with an expiry instead of vanishing (I3).
     pub async fn rebuild_event_waits(&self) -> usize {
         let loaded = match rebuild_live_waits(&self.pool, &self.live_waits).await {
@@ -655,7 +655,7 @@ impl LucidosEngine {
             Err(e) => {
                 crate::log!(
                     "[EventWait] Live-wait rebuild failed: {}. Parked threads will not \
-                     wake until the next restart",
+                     resume until the next restart",
                     e
                 );
                 return 0;
@@ -671,7 +671,7 @@ impl LucidosEngine {
         loaded
     }
 
-    /// Re-drive wakes lost to a restart: a resolution that was persisted but
+    /// Re-drive re-entries lost to a restart: a resolution that was persisted but
     /// whose turn never ran (I3b).
     ///
     /// The rebuild above cannot help here, because the wait is resolved and
@@ -680,32 +680,32 @@ impl LucidosEngine {
     /// shape for the child-completion fan-in.
     ///
     /// "Never ran" means the thread has no event after the resolution other
-    /// than the resolution's own wake anchor, which is exactly one shape (see
+    /// than the resolution's own anchor, which is exactly one shape (see
     /// `emit_resolution`): the `UserPromptInjected`. Anything else after it (a
     /// `TextStreamed`, a `ToolCalled`, a terminator, a later `MessageReceived`)
-    /// means the wake was consumed, so nothing is re-driven.
-    pub async fn refire_unresolved_event_wakes(&self) -> usize {
-        let lost = match super::lost_event_wakes(&self.pool).await {
+    /// means the re-entry was consumed, so nothing is re-driven.
+    pub async fn refire_unresolved_wait_reentries(&self) -> usize {
+        let lost = match super::lost_wait_reentries(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
                 crate::log!(
-                    "[EventWait] Lost-wake query failed: {}. Skipping the recovery \
+                    "[EventWait] Lost-re-entry query failed: {}. Skipping the recovery \
                      sweep this boot",
                     e
                 );
                 return 0;
             }
         };
-        for wake in &lost {
+        for lost_reentry in &lost {
             crate::log!(
-                "[EventWait] Re-driving a wake lost to restart on thread {}",
-                wake.thread_id
+                "[EventWait] Re-driving a re-entry lost to restart on thread {}",
+                lost_reentry.thread_id
             );
-            self.queue_event_wake(wake.thread_id, wake.wake.clone());
+            self.queue_wait_reentry(lost_reentry.thread_id, lost_reentry.reentry.clone());
         }
         if !lost.is_empty() {
             crate::log!(
-                "[EventWait] Re-drove {} event-wait wake(s) lost to engine restart",
+                "[EventWait] Re-drove {} event-wait re-entry(s) lost to engine restart",
                 lost.len()
             );
         }

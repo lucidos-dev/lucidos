@@ -1,0 +1,33 @@
+/* Settings → System → Communication Surfaces: the gallery of every way Lucidos
+   speaks to the user. Two things need styling that the settings base does not
+   already give: a row of sample buttons that must wrap, and an inline frame for
+   a banner shown out of its normal home.
+
+   See components/settings/CommunicationSurfacesPage.tsx. */
+
+/* A samples row holds four to six buttons, which no settings row was built for:
+   the base options row keeps its children on one line, so at a narrow pane or a
+   raised UI scale they would squeeze rather than wrap. */
+.surfaces-sample-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    justify-content: flex-end;
+}
+
+/* A banner normally spans the window between the header and the panes, so shown
+   inside a settings section it has no edges of its own. The frame supplies
+   them, and the clip keeps the bar's own full-bleed borders from bleeding past
+   a corner that only exists here. */
+.surfaces-banner-preview {
+    margin-top: var(--space-sm);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    overflow: clip;
+}
+
+/* The bar's bottom border is the seam against the panes below it, and there is
+   nothing below it here. */
+.surfaces-banner-preview > * {
+    border-bottom: none;
+}

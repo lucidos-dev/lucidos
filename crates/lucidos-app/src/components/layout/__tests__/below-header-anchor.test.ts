@@ -62,6 +62,18 @@ describe('below-header anchor (--app-header-bottom)', () => {
     expect(decl(rootTokens, '--app-header-bottom')!).toContain('var(--app-banner-height');
   });
 
+  /**
+   * The connection bar is a second banner in that same slot, and both can be up
+   * at once. It publishes its OWN property, which the anchor sums: one shared
+   * property would mean two ResizeObservers writing one value, so whichever
+   * measured last would win and retracting either bar would clear the space the
+   * other still occupies.
+   */
+  it('the anchor carries the connection banner as a second, distinct term', () => {
+    expect(decl(rootTokens, '--app-conn-banner-height')).not.toBeNull();
+    expect(decl(rootTokens, '--app-header-bottom')!).toContain('var(--app-conn-banner-height');
+  });
+
   it('.app-header sizes itself from the same height token', () => {
     expect(decl(block(shellCss, '.app-header {'), 'height')).toBe('var(--app-header-height)');
   });

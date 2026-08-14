@@ -47,11 +47,19 @@ objc2 = "0.6"
 # dep (tao / tray-icon / wry) enables it and cargo unifies features, so a Tauri
 # bump that dropped it would break this crate from an unrelated upgrade. Declare
 # what we use.
+#
+# NSNotification + NSOperation + block2 are the traffic-light resize observer
+# (src/traffic_lights.rs): `addObserverForName:object:queue:usingBlock:` lives on
+# NSNotificationCenter, takes an NSOperationQueue (we pass nil, but the
+# parameter type has to exist for the binding to be generated) and a block.
 objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSError",
     "NSArray",
     "NSEnumerator",
+    "NSNotification",
+    "NSOperation",
+    "block2",
 ] }
 objc2-user-notifications = { version = "0.3", features = [
     "UNUserNotificationCenter",

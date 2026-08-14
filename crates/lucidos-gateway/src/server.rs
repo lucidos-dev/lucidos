@@ -1,17 +1,5 @@
-//! Gateway state, supervision, lifecycle, and HTTP routing.
-//!
-//! Routing (ADR 0014 §2/§3/§10):
-//!   * `/~/…`  — the gateway's own surface behind the reserved **sigil
-//!     namespace**: `/~/api/v1/health`, `/~/api/v1/control/*`, and the workspace
-//!     **picker** + its bundled assets (served from `LUCIDOS_STATIC_DIR`, with
-//!     `<base href="/~/">` stamped into the picker's `index.html`).
-//!   * `/`     — smart root: exactly one workspace → redirect straight into it
-//!     (`/<slug>/`); otherwise serve the picker.
-//!   * `/<slug>/…` — reverse-proxied to that workspace's engine (loopback in
-//!     packaged, network-bound in dev) as a pure streaming forward (see
-//!     [`crate::proxy`]), except for the PWA manifest, which the gateway
-//!     re-scopes so a PWA installed from the gateway can navigate between
-//!     workspaces without leaving standalone mode.
+//! Gateway state, supervision, lifecycle, and HTTP routing. `fallback` holds
+//! the route table (ADR 0014 §2/§3/§10).
 //!
 //! A workspace slug can never start with the sigil (slugs are `[a-z0-9-]`), so
 //! the first path segment is unambiguous with no reserved-word list.
@@ -43,94 +31,73 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Default port a bare `lucidos-gateway` binds — the **dev** default, matching
-/// the dev gateway data dir (`~/.lucidos/gateway`, see `resolve_app_data`). Both
-/// real launch paths pass `LUCIDOS_API_PORT` explicitly, so this is only the
-/// no-env fallback: dev (`web-dev.sh`) injects 5251, the packaged desktop app
-/// injects its own historical 5252 (`crates/lucidos-app/src/desktop.rs`
-/// `DEFAULT_ENGINE_PORT`) — so dev and packaged coexist on different ports out of
-/// the box. Override with `LUCIDOS_API_PORT`.
+/// The dev default, and only the no-env fallback: both real launch paths pass
+/// `LUCIDOS_API_PORT`. Dev injects 5251 and the packaged app 5252, so the two
+/// coexist out of the box.
 const DEFAULT_GATEWAY_PORT: u16 = 5251;
 
-/// Build id baked in by `build.rs` (git short SHA + a hash of any uncommitted
-/// gateway-source diff). A running gateway compares this against the on-disk
-/// binary's id — obtained by spawning `current_exe --build-id` — to drive the
-/// picker's "new gateway available" badge. Deterministic for identical source so
-/// a no-op rebuild does not raise the badge. "Available" means **newer**, not
-/// merely different — the direction check lives in [`crate::build_id`]. See
-/// `docs/plans/2026-06-18-gateway-reload-control.md`.
+/// Build id baked in by `build.rs`: git short SHA plus a hash of any
+/// uncommitted gateway-source diff. Deterministic for identical source, so a
+/// no-op rebuild does not raise the picker's "new gateway available" badge.
 pub const GATEWAY_BUILD_ID: &str = env!("GATEWAY_BUILD_ID");
 
-/// In-memory state of the picker's "restore from backup" flow. Single-slot (one
-/// restore at a time, like the engine's old `RestoreState`): the POST flips it to
-/// `Running`, the spawned task advances `phase` and then sets the terminal
-/// `Completed`/`Failed`, and the picker polls `GET /~/api/v1/control/restore-status`
-/// for it. Never persisted — a restore that dies with the gateway is simply gone
-/// (the half-provisioned workspace is cleaned up; the user re-uploads).
+/// In-memory state of the picker's restore-from-backup flow. One slot, so one
+/// restore at a time, polled at `GET /~/api/v1/control/restore-status`. Never
+/// persisted: a restore that dies with the gateway is gone, and its
+/// half-provisioned workspace is cleaned up.
 #[derive(Clone, serde::Serialize, Default, Debug, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RestoreStatus {
-    /// No restore has run since the gateway started (or the last result was read
-    /// and the next restore hasn't begun).
     #[default]
     Idle,
-    /// A restore is in flight. `phase` mirrors the engine CLI's
-    /// `LUCIDOS_RESTORE_PHASE` ticks (starting, restoring, decrypting,
-    /// decompressing, initializing, restoring_db, done).
+    /// `phase` mirrors the engine CLI's `LUCIDOS_RESTORE_PHASE` ticks (starting,
+    /// restoring, decrypting, decompressing, initializing, restoring_db, done).
     Running {
         id: String,
         name: String,
         phase: String,
     },
-    /// The restore finished; the workspace `id` is registered and (best-effort)
-    /// started — the picker refreshes its list and offers Open.
+    /// Registered, and started on a best-effort basis.
     Completed { id: String, name: String },
-    /// The restore failed before committing; `error` is the user-facing message.
-    /// No workspace was registered (cleanup removed the half-provisioned one).
+    /// Failed before committing, so nothing was registered: cleanup removed the
+    /// half-provisioned workspace. `error` is the user-facing message.
     Failed { name: String, error: String },
 }
 
 /// Supervisor cadence + thresholds.
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a freshly-(re)spawned engine whose PROCESS is alive has to answer
-/// `/api/v1/health` before it's treated as wedged. Cold boot does pgvector init,
-/// migrations, and embedding-model warmup, which can take tens of seconds — so a
-/// still-booting engine must NOT be respawned out from under itself.
+/// `/api/v1/health` before it counts as wedged. Cold boot runs pgvector init,
+/// migrations and embedding warmup, so a still-booting engine must NOT be
+/// respawned out from under itself.
 const BOOT_GRACE: Duration = Duration::from_secs(120);
-/// Minimum gap between respawn attempts for one stack (crash backoff), and the
-/// gap before the FIRST retry (see [`respawn_backoff`]).
+/// Minimum gap between respawn attempts for one stack, and the gap before the
+/// FIRST retry (see [`respawn_backoff`]).
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 /// Ceiling on the grown [`respawn_backoff`], so a workspace waiting out a long
 /// external outage still re-checks about once a minute.
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// Auto-respawn attempts (since last healthy) before a stack is marked unhealthy.
-/// Counts EVERY bring-up attempt, a failed Postgres provision included: a
-/// workspace that cannot get a database is no more startable than one whose
-/// engine keeps exiting, and both are bounded by the same budget.
+/// Auto-respawn attempts (since last healthy) before a stack is marked
+/// unhealthy. Counts EVERY bring-up attempt, a failed Postgres provision
+/// included: a workspace that cannot get a database is no more startable than
+/// one whose engine keeps exiting.
 const RESTART_CAP: u32 = 5;
 /// Consecutive missed probes before respawning an engine whose process has
-/// EXITED (crash recovery). Small: a real death should recover promptly. An
-/// engine that is still ALIVE is never culled — whatever the probe says (see
-/// [`respawn_decision`]) — so there is no separate "slow" threshold.
+/// EXITED. An engine that is still ALIVE is never culled, whatever the probe
+/// says (see [`respawn_decision`]), so there is no separate "slow" threshold.
 const DEAD_MISS_THRESHOLD: u32 = 2;
-/// How long a workspace may sit in the boot window (continuously non-healthy
-/// since its boot phase was first set) before the boot splash escapes to the
-/// manual "Back to workspaces" page (see [`proxy::stalled_page`]). Must exceed a
-/// legitimate slow first-run boot: `BOOT_GRACE` (120s) plus migrations and
-/// recovery. (The embedding model is NOT part of that budget: it loads in the
-/// background and boot never waits on it, so a cold-cache first run reaches
-/// healthy just as fast as a warm one.) The escape is needed because an
-/// alive-but-unreachable engine (e.g. a
-/// misconfigured bind, network partition) is NEVER marked `Unhealthy`
-/// ([`respawn_decision`] never culls an alive process), so without a time budget
-/// the splash would meta-refresh forever with no way out.
+/// How long a workspace may sit in the boot window before the splash escapes to
+/// the manual "Back to workspaces" page (see [`proxy::stalled_page`]). Must
+/// exceed a legitimate slow first-run boot: [`BOOT_GRACE`] plus migrations and
+/// recovery. The embedding model is not part of that budget, since it loads in
+/// the background. The escape exists because an alive-but-unreachable engine is
+/// never marked `Unhealthy`, so without a time budget the splash would
+/// meta-refresh forever.
 const BOOT_ESCAPE_BUDGET: Duration = Duration::from_secs(240);
 
-/// One workspace's live boot-window state, mirrored in `boot_phases`. `phase`
-/// drives the splash label; `since` is when the window OPENED (first
-/// `set_boot_phase` of this episode) and is preserved across phase updates so the
-/// elapsed-time budget ([`BOOT_ESCAPE_BUDGET`]) accumulates. The whole entry is
-/// dropped when the workspace becomes healthy / is stopped.
+/// One workspace's live boot-window state. `since` is when the window OPENED,
+/// and is preserved across phase updates so the [`BOOT_ESCAPE_BUDGET`] elapsed
+/// time accumulates over the whole episode.
 #[derive(Clone, Copy)]
 struct BootProgress {
     phase: BootPhase,
@@ -138,16 +105,13 @@ struct BootProgress {
 }
 
 /// Whether a boot window that opened `elapsed` ago has stalled long enough to
-/// show the manual escape page instead of the auto-refreshing "starting" splash.
-/// `None` (no boot window — healthy/stopped/unknown) is never stalled. Pure so the
-/// budget policy is unit-tested.
+/// show the manual escape page instead of the auto-refreshing splash.
 fn boot_window_stalled(elapsed: Option<Duration>) -> bool {
     elapsed.is_some_and(|e| e >= BOOT_ESCAPE_BUDGET)
 }
 
-/// Sum per-workspace unread counts into the aggregate dock-badge total. A `None`
-/// (engine unreachable / count unknown) contributes 0 — matching the picker's
-/// "running workspaces only, no misleading zero" rule. Pure so it's unit-tested.
+/// Sum per-workspace unread counts into the dock-badge total. An unknown count
+/// contributes 0, matching the picker's "running workspaces only" rule.
 fn sum_unread(counts: impl IntoIterator<Item = Option<u64>>) -> u64 {
     counts.into_iter().flatten().sum()
 }
@@ -164,34 +128,31 @@ struct GatewayInner {
     registry_path: PathBuf,
     gateway_port: u16,
     /// The engine binary to spawn per workspace. Must be explicit
-    /// (`LUCIDOS_ENGINE_BIN`) — the gateway's own `current_exe` is the gateway,
+    /// (`LUCIDOS_ENGINE_BIN`): the gateway's own `current_exe` is the gateway,
     /// not the engine (ADR 0014 §1).
     engine_bin: PathBuf,
     /// The built frontend dir (`dist/`) the gateway serves the picker from, and
     /// passes to engines via the inherited env so they serve it too.
     static_dir: Option<PathBuf>,
-    /// Whether spawned engines bind loopback-only (packaged: `true`, the security
-    /// posture) or all interfaces (dev: `false`, so the workspace app is reachable
-    /// directly on its port in addition to via the gateway). See
+    /// Whether spawned engines bind loopback-only (packaged) or all interfaces
+    /// (dev, so the workspace app is also reachable directly on its port). See
     /// `LUCIDOS_GATEWAY_ENGINE_LOOPBACK` and ADR 0014 "Dev runtime topology".
     engine_loopback: bool,
-    /// Whether the spawned engine serves TLS on its port. Packaged engines serve
-    /// plain HTTP on their loopback port (`false` — the gateway terminates TLS). A
-    /// dev engine is the direct front and keeps its TLS cert when one is
-    /// configured, so the gateway must proxy + health-probe it over https.
+    /// Whether the spawned engine serves TLS on its port. A dev engine is the
+    /// direct front and keeps its cert, so the gateway must proxy and
+    /// health-probe it over https. A packaged engine serves plain HTTP on
+    /// loopback and the gateway terminates TLS.
     engine_tls: bool,
     pg_backend: PgBackend,
-    /// True under the packaged desktop runtime (`desktop.rs::spawn_gateway` sets
-    /// `LUCIDOS_PACKAGED=1`), false in dev (`web-dev.sh` sets nothing). Reported in
+    /// True under the packaged desktop runtime. Reported in
     /// `GET /~/api/v1/control/gateway/status` so the picker hides the dev-only
-    /// gateway self-reload control in packaged (where binary swaps happen via the
-    /// app updater + a full service restart, never a re-exec under a running
-    /// gateway).
+    /// self-reload control: a packaged binary swap goes through the app updater
+    /// and a full service restart.
     packaged: bool,
     /// Shared-cluster provisioning is serialized across workspaces. Docker
-    /// container creation and embedded `pg_ctl` startup are cluster-level
-    /// operations; concurrent per-workspace starts should queue at this boundary,
-    /// then create/verify their own databases.
+    /// container creation and embedded `pg_ctl` startup are cluster-level, so
+    /// concurrent per-workspace starts queue here, then create their own
+    /// databases.
     pg_lock: AsyncMutex<()>,
     proxy_client: reqwest::Client,
     health_client: reqwest::Client,
@@ -204,51 +165,44 @@ struct GatewayInner {
     /// workspace). Guards against a burst of concurrent requests each spawning a
     /// duplicate engine before the stack lands in `stacks`.
     starting: AsyncMutex<HashSet<String>>,
-    /// Hot-path id → engine port map for the proxy (the engine binds loopback in
-    /// packaged builds, all interfaces in dev), so proxying never contends with a
-    /// stack mutex held during a multi-second respawn.
+    /// Hot-path id to engine-port map for the proxy, so proxying never contends
+    /// with a stack mutex held during a multi-second respawn.
     routes: RwLock<HashMap<String, u16>>,
-    /// id → current cold-boot phase, rendered as the boot-splash label
-    /// ([`crate::boot_phase`]). Gateway-observed phases are written here directly
-    /// (provisioning, spawning); engine-reported phases arrive via the
-    /// `boot-phase` control endpoint. Entries are removed once the workspace is
-    /// healthy / stopped so a later cold open never shows a stale phase. Mirrors
-    /// the `routes` map (cheap `RwLock`, off the stack-mutex path).
+    /// id to current cold-boot phase, rendered as the boot-splash label
+    /// ([`crate::boot_phase`]). Written by the gateway as it provisions and
+    /// spawns, and by the `boot-phase` control endpoint when the engine reports.
+    /// Entries are removed once the workspace is healthy or stopped, so a later
+    /// cold open never shows a stale phase.
     boot_phases: RwLock<HashMap<String, BootProgress>>,
-    /// id → why this workspace's boot attempt failed ([`crate::boot_failure`]).
-    /// Two producers write it: the engine's `boot-failure` control endpoint
-    /// (always terminal), and a failed Postgres provision here in the gateway
-    /// (terminal or retrying, per [`ProvisionErrorKind`]). A **terminal** entry
-    /// means "this boot cannot succeed": the splash renders the message with no
-    /// refresh and the supervisor stops respawning. A **retrying** one is the
-    /// splash label while the gateway works through its budget. Deliberately a
-    /// SEPARATE map from `boot_phases` rather than a field on [`BootProgress`],
-    /// because `MarkUnhealthy` clears the phase on purpose (a stale label would
-    /// lie about a dead engine) and that is exactly the moment the failure must
-    /// survive. Cleared only when the workspace boots healthy, is stopped, or a
-    /// fresh attempt begins.
+    /// id to why this workspace's boot attempt failed ([`crate::boot_failure`]).
+    /// A TERMINAL entry means this boot cannot succeed: the splash renders the
+    /// message with no refresh and the supervisor stops respawning. A RETRYING
+    /// one is the splash label while the gateway works through its budget.
+    ///
+    /// Separate from `boot_phases` because `MarkUnhealthy` clears the phase on
+    /// purpose, and that is exactly the moment the failure must survive. Cleared
+    /// only when the workspace boots healthy, is stopped, or a fresh attempt
+    /// begins.
     boot_failures: RwLock<HashMap<String, BootFailure>>,
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
     /// Configured bind addresses this process wants but does not hold yet (see
-    /// [`net_config::bind_plan`] and [`serve_optional_address`]). Normally empty.
-    /// Non-empty means the gateway is serving loopback while it waits for an
-    /// interface to appear, which is a REACHABILITY degradation and nothing else,
-    /// so it is reported in `/~/api/v1/health` rather than left to the log.
+    /// [`net_config::bind_plan`]). Normally empty. Non-empty means the gateway
+    /// is serving loopback while it waits for an interface to appear, a
+    /// reachability degradation reported in `/~/api/v1/health`.
     pending_binds: RwLock<BTreeSet<SocketAddr>>,
-    /// Path of the binary this process was launched from (`current_exe`), used by
-    /// the reload control to re-exec onto the rebuilt binary and to stat for the
+    /// Path of the binary this process was launched from, used by the reload
+    /// control to re-exec onto the rebuilt binary and to stat for the
     /// "new gateway available" check.
     exe_path: Option<PathBuf>,
-    /// Cached result of the on-disk-binary update check, so the picker's 2s poll
-    /// doesn't fork `current_exe --build-id` on every tick — re-checked only when
-    /// the binary's mtime moves. See [`GatewayState::gateway_update_available`].
+    /// Cached update check, re-run only when the binary's mtime moves, so the
+    /// picker's 2s poll does not fork `current_exe --build-id` every tick.
     update_check: Mutex<UpdateCheck>,
 }
 
 /// Memoized "is a newer gateway binary on disk?" verdict, keyed by the binary's
-/// last-seen mtime. A `None` mtime means "not yet checked".
+/// last-seen mtime. A `None` mtime means not yet checked.
 #[derive(Default)]
 struct UpdateCheck {
     last_mtime: Option<std::time::SystemTime>,
@@ -260,15 +214,14 @@ impl GatewayState {
         &self.inner.app_data
     }
 
-    /// Loopback port for `id`, if registered. Hot path — no async locks.
+    /// Loopback port for `id`, if registered. Hot path, so no async locks.
     fn route(&self, id: &str) -> Option<u16> {
         self.inner.routes.read().ok()?.get(id).copied()
     }
 
-    /// The scheme the spawned engine serves on its port (`https` for a dev engine
-    /// with TLS, else `http`). Used to build proxy targets + health probes. The
-    /// literals come from `net_config` rather than being spelled here, so this
-    /// side of the hop cannot drift from the rule that decided `engine_tls`.
+    /// The scheme the spawned engine serves on its port. The literals come from
+    /// `net_config` rather than being spelled here, so this side of the hop
+    /// cannot drift from the rule that decided `engine_tls`.
     fn engine_scheme(&self) -> &'static str {
         if self.inner.engine_tls {
             net_config::SCHEME_HTTPS
@@ -278,18 +231,13 @@ impl GatewayState {
     }
 
     /// Tell ONE stack's engine that a person asked for the teardown it is about
-    /// to be signalled for. Binds this gateway's health client + engine scheme to
-    /// that stack's own port, which is what keeps the notify per-workspace: a
-    /// restart of workspace A can reach nothing but A's engine.
+    /// to be signalled for, over that stack's own port.
     ///
-    /// Deliberately called from the two control-plane entry points
-    /// ([`Self::restart_workspace`], [`Self::stop_workspace`]) and NOT from
+    /// Called from the two control-plane entry points, never from
     /// [`Self::respawn_stack`], which is also the supervisor's health-respawn
-    /// path. An engine the supervisor culls for being unhealthy was not stopped
-    /// by anyone, so attributing it to a device would auto-resume work after a
-    /// crash, which is exactly what cause-gated resume exists to prevent. The
-    /// supervisor has no device id to pass either way; keeping the call out of
-    /// the shared respawn is the structural half of that.
+    /// path. An engine the supervisor culls was not stopped by anyone.
+    /// Attributing it to a device would auto-resume work after a crash, which
+    /// cause-gated resume exists to prevent.
     async fn notify_restart_intent(
         &self,
         s: &StackRuntime,
@@ -316,14 +264,12 @@ impl GatewayState {
         }
     }
 
-    /// Record the current cold-boot phase for `id` (rendered on the boot splash).
-    /// Hot path — no async locks. Called by the gateway as it provisions/spawns
-    /// and by the `boot-phase` control endpoint when the engine reports.
+    /// Record the current cold-boot phase for `id`. Hot path, so no async locks.
     pub fn set_boot_phase(&self, id: &str, phase: BootPhase) {
         if let Ok(mut p) = self.inner.boot_phases.write() {
-            // Preserve `since` across phase updates: it marks when THIS boot window
-            // opened, so the escape budget ([`BOOT_ESCAPE_BUDGET`]) accumulates
-            // over the whole episode rather than resetting on every phase advance.
+            // Preserve `since` across phase updates: it marks when THIS boot
+            // window opened, so the escape budget accumulates over the whole
+            // episode rather than resetting on every phase advance.
             p.entry(id.to_string())
                 .and_modify(|bp| bp.phase = phase)
                 .or_insert(BootProgress {
@@ -333,19 +279,17 @@ impl GatewayState {
         }
     }
 
-    /// Drop any boot phase for `id`. Called when the workspace becomes healthy or
-    /// is stopped, so a later cold open starts from the default label rather than
-    /// a stale phase from the previous boot.
+    /// Drop any boot phase for `id`, so a later cold open starts from the
+    /// default label rather than a stale phase from the previous boot.
     pub fn clear_boot_phase(&self, id: &str) {
         if let Ok(mut p) = self.inner.boot_phases.write() {
             p.remove(id);
         }
     }
 
-    /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]).
-    /// Called by the `boot-failure` control endpoint when a dying engine reports
-    /// why its boot cannot succeed (always terminal), and by the provisioning
-    /// paths here when Postgres could not be brought up (terminal or retrying).
+    /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]). Two
+    /// producers: the `boot-failure` control endpoint, always terminal, and the
+    /// provisioning paths here, terminal or retrying.
     pub fn set_boot_failure(&self, id: &str, failure: BootFailure) {
         crate::log!(
             "[Gateway] '{}' boot failure ({}): {}",
@@ -362,9 +306,8 @@ impl GatewayState {
         }
     }
 
-    /// Drop any boot failure for `id`. Called when the workspace boots healthy,
-    /// is stopped, or a fresh attempt begins. Never from `MarkUnhealthy`, which
-    /// is the state the message exists to explain.
+    /// Drop any boot failure for `id`. Never call this from `MarkUnhealthy`,
+    /// which is the state the message exists to explain.
     fn clear_boot_failure(&self, id: &str) {
         if let Ok(mut f) = self.inner.boot_failures.write() {
             f.remove(id);
@@ -376,16 +319,9 @@ impl GatewayState {
         self.inner.boot_failures.read().ok()?.get(id).cloned()
     }
 
-    /// The boot-splash label for `id`: a RETRYING boot failure's message (the
-    /// reason plus how far through the budget we are), else the current phase's
-    /// label, else the default when no phase is known yet (initial paint /
-    /// between boots).
-    ///
-    /// A retrying failure outranks the phase because the phase is what we were
-    /// doing when it failed, and repeating "Provisioning database…" while the
-    /// gateway waits out a backoff is precisely the opaque splash this narration
-    /// exists to avoid. A TERMINAL failure never reaches here: the caller routes
-    /// it to [`proxy::failed_page`], which drops the auto-refresh.
+    /// The boot-splash label for `id`. A TERMINAL failure never reaches here:
+    /// the caller routes it to [`proxy::failed_page`], which drops the
+    /// auto-refresh. See [`splash_label`] for the ranking.
     fn boot_splash_label(&self, id: &str) -> String {
         let phase = self
             .inner
@@ -396,10 +332,8 @@ impl GatewayState {
         splash_label(self.boot_failure(id).as_ref(), phase)
     }
 
-    /// How long `id`'s current boot window has been open, or `None` when there is
-    /// no boot window (healthy / stopped / never opened). Cheap `RwLock` read off
-    /// the stack-mutex path — safe on the proxy hot path. Drives the boot-splash
-    /// escape decision ([`boot_window_stalled`]).
+    /// How long `id`'s current boot window has been open. Cheap `RwLock` read
+    /// off the stack-mutex path, so it is safe on the proxy hot path.
     fn boot_elapsed(&self, id: &str) -> Option<Duration> {
         self.inner
             .boot_phases
@@ -444,7 +378,7 @@ impl GatewayState {
                     health: Health::Unhealthy,
                     autostart: ws.autostart,
                     last_error: Some("not started".to_string()),
-                    // Stopped workspace → no engine to poll → no badge.
+                    // No engine to poll, so no badge.
                     unread_count: None,
                 });
             }
@@ -452,18 +386,15 @@ impl GatewayState {
         out
     }
 
-    /// Fresh aggregate unread total across running workspaces — computed ON DEMAND
-    /// by a concurrent count fan-out over healthy engines, NOT the cached
-    /// `last_unread` the supervise loop maintains. Drives the desktop dock badge's
-    /// instant update when a notification is read: at nudge time the supervise loop
-    /// has not yet re-probed the active engine, so its cached `last_unread` still
-    /// shows the pre-read count — a live fetch reflects the drop immediately. A
-    /// stopped/unhealthy workspace contributes 0 (same "running workspaces only"
-    /// semantics as the cached path; ADR 0014 §1 — the gateway holds no DB handle,
-    /// so the only count path is HTTP-polling running engines).
+    /// Fresh aggregate unread total, fanned out on demand rather than read from
+    /// the `last_unread` the supervise loop caches. This drives the dock badge's
+    /// instant update when a notification is read: at nudge time the supervise
+    /// loop has not yet re-probed, so its cache still shows the pre-read count.
+    /// The gateway holds no DB handle (ADR 0014 §1), so polling running engines
+    /// is the only count path.
     pub async fn fresh_unread_total(&self) -> u64 {
-        // Snapshot the stack handles, then read each briefly for (health, port) —
-        // mirrors `list_status`'s lock discipline so a supervisor probe holding a
+        // Snapshot the stack handles, then read each briefly for (health, port).
+        // Mirrors `list_status`'s lock discipline so a supervisor probe holding a
         // stack mutex never stalls this read across the whole map.
         let stacks: HashMap<String, Arc<AsyncMutex<StackRuntime>>> =
             self.inner.stacks.lock().await.clone();
@@ -493,28 +424,22 @@ impl GatewayState {
     }
 
     /// True under the packaged desktop runtime. The picker hides the dev-only
-    /// gateway self-reload control when this is set (binary swaps in packaged go
-    /// through the app updater + a full service restart, not a gateway re-exec).
+    /// self-reload control when this is set.
     pub fn packaged(&self) -> bool {
         self.inner.packaged
     }
 
-    /// Whether the on-disk gateway binary is NEWER than this running process —
-    /// i.e. a rebuild is waiting to be adopted via [`Self::reload_gateway`].
-    /// Cheap on the steady path: it only forks `current_exe --build-id` when the
-    /// binary's mtime has moved since the last check (the picker polls this every
-    /// 2s), and the direction probe rides the same cache. A dev `--engine-only`
-    /// Apply rebuilds the gateway binary while leaving the running gateway up,
-    /// which is exactly the state this detects (see
-    /// `docs/plans/2026-06-18-gateway-reload-control.md`).
+    /// Whether the on-disk gateway binary is NEWER than this running process,
+    /// so a rebuild is waiting to be adopted via [`Self::reload_gateway`]. Cheap
+    /// on the steady path: it forks `current_exe --build-id` only when the
+    /// binary's mtime has moved, and the direction probe rides the same cache.
     ///
     /// **Newer, not merely different** ([`crate::build_id::disk_id_is_upgrade`]).
     /// `reload_gateway` re-execs onto whatever is on disk, so a bare
-    /// `disk != running` walks the machine's only gateway BACKWARDS onto an
-    /// older binary that some other build left in `target/` — the same downgrade
-    /// the engine hit as the 2026-07-26 toast loop. Anything indeterminate keeps
-    /// the difference test, so this removes a false positive without adding a way
-    /// to miss a real update.
+    /// `disk != running` would walk the machine's only gateway BACKWARDS onto an
+    /// older binary another build left in `target/`. Anything indeterminate
+    /// keeps the difference test, so this removes a false positive without
+    /// adding a way to miss a real update.
     pub async fn gateway_update_available(&self) -> bool {
         let Some(exe) = self.inner.exe_path.clone() else {
             return false;
@@ -536,8 +461,8 @@ impl GatewayState {
             Ok(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
-            // Can't read the on-disk id (binary mid-rewrite, spawn failure) — treat
-            // as "no update" and let the next poll retry once the mtime settles.
+            // Cannot read the on-disk id (binary mid-rewrite, spawn failure), so
+            // report no update and let the next poll retry once mtime settles.
             _ => return false,
         };
         let update_available =
@@ -548,27 +473,24 @@ impl GatewayState {
         update_available
     }
 
-    /// Re-exec this process onto the on-disk binary — same PID, so the supervisor
-    /// keeps `wait`ing on us and the pidfile stays valid; the fresh `main()`
-    /// re-adopts the running engines on boot (see [`Self::boot_all`]). This is the
-    /// ONLY in-place gateway restart: signalling the supervisor (SIGUSR1) is its
-    /// *permanent* stop, not a restart (see `scripts/lib/gateway_supervisor.sh`).
+    /// Re-exec this process onto the on-disk binary, keeping the PID so the
+    /// supervisor keeps `wait`ing and the pidfile stays valid. The fresh
+    /// `main()` re-adopts the running engines (see [`Self::boot_all`]). This is
+    /// the ONLY in-place gateway restart: SIGUSR1 is its permanent stop, not a
+    /// restart (see `scripts/lib/gateway_supervisor.sh`).
     ///
     /// Returns after scheduling the exec so the HTTP caller still gets its
-    /// response; the actual `execv` happens on a short delay. `execv` only returns
-    /// on failure, in which case we log and keep running the current image.
+    /// response. `execv` only returns on failure, and then we keep the current
+    /// image.
     pub fn reload_gateway(&self) -> Result<(), BoxError> {
         let exe = self
             .inner
             .exe_path
             .clone()
             .ok_or("current_exe unavailable — cannot reload")?;
-        // Refuse to adopt a binary living in a coding-agent worktree. Unlike the
-        // shell entry points there is no operator here to read an error, so the
-        // safe move is to keep the CURRENT image and log loudly: re-exec'ing onto
-        // a worktree binary is what let the 2026-07-26 pin re-establish itself
-        // across every restart. See
-        // docs/plans/2026-07-26-worktree-pinned-stack-guard.md.
+        // Refuse to adopt a binary living in a coding-agent worktree (ADR 0021).
+        // Unlike the shell entry points there is no operator here to read an
+        // error, so keep the CURRENT image and log loudly.
         if crate::stack::path_is_in_cc_worktree(&exe) {
             crate::log!(
                 "[Gateway] refusing to reload onto a coding-agent worktree binary: {} \
@@ -602,18 +524,9 @@ impl GatewayState {
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     /// Bring up registered workspaces on gateway startup, concurrently and
-    /// failure-isolated. Per workspace:
-    ///   * an engine already answering health is **re-adopted** (regardless of
-    ///     `autostart`) — engine-statelessness across a gateway restart;
-    ///   * else a workspace the last teardown **stopped** is brought back
-    ///     (regardless of `autostart`): a restart must return what it took, and
-    ///     the packaged service kills every engine on its way out. See
-    ///     [`crate::next_boot`];
-    ///   * else an `autostart` workspace is **spawned** (the always-on posture:
-    ///     a login-launched packaged gateway brings up its auto-start workspaces);
-    ///   * else it is **left stopped** — listed in the picker (via
-    ///     [`Self::list_status`]'s no-stack branch) and started only on an
-    ///     explicit open (lazy, [`Self::lazy_start`]) or launch.
+    /// failure-isolated. [`should_bring_up`] decides which. One left stopped is
+    /// still listed in the picker and starts on an explicit open
+    /// ([`Self::lazy_start`]).
     async fn boot_all(&self) {
         // Consumed exactly once, here, before anything is brought up. Empty in
         // dev, where nothing writes the record.
@@ -650,11 +563,9 @@ impl GatewayState {
     }
 
     /// Re-read the on-disk registry into memory. The dev launcher writes the
-    /// shared registry file directly (`seed_gateway_registry`), so a running
-    /// gateway's in-memory copy can lag a freshly-launched workspace; this
-    /// resyncs it so the picker lists it and [`Self::restart_workspace`] can find
-    /// it. A bad read is logged, not propagated — a transient parse error must
-    /// not break a restart of an already-known workspace.
+    /// shared registry file directly, so a running gateway's copy can lag a
+    /// freshly-launched workspace. A bad read is logged, not propagated: a
+    /// transient parse error must not break a restart of a known workspace.
     fn sync_registry_from_disk(&self) {
         match Registry::load(&self.inner.registry_path) {
             Ok(reg) => *self.inner.registry.lock().unwrap() = reg,
@@ -662,11 +573,10 @@ impl GatewayState {
         }
     }
 
-    /// Lazily start a registered-but-stopped workspace for a document navigation,
-    /// then serve the boot window. Guarded by [`GatewayInner::starting`] so a
-    /// burst of concurrent requests can't each spawn a duplicate engine before
-    /// the stack lands in `stacks`. No-op if a stack already exists or a start is
-    /// in flight.
+    /// Lazily start a registered-but-stopped workspace for a document
+    /// navigation. Guarded by [`GatewayInner::starting`] so a burst of
+    /// concurrent requests cannot each spawn a duplicate engine before the stack
+    /// lands in `stacks`.
     async fn lazy_start(&self, id: &str) {
         if self.inner.stacks.lock().await.contains_key(id) {
             return;
@@ -689,12 +599,11 @@ impl GatewayState {
     /// register its runtime stack + route. Never panics.
     ///
     /// A failure yields a stack whose shape depends on whether retrying it is
-    /// worth anything ([`provision_failure_action`]): a **retryable** one stays
+    /// worth anything ([`provision_failure_action`]). A RETRYABLE one stays
     /// `Booting` and supervised, so the health monitor works through the restart
-    /// budget with backoff; a **terminal** one latches `Unhealthy` immediately
-    /// (the picker's Retry / delete is the escape). Either way the reason is
-    /// recorded as a boot failure so the splash can explain itself instead of
-    /// sitting on the neutral default. See ADR 0014, 2026-08-03 addendum.
+    /// budget. A TERMINAL one latches `Unhealthy` at once, and the picker's
+    /// Retry or delete is the escape. Either way the reason is recorded as a
+    /// boot failure so the splash can explain itself. See ADR 0014.
     async fn bring_up(&self, ws: Workspace) {
         let resolved_dir = ws.resolve_dir(self.app_data());
         if let Err(e) = std::fs::create_dir_all(resolved_dir.join("data")) {
@@ -752,14 +661,11 @@ impl GatewayState {
     /// Put a stack in the map under `id`, tearing down whatever engine that slot
     /// already held.
     ///
-    /// A bare `insert` returns the displaced value and drops it, and dropping a
-    /// `StackRuntime` neither stops nor reaps its engine: a
-    /// `std::process::Child` does neither on drop. The displaced engine would
-    /// keep running on the same port as the one just spawned AND become an
-    /// unreapable zombie the moment it exits. No caller reaches this with an
-    /// occupied slot today (`lazy_start` guards on `contains_key`, create and
-    /// restore allocate a fresh id), which is exactly why the guarantee belongs
-    /// here rather than in each caller's memory.
+    /// Dropping a `StackRuntime` neither stops nor reaps its engine, because
+    /// `std::process::Child` does neither on drop. A displaced engine would keep
+    /// running on the port of the one just spawned AND become an unreapable
+    /// zombie when it exits. No caller reaches this with an occupied slot today,
+    /// which is why the guarantee belongs here rather than in each caller.
     ///
     /// The map lock is released before the stack lock, the ordering every other
     /// map-then-stack site uses (the supervisor holds stack then map).
@@ -815,21 +721,17 @@ impl GatewayState {
     /// fresh one.
     ///
     /// The error carries a [`ProvisionErrorKind`] so [`Self::bring_up`] can tell
-    /// a condition that will clear from one that never will. A failure to spawn
-    /// the engine binary arrives through the `From<BoxError>` default, i.e.
-    /// retryable, which matches what [`Self::respawn_stack`] already does with a
-    /// spawn error.
+    /// a condition that will clear from one that never will.
     async fn provision_and_start(
         &self,
         ws: &Workspace,
         resolved_dir: &Path,
     ) -> Result<(PgHandle, Option<std::process::Child>, Health), ProvisionError> {
-        // First splash phase: provisioning Postgres can pull/start a container or
-        // run `initdb` on a first-ever open.
+        // First splash phase: provisioning Postgres can pull or start a
+        // container, or run `initdb` on a first-ever open.
         self.set_boot_phase(&ws.id, BootPhase::ProvisioningDatabase);
-        // A new boot episode starts with a clean slate: the user may have installed
-        // a newer Lucidos since the failure, and a stale message would outlive the
-        // condition it described.
+        // A new boot episode starts with a clean slate, so a stale message
+        // cannot outlive the condition it described.
         self.clear_boot_failure(&ws.id);
         let prov = self.ensure_postgres(ws).await?;
 
@@ -852,13 +754,11 @@ impl GatewayState {
             self.inner.gateway_port,
             self.inner.engine_loopback,
         )
-        // Retryable, matching what `respawn_stack` already does with a spawn
-        // error: the common causes (a binary mid-rebuild, a transient resource
-        // limit) clear on their own, and the budget bounds the rest.
+        // Retryable: the common causes (a binary mid-rebuild, a transient
+        // resource limit) clear on their own, and the budget bounds the rest.
         .map_err(|e| ProvisionError::transient(format!("could not spawn the engine: {e}")))?;
-        // Engine process is up; it now reports finer phases (migrating, building
-        // search index, recovering) via the boot-phase control endpoint until its
-        // first healthy probe clears the phase.
+        // The engine now reports finer phases through the boot-phase control
+        // endpoint until its first healthy probe clears the phase.
         self.set_boot_phase(&ws.id, BootPhase::StartingEngine);
         Ok((prov.handle, Some(child), Health::Booting))
     }
@@ -868,20 +768,16 @@ impl GatewayState {
     /// provisioning so a provisioning failure leaves a recoverable `Unhealthy`
     /// workspace (retry / delete from the picker) rather than vanishing.
     ///
-    /// New workspaces are created with `autostart = true` (via
-    /// [`Workspace::gateway_provisioned`], shared with restore): a workspace
-    /// someone bothered to create is one they want running, and the always-on
-    /// service only keeps its promise (triggers, scheduled tasks, coding-agent
-    /// sessions, push) for a workspace whose engine is up. The picker toggle
-    /// turns it off per workspace. This is the sole *create* path: there is no
-    /// auto-created bootstrap `default`, and first run shows the picker.
-    /// ([`Self::restore_workspace`] is the other way an entry is born.)
+    /// New workspaces get `autostart = true`: the always-on service only keeps
+    /// its promise (triggers, scheduled tasks, push) for a workspace whose
+    /// engine is up. The picker toggle turns it off per workspace. This is the
+    /// sole *create* path, and [`Self::restore_workspace`] is the other way an
+    /// entry is born.
     ///
-    /// Refuses a display name another workspace already carries: two rows the
-    /// user cannot tell apart is not a state worth creating (see
-    /// [`Registry::find_by_display_name`]). The *address* may still be taken
-    /// while the name is free, and that one is suffixed rather than refused, so
-    /// the picker states the resulting address before the click.
+    /// Refuses a display name another workspace already carries, because two
+    /// rows the user cannot tell apart is not a state worth creating. The
+    /// ADDRESS may still be taken while the name is free, and that one is
+    /// suffixed rather than refused.
     pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, ApiError> {
         let ws = {
             let mut reg = self.inner.registry.lock().unwrap();
@@ -907,9 +803,9 @@ impl GatewayState {
         };
 
         self.bring_up(ws.clone()).await;
-        // Clone the Arc out and drop the map lock before locking the stack — the
-        // supervisor holds stack→map, so map→stack here would deadlock (same
-        // ordering as restart/stop/delete).
+        // Clone the Arc out and drop the map lock before locking the stack. The
+        // supervisor holds stack then map, so the reverse order here would
+        // deadlock (same ordering as restart, stop and delete).
         let stack = self.inner.stacks.lock().await.get(&ws.id).cloned();
         let status = match stack {
             Some(s) => s.lock().await.status(),
@@ -953,12 +849,11 @@ impl GatewayState {
 
     /// The display name an in-flight restore has reserved, if any.
     ///
-    /// A restore holds its name from the moment it is accepted until its
-    /// registry entry is committed, which is minutes later: the archive has to
-    /// be decrypted, unpacked and `pg_restore`d first. For that whole window the
-    /// name exists nowhere in the registry, so create and rename have to consult
-    /// this as well or they would hand out a name the restore is about to
-    /// commit, and `Registry::add` (id-only) would not catch it.
+    /// A restore holds its name from acceptance until its registry entry is
+    /// committed, which is minutes later. For that whole window the name is
+    /// nowhere in the registry. Create and rename must consult this too, or
+    /// they hand out a name the restore is about to commit. `Registry::add`
+    /// does not catch that, because it checks ids only.
     ///
     /// Callers hold the registry lock across this read, which is what makes the
     /// pair atomic. Lock order is always registry then restore.
@@ -978,23 +873,18 @@ impl GatewayState {
         }
     }
 
-    /// Begin restoring a local backup archive (already streamed to `archive_tmp`)
-    /// into a NEW workspace. Validates synchronously — derives the workspace name
-    /// (explicit `requested_name`, else parsed from `archive_filename`), rejects a
-    /// name collision so the picker can ask for a different one (the user's
-    /// "ask-on-collision" rule), and reserves a free port — then spawns the heavy
-    /// restore in the background and returns `{id, name}` (202). The picker polls
-    /// [`Self::restore_status`] for progress / completion / failure.
+    /// Begin restoring a local backup archive into a NEW workspace. Validates
+    /// synchronously, then spawns the heavy restore in the background and
+    /// returns `{id, name}` with a 202. The picker polls
+    /// [`Self::restore_status`].
     ///
-    /// The registry entry is committed only AFTER the archive is restored into the
-    /// dir + database, so a failure before then leaves nothing registered and the
-    /// cleanup removes only what this attempt created (the provisioned Postgres +
-    /// the fresh dir) — never a pre-existing workspace.
+    /// The registry entry is committed only AFTER the archive is restored into
+    /// the dir and database. So a failure before then leaves nothing registered,
+    /// and the cleanup removes only what this attempt created, never a
+    /// pre-existing workspace.
     ///
-    /// The entry it commits is a [`Workspace::gateway_provisioned`] one, exactly
-    /// like [`Self::create_workspace`]'s, so a restored workspace auto-starts and
-    /// its triggers, scheduled tasks and push resume at the next login without
-    /// anyone opening it.
+    /// The entry it commits auto-starts, like [`Self::create_workspace`]'s, so a
+    /// restored workspace resumes its triggers and push at the next login.
     pub async fn restore_workspace(
         &self,
         archive_tmp: PathBuf,
@@ -1002,9 +892,9 @@ impl GatewayState {
         key_b64: String,
         requested_name: Option<String>,
     ) -> Result<(String, String), ApiError> {
-        // Derive the display name: an explicit name wins; otherwise parse it from
-        // the archive filename. A non-archive filename with no explicit name is a
-        // 400 telling the picker to ask for one.
+        // An explicit name wins, otherwise parse it from the archive filename.
+        // A non-archive filename with no explicit name is a 400 telling the
+        // picker to ask for one.
         let derived = || registry::parse_workspace_name_from_archive(&archive_filename);
         let name = requested_name
             .map(|n| n.trim().to_string())
@@ -1017,17 +907,13 @@ impl GatewayState {
                 )
             })?;
 
-        // Validate the name, reserve the id + port, and CLAIM THE RESTORE SLOT,
-        // all while holding the registry lock.
+        // Validate the name, reserve the id and port, and CLAIM THE RESTORE
+        // SLOT, all while holding the registry lock.
         //
-        // The slot claim belongs inside this critical section, not after it,
-        // because the registry entry is committed only minutes later (after the
-        // archive is unpacked and pg_restore'd). Between this check and that
-        // commit the name is not in the registry yet, so nothing but the claim
-        // itself is holding it: a rename could take the name meanwhile and
-        // `Registry::add` would happily commit the duplicate, since it only
-        // checks ids. The claim IS the reservation, and `create_workspace` /
-        // `rename_workspace` consult it (see `restore_reserved_name`).
+        // The claim belongs inside this critical section, not after it. The
+        // registry entry is committed only minutes later, and until then nothing
+        // but the claim holds the name, so a rename could take it meanwhile.
+        // The claim IS the reservation (see `restore_reserved_name`).
         //
         // Lock order is registry then restore, everywhere, so the two can never
         // deadlock against each other.
@@ -1037,16 +923,15 @@ impl GatewayState {
                 let _ = std::fs::remove_file(&archive_tmp);
                 ApiError::internal("restore state poisoned")
             })?;
-            // Check-and-set the single slot: two near-simultaneous restores must
-            // not both pass (the control handler's pre-check is a best-effort
-            // fast-fail; this is the authoritative gate).
+            // Check-and-set the single slot, so two near-simultaneous restores
+            // cannot both pass. The control handler's pre-check is a
+            // best-effort fast-fail; this is the authoritative gate.
             if matches!(*st, RestoreStatus::Running { .. }) {
                 let _ = std::fs::remove_file(&archive_tmp);
                 return Err(ApiError::conflict("A restore is already in progress"));
             }
-            // The name first, then the address it derives: a duplicate NAME is
-            // the one the user can see, so say that rather than talking about an
-            // address when both are taken.
+            // The name first, then the address it derives. A duplicate NAME is
+            // the one the user can see, so say that when both are taken.
             if let Some(existing) = reg.find_by_display_name(&name, None) {
                 let _ = std::fs::remove_file(&archive_tmp);
                 return Err(ApiError::conflict(name_taken_message(&existing.name)));
@@ -1098,11 +983,10 @@ impl GatewayState {
         Ok((id, name))
     }
 
-    /// The heavy restore: provision Postgres ONCE, run the engine `restore-archive`
-    /// CLI into that dir + DB, then commit the registry entry and spawn the engine
-    /// server. Returns a user-facing error string on failure (the caller records
-    /// it as `Failed`). Cleanup on a pre-commit failure removes only what this
-    /// attempt created.
+    /// The heavy restore: provision Postgres ONCE, run the engine
+    /// `restore-archive` CLI into that dir and database, then commit the
+    /// registry entry and spawn the engine. Cleanup on a pre-commit failure
+    /// removes only what this attempt created.
     async fn run_restore(
         &self,
         ws: Workspace,
@@ -1113,10 +997,10 @@ impl GatewayState {
         std::fs::create_dir_all(resolved_dir.join("data"))
             .map_err(|e| format!("create workspace dir: {e}"))?;
 
-        // Provision Postgres ONCE and reuse its URL for BOTH the CLI restore and
-        // the engine server — re-provisioning (e.g. via bring_up) would, for the
-        // embedded backend, stop+restart the cluster on a new port between the two
-        // steps. So we spawn the engine directly here rather than calling bring_up.
+        // Provision Postgres ONCE and reuse its URL for BOTH the CLI restore
+        // and the engine server. Re-provisioning would, on the embedded
+        // backend, restart the cluster on a new port between the two steps.
+        // So spawn the engine directly here rather than calling `bring_up`.
         let prov = match self.ensure_postgres(&ws).await {
             Ok(p) => p,
             Err(e) => {
@@ -1147,11 +1031,11 @@ impl GatewayState {
             }
         }
 
-        // Spawn the engine server on the provisioned (already-restored) DB; its
-        // construction runs migrations, upgrading an older-schema restore. A spawn
-        // failure here is non-fatal: the workspace is registered + restored, so the
-        // picker lists it (stopped) and an Open lazy-starts it — don't tear down
-        // the user's just-restored data.
+        // Spawn the engine on the already-restored database. Its construction
+        // runs migrations, upgrading an older-schema restore. A spawn failure
+        // here is not fatal: the workspace is registered and restored, so the
+        // picker lists it and an Open lazy-starts it. Never tear down the
+        // user's just-restored data.
         stack::reclaim_stale_engine(&resolved_dir);
         match stack::spawn_engine(
             &self.inner.engine_bin,
@@ -1189,10 +1073,10 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Shell out to `lucidos-engine restore-archive` to decrypt + unpack +
-    /// pg_restore the archive into `ws_dir` + `database_url`. The key and DB URL go
-    /// via env (out of argv); stdout `LUCIDOS_RESTORE_PHASE=<phase>:<pct>` lines
-    /// drive the picker's phase; stderr (tail) is the failure message.
+    /// Shell out to `lucidos-engine restore-archive` to decrypt, unpack and
+    /// pg_restore the archive. The key and database URL go via env, out of
+    /// argv. Stdout `LUCIDOS_RESTORE_PHASE=<phase>:<pct>` lines drive the
+    /// picker's phase, and the tail of stderr is the failure message.
     async fn run_restore_cli(
         &self,
         ws_dir: &Path,
@@ -1253,9 +1137,9 @@ impl GatewayState {
     }
 
     /// Tear down a half-provisioned restore: stop the Postgres this attempt
-    /// provisioned (if any) and remove the freshly-created workspace dir. Only ever
-    /// touches state THIS attempt created — the dir is `workspaces/<freshly-allocated-id>`
-    /// and the registry entry isn't committed until after a successful restore.
+    /// provisioned and remove the freshly-created workspace dir. Only ever
+    /// touches state THIS attempt created, because the id is freshly allocated
+    /// and the registry entry is committed only after a successful restore.
     fn cleanup_failed_restore(&self, resolved_dir: &Path, pg: Option<&PgHandle>) {
         if let Some(pg) = pg {
             pg.teardown();
@@ -1290,13 +1174,13 @@ impl GatewayState {
         postgres::teardown_workspace(&self.inner.pg_backend, &ws.id, self.app_data()).await
     }
 
-    /// Rename = edit the display name only (registry + runtime). No dir move, DB
-    /// reconnect, or port change.
+    /// Rename edits the display name only, in the registry and the runtime. No
+    /// dir move, database reconnect, or port change.
     ///
     /// Refuses a name another workspace already carries, so a rename cannot
-    /// produce the pair of identical-looking rows that create and restore now
-    /// refuse to create. Renaming a workspace to what it is already called (or a
-    /// case edit of it) is not a collision with itself.
+    /// produce the pair of identical-looking rows that create and restore
+    /// refuse. Renaming a workspace to what it is already called, or a case
+    /// edit of that, is not a collision with itself.
     pub async fn rename_workspace(&self, id: &str, name: &str) -> Result<(), ApiError> {
         {
             let mut reg = self.inner.registry.lock().unwrap();
@@ -1313,9 +1197,7 @@ impl GatewayState {
             reg.save(&self.inner.registry_path)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
         }
-        // Clone the Arc out and drop the map lock before locking the stack —
-        // the supervisor holds stack→map, so map→stack here would deadlock (see
-        // `set_autostart` / the restart/stop/delete pattern).
+        // Map lock released before the stack lock, as everywhere else here.
         let stack = self.inner.stacks.lock().await.get(id).cloned();
         if let Some(stack) = stack {
             stack.lock().await.ws.name = name.to_string();
@@ -1324,27 +1206,22 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Start or restart one workspace (the picker's "Retry"/"Open", the dev Apply
-    /// engine-only restart, and the dev launcher's start-the-active-workspace
-    /// step all route here). Resyncs the registry from disk first so a
-    /// freshly-launched workspace is known, then:
-    ///   * if a stack exists → respawn it (resets the restart cap), forcing the
-    ///     engine onto a rebuilt binary (the Apply case);
-    ///   * if none exists → bring it up from the registry entry (start a stopped
-    ///     workspace).
+    /// Start or restart one workspace. Resyncs the registry from disk first so
+    /// a freshly-launched workspace is known. An existing stack is respawned
+    /// onto the rebuilt binary, which is the Apply case; otherwise the registry
+    /// entry is brought up.
     ///
-    /// `requested_by` is the device id the picker sent on its control request,
-    /// and `None` for every caller that is not a person clicking (the dev
-    /// launcher, `stop.sh`'s curl). Present, it is handed to the engine just
-    /// before the signal so its in-flight threads settle as a user restart
-    /// rather than a crash; see [`crate::stack::notify_restart_intent`].
+    /// `requested_by` is the device id the picker sent, and `None` for every
+    /// caller that is not a person clicking. Present, it is handed to the engine
+    /// just before the signal so its in-flight threads settle as a user restart
+    /// rather than a crash. See [`crate::stack::notify_restart_intent`].
     pub async fn restart_workspace(
         &self,
         id: &str,
         requested_by: Option<&str>,
     ) -> Result<(), BoxError> {
         // The dev launcher writes the shared registry file directly before
-        // POSTing here, so pick up any newly-seeded entry / flag change.
+        // POSTing here, so pick up any newly-seeded entry or flag change.
         self.sync_registry_from_disk();
         let existing = self.inner.stacks.lock().await.get(id).cloned();
         match existing {
@@ -1352,16 +1229,16 @@ impl GatewayState {
                 let mut s = stack.lock().await;
                 s.restart_attempts = 0;
                 // BEFORE the respawn, whose first act is to signal the engine.
-                // Awaited rather than spawned: the actor has to be stashed by the
+                // Awaited rather than spawned: the actor must be stashed by the
                 // time the engine reaches its shutdown handler, and losing that
-                // race would silently restore the old crash-shaped attribution.
+                // race gives the teardown a crash-shaped attribution.
                 self.notify_restart_intent(&s, requested_by).await;
                 self.respawn_stack(&mut s).await;
                 Ok(())
             }
             None => {
-                // Not running — start it. Route through the guarded lazy_start so
-                // a concurrent proxy-hit lazy-start can't double-spawn the engine.
+                // Route through the guarded `lazy_start` so a concurrent
+                // proxy-hit lazy-start cannot double-spawn the engine.
                 if !self.inner.registry.lock().unwrap().contains(id) {
                     return Err(format!("workspace '{id}' not found").into());
                 }
@@ -1372,19 +1249,14 @@ impl GatewayState {
     }
 
     /// Stop one workspace's engine and drop its runtime stack, but KEEP its
-    /// registry entry (it stays listed in the picker as stopped — membership is
-    /// "all ever launched"). The dev `stop.sh` calls this so the shared gateway
-    /// forgets the stack and its supervisor stops respawning the engine; the
-    /// entry survives so the picker still lists it. Postgres is left untouched
-    /// (dev PG is externally managed; a packaged cluster stays up for a quick
-    /// restart). A no-op if the workspace isn't currently running.
+    /// registry entry: membership is "all ever launched", so it stays listed in
+    /// the picker as stopped. Dropping the stack is also what makes the
+    /// supervisor stop respawning the engine. Postgres is left untouched.
     ///
-    /// `requested_by` carries the picker's device id when a person clicked Stop,
-    /// and is `None` for `stop.sh` (which curls this route with no such header)
-    /// and for every other non-human caller. Same contract as
+    /// `requested_by` carries the picker's device id when a person clicked
+    /// Stop, and is `None` for every other caller. Same contract as
     /// [`Self::restart_workspace`]: a named device makes the engine's in-flight
-    /// threads settle as a deliberate pause that resumes when the workspace next
-    /// boots, rather than as the crash they used to look like.
+    /// threads settle as a deliberate pause rather than a crash.
     pub async fn stop_workspace(
         &self,
         id: &str,
@@ -1397,7 +1269,7 @@ impl GatewayState {
             stop_engine_process(&mut s);
         }
         self.clear_route(id);
-        // No live route means the next open lazy-starts fresh — drop any stale
+        // No live route means the next open lazy-starts fresh. Drop any stale
         // boot phase so that open begins from the default splash label, and any
         // terminal failure so the retry is judged on its own merits.
         self.clear_boot_phase(id);
@@ -1406,9 +1278,8 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Flip a workspace's `autostart` flag (registry only — does NOT start or
-    /// stop the engine). Persisted so it survives a gateway restart; the picker's
-    /// per-workspace toggle drives this.
+    /// Flip a workspace's `autostart` flag. Registry only: this does NOT start
+    /// or stop the engine. Persisted so it survives a gateway restart.
     pub async fn set_autostart(&self, id: &str, enabled: bool) -> Result<(), BoxError> {
         {
             let mut reg = self.inner.registry.lock().unwrap();
@@ -1419,10 +1290,8 @@ impl GatewayState {
             reg.save(&self.inner.registry_path)?;
         }
         // Keep a running stack's copy in sync so a later respawn carries it.
-        // Clone the Arc out and DROP the map lock before locking the stack: the
-        // supervisor holds stack→map (briefly, in its apply phase), so holding
-        // map→stack here would be an AB-BA deadlock. Same ordering as
-        // restart/stop/delete.
+        // DROP the map lock before locking the stack: the supervisor takes
+        // stack then map, so the reverse order here is an AB-BA deadlock.
         let stack = self.inner.stacks.lock().await.get(id).cloned();
         if let Some(stack) = stack {
             stack.lock().await.ws.autostart = enabled;
@@ -1431,9 +1300,9 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Delete-to-trash: optional type-the-name confirm → stop the stack →
-    /// unregister → move the dir to `<app-data>/deleted/<id>-<ts>/` (recoverable
-    /// until purged). Never an immediate `rm`.
+    /// Delete-to-trash: optionally confirm the typed name, stop the stack,
+    /// unregister, then move the dir to `<app-data>/deleted/<id>-<ts>/`, where
+    /// it is recoverable until purged. Never an immediate `rm`.
     pub async fn delete_workspace(&self, id: &str, confirm: Option<&str>) -> Result<(), BoxError> {
         let ws = {
             let reg = self.inner.registry.lock().unwrap();
@@ -1447,13 +1316,12 @@ impl GatewayState {
             }
         }
 
-        // Stop the stack engine and drop it from the runtime maps. The database
-        // is dropped below by registry id so stopped workspaces and unhealthy
-        // stacks without a PgHandle are cleaned up the same way. The shared
-        // Postgres cluster stays up for peers.
-        // Take the stack out from under the map lock first so the blocking
-        // process signal doesn't pin the whole map and stall every other
-        // gateway operation.
+        // The database is dropped below by registry id, so a stopped workspace
+        // and an unhealthy stack with no `PgHandle` are cleaned up the same
+        // way. The shared Postgres cluster stays up for peers.
+        //
+        // Take the stack out from under the map lock first, so the blocking
+        // process signal does not pin the whole map.
         let removed = self.inner.stacks.lock().await.remove(id);
         if let Some(stack) = removed {
             let mut s = stack.lock().await;
@@ -1492,14 +1360,14 @@ impl GatewayState {
     }
 
     /// Respawn one stack's engine in place: stop the old process, re-ensure its
-    /// shared-cluster database, spawn fresh. Records the error (and increments
-    /// the attempt counter) on failure rather than panicking.
+    /// shared-cluster database, spawn fresh. Records the error on failure
+    /// rather than panicking.
     async fn respawn_stack(&self, s: &mut StackRuntime) {
         stop_engine_process(s);
         s.last_spawn = Some(Instant::now());
         s.restart_attempts += 1;
-        // The respawn acts on the accumulated misses — clear them so the fresh
-        // engine starts its boot window with a clean consecutive-miss count.
+        // The respawn acts on the accumulated misses, so clear them and let the
+        // fresh engine start its boot window with a clean count.
         s.health_misses = 0;
 
         self.set_boot_phase(&s.ws.id, BootPhase::ProvisioningDatabase);
@@ -1509,16 +1377,14 @@ impl GatewayState {
         let prov = match self.ensure_postgres(&s.ws).await {
             Ok(p) => p,
             Err(e) => {
-                // Same classification and narration as the first attempt in
-                // `bring_up`: latch only what retrying cannot fix, or a spent
-                // budget. `restart_attempts` was incremented above, so it is this
+                // `restart_attempts` was incremented above, so it is this
                 // attempt's number.
                 s.health = match self.record_provision_failure(&s.ws.id, &e, s.restart_attempts) {
                     ProvisionFailureAction::Latch => Health::Unhealthy,
-                    // Put the stack back under supervision, which matters when
+                    // Put the stack back under supervision. That matters when
                     // this respawn came from the picker's Retry on an already
-                    // LATCHED workspace: leaving it `Unhealthy` would make the
-                    // supervisor skip it again, and the retrying message we just
+                    // LATCHED workspace: leaving it `Unhealthy` makes the
+                    // supervisor skip it again, so the retrying message just
                     // recorded would promise attempts that never come.
                     ProvisionFailureAction::Retry => Health::Booting,
                 };
@@ -1554,22 +1420,20 @@ impl GatewayState {
         }
     }
 
-    /// One supervision pass over every stack. Process liveness vs. health: a
-    /// freshly-spawned engine whose PROCESS is alive but not yet answering
-    /// `/api/v1/health` is still BOOTING (cold boot can take tens of seconds)
-    /// and is left alone within [`BOOT_GRACE`]; a dead process (crash) or one
-    /// wedged past the grace is respawned (backoff + cap).
+    /// One supervision pass over every stack. Liveness is not health: an engine
+    /// whose PROCESS is alive but not yet answering `/api/v1/health` is still
+    /// BOOTING and is left alone within [`BOOT_GRACE`]. See
+    /// [`respawn_decision`] for what happens after that.
     async fn supervise_once(&self) {
         let stacks: Vec<Arc<AsyncMutex<StackRuntime>>> =
             { self.inner.stacks.lock().await.values().cloned().collect() };
 
         // Snapshot phase: capture each candidate stack's probe inputs under a
-        // BRIEF lock, then RELEASE it. The probe must not run with the stack lock
-        // held — `list_status` (the picker's 2s poll) and create/delete/restart
-        // take that same per-stack lock, so holding it across the up-to-5s probe
-        // stalls the picker for seconds whenever an engine is briefly slow to
-        // answer. The `StackRuntime` mutex protects in-memory state, not the
-        // network round-trip.
+        // BRIEF lock, then RELEASE it. The probe must not run with the stack
+        // lock held. The picker's poll takes that same per-stack lock, so
+        // holding it across the up-to-5s probe stalls the picker whenever an
+        // engine is slow to answer. The `StackRuntime` mutex protects in-memory
+        // state, not the network round-trip.
         let mut candidates: Vec<ProbeTarget> = Vec::with_capacity(stacks.len());
         for stack in stacks {
             let (id, port, last_spawn) = {
@@ -1580,9 +1444,9 @@ impl GatewayState {
                 }
                 (s.ws.id.clone(), s.ws.port, s.last_spawn)
             };
-            // A concurrent delete may have removed this stack from the map (and
-            // trashed its dir) while we held only the snapshot Arc. Don't
-            // resurrect a deleted workspace's engine + Postgres — skip it.
+            // A concurrent delete may have removed this stack from the map, and
+            // trashed its dir, while we held only the snapshot Arc. Never
+            // resurrect a deleted workspace's engine and Postgres.
             if !self.inner.stacks.lock().await.contains_key(&id) {
                 continue;
             }
@@ -1598,11 +1462,10 @@ impl GatewayState {
         // stack lock held, so one slow engine never serializes the whole pass.
         let scheme = self.engine_scheme();
         let client = &self.inner.health_client;
-        // Probe health and, for an engine that answers healthy, its unread count
-        // in the same concurrent pass (the count fetch only runs on a healthy
-        // probe, so unhealthy/booting engines cost no extra request). This is the
-        // sole unread-count path — the gateway holds no DB handle (ADR 0014 §1) —
-        // so a stopped workspace yields `None` and shows no badge.
+        // The unread count rides the same pass, and only for an engine that
+        // answers healthy. This is the sole unread-count path, because the
+        // gateway holds no DB handle (ADR 0014 §1). A stopped workspace
+        // therefore yields `None` and shows no badge.
         let outcomes: Vec<(ProbeOutcome, Option<u64>)> =
             futures::future::join_all(candidates.iter().map(|t| async move {
                 let outcome = stack::probe_health(client, scheme, t.port).await;
@@ -1618,11 +1481,10 @@ impl GatewayState {
         // Apply phase: re-acquire each stack briefly to write the result back.
         for (t, (outcome, unread)) in candidates.into_iter().zip(outcomes) {
             let mut s = t.stack.lock().await;
-            // The lock was dropped across the probe, so the stack may have changed
-            // under us. Discard a stale result rather than apply it to a
-            // stopped/deleted/respawned/capped stack (see `probe_result_is_stale`).
-            // `contains_key` is checked WHILE holding the stack lock, matching the
-            // delete path's ordering so a concurrent delete is observed as absent.
+            // The lock was dropped across the probe, so the stack may have
+            // changed under us (see `probe_result_is_stale`). `contains_key` is
+            // checked WHILE holding the stack lock, matching the delete path's
+            // ordering so a concurrent delete is observed as absent.
             let present = self.inner.stacks.lock().await.contains_key(&t.id);
             if probe_result_is_stale(present, t.last_spawn, s.last_spawn, s.health) {
                 continue;
@@ -1632,25 +1494,23 @@ impl GatewayState {
                 s.restart_attempts = 0;
                 s.health_misses = 0;
                 s.last_error = None;
-                // Refresh the per-workspace badge count (None if the fetch failed
-                // even though health passed — show no badge rather than a stale one).
+                // `None` when the fetch failed even though health passed: show
+                // no badge rather than a stale one.
                 s.last_unread = unread;
-                // Booted — drop the boot phase so a later cold open starts clean,
-                // and the failure message with it (this boot demonstrably worked).
+                // Drop the boot phase so a later cold open starts clean, and
+                // the failure message with it: this boot demonstrably worked.
                 self.clear_boot_phase(&t.id);
                 self.clear_boot_failure(&t.id);
                 continue;
             }
 
-            // Not healthy → no trustworthy count; clear the badge for this tick.
+            // Not healthy, so no trustworthy count: clear the badge this tick.
             s.last_unread = None;
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
-            // Count this miss; a healthy probe (above) resets it. Only a DEAD
-            // process is ever culled (after DEAD_MISS_THRESHOLD misses); an
-            // alive engine is never respawned no matter how many it misses, so a
-            // load spike can't cull a working engine (ADR 0014, 2026-06-27).
+            // Count this miss; a healthy probe resets it. Only a DEAD process
+            // is ever culled, so a load spike cannot cull a working engine.
             s.health_misses = s.health_misses.saturating_add(1);
 
             let boot_failure = self.boot_failure(&t.id);
@@ -1669,23 +1529,21 @@ impl GatewayState {
                 // Healthy is handled above; treat defensively as a no-op.
                 SuperviseAction::Healthy => {}
                 SuperviseAction::Booting => s.health = Health::Booting,
-                // Within backoff or below the miss threshold — keep accumulating.
                 SuperviseAction::Wait => {}
                 SuperviseAction::MarkUnhealthy => {
                     s.health = Health::Unhealthy;
-                    // Gave up auto-respawning, so drop the phase: the last label
-                    // would otherwise lie ("Running migrations…" on a dead
-                    // engine). The splash falls back to the neutral default, or to
-                    // the reported failure when we have one (`boot_failures` is
-                    // deliberately NOT cleared here — it outlives the phase).
+                    // Gave up auto-respawning, so drop the phase: the last
+                    // label would otherwise lie about a dead engine.
+                    // `boot_failures` is NOT cleared here, so a reported cause
+                    // outlives the phase and still reaches the splash.
                     self.clear_boot_phase(&t.id);
                     match &boot_failure {
                         // A recorded cause always beats the generic "gave up"
-                        // string, including one an earlier probe already set —
-                        // this is the specific, actionable text, and it doubles as
-                        // the picker's health-dot tooltip. A retrying failure is
-                        // promoted first: the budget is spent, so the splash must
-                        // stop auto-refreshing under a promise of another attempt.
+                        // string: it is the specific, actionable text, and it
+                        // doubles as the picker's health-dot tooltip. A
+                        // retrying failure is promoted first, because the
+                        // budget is spent and the splash must stop
+                        // auto-refreshing under a promise of another attempt.
                         Some(failure) => {
                             let final_failure = failure.gave_up(s.restart_attempts);
                             s.last_error = Some(final_failure.message());
@@ -1705,9 +1563,8 @@ impl GatewayState {
                         "[Gateway] '{}' marked unhealthy after {} attempts{}",
                         t.id,
                         s.restart_attempts,
-                        // Which of the two ways to stop this was. A reported
-                        // terminal failure short-circuits the budget, so saying
-                        // "not retried" of a workspace that simply ran out of
+                        // Which of the two ways to stop this was. Saying "not
+                        // retried" of a workspace that merely ran out of
                         // attempts would send the reader hunting for a report
                         // that was never made.
                         match &boot_failure {
@@ -1733,9 +1590,8 @@ impl GatewayState {
 }
 
 /// One stack's probe inputs, snapshotted under a brief lock so the health probe
-/// itself runs WITHOUT the stack lock held (see `supervise_once`). `last_spawn`
-/// is the generation marker used to discard a result whose engine was respawned
-/// during the unlocked probe window.
+/// runs WITHOUT the stack lock held. `last_spawn` is the generation marker that
+/// discards a result whose engine was respawned during the unlocked window.
 struct ProbeTarget {
     stack: Arc<AsyncMutex<StackRuntime>>,
     id: String,
@@ -1744,18 +1600,16 @@ struct ProbeTarget {
 }
 
 /// Whether a health-probe result must be DISCARDED rather than applied to its
-/// stack. `supervise_once` releases the stack lock across the (up-to-5s) network
-/// probe so the picker's `list_status` never blocks behind it; on re-lock the
-/// stack may have changed under us. Discard if:
-///   * the stack was removed from the map by a concurrent stop/delete
-///     (`present == false`) — never resurrect a stopped/deleted engine;
-///   * the stack was respawned/restarted during the probe (`last_spawn` moved) —
-///     the probe described the OLD engine, so judging the fresh one off it would
-///     bounce a just-restarted workspace;
-///   * the stack is now capped `Unhealthy` — left for manual retry/delete.
+/// stack. `supervise_once` releases the stack lock across the network probe, so
+/// on re-lock the stack may have changed. Discard when:
+///   * a concurrent stop or delete removed the stack from the map, so never
+///     resurrect its engine;
+///   * `last_spawn` moved during the probe, so the result describes the OLD
+///     engine and applying it would bounce a just-restarted workspace;
+///   * the stack is now capped `Unhealthy`, left for a manual retry or delete.
 ///
-/// `None == None` (a re-adopted engine that has never respawned) counts as
-/// "unchanged", so its healthy probes still apply.
+/// `None == None` is a re-adopted engine that has never respawned. It counts as
+/// unchanged, so its healthy probes still apply.
 fn probe_result_is_stale(
     present: bool,
     last_spawn_before: Option<Instant>,
@@ -1766,40 +1620,32 @@ fn probe_result_is_stale(
 }
 
 /// What the supervisor should do with one stack after a single health probe.
-/// Output of the pure [`respawn_decision`] so the cull policy is unit-testable
-/// in isolation from the async probe + process plumbing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SuperviseAction {
-    /// Probe succeeded — mark healthy, reset counters. (Handled before the fn is
-    /// called; returned only for completeness.)
+    /// Probe succeeded. Handled before [`respawn_decision`] is called, and
+    /// returned only for completeness.
     Healthy,
-    /// Process alive, still inside its cold-boot window — leave it alone.
+    /// Process alive, still inside its cold-boot window, so leave it alone.
     Booting,
-    /// Not enough evidence to cull yet (within backoff, or below the miss
-    /// threshold for this outcome) — wait and keep accumulating.
+    /// Not enough evidence to cull yet: within backoff, or below the miss
+    /// threshold for this outcome.
     Wait,
     /// Cull and respawn the engine.
     Respawn,
-    /// Hit the restart cap — mark Unhealthy and stop auto-respawning.
+    /// Hit the restart cap: mark Unhealthy and stop auto-respawning.
     MarkUnhealthy,
 }
 
-/// Pure cull/keep decision for one stack, given a probe outcome and the stack's
-/// current state. Extracted from [`GatewayState::supervise_once`] so the policy
-/// is exhaustively unit-tested.
+/// Pure cull-or-keep decision for one stack. `misses` is the consecutive-miss
+/// count INCLUDING the current probe.
 ///
-/// **An ALIVE engine is never culled** — booting, busy, `Slow`, or even
-/// `Unreachable`-while-alive (apparently wedged). Respawning a live engine
-/// interrupts its in-flight threads and, under sustained contention, feeds a
-/// cross-workspace respawn cascade: each respawn cold-boots (replaying ~14k
-/// trigger events + a worktree rescan), which spikes load and starves the next
-/// engine's probe. A timed-out HTTP probe cannot distinguish "hung forever" from
-/// "busy right now", so the supervisor stops guessing and respawns ONLY a
-/// process that has actually exited (`alive == false`) — preserving crash
-/// recovery + lazy-start. A genuinely deadlocked-but-alive engine is the rare,
-/// accepted cost: it waits for a manual restart. See ADR 0014 (2026-06-27
-/// sub-addendum). `misses` is the consecutive-miss count INCLUDING the current
-/// probe.
+/// **An ALIVE engine is never culled**, whether booting, busy, `Slow`, or
+/// apparently wedged. Respawning a live engine interrupts its in-flight threads
+/// and, under sustained contention, feeds a cross-workspace respawn cascade. A
+/// timed-out HTTP probe cannot tell "hung forever" from "busy right now". So
+/// the supervisor respawns ONLY a process that has actually exited, which still
+/// preserves crash recovery and lazy-start. A deadlocked-but-alive engine is
+/// the rare accepted cost, and waits for a manual restart. See ADR 0014.
 fn respawn_decision(
     outcome: ProbeOutcome,
     alive: bool,
@@ -1811,20 +1657,17 @@ fn respawn_decision(
     if outcome == ProbeOutcome::Healthy {
         return SuperviseAction::Healthy;
     }
-    // The engine told us this boot cannot succeed (`boot-failure` control
-    // endpoint) — canonically a database migrated by a newer Lucidos. Retrying
-    // re-runs the identical failure, so go straight to Unhealthy instead of
-    // burning the restart cap first: five pointless cold boots only delayed the
-    // message by ~30s in the 2026-07-29 incident. Ordered ahead of the alive check
-    // because a dying engine can still be mid-exit when this probe lands; the
-    // "never cull an alive engine" rule protects a HEALTHY-but-busy process, and
-    // this one has already declared itself dead.
+    // The engine reported that this boot cannot succeed, canonically a database
+    // migrated by a newer Lucidos. Retrying re-runs the identical failure, so go
+    // straight to Unhealthy instead of burning the restart cap first. Ordered
+    // ahead of the alive check because a dying engine can still be mid-exit when
+    // this probe lands. The never-cull rule protects a busy process, not one
+    // that has declared itself dead.
     if terminal_boot_failure {
         return SuperviseAction::MarkUnhealthy;
     }
-    // Never cull an alive process. Inside the cold-boot window it's BOOTING
-    // (pgvector init / migrations / embedding warmup take tens of seconds, shown
-    // as the boot splash); past it, it's busy/slow/wedged — leave it be.
+    // Never cull an alive process. Inside the cold-boot window it is BOOTING;
+    // past it, it is busy, slow or wedged, and still left alone.
     if alive {
         return if since_spawn < BOOT_GRACE {
             SuperviseAction::Booting
@@ -1832,7 +1675,7 @@ fn respawn_decision(
             SuperviseAction::Wait
         };
     }
-    // The process has EXITED — crash recovery. Respawn with backoff + cap.
+    // The process has EXITED, so this is crash recovery: backoff, then cap.
     if since_spawn < respawn_backoff(restart_attempts) {
         return SuperviseAction::Wait;
     }
@@ -1845,16 +1688,13 @@ fn respawn_decision(
     SuperviseAction::Respawn
 }
 
-/// Which of the two boot-window narrations the splash shows, given what is
-/// recorded for a workspace. Pure half of [`GatewayState::boot_splash_label`].
+/// Which of the two boot-window narrations the splash shows.
 ///
-/// A RETRYING failure wins: it is strictly more informative than the phase (it
-/// carries the phase's failure AND how far through the budget we are), and a
-/// phase label alone during a backoff is the opaque splash this narration exists
-/// to replace. A TERMINAL failure is not rendered here at all; the caller sends
-/// it to [`proxy::failed_page`] instead, so a `None` phase alongside one still
-/// falls through to the neutral default rather than silently borrowing the
-/// terminal text into an auto-refreshing page.
+/// A RETRYING failure wins, because it carries the phase's failure AND how far
+/// through the budget we are. A TERMINAL failure is not rendered here at all:
+/// the caller sends it to [`proxy::failed_page`]. So a `None` phase alongside
+/// one falls through to the neutral default, rather than borrowing terminal
+/// text into an auto-refreshing page.
 fn splash_label(failure: Option<&BootFailure>, phase: Option<BootPhase>) -> String {
     match failure.filter(|f| !f.is_terminal()) {
         Some(retrying) => retrying.message(),
@@ -1869,13 +1709,11 @@ fn splash_label(failure: Option<&BootFailure>, phase: Option<BootPhase>) -> Stri
 /// `restart_attempts` times since it was last healthy: [`RESPAWN_BACKOFF`]
 /// doubling per attempt, capped at [`RESPAWN_BACKOFF_MAX`].
 ///
-/// The first gap is unchanged (5s), so a one-off engine crash still recovers as
-/// promptly as it always did. The growth matters for a *repeating* failure,
-/// which is now retried rather than latched on the first miss: without it, a
-/// workspace waiting for Docker Desktop would re-run the whole provisioning
-/// sequence (several `docker` invocations) every five seconds. Growth also buys
-/// the retry budget a longer wall-clock reach, which is the point: the budget
-/// has to outlast a cold Docker Desktop start, not just five ticks.
+/// The first gap stays short, so a one-off engine crash recovers promptly. The
+/// growth is for a REPEATING failure: without it, a workspace waiting for
+/// Docker Desktop would re-run the whole provisioning sequence every five
+/// seconds. Growth also buys the budget a longer wall-clock reach, which has to
+/// outlast a cold Docker Desktop start rather than just five ticks.
 fn respawn_backoff(restart_attempts: u32) -> Duration {
     // Shift-clamped before the multiply: 2^6 * 5s is already past the cap, so
     // anything beyond that would only risk an overflow for no behavior change.
@@ -1898,16 +1736,12 @@ enum ProvisionFailureAction {
 
 /// Whether a failed provisioning attempt is worth another try.
 ///
-/// Two ways to stop. A **terminal** failure latches on the first attempt, for
-/// the same reason a reported terminal boot failure does (ADR 0014, 2026-07-29):
-/// retrying re-runs the identical failure, so burning the budget first only
-/// delays the message. Otherwise the budget itself is the bound: `attempts`
-/// counts every bring-up attempt since the stack was last healthy, and once it
-/// reaches [`RESTART_CAP`] the workspace latches with the last cause.
-///
-/// Pure, so the boundary is exhaustively testable: this is what stops the
-/// 2026-08-03 bug (one transient Docker error latching a workspace dead for the
-/// gateway's lifetime) from being reintroduced in either direction.
+/// Two ways to stop. A TERMINAL failure latches on the first attempt, for the
+/// same reason a reported terminal boot failure does (ADR 0014): retrying
+/// re-runs the identical failure, so burning the budget first only delays the
+/// message. Otherwise the budget is the bound. `attempts` counts every bring-up
+/// attempt since the stack was last healthy, and at [`RESTART_CAP`] the
+/// workspace latches with the last cause.
 fn provision_failure_action(kind: ProvisionErrorKind, attempts: u32) -> ProvisionFailureAction {
     if kind == ProvisionErrorKind::Terminal || attempts >= RESTART_CAP {
         ProvisionFailureAction::Latch
@@ -1916,16 +1750,11 @@ fn provision_failure_action(kind: ProvisionErrorKind, attempts: u32) -> Provisio
     }
 }
 
-/// Whether a stack's engine process is currently alive. For an engine this
-/// gateway spawned we `try_wait` the `Child`; for a re-adopted one (no `Child`
-/// handle, e.g. after a self re-exec) we ask `stack::pid_is_live` about the
-/// pidfile pid.
+/// Whether a stack's engine process is currently alive.
 ///
-/// Both arms are zombie-aware, and that is the point: `try_wait` reaps, and
-/// `pid_is_live` reaps too rather than trusting `kill(pid, 0)`, which succeeds
-/// for a process that has already exited. An engine wrongly read as alive is
-/// never culled by `respawn_decision`, so it would keep its workspace on the
-/// boot splash forever instead of being respawned.
+/// Both arms must stay zombie-aware. `kill(pid, 0)` succeeds for a process that
+/// has already exited, and an engine wrongly read as alive is never culled by
+/// [`respawn_decision`]. It would sit on the boot splash forever.
 fn engine_process_alive(s: &mut StackRuntime) -> bool {
     if let Some(child) = s.engine.as_mut() {
         return matches!(child.try_wait(), Ok(None));
@@ -1936,17 +1765,17 @@ fn engine_process_alive(s: &mut StackRuntime) -> bool {
     }
 }
 
-/// Stop a stack's engine process (SIGUSR1 — the engine ignores SIGTERM), reaping
-/// it off-thread so the supervisor isn't blocked by the engine's graceful drain.
+/// Stop a stack's engine process with SIGUSR1, which the engine stops on where
+/// it ignores SIGTERM. Reaped off-thread so the supervisor is not blocked by
+/// the engine's graceful drain.
 ///
 /// **Both arms reap, and that is the invariant.** The gateway is the parent of
 /// every engine it spawns, and a signal is not a wait: an engine torn down
-/// without one stays `<defunct>` until the gateway itself exits. Which arm runs
-/// says only whether we still hold the `Child`, never whether the process is
-/// ours. It usually still is even in the `None` arm, because `reload_gateway`
-/// re-execs in place and keeps the pid (see [`stack::reap_forked_pid`], which is
-/// what `reclaim_stale_engine` calls). Any new teardown path must go through one
-/// of these two.
+/// without one stays `<defunct>` until the gateway exits. Which arm runs says
+/// only whether we still hold the `Child`, never whether the process is ours.
+/// It usually still is even in the `None` arm, because `reload_gateway` re-execs
+/// in place and keeps the pid. Any new teardown path must go through one of
+/// these two.
 fn stop_engine_process(s: &mut StackRuntime) {
     match s.engine.take() {
         Some(mut child) => {
@@ -1961,10 +1790,9 @@ fn stop_engine_process(s: &mut StackRuntime) {
             unsafe {
                 libc::kill(child.id() as libc::pid_t, libc::SIGUSR1);
             }
-            // Reap without blocking the supervisor (graceful drain can take ~10s).
-            // A plain thread rather than `spawn_blocking`, matching the handle-less
-            // arm's `reap_forked_pid`: one reap mechanism, and no tokio-runtime
-            // context required of a sync helper.
+            // Reap without blocking the supervisor: a graceful drain can take
+            // seconds. A plain thread rather than `spawn_blocking`, matching
+            // the handle-less arm, so this sync helper needs no tokio runtime.
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
@@ -1976,17 +1804,15 @@ fn stop_engine_process(s: &mut StackRuntime) {
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Validate `LUCIDOS_ENGINE_BIN` points at a real, executable regular file.
-/// Boot only used to check the var was *set*; a missing / corrupt / non-exec /
-/// quarantined engine binary then surfaced as a per-workspace `spawn` Err that
-/// left the workspace URL meta-refreshing the boot splash until the escape
-/// budget. Fail fast at boot with a path-bearing reason instead.
+/// Checking only that the var is SET is not enough: a missing, corrupt or
+/// quarantined binary then surfaces as a per-workspace spawn error that
+/// meta-refreshes the boot splash until the escape budget runs out.
 fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
     // An engine binary inside a coding-agent worktree pins every spawned engine
-    // to a throwaway checkout frozen at one commit — the 2026-07-26 incident,
-    // where the whole stack ran from a worktree that git had already pruned. Fail
-    // at boot with the corrective command rather than silently serving stale
-    // code forever. Unconditional: LUCIDOS_ALLOW_WORKTREE_STACK covers a
-    // session-scoped direct engine only, never the machine-global gateway.
+    // to a throwaway checkout frozen at one commit (ADR 0021). Fail at boot with
+    // the corrective command rather than serving stale code forever.
+    // Unconditional: `LUCIDOS_ALLOW_WORKTREE_STACK` covers a session-scoped
+    // direct engine only, never the machine-global gateway.
     if crate::stack::path_is_in_cc_worktree(path) {
         return Err(format!(
             "LUCIDOS_ENGINE_BIN points into a coding-agent worktree: {} — a worktree is a \
@@ -2021,24 +1847,20 @@ fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Validate / resolve `LUCIDOS_STATIC_DIR` (the picker frontend). When set, its
-/// `index.html` must exist — otherwise the picker 404/500s while
+/// Validate and resolve `LUCIDOS_STATIC_DIR`, the picker frontend. When set,
+/// its `index.html` must exist. Otherwise the picker fails while
 /// `/~/api/v1/health` still returns 200, so the packaged service supervises a
-/// gateway that can't render its own picker (the user gets a blank error with no
-/// actionable reason). When unset under a packaged build it's a fatal
-/// misconfiguration; in dev (not packaged) an absent static dir is allowed
-/// (`None` → the picker route reports "no frontend configured").
+/// gateway that cannot render its own picker. Unset is fatal under a packaged
+/// build, and allowed in dev.
 fn resolve_static_dir(dir: Option<PathBuf>, packaged: bool) -> Result<Option<PathBuf>, BoxError> {
     match dir {
         Some(dir) => {
             let index = dir.join("index.html");
             if !index.is_file() {
-                // Packaged: a missing index.html is a real staging defect — fail
-                // fast. Dev: the gateway boots BEFORE the frontend build
-                // (`web-dev.sh` runs `start_gateway` then `start_vite`), so
-                // `dist/index.html` legitimately may not exist yet on a cold
-                // start; the picker 404s until the build-watch produces it. Warn,
-                // don't abort — aborting would wedge dev gateway startup.
+                // Packaged: a missing index.html is a staging defect, so fail
+                // fast. Dev: the gateway boots BEFORE the frontend build, so
+                // `dist/index.html` may legitimately not exist yet on a cold
+                // start. Warn rather than abort, which would wedge startup.
                 if packaged {
                     return Err(format!(
                         "LUCIDOS_STATIC_DIR is set to {} but {} is missing — the picker frontend \
@@ -2079,20 +1901,16 @@ pub async fn run() -> Result<(), BoxError> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_GATEWAY_PORT);
-    // Packaged desktop runtime sets `LUCIDOS_PACKAGED=1` (mirrors its
-    // `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`); dev leaves it unset. Drives the picker's
-    // dev-only self-reload control gating AND the fatal-when-packaged static-dir
-    // check below. Resolved here (before the resource validation) so both use it.
+    // Resolved before the resource validation, because it drives both the
+    // picker's dev-only self-reload control and the static-dir check below.
     let packaged = matches!(
         std::env::var("LUCIDOS_PACKAGED").unwrap_or_default().trim(),
         "1" | "true" | "yes" | "on"
     );
 
-    // Validate the resources the gateway REQUIRES at boot — exist + executable,
-    // not merely "the env var is set". A mis-staged / quarantined / app-translocated
-    // binary or a picker-less static dir otherwise surfaces as a per-workspace
-    // spawn Err that meta-refreshes the boot splash forever, or a healthy gateway
-    // that can't render its own picker. Fail fast with a path-bearing reason.
+    // Validate the resources the gateway REQUIRES at boot: present and
+    // executable, not merely named by a set env var. Fail fast with a
+    // path-bearing reason.
     let engine_bin = std::env::var_os("LUCIDOS_ENGINE_BIN")
         .map(PathBuf::from)
         .ok_or("LUCIDOS_ENGINE_BIN must point at the lucidos-engine binary")?;
@@ -2110,27 +1928,23 @@ pub async fn run() -> Result<(), BoxError> {
             .trim(),
         "0" | "false" | "no" | "off"
     );
-    // A dev engine (non-loopback) keeps the inherited TLS cert and serves https
-    // on its own port for direct access (ADR 0014 §4), so the gateway must proxy
-    // + probe it over https. A packaged engine serves plain http on loopback.
+    // A dev engine keeps the inherited TLS cert and serves https on its own
+    // port (ADR 0014 §4). The gateway must proxy and probe it over https. A
+    // packaged engine serves plain http on loopback.
     //
     // Resolved through `net_config::serves_tls`, the same both-present-and-
-    // non-empty rule the ENGINE applies to decide what it actually serves. A cert
-    // with no key (or either set to the empty string, which is how a script
-    // spells "unset") leaves the engine on http while a cert-only test here put
-    // the gateway on https, and the loopback hop then failed to connect.
+    // non-empty rule the ENGINE applies. A cert with no key leaves the engine
+    // on http. A cert-only test here would put the gateway on https, and the
+    // loopback hop would then fail to connect.
     let engine_tls = !engine_loopback
         && net_config::serves_tls(
             std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
             std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
         );
     // The gateway fronts every workspace API and its own destructive control
-    // plane. Resolve its bind with a loopback-first precedence (see
-    // `net_config`): an explicit `LUCIDOS_GATEWAY_BIND_ADDR` → `LUCIDOS_GATEWAY_
-    // BIND_ALL` → the machine-global `~/.lucidos/network.toml` `[gateway] bind` →
-    // loopback. Default with nothing set is loopback-only so a packaged/default
-    // launch is never exposed to the LAN; a malformed value fails safe to
-    // loopback, never to all-interfaces.
+    // plane, so `net_config` resolves its bind loopback-first. With nothing set
+    // the default is loopback-only, and a malformed value fails safe to
+    // loopback, never to all interfaces.
     let network = net_config::read_network_toml();
     let gateway_bind_addr_env = std::env::var("LUCIDOS_GATEWAY_BIND_ADDR").ok();
     let gateway_bind_all_env = std::env::var("LUCIDOS_GATEWAY_BIND_ALL").ok();
@@ -2167,12 +1981,9 @@ pub async fn run() -> Result<(), BoxError> {
     crate::log!("[Gateway] postgres backend: {:?}", pg_backend);
 
     let mut registry = Registry::load(&registry_path)?;
-    // Packaged only: lift a pre-versioning registry to the current autostart
-    // default, once (see `Registry::migrate_to_current`). Dev seeds
-    // `autostart: false` deliberately, so migrating there would spawn every
-    // workspace the launcher has ever registered. A failed save is logged, not
-    // fatal: the migration is a default, and refusing to boot the whole stack
-    // over it would be the worse outcome (it simply retries next boot).
+    // Packaged only. Dev seeds `autostart: false` deliberately, so migrating
+    // there would spawn every workspace the launcher has ever registered. A
+    // failed save is logged rather than fatal, and retries next boot.
     if packaged {
         if let Some(changed) = registry.migrate_to_current() {
             crate::log!(
@@ -2213,9 +2024,8 @@ pub async fn run() -> Result<(), BoxError> {
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
 
     // Re-adopt running engines and spawn the auto-start workspaces (ADR 0014).
-    // A first-run empty registry is a no-op here: nothing is auto-created, so the
-    // smart root serves the picker and the user names their first workspace
-    // instead of being dropped into a pre-made `default`.
+    // A first-run empty registry is a no-op: nothing is auto-created, so the
+    // smart root serves the picker and the user names their first workspace.
     state.boot_all().await;
 
     // Supervisor.
@@ -2232,10 +2042,9 @@ pub async fn run() -> Result<(), BoxError> {
     serve(state, gateway_port, gateway_bind_choice).await
 }
 
-/// Build the gateway router and serve it (TLS when certs are configured, like
-/// the engine). `/~/api/v1/health` + `/~/api/v1/control/*` are the gateway's
-/// own; every other path falls through to [`fallback`] (smart root, picker
-/// static under `/~/`, else proxy `/<slug>/*`).
+/// Build the gateway router and serve it, with TLS when certs are configured.
+/// `/~/api/v1/health` and `/~/api/v1/control/*` are the gateway's own, and
+/// every other path falls through to [`fallback`].
 async fn serve(
     state: GatewayState,
     port: u16,
@@ -2257,12 +2066,11 @@ async fn serve(
         router
     };
 
-    // Every address to listen on, split by what a bind failure MEANS. A specific
-    // `Address` ALSO binds loopback (see `net_config::bind_socket_addrs`) so the
-    // dev launch scripts' control POSTs and each spawned engine's Apply-restart
-    // callback, both over `127.0.0.1`, keep reaching the gateway; `bind_plan`
-    // then makes loopback the REQUIRED half and the configured address the
-    // retryable one, because at boot that address may not exist yet.
+    // Every address to listen on, split by what a bind failure MEANS. A
+    // specific `Address` ALSO binds loopback, so the dev launch scripts and
+    // each engine's Apply-restart callback keep reaching the gateway over
+    // `127.0.0.1`. `bind_plan` makes loopback the REQUIRED half and the
+    // configured address the retryable one, since at boot it may not exist yet.
     let plan = net_config::bind_plan(&bind_choice, port);
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
@@ -2277,8 +2085,7 @@ async fn serve(
     };
 
     // The required addresses, bound BEFORE anything is served so a failure is
-    // still fatal and still reported as one. `?` on the bind is what keeps
-    // `loopback` / `all` behaving exactly as they always have.
+    // fatal and reported as one.
     let mut serving = Vec::with_capacity(plan.required.len());
     for addr in plan.required {
         let listener = bind_and_log(addr, tls.is_some())?;
@@ -2309,18 +2116,15 @@ async fn serve(
     }
 
     // Serve the required addresses concurrently under the one shared shutdown
-    // `Handle`. Reaching here means every one of them is already bound, so this
-    // only ends on shutdown or on a listener genuinely failing mid-flight.
+    // `Handle`. Every one is already bound, so this ends only on shutdown or on
+    // a listener failing mid-flight.
     futures::future::try_join_all(serving).await?;
     Ok(())
 }
 
-/// Bind one address and announce it, in that order.
-///
-/// The order is the point. The announcement used to be printed before the bind
-/// was attempted, so a gateway that died on `EADDRNOTAVAIL` left a log claiming
-/// it was listening on the address it had just failed to acquire, which is the
-/// opposite of what the reader needs at that moment.
+/// Bind one address and announce it, in that order. Announcing first would
+/// leave a gateway that died on `EADDRNOTAVAIL` claiming to listen on the
+/// address it had just failed to acquire.
 fn bind_and_log(addr: SocketAddr, tls: bool) -> std::io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(addr)?;
     if tls {
@@ -2373,14 +2177,12 @@ fn next_bind_retry_delay(current: Duration) -> Duration {
 /// This is what makes a configured tailnet or LAN address non-fatal. At boot,
 /// launchd starts the service before `tailscaled` has assigned the machine's
 /// `100.x` address, so binding it fails with `EADDRNOTAVAIL`. Retrying here
-/// means the listener simply appears a few seconds later, with no restart and
-/// nothing for the user to do, while loopback has been serving the whole time.
+/// means the listener appears a few seconds later, with nothing for the user to
+/// do, while loopback has been serving the whole time.
 ///
-/// Logging is one line per state change rather than one per attempt: the first
+/// Logging is one line per state change rather than one per attempt. The first
 /// failure states the reason AND the retry cadence, so the silence that follows
-/// is readable as "still retrying on that schedule" instead of as a process that
-/// gave up. A machine that never joins its tailnet would otherwise write a line
-/// every 30s forever into a log that is already tens of megabytes.
+/// reads as "still retrying" rather than as a process that gave up.
 async fn serve_optional_address(
     addr: SocketAddr,
     router: Router,
@@ -2397,10 +2199,9 @@ async fn serve_optional_address(
                     pending.remove(&addr);
                 }
                 reported = None;
-                // `Ok` here is the shutdown handle firing, which means the whole
-                // process is going down and this address is nobody's problem any
-                // more. An `Err` is the listener itself failing (the interface
-                // went away under us), so fall back through to re-binding.
+                // `Ok` is the shutdown handle firing, so the whole process is
+                // going down. An `Err` is the listener failing because the
+                // interface went away, so fall through to re-binding.
                 match serve_listener(listener, router.clone(), handle.clone(), tls.clone()).await {
                     Ok(()) => return,
                     Err(e) => {
@@ -2410,12 +2211,11 @@ async fn serve_optional_address(
                         }
                     }
                 }
-                // Backoff is NOT reset by a successful bind, only by a serve that
-                // ran to shutdown (which returns above). An address that binds
-                // and then immediately fails to serve would otherwise re-bind,
-                // re-log and re-fail with no delay at all, spinning a core and
-                // filling the log; keeping the schedule means a flapping
-                // interface backs off exactly like an absent one.
+                // Backoff is NOT reset by a successful bind, only by a serve
+                // that ran to shutdown, which returns above. An address that
+                // binds and then fails to serve would otherwise re-bind and
+                // re-fail with no delay, spinning a core. Keeping the schedule
+                // makes a flapping interface back off like an absent one.
                 tokio::time::sleep(delay).await;
                 delay = next_bind_retry_delay(delay);
             }
@@ -2446,10 +2246,9 @@ fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
 /// Gateway-own health (`/~/api/v1/health`). The launcher polls this.
 ///
 /// `status` stays `ok` while an address is pending: the gateway IS serving, and
-/// the launcher's poll must not be held back by a tailnet that has not come up
-/// (that coupling is what stalled the packaged start for two minutes). The
-/// degraded reachability is reported alongside, in `pending_binds`, so it is
-/// inspectable without reading the log. Normally an empty array.
+/// the launcher's poll must not be held back by a tailnet that has not come up.
+/// The degraded reachability is reported alongside, in `pending_binds`, so it
+/// is inspectable without reading the log.
 async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_json::Value> {
     let count = state.inner.routes.read().map(|r| r.len()).unwrap_or(0);
     let pending: Vec<String> = state
@@ -2468,21 +2267,20 @@ async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_j
 }
 
 /// Everything not handled by a gateway route:
-///   * `/`            — smart root (redirect to a sole workspace, else picker).
-///   * `/~/…`         — picker assets / picker shell (sigil namespace).
-///   * `/<slug>/…`    — proxy to the matching engine.
+///   * `/`, the smart root: redirect to a sole workspace, else the picker.
+///   * `/~/…`, the picker shell and its assets, under the sigil namespace.
+///   * `/<slug>/…`, proxied to the matching engine.
 async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request) -> Response {
     let path = req.uri().path().to_string();
 
     if path == "/" {
-        // Smart root: exactly one workspace → drop the user straight in.
+        // Exactly one workspace drops the user straight in.
         if let Some(slug) = state.sole_workspace() {
             return redirect(&format!("/{slug}/"));
         }
         return serve_picker_shell(&state);
     }
 
-    // Gateway-owned sigil namespace: picker shell + its bundled assets.
     if path == format!("/{SIGIL}") {
         return redirect(&format!("/{SIGIL}/"));
     }
@@ -2490,10 +2288,9 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
         return serve_sigil(&state, rest, req).await;
     }
 
-    // `/<slug>/…` → proxy to that workspace's engine. The one exception is the
-    // manifest: a gateway-fronted workspace install must cover the whole
-    // gateway origin, not only `/<slug>/`, or switching workspaces leaves the
-    // installed PWA's scope and the browser opens a separate browser context.
+    // Proxy to that workspace's engine. The one exception is the manifest: a
+    // gateway-fronted install must cover the whole gateway origin, not only
+    // `/<slug>/`, or switching workspaces leaves the installed PWA's scope.
     let slug = path
         .trim_start_matches('/')
         .split('/')
@@ -2510,21 +2307,18 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             if rest == "manifest.json" {
                 return serve_workspace_manifest(&state, &slug);
             }
-            // A document navigation to a workspace stuck in its boot window past
-            // the budget ([`BOOT_ESCAPE_BUDGET`]) escapes to the manual "Back to
-            // workspaces" page instead of the forever-refreshing starting splash —
-            // an alive-but-unreachable engine (e.g. a misconfigured bind) is never
-            // marked `Unhealthy`, so the time budget is the only honest signal.
-            // Non-document traffic (API/SSE/assets from an already-open tab) still
-            // proxies; the frontend owns its own disconnected recovery.
+            // A document navigation to a workspace stuck past
+            // [`BOOT_ESCAPE_BUDGET`] escapes to the manual "Back to workspaces"
+            // page. An alive-but-unreachable engine is never marked
+            // `Unhealthy`, so the time budget is the only honest signal.
+            // Non-document traffic still proxies, and the frontend owns its own
+            // disconnected recovery.
             if is_document_navigation(&req) {
-                // A TERMINAL failure outranks the time budget: we already know why
-                // this workspace will never come up, so say so now rather than
-                // making the user wait out BOOT_ESCAPE_BUDGET for a page that only
-                // says "taking longer than expected". A RETRYING one deliberately
-                // does not land here: it is rendered as the ordinary splash's
-                // label below, which keeps the auto-refresh that carries the user
-                // into the workspace the moment an attempt succeeds.
+                // A TERMINAL failure outranks the time budget, because we
+                // already know this workspace will never come up. A RETRYING one
+                // does not land here: it renders as the ordinary splash label
+                // below, keeping the auto-refresh that carries the user in the
+                // moment an attempt succeeds.
                 if let Some(failure) = state.boot_failure(&slug).filter(|f| f.is_terminal()) {
                     return proxy::failed_page(&failure.message());
                 }
@@ -2533,24 +2327,21 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 }
             }
             let target = format!("{}://127.0.0.1:{port}", state.engine_scheme());
-            // The route is set the instant `bring_up` spawns the engine — while
-            // it's still Booting — so a cold-open navigation lands HERE, not on
-            // the no-route branch below. Pass the current boot phase so the
-            // proxy's connect-failure splash narrates the engine-reported phases
-            // (migrating → recovering); a transient restart of a live workspace
-            // simply has no phase set (default).
+            // The route is set the instant `bring_up` spawns the engine, while
+            // it is still Booting. So a cold-open navigation lands HERE rather
+            // than on the no-route branch below. The boot phase goes with it so
+            // the proxy's connect-failure splash can narrate what the engine
+            // reported. A transient restart has no phase set.
             let boot_label = state.boot_splash_label(&slug);
             proxy::proxy(&state.inner.proxy_client, &target, &slug, &boot_label, req).await
         }
         None => {
-            // No live route. If the slug is a registered-but-stopped workspace
-            // (membership is "all ever launched"; an autostart=false / stopped
-            // workspace has no stack), lazy-start it for a document navigation
-            // and serve the boot window — the page's auto-refresh lands once the
-            // engine is healthy and the route exists. Do NOT lazy-start on API,
-            // SSE, asset, or service-worker retry traffic from an already-open
-            // tab; otherwise the picker's Stop button would shut the engine down
-            // only for the stopped app to immediately resurrect itself.
+            // No live route. A registered-but-stopped workspace lazy-starts on
+            // a document navigation and serves the boot window, whose
+            // auto-refresh lands once the engine is healthy. Never lazy-start
+            // on API, SSE, asset or service-worker traffic from an open tab.
+            // Otherwise the picker's Stop shuts the engine down only for the
+            // stopped app to resurrect it.
             let registered = state.inner.registry.lock().unwrap().contains(&slug);
             if registered {
                 if rest == "manifest.json" {
@@ -2558,16 +2349,14 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 }
                 if is_document_navigation(&req) {
                     // Kick the lazy-start in the background and return the boot
-                    // window immediately — don't block this response on a
-                    // multi-second provision+spawn; the page's auto-refresh lands
-                    // once the engine is healthy. lazy_start is self-guarded
-                    // against duplicate starts.
+                    // window at once, rather than blocking this response on a
+                    // multi-second provision and spawn. The page's auto-refresh
+                    // lands once the engine is healthy.
                     let st = state.clone();
                     let id = slug.clone();
                     tokio::spawn(async move { st.lazy_start(&id).await });
-                    // Label reflects the current boot phase (default until the
-                    // background lazy-start records one); the 2s meta-refresh
-                    // picks up later phases.
+                    // Default until the background lazy-start records a phase.
+                    // The meta-refresh picks up later phases.
                     return proxy::starting_page(&state.boot_splash_label(&slug));
                 }
                 return (
@@ -2576,15 +2365,13 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 )
                     .into_response();
             }
-            // Unknown (never-registered / deleted) slug. On a document navigation,
-            // send the browser to the picker list (`/~/?pick`) rather than a raw
-            // 404 dead-end: the PWA cold-start head redirect (index.html) opens
-            // the remembered workspace optimistically without an existence check,
-            // so a since-deleted last-workspace must land somewhere recoverable.
-            // `?pick` also makes that head redirect stand down, so the picker
-            // renders its list (and forgets the stale workspace) instead of
-            // bouncing straight back here — no redirect loop. Non-document traffic
-            // (API/SSE/assets/SW retries) still gets a 404.
+            // Unknown slug. On a document navigation, send the browser to the
+            // picker list rather than a 404 dead-end: the PWA cold-start head
+            // redirect opens the remembered workspace with no existence check,
+            // so a since-deleted one must land somewhere recoverable. `?pick`
+            // also makes that head redirect stand down, so the picker renders
+            // its list instead of bouncing back here in a loop. Non-document
+            // traffic still gets a 404.
             if is_document_navigation(&req) {
                 return redirect(&format!("/{SIGIL}/?pick"));
             }
@@ -2593,21 +2380,19 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
     }
 }
 
-/// The refusal when a create / rename / restore asks for a display name another
+/// The refusal when a create, rename or restore asks for a display name another
 /// workspace already carries.
 ///
-/// One sentence for all three surfaces, because it is one rule. It quotes the
-/// existing workspace's name as stored rather than what the user typed: the
+/// It quotes the existing name AS STORED rather than what the user typed. The
 /// match is case- and space-insensitive, so "PersonAAA" must come back as the
-/// "personaaa" they can actually see in the list.
+/// "personaaa" they can see in the list.
 fn name_taken_message(existing_name: &str) -> String {
     format!("You already have a workspace called \"{existing_name}\". Choose a different name.")
 }
 
 /// Do these two display names count as the same one? Trimmed and
-/// case-insensitive, matching [`Registry::find_by_display_name`], so the
-/// in-flight-restore reservation is compared exactly the way a registered name
-/// is. `None` (no restore running) never matches.
+/// case-insensitive, matching [`Registry::find_by_display_name`], so an
+/// in-flight restore's reservation compares the way a registered name does.
 fn names_match(reserved: &Option<String>, name: &str) -> bool {
     reserved
         .as_deref()
@@ -2627,13 +2412,12 @@ fn name_being_restored_message(name: &str) -> String {
 /// The refusal when a restore asks for an address another workspace already
 /// holds.
 ///
-/// It names the workspace **as the picker lists it** and states the address they
-/// collide on, because those are two different strings the moment anyone renames
-/// anything: the address is frozen at create time and a rename edits only the
-/// display name. The old wording ("a workspace named X already exists") asserted
-/// the existence of a name that, after a rename, no row on screen has, which is
-/// unanswerable for the user. Mirrors what the picker predicts client-side, so
-/// the pre-check and this authoritative check can't tell different stories.
+/// It names the workspace AS THE PICKER LISTS IT and states the address they
+/// collide on. Those are two different strings the moment anyone renames
+/// anything, because the address is frozen at create time. Naming a workspace
+/// no row on screen carries is unanswerable for the user. Mirrors what the
+/// picker predicts client-side, so the two checks cannot tell different
+/// stories.
 fn address_taken_message(slug: &str, existing_name: &str) -> String {
     format!(
         "The address /{slug}/ is already taken by \"{existing_name}\". \
@@ -2643,12 +2427,11 @@ fn address_taken_message(slug: &str, existing_name: &str) -> String {
 
 /// Should [`GatewayState::boot_all`] bring this workspace up?
 ///
-/// Pure, so the rule is unit-tested without spawning an engine. The three yeses
-/// are deliberately different questions: `healthy` is an engine that outlived
-/// the gateway and only needs re-adopting, `restore` is one the last teardown
-/// stopped and owes the user (see [`crate::next_boot`]), and `autostart` is the
-/// user's own boot posture. A restore does NOT consult `autostart`: a restart
-/// must return what it took, whatever the flag says.
+/// The three yeses are different questions. `healthy` is an engine that
+/// outlived the gateway and needs re-adopting. `restore` is one the last
+/// teardown stopped (see [`crate::next_boot`]), and `autostart` is the user's
+/// boot posture. A restore does NOT consult `autostart`: a restart must return
+/// what it took, whatever the flag says.
 fn should_bring_up(ws: &Workspace, healthy: bool, restore: &HashSet<String>) -> bool {
     healthy || restore.contains(&ws.id) || ws.autostart
 }
@@ -2687,28 +2470,26 @@ fn is_document_navigation(req: &axum::extract::Request) -> bool {
         .unwrap_or(false)
 }
 
-/// Serve a path under the sigil namespace (`rest` is the path AFTER `/~/`). A
-/// real bundled asset is streamed from `static_dir`; anything else (the picker's
-/// own SPA routes, `/~/`) falls back to the picker shell.
+/// Serve a path under the sigil namespace, where `rest` is the path AFTER
+/// `/~/`. A real bundled asset streams from `static_dir`, and anything else
+/// falls back to the picker shell.
 async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Request) -> Response {
     let Some(dir) = state.inner.static_dir.clone() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
-    // `/~/` and an explicit `/~/index.html` → the picker shell (with `<base
-    // href="/~/">` stamped). Serving the raw `dist/index.html` for the latter
-    // would carry no base tag, so the bundle would render the app, not the
-    // picker — mirror the engine's `serve_frontend` index special-case.
+    // Serving the raw `dist/index.html` here would carry no base tag, so the
+    // bundle would render the app rather than the picker. Mirrors the engine's
+    // own `serve_frontend` index special-case.
     if rest.is_empty() || rest == "index.html" {
         return serve_picker_shell(state);
     }
-    // The PWA manifest needs a picker-specific `scope`/`start_url` re-stamp so the
-    // installed picker keeps workspace navigation in-app (see
-    // `serve_picker_manifest`); it must NOT be served verbatim from `dist/`.
+    // The PWA manifest needs a picker-specific re-stamp (see
+    // `serve_picker_manifest`), so it must NOT be served verbatim.
     if rest == "manifest.json" {
         return serve_picker_manifest(state);
     }
-    // Reconstruct the request with the sigil stripped so ServeDir resolves the
-    // asset against `static_dir` (e.g. `/~/assets/x.js` → `/assets/x.js`).
+    // Reconstruct the request with the sigil stripped so `ServeDir` resolves
+    // the asset against `static_dir`.
     let query = req.uri().query();
     let stripped = match query {
         Some(q) => format!("/{rest}?{q}"),
@@ -2724,7 +2505,7 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     let service = ServeDir::new(&dir);
     match service.oneshot(asset_req).await {
         Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(Body::new),
-        // No such asset → the picker is a SPA; serve its shell.
+        // No such asset. The picker is a SPA, so serve its shell.
         _ => serve_picker_shell(state),
     }
 }
@@ -2756,22 +2537,20 @@ fn serve_picker_shell(state: &GatewayState) -> Response {
         .into_response()
 }
 
-/// Serve the picker's PWA manifest (`/~/manifest.json`), re-stamped from the
-/// bundled `dist/manifest.json` so the installed picker keeps workspace
-/// navigation inside the standalone PWA.
+/// Serve the picker's PWA manifest, re-stamped from the bundled one so the
+/// installed picker keeps workspace navigation inside the standalone PWA.
 ///
-/// The bundled manifest declares `start_url`/`scope` as `"."`. In the picker
-/// context, that would resolve the installed PWA's scope to `/~/` alone, so
-/// tapping a workspace (`/<slug>/`) would navigate out of scope and open a
-/// browser instead of staying inside the standalone PWA.
+/// The bundled manifest declares `start_url` and `scope` as `"."`. Here that
+/// would scope the installed PWA to `/~/` alone, so tapping a workspace would
+/// navigate out of scope and open a browser.
 fn serve_picker_manifest(state: &GatewayState) -> Response {
     serve_gateway_manifest(state, &format!("/{SIGIL}/"), &format!("/{SIGIL}/"))
 }
 
-/// Serve a gateway-fronted workspace's PWA manifest (`/<slug>/manifest.json`).
-/// Direct engine access keeps the bundled relative manifest and therefore a
-/// per-workspace scope; gateway access widens `scope` to `/` so in-app workspace
-/// switches stay inside the PWA installed from the gateway's stable port.
+/// Serve a gateway-fronted workspace's PWA manifest. Direct engine access keeps
+/// the bundled relative manifest, and therefore a per-workspace scope. Gateway
+/// access widens `scope` to `/` so in-app workspace switches stay inside the
+/// PWA installed from the gateway's stable port.
 fn serve_workspace_manifest(state: &GatewayState, slug: &str) -> Response {
     let workspace_url = format!("/{slug}/");
     serve_gateway_manifest(state, &workspace_url, &workspace_url)
@@ -2785,8 +2564,8 @@ fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Re
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            // Degrade to a minimal valid manifest carrying the gateway scope —
-            // a missing manifest would otherwise lose the in-app-navigation fix.
+            // Degrade to a minimal valid manifest carrying the gateway scope,
+            // so a missing one does not lose in-app navigation.
             crate::log!("[Gateway] manifest read failed ({}): {}", path.display(), e);
             String::new()
         }
@@ -2799,12 +2578,10 @@ fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Re
 }
 
 /// Re-stamp a bundled manifest for a GATEWAY-served install: force `scope` to
-/// `/` so the installed PWA covers the picker and every `/<slug>/` workspace,
-/// keeping workspace navigation in-app. `start_url` + `id` are supplied by the
-/// caller: picker installs start at `/~/`, workspace installs start at their
-/// workspace. Every other field (name, icons, theme) is preserved from the
-/// source; relative icon refs stay relative to the manifest URL. A malformed or
-/// empty source degrades to a minimal manifest carrying the gateway scope.
+/// `/` so the installed PWA covers the picker and every `/<slug>/` workspace.
+/// The caller supplies `start_url` and `id`. Every other field is preserved
+/// from the source, and relative icon refs stay relative to the manifest URL. A
+/// malformed or empty source degrades to a minimal manifest.
 fn gateway_manifest_json(source: &str, start_url: &str, id: &str) -> String {
     let mut manifest = serde_json::from_str::<serde_json::Value>(source)
         .ok()
@@ -2828,8 +2605,8 @@ fn redirect(location: &str) -> Response {
 }
 
 /// Insert `<base href="…">` as the first child of `<head>` so every relative
-/// ref in the document resolves against it. Falls back to prepending if there
-/// is no `<head>`. Mirrors the engine's own stamping (duplicated, ADR 0014 §1).
+/// ref in the document resolves against it. Falls back to prepending when there
+/// is no `<head>`. Deliberately duplicates the engine's stamping (ADR 0014 §1).
 pub fn inject_base_href(html: &str, href: &str) -> String {
     let tag = format!("<base href=\"{href}\">");
     if let Some(pos) = find_head_open_end(html) {
@@ -2854,8 +2631,8 @@ fn find_head_open_end(html: &str) -> Option<usize> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Resolve the gateway's base dir: `LUCIDOS_GATEWAY_DATA` wins; else
-/// `~/.lucidos/gateway` (dev). Packaged sets it to the OS app-data dir.
+/// Resolve the gateway's base dir. `LUCIDOS_GATEWAY_DATA` wins, else
+/// `~/.lucidos/gateway`. Packaged sets it to the OS app-data dir.
 fn resolve_app_data() -> Result<PathBuf, BoxError> {
     if let Some(d) = std::env::var_os("LUCIDOS_GATEWAY_DATA") {
         return Ok(PathBuf::from(d));
@@ -2904,8 +2681,8 @@ fn install_shutdown(handle: axum_server::Handle) {
     });
 }
 
-/// Raise the file-descriptor limit — the gateway holds an inbound + outbound
-/// socket per proxied connection, and SSE streams are long-lived.
+/// Raise the file-descriptor limit. The gateway holds an inbound and an
+/// outbound socket per proxied connection, and SSE streams are long-lived.
 fn raise_fd_limit() {
     #[cfg(unix)]
     {
@@ -2930,16 +2707,13 @@ mod tests {
 
     // ── Reaping a stopped engine ─────────────────────────────────────────────
     //
-    // The gateway is the parent of every engine it spawns, so a teardown that
-    // SIGNALS without WAITING leaves a `<defunct>` process behind for the
-    // gateway's whole lifetime. Both arms of `stop_engine_process` are exercised
-    // against a real fork, because a zombie is a property of the process table
-    // and no test that stubs the process layer can produce one. Observed
-    // 2026-08-09: nineteen defunct engines under a two-day gateway uptime, all
-    // from the handle-less arm.
+    // A teardown that SIGNALS without WAITING leaves a `<defunct>` engine behind
+    // for the gateway's whole lifetime. Both arms of `stop_engine_process` are
+    // exercised against a real fork: a zombie is a property of the process
+    // table, and no test that stubs the process layer can produce one.
 
-    /// A throwaway workspace dir, named per-test + per-process so parallel tests
-    /// (and parallel suites) never share one.
+    /// A throwaway workspace dir, named per test and per process so parallel
+    /// tests never share one.
     #[cfg(unix)]
     fn reap_scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2953,20 +2727,16 @@ mod tests {
         dir
     }
 
-    /// Block until `pid` has left the process table ENTIRELY, rather than merely
-    /// exited. `ps` prints a state for a zombie (`Z`) and nothing at all for a
-    /// reaped pid, which is the whole distinction under test. Deliberately never
-    /// calls `waitpid` itself, since that would perform the reap it is checking
-    /// for. Polled rather than slept: these tests share a machine with the rest
-    /// of the suite, so a fixed delay long enough to be reliable under load is
-    /// one every run pays.
+    /// Block until `pid` has left the process table ENTIRELY, rather than
+    /// merely exited. `ps` prints a state for a zombie and nothing at all for a
+    /// reaped pid, which is the distinction under test. Never calls `waitpid`
+    /// itself, which would perform the reap it is checking for.
     ///
-    /// An unspawnable `ps` PANICS rather than reading as "gone". The empty
-    /// string means the pid is absent, so defaulting to it on an `Err` would
-    /// make a broken probe report a clean process table, i.e. pass the very
-    /// tests it is supposed to be observing. (The sibling `wait_until_defunct`
-    /// in stack.rs can default: there empty means "not defunct yet", which
-    /// fails safe.)
+    /// An unspawnable `ps` PANICS rather than reading as gone. Empty means the
+    /// pid is absent, so defaulting to it on an `Err` would make a broken probe
+    /// report a clean process table. The sibling `wait_until_defunct` in
+    /// `stack.rs` can default, because there empty means "not defunct yet",
+    /// which fails safe.
     #[cfg(unix)]
     fn wait_until_reaped(pid: u32) -> bool {
         for _ in 0..400 {
@@ -3018,7 +2788,7 @@ mod tests {
             .expect("spawn sleep")
     }
 
-    /// The arm that already worked: we hold the `Child`, so the wait rides it.
+    /// We hold the `Child`, so the wait rides it.
     #[cfg(unix)]
     #[test]
     fn stopping_an_engine_we_hold_the_handle_for_reaps_it() {
@@ -3037,11 +2807,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The 2026-08-09 leak. `reload_gateway` re-execs the gateway image in
-    /// place, so the pid is unchanged and the engine is STILL our child, while
-    /// the `Child` handle died with the old image. The fresh image re-adopts it
-    /// with `engine: None` and only the pidfile, which used to mean the teardown
-    /// signalled it and walked away.
+    /// `reload_gateway` re-execs the gateway image in place. The pid is
+    /// unchanged and the engine is STILL our child, while the `Child` handle
+    /// died with the old image. The fresh image re-adopts it with
+    /// `engine: None` and only the pidfile.
     #[cfg(unix)]
     #[test]
     fn stopping_a_re_adopted_engine_reaps_it_too() {
@@ -3049,8 +2818,8 @@ mod tests {
         let child = spawn_stand_in_engine();
         let pid = child.id();
         std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
-        // Exactly what `execv` does to the handle: dropped without a wait, while
-        // the process itself carries on as our child.
+        // Exactly what `execv` does to the handle: dropped without a wait,
+        // while the process carries on as our child.
         drop(child);
 
         let mut s = reap_test_stack(None, dir.clone());
@@ -3141,9 +2910,9 @@ mod tests {
         }
     }
 
-    // The bug this exists for: a packaged Restart stops every engine, so nothing
-    // is healthy and `autostart` alone leaves the workspace the user was sitting
-    // in stopped. A restore must not consult the flag.
+    // A packaged Restart stops every engine, so nothing is healthy and
+    // `autostart` alone would leave the workspace the user was sitting in
+    // stopped. A restore must not consult the flag.
     #[test]
     fn a_workspace_the_last_teardown_stopped_comes_back_without_autostart() {
         let restore: HashSet<String> = ["myws".to_string()].into_iter().collect();
@@ -3162,10 +2931,9 @@ mod tests {
 
     // ── Refusing a restore whose address is taken ────────────────────────────
 
-    /// The reported case: a workspace created as "personal" and later renamed to
-    /// "personaal" still holds `/personal/`. Restoring a "personal" backup was
-    /// refused with `a workspace named "personal" already exists`, naming a
-    /// workspace the picker does not list.
+    /// A workspace created as "personal" and later renamed to "personaal" still
+    /// holds `/personal/`. The refusal must not name a workspace the picker
+    /// does not list.
     #[test]
     fn the_refusal_names_the_workspace_the_user_can_see() {
         let msg = address_taken_message("personal", "personaal");
@@ -3178,9 +2946,8 @@ mod tests {
     }
 
     // A restore holds its name for minutes with nothing in the registry to show
-    // for it, so create / rename consult the running slot as well. Without that,
-    // a rename during a restore lands a duplicate at commit time, because
-    // `Registry::add` only checks ids.
+    // for it, so create and rename consult the running slot as well. Without
+    // that, a rename during a restore lands a duplicate at commit time.
     #[test]
     fn an_in_flight_restore_reserves_its_name_the_same_way_the_registry_does() {
         let reserved = Some("Personal Notes".to_string());
@@ -3216,9 +2983,8 @@ mod tests {
         assert!(msg.contains("delete"), "{msg}");
     }
 
-    // The other half of the contract: Stop must stick. A workspace the user
-    // stopped is not running at teardown, so it is not in the record, and nothing
-    // else may start it.
+    // Stop must stick. A workspace the user stopped is not running at teardown,
+    // so it is not in the record, and nothing else may start it.
     #[test]
     fn a_stopped_workspace_stays_stopped() {
         let restore: HashSet<String> = ["other".to_string()].into_iter().collect();
@@ -3235,10 +3001,12 @@ mod tests {
     }
 
     /// A worktree-rooted engine binary is refused at boot with the corrective
-    /// command — the 2026-07-26 self-perpetuating pin.
+    /// command (ADR 0021).
     #[test]
     fn validate_engine_bin_errors_on_coding_agent_worktree() {
-        let path = Path::new("/w/dev/.lucidos/worktrees/thread-abc/target/debug/lucidos-engine");
+        // The published launch path a worktree `-b` produces (ADR 0063).
+        let path =
+            Path::new("/w/dev/.lucidos/worktrees/thread-abc/.launch/debug/plain/lucidos-engine");
         let err = validate_engine_bin(path).expect_err("worktree engine bin must error");
         let msg = err.to_string();
         assert!(msg.contains("coding-agent worktree"), "{msg}");
@@ -3394,12 +3162,10 @@ mod tests {
         assert!(!is_document_navigation(&req));
     }
 
-    /// An unknown (deleted/stale) workspace slug on a document navigation must
-    /// send the browser to the picker list (`/~/?pick`), not a 404 dead-end — the
-    /// PWA cold-start head redirect opens the remembered workspace without an
-    /// existence check, and `?pick` makes that head redirect stand down so the
-    /// picker renders (no redirect loop). This locks the exact target (SIGIL +
-    /// `?pick`) the frontend guard depends on.
+    /// Locks the exact redirect target the frontend guard depends on: the sigil
+    /// plus `?pick`. The PWA cold-start head redirect opens the remembered
+    /// workspace with no existence check. `?pick` makes it stand down, so the
+    /// picker renders instead of looping.
     #[test]
     fn unknown_slug_document_nav_redirects_to_picker_list() {
         let resp = redirect(&format!("/{SIGIL}/?pick"));
@@ -3422,13 +3188,12 @@ mod tests {
         }
     }
 
-    /// The bug: the bundled manifest's relative `scope: "."` would scope the
-    /// installed picker PWA to `/~/`, so opening a workspace (`/<slug>/`) left the
-    /// scope and iOS opened it in an in-app browser. The picker manifest must
-    /// instead scope to `/` (covering every workspace) so navigation stays in-app.
+    /// The bundled manifest's relative `scope: "."` would scope the installed
+    /// picker PWA to `/~/`. Opening a workspace then leaves the scope and iOS
+    /// opens an in-app browser, so the picker manifest must scope to `/`.
     #[test]
     fn picker_manifest_widens_scope_and_starts_at_picker() {
-        // The real bundled shape: relative start_url/scope + relative icons.
+        // The real bundled shape: relative start_url, scope and icons.
         let source = r#"{
             "name": "Lucidos",
             "short_name": "Lucidos",
@@ -3440,12 +3205,12 @@ mod tests {
         let out: serde_json::Value =
             serde_json::from_str(&gateway_manifest_json(source, "/~/", "/~/")).expect("valid JSON");
 
-        // The fix: scope covers the whole origin, start_url + id are the picker.
+        // Scope covers the whole origin; start_url and id are the picker.
         assert_eq!(out["scope"], "/");
         assert_eq!(out["start_url"], "/~/");
         assert_eq!(out["id"], "/~/");
-        // Everything else is preserved, so the installed picker keeps its
-        // name/icons/display. Icons stay relative (resolve against /~/manifest.json).
+        // Everything else is preserved. Icons stay relative, and resolve
+        // against `/~/manifest.json`.
         assert_eq!(out["name"], "Lucidos");
         assert_eq!(out["display"], "standalone");
         assert_eq!(out["icons"][0]["src"], "icons/icon-192.png");
@@ -3513,14 +3278,11 @@ mod tests {
     }
 
     // ── Gateway health-supervisor cull policy (respawn_decision) ───────────
-    // The 2026-06-24 respawn storm recurred under sustained contention
-    // (2026-06-27): the patient-but-still-culling policy kept respawning
-    // alive-but-Slow engines, interrupting threads and feeding the cascade. The
-    // policy is now: NEVER cull an alive engine — respawn ONLY a process that has
-    // actually exited. These tests pin that contract.
+    // The contract these pin: NEVER cull an alive engine. Respawn ONLY a
+    // process that has actually exited.
 
-    /// `since_spawn` comfortably past the boot grace → an "established" engine
-    /// (also past the respawn backoff, since BOOT_GRACE > RESPAWN_BACKOFF).
+    /// `since_spawn` comfortably past the boot grace, so an established engine.
+    /// Also past the respawn backoff, since `BOOT_GRACE` is the larger.
     fn established() -> Duration {
         BOOT_GRACE + Duration::from_secs(1)
     }
@@ -3538,9 +3300,9 @@ mod tests {
         respawn_decision(outcome, alive, since_spawn, misses, restart_attempts, false)
     }
 
-    /// A reported terminal boot failure short-circuits to Unhealthy on the FIRST
-    /// probe — no backoff, no restart cap, no five pointless cold boots. Retrying
-    /// re-runs the identical failure (the 2026-07-29 downgrade incident).
+    /// A reported terminal boot failure short-circuits to Unhealthy on the
+    /// FIRST probe: no backoff, no restart cap. Retrying re-runs the identical
+    /// failure.
     #[test]
     fn terminal_boot_failure_marks_unhealthy_immediately() {
         for outcome in [
@@ -3609,11 +3371,10 @@ mod tests {
 
     #[test]
     fn alive_engine_is_never_culled_regardless_of_outcome_or_misses() {
-        // The core contract: an established, alive engine is never respawned —
-        // not on one slow probe, not on a long run of misses, whatever the probe
-        // outcome (Slow, Unreachable-while-alive, or Other). Respawning a live
-        // engine interrupts its threads and feeds the cross-workspace respawn
-        // cascade (ADR 0014, 2026-06-27).
+        // An established, alive engine is never respawned: not on one slow
+        // probe, not on a long run of misses, whatever the outcome. Respawning
+        // a live engine interrupts its threads and feeds the cross-workspace
+        // respawn cascade (ADR 0014).
         for outcome in [
             ProbeOutcome::Slow,
             ProbeOutcome::Unreachable,
@@ -3631,8 +3392,8 @@ mod tests {
 
     #[test]
     fn alive_engine_at_restart_cap_still_waits_never_unhealthy() {
-        // Liveness gates everything: an alive engine is left alone even with the
-        // restart cap's worth of attempts accumulated — never marked Unhealthy.
+        // Liveness gates everything: an alive engine is left alone even with
+        // the restart cap's worth of attempts accumulated.
         assert_eq!(
             decide(
                 ProbeOutcome::Unreachable,
@@ -3647,7 +3408,7 @@ mod tests {
 
     #[test]
     fn unreachable_engine_culled_promptly() {
-        // A refused connection is a strong "down" signal → small threshold.
+        // A refused connection is a strong "down" signal, so a small threshold.
         assert_eq!(
             decide(
                 ProbeOutcome::Unreachable,
@@ -3672,8 +3433,8 @@ mod tests {
 
     #[test]
     fn dead_process_uses_the_fast_threshold_even_if_slow() {
-        // Probe timed out but the process has EXITED → treat as dead, not busy,
-        // so a crash recovers promptly instead of waiting the slow threshold.
+        // Probe timed out but the process has EXITED, so treat it as dead
+        // rather than busy and let the crash recover promptly.
         assert_eq!(
             decide(
                 ProbeOutcome::Slow,
@@ -3701,13 +3462,10 @@ mod tests {
     }
 
     // ── Provisioning-failure retry policy ──────────────────────────────────
-    // 2026-08-03: the gateway autostarted before Docker Desktop had created its
-    // daemon socket. `bring_up` built its failure stack with
-    // `restart_attempts: RESTART_CAP` and `health: Unhealthy`, so one transient
-    // error latched both workspaces dead for the gateway's lifetime, splash stuck
-    // on "Provisioning database…". These pin the fix in both directions: a
-    // transient failure is retried, a terminal one still is not, and the retry is
-    // bounded and backed off.
+    // Pinned in both directions: a transient failure is retried, a terminal one
+    // is not, and the retry is bounded and backed off. Without the first, a
+    // gateway that autostarts before Docker Desktop has its daemon socket
+    // latches every workspace dead for the gateway's lifetime.
 
     #[test]
     fn a_transient_provisioning_failure_is_retried() {
@@ -3720,9 +3478,9 @@ mod tests {
 
     #[test]
     fn a_terminal_provisioning_failure_latches_on_the_first_attempt() {
-        // Same reasoning as a reported terminal boot failure (ADR 0014,
-        // 2026-07-29): the retry re-runs the identical failure, so spending the
-        // budget first only delays the message the user needs.
+        // Same reasoning as a reported terminal boot failure (ADR 0014): the
+        // retry re-runs the identical failure, so spending the budget first
+        // only delays the message the user needs.
         assert_eq!(
             provision_failure_action(ProvisionErrorKind::Terminal, 1),
             ProvisionFailureAction::Latch
@@ -3751,10 +3509,10 @@ mod tests {
 
     #[test]
     fn the_stack_a_transient_failure_leaves_behind_is_one_the_supervisor_respawns() {
-        // The other half of the latch was `health: Unhealthy`, which makes
-        // `supervise_once` skip the stack before it ever probes. `bring_up` now
-        // leaves `Booting` / `restart_attempts: 1` / no engine process; assert
-        // that shape reaches `Respawn` once the backoff and miss threshold pass.
+        // `health: Unhealthy` makes `supervise_once` skip the stack before it
+        // ever probes. `bring_up` leaves `Booting`, one attempt and no engine
+        // process, so assert that shape reaches `Respawn` once the backoff and
+        // the miss threshold pass.
         let attempts = 1;
         assert_eq!(
             decide(
@@ -3787,8 +3545,8 @@ mod tests {
 
     #[test]
     fn respawn_backoff_grows_from_the_old_flat_gap_up_to_the_cap() {
-        // The first gap is unchanged, so a one-off engine crash recovers exactly
-        // as promptly as it did before retries existed.
+        // The first gap is the flat one, so a one-off engine crash recovers
+        // promptly.
         assert_eq!(respawn_backoff(0), RESPAWN_BACKOFF);
         // Then it doubles, and never shrinks or overflows however many attempts
         // are claimed.
@@ -3805,9 +3563,9 @@ mod tests {
 
     #[test]
     fn the_retry_budget_outlasts_a_cold_docker_desktop_start() {
-        // The reason the budget is spent over grown gaps rather than five 5s ones:
-        // it has to still be trying when Docker Desktop finishes starting. Sum the
-        // gaps the supervisor will actually wait, attempt 1 (bring_up) onward.
+        // Why the budget is spent over grown gaps: it has to still be trying
+        // when Docker Desktop finishes starting. Sum the gaps the supervisor
+        // will actually wait, from the first attempt onward.
         let window: Duration = (1..RESTART_CAP).map(respawn_backoff).sum();
         assert!(
             window >= Duration::from_secs(120),
@@ -3819,9 +3577,9 @@ mod tests {
 
     #[test]
     fn only_a_terminal_boot_failure_stops_the_supervisor() {
-        // The retrying failure is the gateway narrating its own backoff. Reading
-        // it as terminal would latch precisely the workspace it exists to keep
-        // alive, which is the 2026-08-03 bug wearing a different hat.
+        // The retrying failure is the gateway narrating its own backoff.
+        // Reading it as terminal would latch precisely the workspace it exists
+        // to keep alive.
         let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 2, 5);
         assert!(!retrying.is_terminal());
         assert_eq!(
@@ -3840,9 +3598,9 @@ mod tests {
 
     #[test]
     fn a_retrying_failure_is_what_the_splash_says() {
-        // The secondary half of the 2026-08-03 bug: the failure arm cleared the
-        // phase and set nothing, so the splash sat on "Workspace starting…" while
-        // the actual reason was buried in the picker's tooltip.
+        // A failure arm that clears the phase and sets nothing leaves the
+        // splash on "Workspace starting…". The actual reason is then buried in
+        // the picker's tooltip.
         let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 2, 5);
         assert_eq!(
             splash_label(Some(&retrying), Some(BootPhase::ProvisioningDatabase)),
@@ -3865,14 +3623,13 @@ mod tests {
     }
 
     // ── Probe staleness guard (probe_result_is_stale) ──────────────────────
-    // The supervisor drops the stack lock across the (up-to-5s) probe so the
-    // picker's `list_status` never blocks behind it. On re-lock the stack may
-    // have changed under us; these pin which results must be DISCARDED.
+    // The supervisor drops the stack lock across the probe, so on re-lock the
+    // stack may have changed. These pin which results must be DISCARDED.
 
     #[test]
     fn removed_stack_result_is_stale() {
-        // A concurrent stop/delete removed the stack from the map → never apply
-        // (never resurrect a stopped/deleted engine), regardless of generation.
+        // A concurrent stop or delete removed the stack from the map, so never
+        // apply, whatever the generation.
         let t0 = Instant::now();
         assert!(probe_result_is_stale(
             false,
@@ -3885,8 +3642,8 @@ mod tests {
 
     #[test]
     fn respawned_stack_result_is_stale() {
-        // `last_spawn` moved during the probe → the probe described the OLD
-        // engine; applying it would bounce a just-restarted workspace.
+        // `last_spawn` moved during the probe, so the probe described the OLD
+        // engine and applying it would bounce a just-restarted workspace.
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);
         assert!(probe_result_is_stale(
@@ -3901,7 +3658,8 @@ mod tests {
 
     #[test]
     fn capped_unhealthy_result_is_stale() {
-        // Capped Unhealthy while the probe was in flight → left for manual retry.
+        // Capped Unhealthy while the probe was in flight, so left for a manual
+        // retry.
         let t0 = Instant::now();
         assert!(probe_result_is_stale(
             true,
@@ -3913,7 +3671,7 @@ mod tests {
 
     #[test]
     fn unchanged_present_result_applies() {
-        // Still present, same generation, not capped → apply the probe result.
+        // Still present, same generation, not capped: apply the probe result.
         let t0 = Instant::now();
         assert!(!probe_result_is_stale(
             true,
@@ -3931,9 +3689,9 @@ mod tests {
 
     #[test]
     fn readopted_engine_unchanged_applies() {
-        // A re-adopted engine keeps `last_spawn == None`; None == None counts as
-        // "unchanged", so its healthy probes still apply (else it never leaves
-        // Booting).
+        // A re-adopted engine keeps `last_spawn == None`, which counts as
+        // unchanged, so its healthy probes still apply. Otherwise it never
+        // leaves Booting.
         assert!(!probe_result_is_stale(true, None, None, Health::Booting));
         assert!(!probe_result_is_stale(true, None, None, Health::Healthy));
     }

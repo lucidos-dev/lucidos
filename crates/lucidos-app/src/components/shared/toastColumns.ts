@@ -1,4 +1,11 @@
+import type { ToastPlacement } from '../../store/store';
+
 /** Pure grouping behind the toast stack's per-pane columns.
+ *
+ *  Per-pane is one of several shapes under comparison right now, and every
+ *  other one is a single stack (`ToastPlacement`, docs/temporary-measures.md).
+ *  What follows describes the per-pane shape, which `toastLayout` reaches only
+ *  when that is the placement in force.
  *
  *  Toasts are pinned to the pane that was focused when they appeared
  *  (`ToastItem.pane`, frozen in `showToast`). Rendering them all into ONE
@@ -33,8 +40,18 @@ export interface ToastColumn<T> {
  *  `data-thread-collapsed` / `data-content-collapsed` attributes) exactly, so
  *  the columns and the panes agree on what is visible. Mid-drag the ratio is
  *  held strictly inside (0, 1), so a drag never flips the layout: the same
- *  deferred-snap contract the header regions follow. */
-export function toastLayout(isMobile: boolean, splitRatio: number): ToastLayout {
+ *  deferred-snap contract the header regions follow.
+ *
+ *  Every CROSS-PANE placement answers `single`, the one column that already
+ *  exists for mobile. Those shapes differ only in where the column sits and how
+ *  a toast in it is drawn, which is CSS keyed on `data-toast-placement`. So the
+ *  split lives in one branch here rather than in a parallel layout enum. */
+export function toastLayout(
+  isMobile: boolean,
+  splitRatio: number,
+  placement: ToastPlacement = 'pane',
+): ToastLayout {
+  if (placement !== 'pane') return 'single';
   if (isMobile) return 'single';
   if (splitRatio <= 0) return 'content-only';
   if (splitRatio >= 1) return 'thread-only';

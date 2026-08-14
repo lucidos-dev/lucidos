@@ -30,6 +30,7 @@
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent, TodoItem, TodoStatus};
+use crate::engine::LucidosEngine;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -172,6 +173,105 @@ async fn thread_held_event_wait(
     .await
 }
 
+/// The thread's newest todo list, as its items plus the sequence it was written
+/// at.
+///
+/// `Ok(None)` folds together three cases every caller treats alike: no list was
+/// ever written, the row's payload is malformed, and the list is empty. A
+/// coding-agent thread is always the first of those, since Claude Code has its
+/// own `TodoWrite` and never emits this event.
+///
+/// `Err` is none of those. It is the question going unanswered, which callers
+/// must not read as "nothing open" (`.claude/rules/rust.md`).
+///
+/// Shared by the settle and the *wake check* so the two cannot come to disagree
+/// about which list is current. They differ in what they do next: the settle
+/// compares the sequence against its terminator, while the wake check runs
+/// inside the turn, where the newest list is current by definition.
+async fn latest_todo_list(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<(Vec<TodoItem>, i64)>, sqlx::Error> {
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
+        "SELECT payload, sequence FROM events \
+         WHERE thread_id = $1 AND event_type = 'TodoListWritten' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((payload, seq)) = row else {
+        return Ok(None);
+    };
+
+    let Some(items) = payload
+        .get("items")
+        .and_then(|v| serde_json::from_value::<Vec<TodoItem>>(v.clone()).ok())
+    else {
+        log!(
+            "[Todo] malformed TodoListWritten payload for thread {}",
+            thread_id
+        );
+        return Ok(None);
+    };
+
+    Ok((!items.is_empty()).then_some((items, seq)))
+}
+
+/// How many items on the thread's newest todo list are still open.
+///
+/// `TodoStatus::is_open` decides, which is the point. The *wake check* asks the
+/// question the settle answers moments later. A second definition of "open"
+/// would let the gate and the panel describe different work.
+pub(crate) async fn open_todo_count(pool: &PgPool, thread_id: Uuid) -> Result<usize, sqlx::Error> {
+    Ok(latest_todo_list(pool, thread_id)
+        .await?
+        .map_or(0, |(items, _)| {
+            items.iter().filter(|i| i.status.is_open()).count()
+        }))
+}
+
+impl LucidosEngine {
+    /// The two facts the *wake check* decides on, as
+    /// `(open items, something will re-open this thread)`.
+    ///
+    /// The open count is `None` when the read failed, which is UNKNOWN rather
+    /// than zero. `Some(0)` means the list genuinely holds nothing open.
+    /// `should_nudge_unwatched_turn` combines them with the per-turn bound.
+    ///
+    /// **The probe order is the cost control.** Both coverage reads are
+    /// in-memory, and either one true settles the answer. So they run FIRST and
+    /// skip the query, which keeps a parked thread free. The query itself is a
+    /// second copy of the one `settle_open_todos` runs per terminator.
+    ///
+    /// **The registry is read, not the settle's anti-join.** This runs inside
+    /// the turn, before any terminator exists. There is no sequence to be
+    /// as-of, so the registry is the current truth. The settle is an async
+    /// consumer and must answer as of its terminator, which is why it cannot
+    /// share this reader.
+    pub(crate) async fn wake_check_facts(&self, thread_id: Uuid) -> (Option<usize>, bool) {
+        let covered = !self.live_waits.for_thread(thread_id).await.is_empty()
+            || self.bash_background.has_running_for_thread(thread_id).await;
+        if covered {
+            return (None, true);
+        }
+
+        match open_todo_count(&self.pool, thread_id).await {
+            Ok(open) => (Some(open), false),
+            Err(e) => {
+                log!(
+                    "[Todo] Could not read the todo list for thread {}: {}. \
+                     Not asking whether this turn leaves work unwatched.",
+                    thread_id,
+                    e
+                );
+                (None, false)
+            }
+        }
+    }
+}
+
 /// Engine-side post-response hook: settles every OPEN item in the thread's
 /// latest todo list, so the panel says what actually became of the work. The
 /// list stays visible either way and the user keeps the trail of what was
@@ -217,21 +317,12 @@ pub async fn settle_open_todos(
     terminator_seq: i64,
     holds_background_work: bool,
 ) {
-    // SELECT the latest TodoListWritten in the thread regardless of sequence,
-    // then decide. If `sequence > terminator_seq` a fresh turn has already
-    // written a new list, so skip: that turn's own terminator will run the
-    // cleanup. Otherwise the row at-or-before the terminator IS the list we
-    // need to evaluate.
-    let row: Option<(serde_json::Value, i64)> = match sqlx::query_as(
-        "SELECT payload, sequence FROM events \
-         WHERE thread_id = $1 AND event_type = 'TodoListWritten' \
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(row) => row,
+    // The list is read at-or-before nothing: `latest_todo_list` takes the
+    // newest row whatever its sequence, and the race check below is what scopes
+    // it to this terminator.
+    let (items, latest_seq) = match latest_todo_list(pool, thread_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
         Err(e) => {
             log!(
                 "[Todo] settle_open_todos query failed for thread {}: {}",
@@ -242,10 +333,6 @@ pub async fn settle_open_todos(
         }
     };
 
-    let Some((payload, latest_seq)) = row else {
-        return;
-    };
-
     if latest_seq > terminator_seq {
         // Race: a fresh turn already wrote a new list after this terminator
         // landed but before we got to it. Leave the new list alone, since its
@@ -253,23 +340,6 @@ pub async fn settle_open_todos(
         return;
     }
 
-    let items: Vec<TodoItem> = match payload
-        .get("items")
-        .and_then(|v| serde_json::from_value::<Vec<TodoItem>>(v.clone()).ok())
-    {
-        Some(items) => items,
-        None => {
-            log!(
-                "[Todo] settle_open_todos: malformed TodoListWritten payload for thread {}",
-                thread_id
-            );
-            return;
-        }
-    };
-
-    if items.is_empty() {
-        return;
-    }
     // Nothing to do when no item is still open: everything is completed, or
     // already settled by an earlier terminator.
     if !items.iter().any(|item| item.status.is_open()) {
@@ -1137,6 +1207,114 @@ mod tests {
 
         settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
         assert_no_todo_cleanup(&mut rx, thread_id).await;
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    // ---- The wake check's half of the question: how much is still open.
+
+    async fn seed_list(bus: &EventBus, thread_id: Uuid, statuses: &[&str]) {
+        let todos: Vec<_> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| {
+                json!({
+                    "content": format!("item {i}"),
+                    "active_form": format!("doing item {i}"),
+                    "status": status,
+                })
+            })
+            .collect();
+        todo_write_impl(bus, &json!({ "todos": todos }), thread_id)
+            .await
+            .expect("seed write");
+    }
+
+    async fn count_open(pool: &sqlx::PgPool, thread_id: Uuid) -> usize {
+        open_todo_count(pool, thread_id)
+            .await
+            .expect("open_todo_count should succeed")
+    }
+
+    #[tokio::test]
+    async fn open_todo_count_is_zero_for_every_shape_that_leaves_nothing_open() {
+        // The four shapes an ordinary turn ends in. Each must read zero, or the
+        // wake check spends a round on a turn that finished its work.
+        let (bus, _rx, pool, db) = setup().await;
+
+        let never_wrote = Uuid::new_v4();
+        assert_eq!(count_open(&pool, never_wrote).await, 0, "no list ever");
+
+        let cleared = Uuid::new_v4();
+        seed_list(&bus, cleared, &[]).await;
+        assert_eq!(count_open(&pool, cleared).await, 0, "list cleared");
+
+        let finished = Uuid::new_v4();
+        seed_list(&bus, finished, &["completed", "completed"]).await;
+        assert_eq!(count_open(&pool, finished).await, 0, "all completed");
+
+        // Already settled by an earlier terminator. `Abandoned` is terminal, so
+        // it must not re-trigger the check on every later turn of the thread.
+        let walked_away = Uuid::new_v4();
+        seed_list(&bus, walked_away, &["completed", "in_progress"]).await;
+        settle_open_todos(&bus, &pool, walked_away, i64::MAX, false).await;
+        assert_eq!(count_open(&pool, walked_away).await, 0, "already abandoned");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn open_todo_count_counts_pending_and_in_progress() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(
+            &bus,
+            thread_id,
+            &["completed", "in_progress", "pending", "pending"],
+        )
+        .await;
+
+        assert_eq!(count_open(&pool, thread_id).await, 3);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn open_todo_count_treats_a_parked_item_as_open() {
+        // `Waiting` is open, per `TodoStatus::is_open`, and this is the case
+        // that makes sharing that predicate matter. A wait resolved in an
+        // earlier turn leaves `Waiting` items behind on the list. If the agent
+        // ends the next turn without re-arming, that work is unwatched again
+        // and the check has to see it.
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, thread_id, &["completed", "in_progress"]).await;
+        seed_event_wait(&bus, thread_id).await;
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
+
+        assert_eq!(count_open(&pool, thread_id).await, 1, "the parked item");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn open_todo_count_reads_only_the_newest_list() {
+        // Replace-whole-list semantics. An earlier turn's open items are gone
+        // once the agent writes a new list, and counting them would nudge over
+        // work that no longer exists.
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        seed_list(&bus, thread_id, &["in_progress", "pending", "pending"]).await;
+        seed_list(&bus, thread_id, &["completed"]).await;
+
+        assert_eq!(count_open(&pool, thread_id).await, 0);
 
         pool.close().await;
         teardown_test_db(&db).await;

@@ -953,10 +953,17 @@ test_real_checkout_is_not_refused() {
 # ── Published launch binaries (ADR 0022) ───────────────────────────────
 # Regression cover for the 2026-07-26 root cause: every cargo variant in the
 # checkout uplifts to ONE `target/<profile>/lucidos-engine`, so launching from
-# it ran (and compared against) whatever landed there last — another commit,
+# it ran (and compared against) whatever landed there last: another commit,
 # another feature configuration. Builds now publish into
-# `target/<profile>/launch/<variant>/` and launch from there.
+# `.launch/<profile>/<variant>/` and launch from there.
 # See docs/plans/2026-07-27-launch-binary-published-per-variant.md.
+#
+# The dir sits OUTSIDE `target/`, which is the 2026-08-13 regression cover:
+# `cargo clean` wipes `target/` wholesale, and the launch dir holds the
+# `lucidos` CLI that the engine puts on PATH for every spawned trigger and
+# coding-agent session. One inline `cargo clean` in the nightly orchestrator
+# left the workspace with no CLI for eight hours.
+# See docs/plans/2026-08-13-launch-binaries-survive-cargo-clean.md.
 
 # A stand-in for a built binary: prints `$id` for `--build-id`, like the real
 # `lucidos-engine --build-id` the verification step reads.
@@ -975,34 +982,34 @@ test_launch_bin_dir_is_per_profile_and_variant() {
 
     local got
     got="$(RELEASE="" ENGINE_BUILD_FEATURES="" launch_bin_dir)"
-    if [ "$got" = "$PROJECT_DIR/target/debug/launch/plain" ]; then
-        pass "plain debug build publishes to target/debug/launch/plain"
+    if [ "$got" = "$PROJECT_DIR/.launch/debug/plain" ]; then
+        pass "plain debug build publishes to .launch/debug/plain"
     else
         fail "unexpected plain debug launch dir: $got"
     fi
 
     # The pairing that matters: e2e (release + e2e-test-hooks) and a dev
     # workspace (debug + plain) must resolve to DISJOINT directories, so a
-    # hooks-enabled engine — whose push transport is an in-process stub — can
+    # hooks-enabled engine, whose push transport is an in-process stub, can
     # never become what a dev workspace launches.
     local e2e_dir dev_dir
     e2e_dir="$(RELEASE=1 ENGINE_BUILD_FEATURES="e2e-test-hooks" launch_bin_dir)"
     dev_dir="$(RELEASE="" ENGINE_BUILD_FEATURES="" launch_bin_dir)"
-    if [ "$e2e_dir" = "$PROJECT_DIR/target/release/launch/e2e-test-hooks" ]; then
-        pass "e2e publishes to target/release/launch/e2e-test-hooks"
+    if [ "$e2e_dir" = "$PROJECT_DIR/.launch/release/e2e-test-hooks" ]; then
+        pass "e2e publishes to .launch/release/e2e-test-hooks"
     else
         fail "unexpected e2e launch dir: $e2e_dir"
     fi
     if [ "$e2e_dir" != "$dev_dir" ]; then
         pass "e2e and dev launch dirs are disjoint"
     else
-        fail "e2e and dev share a launch dir — the whole collision is back"
+        fail "e2e and dev share a launch dir, the whole collision is back"
     fi
 
     # LUCIDOS_E2E_DEBUG=1 drops e2e to the debug profile; it must still not
     # land on the plain dev binary.
     got="$(RELEASE="" ENGINE_BUILD_FEATURES="e2e-test-hooks" launch_bin_dir)"
-    if [ "$got" = "$PROJECT_DIR/target/debug/launch/e2e-test-hooks" ]; then
+    if [ "$got" = "$PROJECT_DIR/.launch/debug/e2e-test-hooks" ]; then
         pass "debug e2e stays out of the plain debug launch dir"
     else
         fail "unexpected debug e2e launch dir: $got"
@@ -1021,6 +1028,66 @@ test_launch_bin_dir_is_per_profile_and_variant() {
         pass "slug strips path separators and dots"
     else
         fail "slug did not sanitize traversal: $got"
+    fi
+}
+
+test_launch_dir_is_outside_cargo_target() {
+    echo "test: no launch dir is under target/, so cargo clean cannot remove it"
+
+    local PROJECT_DIR="$SANDBOX/proj-launch-outside"
+
+    # `cargo clean` deletes `target/` wholesale. The launch dir holds the
+    # `lucidos` CLI the engine puts on PATH for every spawned trigger and
+    # coding-agent session (`find_lucidos_cli_dir`), so a launch dir under
+    # `target/` means one `cargo clean` disables the workspace: triggers fail
+    # with "No such file or directory: 'lucidos'" and `run_coding_agent` cannot
+    # even spawn the child that would rebuild it. That is the 2026-08-13 outage.
+    local profile variant dir
+    for profile in debug release; do
+        for variant in plain e2e-test-hooks; do
+            dir="$(launch_bin_dir "$profile" "$variant")"
+            case "$dir" in
+                */target/*)
+                    fail "launch dir is under target/, cargo clean would wipe it: $dir"
+                    continue
+                    ;;
+            esac
+            case "$dir" in
+                "$PROJECT_DIR"/*) ;;
+                *)
+                    # Inside the CHECKOUT is the real requirement (ADR 0022):
+                    # `paths::repo_root` walks ancestors for `scripts/web-dev.sh`,
+                    # and ADR 0021's worktree refusal is a substring path test.
+                    # A dir outside the checkout breaks the first and launders a
+                    # worktree binary past the second.
+                    fail "launch dir escaped the checkout: $dir"
+                    continue
+                    ;;
+            esac
+            pass "$profile/$variant publishes outside target/ but inside the checkout"
+        done
+    done
+}
+
+test_worktree_refusal_still_sees_a_worktree_launch_dir() {
+    echo "test: a worktree's own launch dir is still refused (ADR 0021)"
+
+    # Moving the launch dir out of `target/` must not move it out of the
+    # worktree, or ADR 0021's pure path test would stop matching and a
+    # worktree-built binary would be launderable into a long-lived stack.
+    local wt="$SANDBOX/ws-refusal/.lucidos/worktrees/thread-abc"
+    local PROJECT_DIR="$wt"
+    local dir
+    dir="$(launch_bin_dir debug plain)"
+    if path_is_in_cc_worktree "$dir"; then
+        pass "a worktree-rooted launch dir is still classified as a worktree"
+    else
+        fail "worktree launch dir escaped the ADR 0021 path test: $dir"
+    fi
+    if path_is_in_cc_worktree "$dir/lucidos-engine"; then
+        pass "the published engine path inside it is classified too"
+    else
+        fail "worktree engine path escaped the ADR 0021 path test"
     fi
 }
 
@@ -1298,20 +1365,22 @@ test_locate_prefers_published_and_falls_back() {
 
     local PROJECT_DIR="$SANDBOX/proj-locate"
     local ENGINE_BIN="" GATEWAY_BIN="" out rc=0
-    mkdir -p "$PROJECT_DIR/target/debug/launch/plain"
+    # Both dirs explicitly: the launch dir no longer lives under `target/`, so
+    # creating it no longer creates cargo's uplift dir as a side effect.
+    mkdir -p "$PROJECT_DIR/.launch/debug/plain" "$PROJECT_DIR/target/debug"
     : > "$PROJECT_DIR/target/debug/lucidos-engine"
     : > "$PROJECT_DIR/target/debug/lucidos-gateway"
-    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
-    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway"
+    : > "$PROJECT_DIR/.launch/debug/plain/lucidos-engine"
+    : > "$PROJECT_DIR/.launch/debug/plain/lucidos-gateway"
 
     out="$(RELEASE="" locate_launch_binaries 2>&1)"
     RELEASE="" locate_launch_binaries >/dev/null 2>&1
-    if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine" ]; then
+    if [ "$ENGINE_BIN" = "$PROJECT_DIR/.launch/debug/plain/lucidos-engine" ]; then
         pass "published binary preferred over cargo's uplift path"
     else
         fail "did not prefer the published binary: $ENGINE_BIN"
     fi
-    if [ "$GATEWAY_BIN" = "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway" ]; then
+    if [ "$GATEWAY_BIN" = "$PROJECT_DIR/.launch/debug/plain/lucidos-gateway" ]; then
         pass "engine and gateway come from the same directory"
     else
         fail "gateway did not pair with the engine: $GATEWAY_BIN"
@@ -1323,7 +1392,7 @@ test_locate_prefers_published_and_falls_back() {
 
     # No published binary yet (first launch after this change, or a hand-run
     # `cargo build`): fall back rather than strand the workspace, but say so.
-    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+    rm -f "$PROJECT_DIR/.launch/debug/plain/lucidos-engine"
     out="$(RELEASE="" locate_launch_binaries 2>&1)"
     RELEASE="" locate_launch_binaries >/dev/null 2>&1
     if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
@@ -1339,16 +1408,16 @@ test_locate_prefers_published_and_falls_back() {
     # A launch dir holding ONLY the engine is a half-finished build: selecting it
     # would pair a fresh engine with a missing gateway and fail much later, with
     # a far less obvious error than "run with -b".
-    mkdir -p "$PROJECT_DIR/target/debug/launch/plain"
-    : > "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
-    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-gateway"
+    mkdir -p "$PROJECT_DIR/.launch/debug/plain"
+    : > "$PROJECT_DIR/.launch/debug/plain/lucidos-engine"
+    rm -f "$PROJECT_DIR/.launch/debug/plain/lucidos-gateway"
     RELEASE="" locate_launch_binaries >/dev/null 2>&1
     if [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/lucidos-engine" ]; then
         pass "a gateway-less launch dir is skipped, not half-selected"
     else
         fail "selected an incomplete launch dir: $ENGINE_BIN"
     fi
-    rm -f "$PROJECT_DIR/target/debug/launch/plain/lucidos-engine"
+    rm -f "$PROJECT_DIR/.launch/debug/plain/lucidos-engine"
 
     # A release request still falls back to a debug build, as it always has.
     if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
@@ -1359,11 +1428,11 @@ test_locate_prefers_published_and_falls_back() {
     fi
 
     # A featured build looks in its OWN launch dir, not the plain one.
-    mkdir -p "$PROJECT_DIR/target/debug/launch/e2e-test-hooks"
-    : > "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-engine"
-    : > "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-gateway"
+    mkdir -p "$PROJECT_DIR/.launch/debug/e2e-test-hooks"
+    : > "$PROJECT_DIR/.launch/debug/e2e-test-hooks/lucidos-engine"
+    : > "$PROJECT_DIR/.launch/debug/e2e-test-hooks/lucidos-gateway"
     if RELEASE="" ENGINE_BUILD_FEATURES="e2e-test-hooks" locate_launch_binaries >/dev/null 2>&1 &&
-       [ "$ENGINE_BIN" = "$PROJECT_DIR/target/debug/launch/e2e-test-hooks/lucidos-engine" ]; then
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/.launch/debug/e2e-test-hooks/lucidos-engine" ]; then
         pass "a featured build locates its own variant dir"
     else
         fail "featured build did not use its variant dir: $ENGINE_BIN"
@@ -1468,6 +1537,8 @@ test_pid_is_live_rejects_a_zombie
 test_keeps_shared_build_watch_when_a_workspace_still_serves
 test_kills_shared_build_watch_when_no_workspace_serves
 test_launch_bin_dir_is_per_profile_and_variant
+test_launch_dir_is_outside_cargo_target
+test_worktree_refusal_still_sees_a_worktree_launch_dir
 test_publish_launch_binary_is_atomic_and_executable
 test_publish_failure_preserves_the_previous_binary
 test_publish_prunes_only_dead_publish_temps

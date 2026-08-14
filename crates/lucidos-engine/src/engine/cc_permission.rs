@@ -6,27 +6,18 @@
 //! the command-lane specifics live in `engine::command_permission`.
 //!
 //! Why dedup: a single agent turn can fire several requests for the same
-//! logical action (CC's parallel tool_use blocks or sequential retries after a
-//! denial). Without dedup, each one would render its own `PermissionCard` —
-//! the "infinite loop of file-access prompts" the user saw.
+//! logical action, and each one would render its own `PermissionCard`. So this
+//! state collapses identical `(thread_id, tool_name, input)` requests onto a
+//! single canonical entry. The first request emits the event, every subsequent
+//! identical one subscribes to the same broadcast channel, and one click
+//! answers every blocked waiter.
 //!
-//! This state collapses identical `(thread_id, tool_name, input)` requests
-//! onto a single canonical entry: the first request emits the event, every
-//! subsequent identical request just subscribes to the same broadcast
-//! channel. When the user clicks once, every blocked waiter receives the same
-//! answer and the agent continues all of its parallel calls.
-//!
-//! In-flight waiters live entirely in memory; on engine restart they are
-//! dropped (CC's MCP client returns deny; a chat command waiter dies with its
-//! turn), so there's nothing to recover beyond the orphan-resolution sweeps.
+//! In-flight waiters live entirely in memory and are dropped on engine restart,
+//! so there is nothing to recover beyond the orphan-resolution sweeps.
 //!
 //! The per-thread session-allow set is different: it is a **cache** over
-//! durable state. The grants are persisted as
-//! `CodingAgentPermissionResolved { allowed: true, persist_scope: "session" }`,
-//! and [`hydrate_session_allows`] refills a thread's set from the event store
-//! on the first prompt after a restart — otherwise an Apply-with-restart would
-//! silently drop grants the user had already clicked while the thread itself
-//! resumed.
+//! durable state. [`hydrate_session_allows`] refills a thread's set from the
+//! event store on the first prompt after a restart.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -47,13 +38,12 @@ use crate::triggers::TriggerConfig;
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
 pub const DENIAL_REASON: &str = "User denied";
 
-/// Reason returned to the coding agent when a pending permission prompt resolves
-/// because the broadcast channel CLOSED — i.e. the engine is tearing down
-/// (restart), NOT because the user clicked Deny. Distinct from `DENIAL_REASON`:
-/// a restart is not a user decision, so a resumed session must not read it as
-/// "the user rejected my approach". The companion half is the
-/// restart-not-rejection note carried by the recovery system prompts (see
-/// `RESTART_NOT_REJECTION_RULE` in `agent_session::prompts`).
+/// Reason returned to the coding agent when a prompt resolves because the
+/// broadcast channel CLOSED. The engine is tearing down, and the user did not
+/// click Deny. Distinct from `DENIAL_REASON`: a restart is not a user decision,
+/// so a resumed session must not read it as "the user rejected my approach".
+/// The companion half is `RESTART_NOT_REJECTION_RULE` in
+/// `agent_session::prompts`.
 pub const RESTART_INTERRUPT_REASON: &str =
     "Interrupted by an engine restart — not a user decision. Re-attempt the action; \
      the restart did not reject your approach.";
@@ -66,38 +56,28 @@ pub const RESTART_INTERRUPT_REASON: &str =
 pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 
 /// Reason stamped on a `CodingAgentPermissionResolved` that the engine emits
-/// when a coding-agent session IDLES with a permission card still unresolved
-/// (e.g. a workflow whose parallel subagent's card dangled while the main turn
-/// finished). Cleared at the turn boundary in `emit_coding_agent_idled` so the
-/// stale card can't sit clickable and a later click can't resurrect the
-/// finished thread. Distinct from `SUPERSEDED_REASON` (the user typed instead
-/// of clicking) and from the boot orphan-recovery reason (engine restart).
+/// when a coding-agent session IDLES with a permission card still unresolved.
+/// Cleared at the turn boundary in `emit_coding_agent_idled`, so the stale card
+/// cannot sit clickable and a later click cannot resurrect the finished thread.
+/// Distinct from `SUPERSEDED_REASON` and from the boot orphan-recovery reason.
 pub const SESSION_ENDED_REASON: &str =
     "Coding agent session ended before answering — request expired";
 
-/// Reason returned to CC's MCP middleware when `permission_prompt` auto-
-/// allows a request via a session-allow match. Echoed in the HTTP response
-/// body so CC's tool-call log records *why* the prompt was bypassed; no
-/// `CodingAgentPermissionRequest`/`Resolved` event is emitted on the
-/// auto-allow path, so this string never reaches the chat UI.
+/// Reason returned to CC's MCP middleware when `permission_prompt` auto-allows
+/// a request through a session-allow match. Every fast path here emits NO
+/// request or resolved event, so the string never reaches the chat UI. It only
+/// rides the response body, so the agent's tool log records why the prompt was
+/// bypassed.
 pub const SESSION_ALLOW_REASON: &str = "Allowed for this thread";
 
 /// Reason returned when the request is a file write landing inside the
-/// session's own worktree (see [`worktree_write_auto_allowed`]). Like the
-/// session-allow and unattended fast paths, this emits NO
-/// `CodingAgentPermissionRequest`/`Resolved` event, so the string never reaches
-/// the chat UI — it only rides the response body so the agent's tool log
-/// records *why* the prompt was bypassed.
+/// session's own worktree (see [`worktree_write_auto_allowed`]).
 pub const WORKTREE_WRITE_ALLOW_REASON: &str =
     "Auto-allowed: file write inside this session's own worktree";
 
-/// Reason on an unattended auto-ALLOW of a benign in-workspace request (a read,
-/// an in-workspace write/edit, git, `lucidos data write`, …). The coding-agent
-/// session was launched by a trigger with no human to answer a card, so the
-/// engine resolves immediately. Like the session-allow fast path, the
-/// unattended path emits NO `CodingAgentPermissionRequest`/`Resolved` event, so
-/// this string never reaches the chat UI — it only rides the response body so
-/// the agent's tool log records *why* the prompt was bypassed.
+/// Reason on an unattended auto-ALLOW of a benign in-workspace request. The
+/// coding-agent session was launched by a trigger with no human to answer a
+/// card, so the engine resolves immediately.
 pub const UNATTENDED_ALLOW_BENIGN_REASON: &str =
     "Auto-allowed: benign in-workspace operation (unattended trigger session)";
 
@@ -106,22 +86,21 @@ pub const UNATTENDED_ALLOW_BENIGN_REASON: &str =
 pub const UNATTENDED_ALLOW_GRANTED_REASON: &str =
     "Auto-allowed: covered by the trigger's side-effect grant";
 
-/// Reason on an unattended auto-DENY of a catastrophic command — denied
+/// Reason on an unattended auto-DENY of a catastrophic command, denied
 /// regardless of any grant (the command guard's hard deny-list).
 pub const UNATTENDED_DENY_CATASTROPHIC_REASON: &str =
     "Auto-denied: catastrophic operation, never permitted unattended";
 
-/// Grouping key for collapsing identical concurrent permission requests.
-/// `canonical_input` is `serde_json::to_string(&input)` — sufficient for CC's
-/// repeated identical calls because CC re-serializes the same struct each
-/// time, producing the same byte sequence.
+/// Grouping key for collapsing identical concurrent permission requests. The
+/// canonical input is the serialized `input`, which suffices because the agent
+/// re-serializes the same struct each time and produces the same bytes.
 pub type DedupKey = (Uuid, String, String);
 
-/// Canonical pending entry — owns the broadcast channel that fans out the
-/// answer to every blocked waiter on this `(thread, tool, input)` triple.
-/// `tool_name` and `input` are kept on the entry (in addition to being part
-/// of the `DedupKey`) so the consent handler can derive an "Always allow"
-/// persistence pattern without re-parsing the canonical input.
+/// Canonical pending entry, owning the broadcast channel that fans the answer
+/// out to every blocked waiter on this `(thread, tool, input)` triple.
+/// `tool_name` and `input` are kept on the entry as well as in the `DedupKey`.
+/// The consent handler can then derive an "Always allow" pattern without
+/// re-parsing the canonical input.
 pub struct PermissionEntry {
     pub thread_id: Uuid,
     pub request_id: String,
@@ -135,20 +114,15 @@ pub struct PermissionEntry {
 /// user's "Allow for this thread" choices so subsequent identical-pattern
 /// requests skip the prompt entirely.
 ///
-/// `session_allows` is a **cache, not the source of truth** — the grants are
-/// durable in the event store (`CodingAgentPermissionResolved` with
-/// `persist_scope: "session"`), and [`hydrate_session_allows`] refills a
-/// thread's set from there on the first prompt after an engine restart. Before
-/// that existed, an Apply-with-restart silently dropped every grant the user
-/// had clicked while the thread itself resumed, so the same file re-asked
-/// minutes later.
+/// `session_allows` is a **cache, not the source of truth**. The grants are
+/// durable in the event store, and [`hydrate_session_allows`] refills a
+/// thread's set from there on the first prompt after an engine restart.
 ///
 /// `hydrated_threads` is that cache's per-thread "already refilled" marker. It
 /// is set only after a SUCCESSFUL read, so a transient DB failure retries on
-/// the next prompt instead of pinning an empty set. Only the coding-agent lane
-/// hydrates today; the command lane (`Engine::pending_command_permission`)
-/// shares this struct but persists a `command` string rather than a tool
-/// `input`, so it needs its own extractor before it can adopt the same shape.
+/// the next prompt rather than pinning an empty set. Only the coding-agent lane
+/// hydrates today. The command lane shares this struct but persists a command
+/// string rather than a tool `input`, so it needs its own extractor first.
 #[derive(Default)]
 pub struct PermissionState {
     pub by_dedup_key: HashMap<DedupKey, PermissionEntry>,
@@ -166,11 +140,10 @@ impl PermissionState {
         self.by_dedup_key.remove(&key)
     }
 
-    /// Record a session-allow pattern for a thread. Idempotent — duplicate
-    /// inserts are a no-op. The pattern is whatever `derive_allow_pattern`
-    /// returned for `AllowScope::Session` on the originating prompt; matching
-    /// is exact-string against the set returned by the same derivation on
-    /// future prompts.
+    /// Record a session-allow pattern for a thread. Idempotent: a duplicate
+    /// insert is a no-op. The pattern is what `derive_allow_pattern` returned
+    /// for `AllowScope::Session` on the originating prompt, and matching is
+    /// exact-string against the same derivation on future prompts.
     pub fn allow_session(&mut self, thread_id: Uuid, pattern: String) {
         self.session_allows
             .entry(thread_id)
@@ -192,11 +165,9 @@ impl PermissionState {
     /// return a fresh receiver.
     ///
     /// Returns `(request_id, receiver, is_canonical)`. The caller emits the
-    /// `*PermissionRequest(ed)` event only when `is_canonical` is true, so a
-    /// burst of identical concurrent requests renders a single card and one
-    /// click (fanned out over the broadcast) answers them all. Shared by both
-    /// permission lanes — CC's MCP `permission_prompt` handler and the command
-    /// guard's in-process block.
+    /// request event only when `is_canonical` is true. A burst of identical
+    /// concurrent requests then renders a single card, and one click answers
+    /// them all. Shared by both permission lanes.
     pub fn register_or_attach(
         &mut self,
         dedup_key: DedupKey,
@@ -204,9 +175,8 @@ impl PermissionState {
         tool_name: String,
         input: serde_json::Value,
     ) -> (String, tokio::sync::broadcast::Receiver<bool>, bool) {
-        // Opportunistic sweep: each new prompt is a chance to evict orphans
-        // whose waiters were canceled (CC died, the chat turn was canceled)
-        // and would otherwise leak until engine restart.
+        // Opportunistic sweep: each new prompt evicts orphans whose waiters
+        // were canceled and would otherwise leak until an engine restart.
         self.gc_dead_entries();
         if let Some(entry) = self.by_dedup_key.get(&dedup_key) {
             return (entry.request_id.clone(), entry.tx.subscribe(), false);
@@ -227,10 +197,9 @@ impl PermissionState {
         (request_id, rx, true)
     }
 
-    /// Drop entries whose subscribers have all been canceled (waiter futures
-    /// dropped because CC died or a chat turn was canceled). With no live
-    /// receiver the entry can never deliver an answer; it would otherwise sit
-    /// in memory until engine restart. Cheap O(N) sweep — N is bounded by the
+    /// Drop entries whose subscribers have all been canceled. With no live
+    /// receiver the entry can never deliver an answer, and it would otherwise
+    /// sit in memory until an engine restart. Cheap O(N) sweep, bounded by the
     /// user's pending in-flight prompts.
     pub fn gc_dead_entries(&mut self) {
         let dead: Vec<DedupKey> = self
@@ -247,9 +216,8 @@ impl PermissionState {
     }
 }
 
-/// Outcome of one blocking permission prompt — what the caller relays back
-/// to its agent (CC's MCP middleware as JSON; the Codex app-server driver as
-/// an approval decision).
+/// Outcome of one blocking permission prompt: what the caller relays back to
+/// its agent.
 pub struct PermissionPromptOutcome {
     pub allowed: bool,
     pub reason: Option<String>,
@@ -263,11 +231,10 @@ const SUMMARY_MAX_PATHS: usize = 3;
 /// What the engine could learn about a file-write request's targets.
 ///
 /// Three states rather than a `Vec`, because both decisions below are made over
-/// the WHOLE set and a plain list cannot tell "no targets, this is not a file
+/// the WHOLE set. A plain list cannot tell "no targets, this is not a file
 /// write" from "a target we could not read". Dropping an unreadable entry is
-/// the dangerous shape: its siblings would then vouch for it, and one
-/// in-worktree path would auto-approve a patch whose other half writes
-/// somewhere nobody looked.
+/// the dangerous shape: its siblings would vouch for it, and one in-worktree
+/// path would auto-approve a patch whose other half writes somewhere unseen.
 enum FileTargets {
     /// Not one of the file-write tools.
     NotAFileWrite,
@@ -281,24 +248,21 @@ enum FileTargets {
 /// Render the PermissionCard's one-line summary from the tool call shape.
 /// Picks the first recognizable argument; falls back to the bare tool name.
 ///
-/// A Codex `file_change` is the awkward one: its approval request carries no
-/// path of its own, so the paths come from the `changes` list the driver attached,
-/// and they win over `reason` / `grant_root`. Those two stay as last-resort
-/// keys for the case where the `changes` list is unknown, but both arrive `null` in
-/// practice (verified live against codex-cli 0.146.1), which is why the card
-/// used to read as a bare "file_change" with nothing telling the user WHAT was
-/// being approved.
+/// A Codex `file_change` is the awkward one. Its approval request carries no
+/// path of its own, so the paths come from the `changes` list the driver
+/// attached. They win over `reason` and `grant_root`, which stay as last-resort
+/// keys for an unknown `changes` list but both arrive `null` in practice.
 pub fn build_permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
     let display_name = match tool_name {
         "Skill" => "skill",
         _ => tool_name,
     };
     // Only a FULLY resolved `changes` list is named, and only from `changes`
-    // itself. Listing the entries that happened to parse would be worse than
-    // naming none, since the user would read a complete-looking card and
-    // approve a patch whose unnamed half writes somewhere else; and a
-    // `grant_root` is a directory the agent wants opened up, not a file it is
-    // editing, so it stays a last-resort `arg` below rather than posing as one.
+    // itself. Listing the entries that parsed would be worse than naming none:
+    // the user would read a complete-looking card and approve a patch whose
+    // unnamed half writes elsewhere. A `grant_root` is a directory the agent
+    // wants opened up, not a file it is editing. It stays a last-resort key
+    // below rather than posing as one.
     if tool_name == "file_change" && input.get("changes").is_some() {
         if let FileTargets::Known(paths) = coding_agent_file_targets(tool_name, input) {
             let shown = paths
@@ -336,13 +300,11 @@ pub fn build_permission_summary(tool_name: &str, input: &serde_json::Value) -> S
     }
 }
 
-/// Recover the originating user actor for a coding-agent thread by reading
-/// the most recent user-message event on the thread (`MessageReceived` for
-/// chat-spawned sessions, `CodingAgentUserMessageSent` for in-session
-/// follow-ups). Narrowing to these two event types ensures a later
-/// engine-stamped event (e.g. `CodingAgentSettingsChanged`) doesn't overwrite
-/// the human actor. Returns `None` if no such event carries an actor —
-/// caller falls back to `EventMeta::NONE`.
+/// Recover the originating user actor for a coding-agent thread from its most
+/// recent user-message event. Narrowing to those two event types keeps a later
+/// engine-stamped event from overwriting the human actor. Returns `None` when
+/// no such event carries an actor, and the caller falls back to
+/// `EventMeta::NONE`.
 pub async fn lookup_thread_actor(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<MessageOrigin> {
     let row: Result<Option<(serde_json::Value,)>, sqlx::Error> = sqlx::query_as(
         "SELECT payload->'actor' FROM events \
@@ -370,51 +332,24 @@ pub async fn lookup_thread_actor(pool: &sqlx::PgPool, thread_id: Uuid) -> Option
 }
 
 /// Refill `thread_id`'s in-memory session-allow set from the event store, once
-/// per thread per engine lifetime.
-///
-/// "Allow for this thread" is durable in the events (a
-/// `CodingAgentPermissionResolved` carrying `allowed: true` and
-/// `persist_scope: "session"`), but `PermissionState::session_allows` is only a
-/// cache — so before this existed, an engine restart between the click and the
-/// next matching request re-asked the user. Threads survive a restart and
-/// resume; the grant the user gave them must too.
+/// per thread per engine lifetime. The grants are durable, but
+/// `PermissionState::session_allows` is only a cache, and a thread that
+/// survives a restart must keep the grant the user gave it.
 ///
 /// Deliberately **lazy** rather than a boot sweep: the work lands on the one
-/// path that was about to block on a human anyway, costs a single query per
-/// thread, and never scans threads that don't prompt.
+/// path that was about to block on a human anyway. Only genuine session grants
+/// hydrate, because the `allowed` and `persist_scope` filter excludes
+/// Allow-once, Deny, the scopes that live in `cc-allowed-tools`, and every
+/// engine-emitted resolution. The pattern is re-derived by the same call that
+/// recorded the grant, so the two cannot drift.
 ///
-/// Two properties make this safe:
-///
-///   * **Only genuine session grants hydrate.** The `allowed` + `persist_scope`
-///     filter excludes Allow-once (no scope), Deny, the `narrow`/`broad` scopes
-///     (which live in `cc-allowed-tools`, not here), and every engine-emitted
-///     resolution — supersession, session-ended, and boot orphan-recovery all
-///     write `allowed: false`.
-///   * **The pattern is re-derived, never re-stored.** `derive_allow_pattern`
-///     is the same call `api::mcp::record_allow_grant` used to record the
-///     grant, so the two sites cannot drift; a stored string could.
-///
-/// `r.thread_id = $1` is a **trust boundary, not just a scope filter** — keep
-/// it. This query turns persisted rows into standing permission grants, so it
-/// must only read rows the engine itself wrote through `BusEvent::Thread`.
-/// `POST /api/v1/events/emit` (reachable from an app UI, and from a
-/// coding-agent session via `lucidos data emit`) lets a caller choose an
-/// arbitrary `event_type`, and its `is_reserved_type_name` guard covers
-/// `SystemEvent` names only — `CodingAgentPermissionResolved` is a
-/// `ThreadEvent`, so the name itself is not refused. What closes the hole is
-/// that a domain event is persisted with a NULL `thread_id`, so a forged row
-/// can never satisfy this predicate. Widening the join to match on
-/// `request_id` alone would let an agent grant itself a standing allow for any
-/// tool.
-///
-/// That boundary has to hold on BOTH aliases, which is why `q` carries its own
-/// `thread_id = $1`. The resolved row `r` being thread-scoped is not enough: the
-/// REQUEST row is what supplies `tool_name` and `input` to
-/// `derive_allow_pattern`, so a forged request matched on `request_id` alone
-/// could pair a legitimate grant with an attacker-chosen tool.
-///
-/// Fails toward asking: a query error logs and leaves the thread unhydrated, so
-/// the card renders and the next prompt retries.
+/// `r.thread_id = $1` is a **trust boundary, not just a scope filter**. This
+/// query turns persisted rows into standing grants, so it must read only rows
+/// the engine wrote through `BusEvent::Thread`. A domain event is persisted
+/// with a NULL `thread_id`, so a row forged through the emit endpoint can never
+/// satisfy it. The boundary holds on BOTH aliases, which is why `q` carries its
+/// own `thread_id = $1`: the REQUEST row supplies `tool_name` and `input`.
+/// Fails toward asking: a query error leaves the thread unhydrated.
 async fn hydrate_session_allows(
     pool: &sqlx::PgPool,
     pending: &Mutex<PermissionState>,
@@ -481,10 +416,9 @@ async fn hydrate_session_allows(
 }
 
 /// Whether a coding-agent session has a human reachable to answer a permission
-/// card. Decided by walking the spawn tree to its root (see
-/// [`resolve_attend_mode`]): a human device at the root ⇒ [`AttendMode::Interactive`]
-/// (render a card, wait); a trigger/scheduler (or any engine origin) at the root
-/// ⇒ [`AttendMode::Unattended`] (auto-resolve, never hang).
+/// card. [`resolve_attend_mode`] decides it by walking the spawn tree to its
+/// root. A human device there renders a card and waits. Any engine origin there
+/// auto-resolves and never hangs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttendMode {
     /// A human is reachable at the root of the spawn tree — render a card and
@@ -545,30 +479,25 @@ async fn fetch_thread_origin_and_linkage(
     }
 }
 
-/// Decide whether this coding-agent session is interactive (a human can answer a
-/// card) or unattended, and — when unattended — what side-effect grant it
-/// inherits. Walks the spawn tree from `thread_id` up to its root via the
-/// persisted `MessageOrigin` chain:
+/// Decide whether this coding-agent session is interactive or unattended, and
+/// what side-effect grant an unattended one inherits. Walks the spawn tree from
+/// `thread_id` up to its root through the persisted `MessageOrigin` chain:
 ///
-///   * `Device` / human-mode `Api`/`Workspace` at the root ⇒ `Interactive`.
-///   * `Engine { Scheduler { trigger_id } }` ⇒ `Unattended` with that trigger's
-///     `side_effect_grant` (looked up in the in-memory registry, rebuilt from
-///     events at boot — so this is restart-safe).
-///   * any other engine / system / non-human origin ⇒ `Unattended` with an
-///     empty grant.
-///   * `ThreadLink { direction: Parent }` **whose event also carries the
-///     `parent_thread_id` callback linkage** ⇒ hop to the parent and continue.
-///     A `ThreadLink` without linkage is attribution only (a `relation: "top"`
-///     spawn, or a parent's child follow-up): it names who launched the thread
-///     for the route popover, and deliberately does NOT lend that spawning thread's
-///     attend mode or side-effect grant. Unclassifiable ⇒ `Interactive`, so an
-///     independent spawn asks a human rather than auto-resolving.
+///   * a `Device`, or a human-mode `Api` or `Workspace`, gives `Interactive`.
+///   * a scheduler origin gives `Unattended` with that trigger's
+///     `side_effect_grant`, read from the in-memory registry that boot rebuilds
+///     from events.
+///   * any other non-human origin gives `Unattended` with an empty grant.
+///   * a `ThreadLink { direction: Parent }` **whose event also carries the
+///     `parent_thread_id` callback linkage** hops to the parent and continues.
+///     A `ThreadLink` without linkage is attribution only. It names who
+///     launched the thread for the route popover, and deliberately does NOT
+///     lend that thread's attend mode or grant. Anything unclassifiable gives
+///     `Interactive`, so an independent spawn asks a human.
 ///
-/// Everything is derived from already-persisted events plus the trigger
-/// registry — no new persistence, no spawn-time plumbing. A user-rooted tree
-/// stays interactive even when an agent spawned the leaf coding-agent thread, so
-/// a human watching can still answer; only trigger/engine-rooted trees
-/// auto-resolve.
+/// Everything derives from already-persisted events plus the trigger registry,
+/// with no new persistence and no spawn-time plumbing. A user-rooted tree stays
+/// interactive even when an agent spawned the leaf thread.
 pub async fn resolve_attend_mode(
     pool: &sqlx::PgPool,
     trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
@@ -578,12 +507,12 @@ pub async fn resolve_attend_mode(
     let mut seen: HashSet<Uuid> = HashSet::new();
     for _ in 0..MAX_ANCESTRY_HOPS {
         if !seen.insert(current) {
-            break; // cycle guard — should never happen for a tree
+            break; // cycle guard, which a real tree never trips
         }
         let Some((origin, callback_linkage)) = fetch_thread_origin_and_linkage(pool, current).await
         else {
-            // No recorded origin — preserve the pre-existing interactive behavior
-            // rather than auto-resolving a thread we can't classify.
+            // No recorded origin, so stay interactive rather than
+            // auto-resolving a thread we cannot classify.
             return AttendMode::Interactive;
         };
         match origin {
@@ -606,19 +535,19 @@ pub async fn resolve_attend_mode(
                 };
             }
             MessageOrigin::ThreadLink { direction, .. } => {
-                // Only a Parent link means "the linked thread spawned me"; a
-                // Child callback shouldn't be a thread's originating origin, but
-                // be safe and treat it as non-human.
+                // Only a Parent link means "the linked thread spawned me". A
+                // Child callback should never be a thread's originating origin,
+                // so treat it as non-human.
                 if direction != ThreadDirection::Parent {
                     return AttendMode::Unattended { grant: Vec::new() };
                 }
                 // Hop via the LINKAGE, not the origin's `thread_id`. The two
-                // name the same thread on every row the engine writes, but this
-                // walk decides privilege, and `parent_thread_id` is the field
-                // that owns parent-ness; the origin only owns display. Absent
-                // linkage is a `relation: "top"` spawn: it names its spawning thread
-                // for the popover but is NOT in that spawning thread's tree, so the
-                // walk stops rather than inheriting a trigger's grant.
+                // name the same thread on every row the engine writes. But this
+                // walk decides privilege, and `parent_thread_id` owns
+                // parent-ness while the origin owns display. Absent linkage is a
+                // top-level spawn, which names its spawning thread for the
+                // popover but is NOT in that thread's tree. The walk stops there
+                // rather than inheriting a trigger's grant.
                 match callback_linkage {
                     Some(parent) => current = parent,
                     None => return AttendMode::Interactive,
@@ -640,14 +569,14 @@ pub async fn resolve_attend_mode(
             MessageOrigin::System => return AttendMode::Unattended { grant: Vec::new() },
         }
     }
-    // Depth/cycle exceeded — a chain this deep is automated; never hang.
+    // Depth or cycle exceeded. A chain this deep is automated, so never hang.
     AttendMode::Unattended { grant: Vec::new() }
 }
 
-/// Static classification of one coding-agent permission request, deciding how an
-/// unattended session resolves it. Deterministic — reuses the command guard's
-/// static passes, never the LLM judge (the permission path must not be able to
-/// stall).
+/// Static classification of one coding-agent permission request, deciding how
+/// an unattended session resolves it. Deterministic: it reuses the command
+/// guard's static passes and never the LLM judge, because the permission path
+/// must not be able to stall.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestVerdict {
     /// Benign in-workspace work — allow even with an empty grant.
@@ -669,18 +598,13 @@ fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> Op
 }
 
 /// Extract the target paths of a coding-agent *file-write* request. Claude Code
-/// raises these as `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, each naming a
-/// single `file_path`/`path`; Codex raises `file_change`, whose
-/// `changes: [{path, kind}]` list (attached by the app-server driver from the
-/// item's `item/started`, since the approval carries no paths of its own) can
-/// name several files at once.
+/// raises one of several tools, each naming a single path. Codex raises
+/// `file_change`, whose `changes` list can name several files at once.
 ///
 /// **One unreadable entry makes the whole set [`FileTargets::Unresolved`]**,
-/// rather than being filtered out of the list. The driver writes a change's
-/// path through `str_field`, which yields `""` when codex omits it, so a
-/// partially-understood patch is a shape that really reaches here; excusing it
-/// by the entries that DID parse is exactly the fail-open the callers must not
-/// make.
+/// rather than being filtered out. A partially-understood patch really does
+/// reach here, and excusing it by the entries that DID parse is exactly the
+/// fail-open the callers must not make.
 fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> FileTargets {
     if !matches!(
         tool_name,
@@ -689,16 +613,15 @@ fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> File
         return FileTargets::NotAFileWrite;
     }
     // `changes` is Codex vocabulary, so only a `file_change` may be read from
-    // it. Without the tool gate a stray `changes` key on a Claude Code `Write`
-    // would REPLACE its real `file_path` (this branch returns before the key
-    // scan below), and one in-worktree entry would skip the card for a write
-    // landing anywhere. CC's input is model-authored JSON that the MCP
-    // permission server forwards verbatim, so that is not a hypothetical shape.
+    // it. Without the tool gate, a stray `changes` key on a Claude Code `Write`
+    // would REPLACE its real `file_path`. One in-worktree entry would then skip
+    // the card for a write landing anywhere. CC's input is model-authored JSON
+    // the permission server forwards verbatim, so that shape is not
+    // hypothetical.
     if tool_name == "file_change" {
         if let Some(changes) = input.get("changes") {
-            // Present but not a list means the `changes` list is a shape we do not
-            // understand, which is `Unresolved` and NOT a licence to fall
-            // through to `grant_root` below.
+            // Present but not a list is a shape we do not understand. That is
+            // `Unresolved`, not a licence to fall through to `grant_root`.
             let Some(changes) = changes.as_array() else {
                 return FileTargets::Unresolved;
             };
@@ -707,11 +630,9 @@ fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> File
                 match change.get("path").and_then(|p| p.as_str()) {
                     // Absolute only. A relative path cannot be placed without
                     // the agent's cwd, and `path_outside_workspace` reads an
-                    // unplaceable path as in-workspace (correct for CC, whose
-                    // file tools require an absolute path and whose relative
-                    // paths resolve against the worktree). For a `file_change`
-                    // that reasoning is inverted by the request's own
-                    // existence: codex raises it BECAUSE the patch escaped its
+                    // unplaceable path as in-workspace, which is right for CC.
+                    // For a `file_change` the request's own existence inverts
+                    // that: codex raises it BECAUSE the patch escaped its
                     // sandbox, so "assume it lands in the worktree" is the one
                     // conclusion the evidence rules out.
                     Some(path) if !path.is_empty() && Path::new(path).is_absolute() => {
@@ -740,14 +661,13 @@ fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> File
 }
 
 /// True when `path` provably targets somewhere OUTSIDE the workspace root. A
-/// `..` component (absolute OR relative) can escape and can't be proven
-/// contained lexically → treat as outside (conservative: grant-gated). A
-/// relative path with no `..` resolves against the worktree (inside the
-/// workspace) → inside. Otherwise check containment against the workspace root,
-/// lexically first and then against the RESOLVED filesystem.
+/// `..` component cannot be proven contained lexically, so it reads as outside
+/// and is grant-gated. A relative path with no `..` resolves against the
+/// worktree, so it reads as inside. Otherwise check containment against the
+/// workspace root, lexically first and then against the RESOLVED filesystem.
 fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     let p = Path::new(path);
-    // Checked FIRST, before the relative-is-inside shortcut — a relative
+    // Checked FIRST, before the relative-is-inside shortcut: a relative
     // `../../etc/...` escapes the worktree just as an absolute one does.
     if p.components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -760,14 +680,14 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     if !p.starts_with(workspace_path) {
         return true;
     }
-    // A lexical prefix check is escapable, which is why its sibling
-    // `path_inside_worktree` resolves both sides: a symlink INSIDE the workspace
-    // pointing at an external directory makes `<ws>/link/crontab` read as
-    // contained while the write lands in `/etc`, and on the unattended lane that
-    // is an auto-allow. Resolve here too, but only to OVERRIDE a lexical
-    // "inside": when either side fails to resolve we keep the lexical answer,
-    // because the ordinary case is a `Write` naming a file that does not exist
-    // yet and calling that outside would card every new file.
+    // A lexical prefix check is escapable, which is why the sibling
+    // `path_inside_worktree` resolves both sides. A symlink inside the
+    // workspace pointing outside makes the path read as contained while the
+    // write lands elsewhere, and the unattended lane auto-allows that. Resolve
+    // here too, but only to OVERRIDE a lexical "inside". When either side fails
+    // to resolve we keep the lexical answer. The ordinary case is a `Write`
+    // naming a file that does not exist yet, and calling that outside would
+    // card every new file.
     match (
         std::fs::canonicalize(workspace_path),
         canonical_existing_prefix(p),
@@ -778,7 +698,7 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
 }
 
 /// A path component that disqualifies a target from the in-worktree fast path:
-/// `..` (can't be proven contained lexically) or `.git` (git metadata — see
+/// `..`, which cannot be proven contained lexically, or `.git` (see
 /// [`path_inside_worktree`]).
 fn has_rejected_component(p: &Path) -> bool {
     p.components().any(|c| match c {
@@ -789,9 +709,9 @@ fn has_rejected_component(p: &Path) -> bool {
 }
 
 /// Canonicalize the longest existing prefix of `p`. A `Write` names a file that
-/// doesn't exist yet, so canonicalizing the target itself would fail on exactly
-/// the case we most need to classify — walk up to the nearest ancestor that
-/// does resolve. `None` when nothing along the chain resolves.
+/// does not exist yet, so canonicalizing the target itself fails on exactly the
+/// case we most need to classify. Walk up to the nearest ancestor that does
+/// resolve, and return `None` when nothing along the chain does.
 fn canonical_existing_prefix(p: &Path) -> Option<std::path::PathBuf> {
     let mut current = Some(p);
     while let Some(candidate) = current {
@@ -803,35 +723,24 @@ fn canonical_existing_prefix(p: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// True when `path` provably resolves INSIDE `worktree_root` — the session's own
-/// disposable worktree — and is therefore covered by the reviewed-before-Apply
+/// True when `path` provably resolves INSIDE `worktree_root`, the session's own
+/// disposable worktree, and is therefore covered by the reviewed-before-Apply
 /// guarantee that makes [`worktree_write_auto_allowed`] safe.
 ///
 /// "Provably" is load-bearing: a false positive here skips a security card, so
-/// every branch that can't *prove* containment returns false.
+/// every branch that cannot *prove* containment returns false.
 ///
-///   * **Symlinks are resolved, not trusted lexically.** A lexical prefix check
-///     is escapable — a symlink inside the worktree pointing at an external
-///     directory makes `<worktree>/link/.claude/settings.json` look contained
-///     while the write lands outside, invisible to the reviewed diff. So both
-///     sides are canonicalized: the root, and the longest existing prefix of
-///     the target (see [`canonical_existing_prefix`]). Canonicalizing the
-///     target also catches the case where the target file is itself a symlink
-///     out of the tree. If either side fails to resolve, containment is
-///     unproven → false.
-///   * **A `..` component** (checked lexically before resolution) → false.
-///   * **A `.git` component** → false, checked BOTH on the input path and on
-///     the resolved worktree-relative path, so a symlink pointing into git
-///     metadata is caught too. Writes there (a `.git/hooks/pre-commit` that
-///     runs on the worktree's next commit) do not appear in the diff the user
-///     reviews before Apply, so they don't inherit the justification for
-///     auto-allowing everything else in here.
-///   * **A relative path** → false. Resolving one needs the agent's cwd, which
-///     is the worktree for a repo-rooted spawn but `data/apps/<id>` beneath it
-///     for an app coding-agent thread — so the worktree root alone can't
-///     resolve it. Costs nothing in practice: Claude Code's file tools require
-///     an absolute `file_path` and Codex's `grant_root` is absolute, and the
-///     fallback is just the card that rendered before this fast path existed.
+///   * **Symlinks are resolved, not trusted lexically.** A symlink inside the
+///     worktree pointing outside makes a path look contained while the write
+///     lands elsewhere, invisible to the reviewed diff. So both sides are
+///     canonicalized, and an unresolvable side leaves containment unproven.
+///   * **A `..` component** is checked lexically before resolution.
+///   * **A `.git` component** is checked BOTH on the input path and on the
+///     resolved one, so a symlink into git metadata is caught too. A hook
+///     written there never appears in the diff reviewed before Apply.
+///   * **A relative path** cannot be resolved without the agent's cwd, which is
+///     the worktree for a repo-rooted spawn but a subdirectory for an app
+///     thread. It costs nothing, since both backends pass an absolute path.
 fn path_inside_worktree(path: &str, worktree_root: &Path) -> bool {
     let p = Path::new(path);
     if !p.is_absolute() || has_rejected_component(p) {
@@ -854,30 +763,21 @@ fn path_inside_worktree(path: &str, worktree_root: &Path) -> bool {
 /// rendering a card.
 ///
 /// Why this exists: Claude Code auto-approves in-cwd writes under
-/// `--permission-mode acceptEdits` **except** under `.claude/` and `.git/`,
-/// which it routes through `--permission-prompt-tool` in every mode and
-/// regardless of `--allowedTools` (see `CC_PROTECTED_PATH_MARKERS` in
-/// `engine::claude_code`). Lucidos keeps all of its own agent configuration in
-/// `.claude/`, so editing a rule or a skill cost a card on every single edit,
-/// and the persisted "Always allow" scopes can't suppress it. The engine's
-/// policy is stated as the simpler invariant — *an in-worktree file write needs
-/// no card* — whose only observable delta is exactly CC's protected paths.
+/// `acceptEdits` **except** under `.claude/` and `.git/`, which it routes
+/// through the permission prompt in every mode. Lucidos keeps its own agent
+/// configuration in `.claude/`, so editing a rule cost a card every time, and
+/// no persisted scope suppresses that. The engine's policy is the simpler
+/// invariant, *an in-worktree file write needs no card*.
 ///
 /// It is safe because the worktree is disposable and every change in it is
 /// reviewed in the Diff before Apply. `.git` is carved out of
-/// [`path_inside_worktree`] precisely because it is the one in-worktree
-/// location that ISN'T in that diff.
+/// [`path_inside_worktree`] because it is the one in-worktree location that
+/// ISN'T in that diff.
 ///
-/// Scope is the file-write vocabulary of [`coding_agent_file_targets`].
-/// Commands (`Bash` / `command_execution`) are deliberately NOT covered: a
-/// command can do anything, so it stays on the card path even when it merely
-/// mentions a `.claude/` file. `None` for `worktree_root` (no live session
-/// entry, or the session never recorded one) fails closed.
-///
-/// **Every** target must be contained, and an empty target list is never
-/// auto-allowed. A Codex `changes` list can name several files, and skipping the
-/// card is only justified when the whole patch lands in the reviewed diff, so
-/// one path we cannot place is enough to ask.
+/// Scope is the file-write vocabulary of [`coding_agent_file_targets`]. A
+/// command is NOT covered, since it can do anything. A `None` `worktree_root`
+/// fails closed. **Every** target must be contained, and an empty target list
+/// is never auto-allowed.
 pub fn worktree_write_auto_allowed(
     tool_name: &str,
     input: &serde_json::Value,
@@ -901,21 +801,17 @@ pub fn worktree_write_auto_allowed(
 
 /// Classify one coding-agent permission request for the unattended decision.
 ///
-/// * Command requests (`command_execution` / `Bash`): reuse the command guard's
-///   STATIC classification by normalizing onto its bash tool vocabulary — the
-///   catastrophic deny-list, the obviously-safe allowlist, and the static
-///   side-effect/destruction fallback all apply, with no LLM judge. An
-///   in-workspace destruction (`ReversibleDanger`) counts as benign here (it's
-///   recoverable and in-workspace); an irreversible side-effect carries its
-///   category for the grant check.
-/// * File requests (`file_change` / `Edit` / `Write` / …): benign only when
-///   EVERY target is in-workspace; **any** target outside the workspace root
-///   makes the whole request out-of-workspace destruction (grant-gated). A
-///   Codex `file_change` whose targets are unknown is grant-gated too: codex
-///   raises that approval precisely because the patch escaped its sandbox, so
-///   an unattended session must not read "I could not see the paths" as
-///   permission to write them.
-/// * Anything else (reads, etc.) is benign.
+/// * A command request reuses the command guard's STATIC classification,
+///   normalized onto its bash tool vocabulary. The deny-list, the allowlist and
+///   the static fallback all apply, with no LLM judge. An in-workspace
+///   destruction counts as benign here, because it is recoverable. An
+///   irreversible side-effect carries its category for the grant check.
+/// * A file request is benign only when EVERY target is in-workspace. **Any**
+///   target outside the workspace root makes the whole request out-of-workspace
+///   destruction, which is grant-gated. A `file_change` whose targets are
+///   unknown is grant-gated too: codex raises that approval because the patch
+///   escaped its sandbox, so "I could not see the paths" is not permission.
+/// * Anything else is benign.
 pub fn classify_coding_agent_request(
     tool_name: &str,
     input: &serde_json::Value,
@@ -954,10 +850,9 @@ pub fn classify_coding_agent_request(
         }
         // A file write we cannot place is the opposite of benign, so it is
         // grant-gated rather than waved through. Codex only asks about a patch
-        // that escaped its sandbox in the first place, and falling through to
-        // the benign default below is how an unattended trigger session used to
-        // auto-allow every out-of-workspace Codex write: `grant_root` was the
-        // only path key the approval ever carried, and it arrives `null`.
+        // that already escaped its sandbox. Falling through to the benign
+        // default below would auto-allow every out-of-workspace write in an
+        // unattended session, since `grant_root` arrives `null`.
         FileTargets::Unresolved => {
             return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
         }
@@ -991,9 +886,8 @@ fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (
 }
 
 /// The per-request payload a backend funnels into
-/// [`prompt_coding_agent_permission`] — the call-specific data, kept distinct
-/// from the engine-infra handles (`pool` / `event_bus` / `pending` /
-/// `trigger_configs` / `workspace_path`) the chokepoint also needs.
+/// [`prompt_coding_agent_permission`]: the call-specific data, kept distinct
+/// from the engine-infra handles the chokepoint also needs.
 pub struct CodingAgentPermissionInput {
     pub thread_id: Uuid,
     pub tool_use_id: String,
@@ -1003,16 +897,14 @@ pub struct CodingAgentPermissionInput {
 
 /// Read the worktree root of `thread_id`'s live agent session, if any.
 ///
-/// For the **out-of-process** raise path (CC's MCP permission server POSTing to
-/// `api::internal::permission_prompt`) the registry is the only way in — the
+/// For the **out-of-process** raise path the registry is the only way in: the
 /// request carries a thread id and a tool call, nothing about the worktree. The
 /// **in-process** Codex bridge instead reads `run_session`'s own
-/// `worktree_path` local, which is the value that seeded this registry entry,
-/// so both paths see the same root without the bridge taking a lock in the
-/// engine's highest-traffic loop.
+/// `worktree_path` local, which is the value that seeded this registry entry.
+/// Both paths see the same root, and the bridge takes no lock in the engine's
+/// highest-traffic loop.
 ///
-/// `None` — no live session entry, or a session that never recorded a worktree
-/// — makes [`worktree_write_auto_allowed`] fail closed.
+/// A `None` result makes [`worktree_write_auto_allowed`] fail closed.
 pub async fn lookup_session_worktree(
     agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, crate::engine::types::AgentSession>>,
     thread_id: Uuid,
@@ -1021,33 +913,26 @@ pub async fn lookup_session_worktree(
     sessions.get(&thread_id)?.worktree_path.clone()
 }
 
-/// One blocking permission round-trip — the shared core both permission
-/// raise paths drive:
+/// One blocking permission round-trip: the shared core both raise paths drive,
+/// CC's MCP HTTP path and the Codex app-server bridge. The flow is four gates,
+/// in order:
 ///
-///   * CC's MCP HTTP path (`api::internal::permission_prompt`, invoked by
-///     `lucidos mcp-permission-server`)
-///   * the Codex app-server bridge (the `permission_rx` select arm in
-///     `run_session/run.rs`, fed by `item/*/requestApproval` JSON-RPC
-///     requests)
+///   1. **In-worktree write fast path.** A file write inside the session's own
+///      worktree needs no card. Checked first because it is pure and DB-free.
+///   2. **Session-allow pre-check.** An earlier "Allow for this thread" click
+///      whose pattern matches skips the prompt, rehydrated from persisted
+///      events so it survives an engine restart.
+///   3. **Unattended fast path.** A trigger-rooted session has no human to
+///      answer, so it resolves immediately: benign in-workspace work
+///      auto-allows, an irreversible side-effect auto-allows only under a
+///      matching trigger grant, everything else auto-denies. No card events,
+///      so the session never hangs.
+///   4. **Interactive.** `register_or_attach` dedups, the canonical request
+///      emits `CodingAgentPermissionRequest`, and the wait on the broadcast is
+///      **indefinite**.
 ///
-/// Flow: **in-worktree write fast path** (a file write landing inside the
-/// session's own worktree needs no card — see [`worktree_write_auto_allowed`];
-/// checked first because it is pure, lock-free and DB-free) → session-allow
-/// pre-check (an earlier "Allow for this thread" click whose pattern matches
-/// skips the prompt entirely, rehydrated from persisted events so it survives
-/// an engine restart) → **unattended fast path**
-/// (a trigger/engine-rooted session has no human to answer a card, so
-/// [`resolve_attend_mode`] + [`classify_coding_agent_request`] +
-/// [`decide_unattended`] resolve it immediately — benign in-workspace work
-/// auto-allows, an irreversible side-effect auto-allows iff the originating
-/// trigger granted its category, everything else auto-denies; emits no card
-/// events, so the session never hangs) → otherwise (interactive) dedup
-/// `register_or_attach` (identical concurrent requests share one card) → if
-/// canonical, emit `CodingAgentPermissionRequest` (rendered as a
-/// PermissionCard) → wait **indefinitely** on the broadcast for the user's
-/// click. The paired `CodingAgentPermissionResolved` is emitted by the
-/// consent endpoint (`api::mcp::submit_mcp_consent`) so it fires once per
-/// click, not once per deduped listener.
+/// The paired `CodingAgentPermissionResolved` is emitted by the consent
+/// endpoint, so it fires once per click rather than once per deduped listener.
 pub async fn prompt_coding_agent_permission(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
@@ -1074,9 +959,9 @@ pub async fn prompt_coding_agent_permission(
         };
     }
 
-    // Rebuild this thread's "Allow for this thread" grants from persisted
-    // events if we haven't yet in this engine lifetime, so a restart between
-    // the click and the next matching request doesn't re-ask.
+    // Rebuild this thread's grants from persisted events, once per engine
+    // lifetime, so a restart between the click and the next matching request
+    // does not re-ask.
     hydrate_session_allows(pool, pending, thread_id).await;
 
     let session_pattern = derive_allow_pattern(&tool_name, &input, AllowScope::Session);
@@ -1094,12 +979,11 @@ pub async fn prompt_coding_agent_permission(
         };
     }
 
-    // Unattended (trigger/engine-rooted) sessions have no human to answer a
-    // card — resolve immediately from the originating trigger's inherited
-    // side-effect grant plus a static benign check, so the session NEVER hangs.
-    // Like the session-allow fast path above, this emits no card events. An
-    // auto-allow surfaces as the normal CodingAgentToolCalled/Result; an
-    // auto-deny surfaces in the agent's own failure report.
+    // An unattended session has no human to answer a card, so resolve it from
+    // the inherited side-effect grant plus a static benign check. The session
+    // NEVER hangs. Like the fast path above, this emits no card events. An
+    // auto-allow surfaces as the normal tool call, and an auto-deny surfaces in
+    // the agent's own failure report.
     if let AttendMode::Unattended { grant } =
         resolve_attend_mode(pool, trigger_configs, thread_id).await
     {
@@ -1120,16 +1004,12 @@ pub async fn prompt_coding_agent_permission(
 
     let canonical_input = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
     let dedup_key: DedupKey = (thread_id, tool_name.clone(), canonical_input);
-    // The event below is persisted in `events` AND fanned out over SSE, and it
-    // carries the tool input verbatim, so a hardcoded
-    // `postgres://user:pass@host/db` in the command text would be written to the
-    // event store in the clear. Redact a COPY for the event; the dedup key and
-    // the pending entry keep the verbatim input, which is what the agent
-    // actually asked to run and what the approval must match. The summary is
-    // built from the redacted copy because it interpolates the command. Same
-    // scrub the sibling surfaces already apply: `CodingAgentToolCalled`,
-    // `ToolCalled.args`, `CommandPermissionRequested.command`, and
-    // `CommandCheckpointed.command`.
+    // The event below is persisted AND fanned out over SSE, and it carries the
+    // tool input verbatim. A hardcoded connection URI in the command text would
+    // reach the event store in the clear, so redact a COPY for the event. The
+    // dedup key and the pending entry keep the verbatim input, which is what
+    // the agent asked to run and what the approval must match. The summary is
+    // built from the redacted copy, because it interpolates the command.
     let mut event_input = input.clone();
     crate::core::redact_postgres_secrets_in_json(&mut event_input);
     let summary = build_permission_summary(&tool_name, &event_input);
@@ -1174,15 +1054,14 @@ pub async fn prompt_coding_agent_permission(
 
 /// Map the broadcast `recv` result for a pending permission into the outcome
 /// relayed to the agent. The three outcomes are distinct:
-///   * `Ok(true)`  — an explicit Allow fanned over the broadcast.
-///   * `Ok(false)` — an explicit Deny (incl. supersession's `send(false)`).
-///   * `Err(_)`    — the channel CLOSED. This can only mean the engine is tearing
-///     down (restart): every live resolution path `send`s before dropping the
-///     sender, and `gc_dead_entries` never reaps an entry whose receiver is still
-///     awaiting. A restart is NOT a user denial, so it carries the neutral
-///     `RESTART_INTERRUPT_REASON` — otherwise a resumed session reads "User
-///     denied" in its transcript and treats the restart as the user rejecting its
-///     approach.
+///   * `Ok(true)` is an explicit Allow fanned over the broadcast.
+///   * `Ok(false)` is an explicit Deny, supersession included.
+///   * `Err(_)` means the channel CLOSED, which can only be the engine tearing
+///     down. Every live resolution path sends before dropping the sender, and
+///     `gc_dead_entries` never reaps an entry whose receiver is still awaiting.
+///     A restart is NOT a user denial, so it carries the neutral
+///     `RESTART_INTERRUPT_REASON`. Otherwise a resumed session reads "User
+///     denied" and treats the restart as a rejection of its approach.
 fn outcome_from_permission_recv(
     recv: Result<bool, tokio::sync::broadcast::error::RecvError>,
 ) -> PermissionPromptOutcome {
@@ -1227,13 +1106,11 @@ pub async fn resolve_pending_permissions_as_superseded(
 }
 
 /// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
-/// denied — because the coding-agent session IDLED with a card still dangling
-/// (a workflow whose parallel subagent's card outlived the main turn, a
-/// canceled turn, etc.). Thin wrapper over
-/// [`resolve_pending_permissions_with_reason`]. Called from
-/// `emit_coding_agent_idled` at the turn boundary: by then the session/turn is
-/// done, so any still-pending card is orphaned and clearing it is safe (a live
-/// card blocks the turn, so idle cannot fire during a genuine wait).
+/// denied, because the session IDLED with a card still dangling. Thin wrapper
+/// over [`resolve_pending_permissions_with_reason`], called from
+/// `emit_coding_agent_idled` at the turn boundary. The turn is done by then, so
+/// a still-pending card is orphaned and clearing it is safe: a live card blocks
+/// the turn, so idle cannot fire during a genuine wait.
 pub async fn resolve_pending_permissions_as_session_ended(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
@@ -1253,26 +1130,22 @@ pub async fn resolve_pending_permissions_as_session_ended(
     .await;
 }
 
-/// Shared core of the "clear every unresolved `CodingAgentPermissionRequest` on
-/// this thread as denied" sweeps — the superseded path (user typed instead of
-/// clicking) and the session-ended path (the session idled with a card
-/// dangling). Mirrors `recover_orphan_cc_permission_requests` but scoped to one
-/// thread. Two effects per unresolved request:
+/// Shared core of the two sweeps that clear every unresolved
+/// `CodingAgentPermissionRequest` on this thread as denied: the superseded path
+/// and the session-ended path. Mirrors `recover_orphan_cc_permission_requests`
+/// but scoped to one thread. Two effects per unresolved request:
 ///
-///   1. Fan a `false` (deny) out to any still-blocked MCP handler via the
-///      in-memory broadcast entry, so the Claude Code subprocess's pending
-///      `tools/call` returns immediately instead of dangling until the next
-///      `gc_dead_entries` sweep.
-///   2. Emit `CodingAgentPermissionResolved { allowed: false }` so the
-///      PermissionCard's buttons stop dangling — without this the card sits
-///      clickable forever (clicking it 404s once CC interrupts and the waiter
-///      is gc'd) and the thread reads as stuck.
+///   1. Fan a deny out to any still-blocked handler through the in-memory
+///      broadcast entry. The subprocess's pending call then returns
+///      immediately, rather than dangling until the next sweep.
+///   2. Emit a denied `CodingAgentPermissionResolved`, so the card's buttons
+///      stop dangling. Without it the card sits clickable forever and the
+///      thread reads as stuck.
 ///
-/// A resolution now flips the thread to `running` ONLY from
-/// `waiting_for_user_answer` (see `event_bus_projection_thread.rs`), so emitting
-/// these on an already-idle thread clears the stale card WITHOUT resurrecting it
-/// into a dead `running`. `reason` / `log_label` distinguish the two callers in
-/// the persisted event and the logs. No-op when nothing is pending.
+/// A resolution flips the thread to `running` ONLY from
+/// `waiting_for_user_answer`, so emitting these on an already-idle thread
+/// clears the stale card WITHOUT resurrecting it. `reason` and `log_label`
+/// distinguish the two callers. No-op when nothing is pending.
 async fn resolve_pending_permissions_with_reason(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
@@ -1590,9 +1463,9 @@ mod tests {
         );
     }
 
-    /// Seed the thread as a coding-agent thread — the lifecycle guard
-    /// rejects `CodingAgentPermissionRequest` on a thread it classifies as
-    /// Chat, which is exactly what an unseeded test thread looks like.
+    /// Seed the thread as a coding-agent thread. The lifecycle guard rejects
+    /// `CodingAgentPermissionRequest` on a thread it classifies as Chat, which
+    /// is what an unseeded test thread looks like.
     async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uuid) {
         bus.emit(BusEvent::Thread {
             thread_id,
@@ -1638,12 +1511,12 @@ mod tests {
         Arc::new(RwLock::new(map))
     }
 
-    /// Insert a raw event row carrying `{"origin": <origin>}` so the resolver's
-    /// `payload->'origin'` query has something to read — cheaper than driving a
-    /// full MessageReceived through the bus + lifecycle guard.
+    /// Insert a raw event row carrying an origin, so the resolver's query has
+    /// something to read. Cheaper than driving a full `MessageReceived` through
+    /// the bus and the lifecycle guard.
     ///
-    /// Origin only, no `parent_thread_id`: that is the shape of a thread with no
-    /// callback linkage (a `relation: "top"` spawn, a trigger, a device chat).
+    /// Origin only, no `parent_thread_id`: that is the shape of a thread with
+    /// no callback linkage.
     /// A child spawn carries both, so it uses [`insert_child_spawn_event`].
     async fn insert_origin_event(
         pool: &sqlx::PgPool,
@@ -2000,8 +1873,8 @@ mod tests {
     #[test]
     fn path_inside_worktree_rejects_relative_paths() {
         // Resolving a relative path needs the agent's cwd, which differs
-        // between repo-rooted and app coding-agent threads — so it fails
-        // closed rather than guessing the worktree root.
+        // between repo-rooted and app threads. It fails closed rather than
+        // guessing the worktree root.
         let f = worktree_fixture();
         assert!(!path_inside_worktree(".claude/rules/frontend.md", &f.root));
     }
@@ -2142,10 +2015,9 @@ mod tests {
 
     #[test]
     fn one_unreadable_change_entry_makes_the_whole_set_unresolved() {
-        // The dangerous shape: filtering the unreadable entry out would let the
-        // readable sibling vouch for it, so an in-worktree path would skip the
-        // card and an in-workspace path would classify benign, for a patch
-        // whose other half writes nobody knows where.
+        // The dangerous shape. Filtering the unreadable entry out would let
+        // the readable sibling vouch for it. An in-worktree path would then
+        // skip the card for a patch whose other half writes somewhere unseen.
         let f = worktree_fixture();
         let inside = under(&f.root, "src/a.rs");
         assert!(
@@ -2173,9 +2045,9 @@ mod tests {
 
     #[test]
     fn a_stray_changes_key_never_speaks_for_a_claude_code_file_write() {
-        // `changes` is Codex vocabulary. CC's input is model-authored JSON the
-        // MCP permission server forwards verbatim, so an extra key can arrive;
-        // reading it would REPLACE the real `file_path` and let one in-worktree
+        // `changes` is Codex vocabulary. CC's input is model-authored JSON
+        // the permission server forwards verbatim, so an extra key can arrive.
+        // Reading it would REPLACE the real `file_path` and let one in-worktree
         // entry skip the card for a write landing anywhere.
         let f = worktree_fixture();
         let input = serde_json::json!({
@@ -2217,20 +2089,19 @@ mod tests {
 
     #[test]
     fn a_change_set_of_an_unknown_shape_is_not_classified_from_grant_root() {
-        // `changes` present but not a list is a shape we did not understand, so
-        // the security decision must not quietly fall through to `grant_root` and
-        // treat that directory as the request's one known target.
+        // `changes` present but not a list is a shape we did not understand.
+        // The security decision must not fall through to `grant_root` and treat
+        // that directory as the request's one known target.
         let input = serde_json::json!({ "changes": "surprise", "grant_root": "/ws/sub" });
         assert_eq!(
             classify_coding_agent_request("file_change", &input, Path::new("/ws")),
             RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
             "an in-workspace grant_root must not make an unreadable `changes` list benign"
         );
-        // The SUMMARY may still surface it: `grant_root` is a documented
-        // last-resort `arg` (the root the agent wants opened up), and reaching
-        // it through the key scan makes no claim that it is a file being
-        // edited. What must never happen is it arriving via the change-set
-        // branch, which is what the `Known` path above prints as the files.
+        // The SUMMARY may still surface it. `grant_root` is a documented
+        // last-resort key, and reaching it through the key scan makes no claim
+        // that it is a file being edited. What must never happen is it arriving
+        // through the change-set branch, which prints the files.
         assert_eq!(
             build_permission_summary("file_change", &input),
             "file_change /ws/sub"
@@ -2278,11 +2149,10 @@ mod tests {
 
     #[test]
     fn classify_grant_gates_a_codex_change_whose_paths_are_unknown() {
-        // Codex raises a file-change approval precisely because the patch
-        // escaped its sandbox. Before the driver attached the `changes` list, the
-        // only path key was `grant_root`, which arrives null, so this request
-        // classified as Benign and an unattended trigger session auto-allowed
-        // every out-of-workspace Codex write.
+        // Codex raises a file-change approval because the patch escaped its
+        // sandbox. Without the `changes` list, the only path key is
+        // `grant_root`, and it arrives null. The request would then classify as
+        // Benign and an unattended session would auto-allow it.
         assert_eq!(
             classify_coding_agent_request(
                 "file_change",
@@ -2305,10 +2175,10 @@ mod tests {
         assert!(path_outside_workspace("../../etc/cron.d/evil", ws));
     }
 
-    /// The same symlink escape `path_inside_worktree` resolves for: a link
-    /// inside the workspace pointing at an external directory made
-    /// `<ws>/escape/<file>` pass a purely lexical prefix check, so the write
-    /// landed outside and the unattended lane auto-allowed it as `Benign`.
+    /// The same symlink escape `path_inside_worktree` resolves for. A link
+    /// inside the workspace pointing outside passes a purely lexical prefix
+    /// check, so the write lands outside and the unattended lane auto-allows
+    /// it.
     #[test]
     #[cfg(unix)]
     fn path_outside_workspace_rejects_a_symlink_escape() {

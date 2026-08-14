@@ -738,7 +738,7 @@ fn make_orphan(text: &str) -> InjectedPrompt {
     }
 }
 
-fn make_wake(text: &str) -> InjectedPrompt {
+fn make_reentry(text: &str) -> InjectedPrompt {
     InjectedPrompt {
         text: text.to_string(),
         event_id: Some(Uuid::new_v4()),
@@ -746,7 +746,7 @@ fn make_wake(text: &str) -> InjectedPrompt {
         spawning_event_id: Some(Uuid::new_v4()),
         images: None,
         origin: None,
-        kind: crate::engine::InjectedPromptKind::WakeFromChild,
+        kind: crate::engine::InjectedPromptKind::ReentryFromEngine,
     }
 }
 
@@ -773,8 +773,8 @@ async fn drain_orphan_queue_coalesces_contiguous_user_orphans_in_order() {
 }
 
 #[tokio::test]
-async fn drain_orphan_queue_keeps_wake_from_child_separate() {
-    let initial = vec![make_orphan("a"), make_wake("wake"), make_orphan("b")];
+async fn drain_orphan_queue_keeps_an_engine_reentry_separate() {
+    let initial = vec![make_orphan("a"), make_reentry("reentry"), make_orphan("b")];
     let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
     let processed_clone = processed.clone();
     drain_orphan_queue(initial, move |orphans| {
@@ -792,7 +792,7 @@ async fn drain_orphan_queue_keeps_wake_from_child_separate() {
         *processed.lock().unwrap(),
         vec![
             vec!["a".to_string()],
-            vec!["wake".to_string()],
+            vec!["reentry".to_string()],
             vec!["b".to_string()]
         ]
     );

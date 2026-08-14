@@ -3,6 +3,7 @@ import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm, type Setting
 import type { NavEntry } from '../../store/actions/navigation';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
+import { previewFileName } from '../../utils/previewPath';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
 
 const menuLabels: Record<string, string> = {
@@ -44,15 +45,6 @@ function getFormTitle(form: InlineForm): string {
 
 function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
-}
-
-/** Base name of a file-preview overlay path. A repo-encoded path
- *  (`repo:<repoId>:file:<path>`) is unwrapped first — a repo file at the clone
- *  root has no `/` to split on, so the raw encoding would surface the repo id
- *  and mode as the header title. */
-function previewFileName(path: string): string {
-  const repoRelative = parseRepoPath(path)?.path ?? path;
-  return repoRelative.split('/').pop() || repoRelative;
 }
 
 /** Title of whatever the content pane is showing, in one of two forms.

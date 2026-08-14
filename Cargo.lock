@@ -4328,12 +4328,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucidos-build-slot"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "tempfile",
+]
+
+[[package]]
 name = "lucidos-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
  "dirs",
+ "lucidos-build-slot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

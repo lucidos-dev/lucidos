@@ -1003,7 +1003,7 @@ impl EventBus {
             | ThreadEvent::ToolResult { .. }
             | ThreadEvent::TextStreamed { .. }
             | ThreadEvent::ThoughtStreamed { .. }
-            | ThreadEvent::MemorySearched { .. }
+            | ThreadEvent::MemoryRecalled { .. }
             | ThreadEvent::CodingAgentTextStreamed { .. }
             | ThreadEvent::CodingAgentThoughtStreamed { .. }
             | ThreadEvent::CodingAgentToolCalled { .. }

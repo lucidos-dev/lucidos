@@ -1,5 +1,10 @@
 # Build artifacts
 /target/
+# Published launch binaries (ADR 0022 + ADR 0063): the
+# engine / gateway / CLI a workspace actually launches, one dir per
+# (profile, variant). Deliberately outside /target/ so `cargo clean` cannot
+# remove the running system's `lucidos` CLI. Reclaim it with `rm -rf .launch`.
+/.launch/
 # Ad-hoc compiled binary at the repo root (a one-off debug build accidentally
 # auto-committed). Compiled binaries never belong in source.
 /test_url_generation

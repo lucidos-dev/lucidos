@@ -75,13 +75,12 @@ const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your c
 /// /harden skill itself runs the test suites and iterates on failure — keep
 /// this text in sync with `.claude/commands/harden.md` Phase 4.5.
 ///
-/// This is the SOLE statement of the rule to a session. `CLAUDE.md` carried a
-/// second copy until 2026-08-06; running `/harden` is session truth, so under
-/// the split in `docs/agent-config.md` § Which surface owns a rule the engine
-/// owns it outright. The last three sentences came from that copy and exist
-/// nowhere else, so do not trim them back as redundant. What stays in
+/// This is the SOLE statement of the rule to a session. Running `/harden` is
+/// session truth, so the engine owns it outright under the split in
+/// `docs/agent-config.md` § Which surface owns a rule. The last three sentences
+/// exist nowhere else, so do not trim them as redundant. What stays in
 /// `CLAUDE.md` is the repo-side fact that `.claude/hooks/pre-push.sh` enforces
-/// the marker, which also binds a hand-run `claude` that never sees this text.
+/// the marker, which binds a hand-run `claude` that never sees this text.
 const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete and committed, \
     you MUST run `/harden`. No exceptions — even for docs-only, CSS-only, comment-only, or \
     seemingly trivial changes. Do not rationalize skipping it (\"too small to harden\", \
@@ -98,15 +97,13 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
 
 /// Implementation-planning rule shared by the two Lucidos-source prompts
 /// (`worktree_system_prompt`, `recovery_system_prompt`). Lives in the shared
-/// base — NOT in a backend section — so it reaches BOTH Claude Code (via
-/// `--append-system-prompt`) and Codex (via `developerInstructions`). It is the
-/// soft, prospective half of enforcement; the hard halves are the Claude-Code
-/// `cc-plan-gate` PreToolUse hook (blocks the first source edit until a
-/// gate-satisfying — recorded AND approved — marker exists) and the Apply floor
-/// (refuses a missing-or-unapproved Lucidos-source change). Codex has no
-/// PreToolUse hook, so for Codex this rule + the Apply floor are the whole
-/// enforcement. Keep in sync with the `implementation-plan` skill
-/// (`.claude/skills/implementation-plan/SKILL.md`) and `lucidos planned`.
+/// base, NOT in a backend section, so it reaches both Claude Code and Codex.
+///
+/// This is the soft, prospective half of enforcement. The hard halves are the
+/// Claude-Code `cc-plan-gate` PreToolUse hook and the Apply floor. Codex has no
+/// PreToolUse hook, so for Codex this rule plus the Apply floor are the whole
+/// enforcement. Keep in sync with the `implementation-plan` skill and
+/// `lucidos planned`.
 const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST code edit, decide \
     whether this is complex work — ADR- or design-thread-backed, cross-layer, any routing / \
     topology / storage / security / migration / process change, or anything beyond a local bug \
@@ -134,17 +131,16 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \
     first appearance to `/harden`.";
 
-/// Restart-is-not-rejection note shared by the three recovery system prompts
-/// (`recovery_system_prompt`, `external_repo_recovery_system_prompt`,
-/// `app_worktree_recovery_system_prompt`). A session resumed after an engine
-/// restart replays its own transcript, which may contain a permission denial
-/// ("User denied"), an interrupted/incomplete tool call, or a synthetic
-/// "[Request interrupted…]" result — all artifacts of the restart, NOT user
-/// decisions. Without this, the resumed agent reads them as the user rejecting
-/// its approach and changes course. Kept repo-generic (no Lucidos-only tokens)
-/// so it is safe in the external-repo recovery prompt. The companion half is the
-/// neutral `RESTART_INTERRUPT_REASON` returned on the permission teardown path
-/// (`engine::cc_permission`).
+/// Restart-is-not-rejection note shared by the three recovery system prompts.
+///
+/// A session resumed after an engine restart replays its own transcript. That
+/// may hold a permission denial, an interrupted tool call, or a synthetic
+/// "[Request interrupted…]" result. All are artifacts of the restart, not user
+/// decisions, and without this note the resumed agent changes course.
+///
+/// Kept repo-generic, with no Lucidos-only tokens, so it is safe in the
+/// external-repo recovery prompt. The companion half is the neutral
+/// `RESTART_INTERRUPT_REASON` returned on the permission teardown path.
 const RESTART_NOT_REJECTION_RULE: &str = "RESTART CONTEXT — NOT A REJECTION: This session was \
     resumed after the engine restarted mid-work. If your recent history shows a permission denial \
     (e.g. \"User denied\"), a tool call that was interrupted or never completed, or a synthetic \
@@ -153,51 +149,76 @@ const RESTART_NOT_REJECTION_RULE: &str = "RESTART CONTEXT — NOT A REJECTION: T
     those signals. Re-confirm where you left off (the git log/diff steps above) and continue the \
     same plan, unless the user has since told you otherwise in a new message.";
 
-/// Tell CC that "Task not found" / "task already completed" after a task ends
-/// is expected — the engine evicts the bg-bash registry record on completion,
-/// and CC's own task-list entries also get cleaned up. CC was treating these
-/// as failures and retrying (nightly workspace-learning flagged 5/day on
-/// `TaskOutput`, then 3 `TaskUpdate` in one thread within 1 minute). The rule
-/// covers all three lookup tools so a single sighting in any prompt
-/// inoculates the model. Applies to chat-style prompts only; merge-conflict
-/// sessions don't run bg tasks.
+/// Tell the agent that "Task not found" after a task ends is expected. The
+/// engine evicts the bg-bash registry record on completion, and the agent's own
+/// task-list entries are cleaned up too. Without the rule the agent reads the
+/// error as a failure and retries.
+///
+/// Covers all three lookup tools, so one sighting in any prompt inoculates the
+/// model. Chat-style prompts only: merge-conflict sessions run no bg tasks.
 const TASK_LIFECYCLE_RULE: &str = "TASK LIFECYCLE: After a background task ends, its registry \
     record is evicted — so subsequent `TaskOutput`, `TaskUpdate`, or `TaskList` calls referencing \
     that id return errors like \"Task not found\" or \"task already completed\". This is \
     **expected**, not a bug. Treat the error as confirmation the task is done; do NOT retry the \
     call.";
 
+/// Teach the *build slot* wrapper to sessions in somebody else's repo.
+///
+/// Only those. A Lucidos-source session needs none of it: `make lint` and
+/// `make test` take a slot themselves. Every line here is paid on every
+/// request of every session that carries it. See ADR 0070.
+const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run in parallel \
+    worktrees, so N simultaneous full builds are N compilers resident on ONE machine, which \
+    OOM-kills the host. Prefix a heavy build with `lucidos build-slot -- ` (e.g. `lucidos \
+    build-slot -- cargo test --release`). It waits for a free slot, then runs your command \
+    unchanged, passing its output and exit code through. Do NOT wrap cheap work such as a \
+    type-check: that holds a slot for minutes to save seconds. Nothing to release afterwards: \
+    the slot frees when your command exits, or by the kernel if it is killed.";
+
 /// Tell the coding agent that background processes do NOT outlive the turn that
-/// started them. A coding-agent session is a per-turn subprocess: when the turn
-/// goes idle the engine tears down the whole process group (the agent + every
-/// child it spawned — see `lifecycle::terminate_decision` +
-/// `runtime::spawn_env::graceful_kill_child_process_group`), and nothing
-/// re-invokes the agent when a backgrounded job would later finish (that wake
-/// path exists only for the *chat* agent's tracked `run_bash_background` tool,
-/// which coding agents don't have). Left to its own devices the agent trusts its
-/// Bash tool's native "runs across turns, re-invokes you on exit" contract —
-/// true for the standalone CLI, false here — so it kicks off a long build in the
-/// background, ends the turn, and the build is killed; the next `--resume` turn
-/// starts it over. This bit us in a real DMG-build thread (three restarts, no
-/// artifact). The fix is guidance: foreground long commands, or wait them out
-/// within the same turn.
+/// started them.
+///
+/// A coding-agent session is a per-turn subprocess. When the turn goes idle the
+/// engine tears down the whole process group, the agent and every child it
+/// spawned (`lifecycle::terminate_decision`,
+/// `runtime::spawn_env::graceful_kill_child_process_group`). Nothing re-invokes
+/// the agent when a backgrounded job later finishes: that wake path exists only
+/// for the *chat* agent's tracked `run_bash_background` tool. Left alone the
+/// agent trusts its Bash tool's native "runs across turns" contract, which is
+/// true for the standalone CLI and false here.
 ///
 /// The second half of the rule is about the COST of that wait. "Wait inside the
-/// turn" on its own reads as "tick until done", and the agent's cheapest-looking
-/// tick is the tool default — 120000 ms on CC's Bash tool — so a 40-minute
-/// release build turned into ~20 round-trips, each dragging a log tail into
-/// context. Both waits can block instead: a foreground command accepts an
-/// explicit `timeout` up to 600000 ms, and `TaskOutput` takes `block: true` with
-/// the same ceiling and returns the moment the task exits. Naming those two
-/// ceilings is what turns ~20 polls into ~4. Spell the numbers the same way here
-/// as in the prompt string and the test needles (`600000`, not `600 000`) so one
-/// grep finds every site when a ceiling moves.
+/// turn" alone reads as "tick until done", and the cheapest-looking tick is the
+/// tool default of 120000 ms. Both waits can block instead: a foreground command
+/// accepts an explicit `timeout` up to 600000 ms, and `TaskOutput` takes
+/// `block: true` with the same ceiling. Naming those two ceilings is what turns
+/// twenty polls into four. Spell the numbers the same way here as in the prompt
+/// string and the test needles, so one grep finds every site.
 ///
-/// The foreground half carries a trap worth naming in the prompt: overrunning
-/// the tool timeout KILLS the command, so "max out the timeout" is only safe
-/// when the run fits — an uncertain estimate should go to the background path,
-/// which has no such cliff. Applies to chat-style prompts only (grouped with
-/// `TASK_LIFECYCLE_RULE`); merge-conflict sessions don't run builds.
+/// Fewer calls is only half the saving, because `TaskOutput` is not a delta:
+/// every call replays the task's whole accumulated output. Four blocking calls
+/// therefore cost four copies of the build log unless the task is quiet.
+/// Redirecting stdout and stderr to a log file at spawn time is what makes it
+/// quiet. The obvious `sleep N; tail -c` improvisation does not: a fixed sleep
+/// ignores an early exit, so it trades one waste for another.
+///
+/// The blocking call is named rather than dropped, even though Claude Code's
+/// own `TaskOutput` description now points at the task's output file. Reading a
+/// file is not a WAIT. A Lucidos turn that stops issuing tool calls has its
+/// process group torn down under the running task.
+///
+/// The example log path is per-worktree (`$(basename "$PWD")`) rather than a
+/// fixed `/tmp/run.log`. Concurrent sessions share `/tmp`, and the second to
+/// open a fixed name truncates the first's log under a running build. That
+/// basename is `deterministic_worktree_path`'s `thread-<short_thread_id>`, so it
+/// is already unique. It is deliberately not the worktree-local `.lucidos/`
+/// that `/harden` writes to, which is Lucidos-checkout-only: four flavors here
+/// run in an external repo or an app worktree.
+///
+/// The foreground half carries a trap worth naming in the prompt. Overrunning
+/// the tool timeout KILLS the command, so maxing it out is only safe when the
+/// run fits. An uncertain estimate belongs on the background path. Applies to
+/// chat-style prompts only; merge-conflict sessions run no builds.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates your whole process group — you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
@@ -216,80 +237,71 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     Background: call `TaskOutput` with `block: true` and `timeout: 600000` — it returns the \
     instant the task exits, or after 10 minutes; re-issue it until the task is done, with no \
     cliff if you guessed the duration wrong. A 40-minute build costs ~4 blocking calls that way, \
-    versus ~20 polls at the 2-minute default, each one a full round-trip that floods your \
-    context with log tails. Tick on a short interval only when you deliberately want live \
+    versus ~20 polls at the 2-minute default. Also REDIRECT ITS OUTPUT TO A LOG FILE \
+    (`<cmd> > /tmp/$(basename \"$PWD\").log 2>&1`): every `TaskOutput` call re-dumps the task's \
+    ENTIRE accumulated output, not just the new part, so an un-redirected chatty build re-floods \
+    your context on every wait. Redirected, the wait is nearly free and you `tail` the log for \
+    detail. Tick on a short interval only when you deliberately want live \
     progress or an early abort — never as the default way to wait.";
 
-/// Encourage the coding agent to ask via the structured `AskUserQuestion` tool
-/// — which the Lucidos UI renders as clickable buttons — for the DECISIONS it
-/// needs to proceed, while forbidding post-work "does this look good?"
-/// confirmations. The forbidding half is load-bearing: a held-open question
-/// parks the thread in `waiting_for_user_answer`, which stalls hand-off (in an
-/// Apply-based worktree it blocks the Apply button — see
-/// [`APPLY_CONFIRMATION_NOTE`]), and for a visual/behavioral change the user
-/// can't even judge the result until it's landed — the two lock each other out
-/// (the "cant apply when you ask question" dark-mode-contrast thread). The prior
-/// wording actively told the agent to turn end-of-turn confirmations into button
-/// questions, which caused exactly that deadlock.
+/// Send the coding agent's DECISIONS through the structured `AskUserQuestion`
+/// tool, which the Lucidos UI renders as clickable buttons. Forbids post-work
+/// "does this look good?" confirmations.
 ///
-/// The forbidding half then over-reached, so the rule carries an explicit
-/// carve-out for **plan approval**. A plan written and committed by the
-/// `implementation-plan` skill reads to the model as work it has ALREADY done,
-/// so "never CONFIRM finished work" swallowed the one approval the plan marker
-/// depends on: the agent presented the plan in prose and the thread sat idle
-/// until the user typed "approve" by hand (2026-08-02). It is the opposite
-/// case in every way that matters. The plan is a proposal about work NOT done,
-/// the `cc-plan-gate` hook blocks source edits until the answer arrives, and
-/// nothing is appliable yet. Keep the carve-out in sync with
-/// [`IMPLEMENTATION_PLAN_RULE`], `cc_plan_gate::build_awaiting_approval_json`
-/// and the `implementation-plan` skill, which all describe the same option
-/// FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers
-/// no real fork, never a third slot beside one. Those surfaces stated the pair
-/// unconditionally until 2026-08-04, which produced a live three-option card
-/// (`Approve` / `Frontend only` / `Request changes`) whose last button meant
-/// only "I will type what I want changed". That is the exact shape the NEVER
-/// AUTHOR AN "OTHER" OPTION paragraph below bans, and it is redundant with the
-/// free-text escape the card already names.
+/// The forbidding half is load-bearing. A held-open question parks the thread in
+/// `waiting_for_user_answer`, which stalls hand-off and, in an Apply-based
+/// worktree, blocks the Apply button (see [`APPLY_CONFIRMATION_NOTE`]). For a
+/// visual change the user cannot judge the result until it has landed, so the
+/// two lock each other out.
 ///
-/// The general lesson from that same incident is the "WHY THE TOOL AND NOT
-/// PROSE" paragraph, and it is what makes the two halves cohere instead of
-/// reading as a contradiction. Both describe ONE mechanism: a tool call parks
-/// the thread in `WaitingForUserAnswer`, which is the only input to
+/// The forbidding half over-reaches without an explicit carve-out for **plan
+/// approval**. A plan the `implementation-plan` skill committed reads to the
+/// model as work it has ALREADY done. So "never CONFIRM finished work" swallows
+/// the one approval the plan marker depends on. It is the opposite case in every
+/// way that matters: the plan is a proposal about work NOT done, the
+/// `cc-plan-gate` hook blocks source edits until the answer arrives, and nothing
+/// is appliable yet.
+///
+/// Keep the carve-out in sync with [`IMPLEMENTATION_PLAN_RULE`],
+/// `cc_plan_gate::build_awaiting_approval_json` and the `implementation-plan`
+/// skill. All describe the same option FLOOR: `Approve` first, `Request changes`
+/// second ONLY when the plan offers no real fork, never a third slot beside one.
+/// Stated unconditionally, the pair yields a three-option card whose last button
+/// means only "I will type what I want changed". The NEVER AUTHOR AN "OTHER"
+/// OPTION paragraph below bans exactly that shape.
+///
+/// The "WHY THE TOOL AND NOT PROSE" paragraph is what makes the two halves
+/// cohere instead of reading as a contradiction. Both describe ONE mechanism: a
+/// tool call parks the thread in `WaitingForUserAnswer`, the only input to
 /// `thread_lifecycle::is_attention_needing`. That predicate lights the
-/// needs-attention badge, keeps the thread in `DisplaySection::Current` even
-/// once archived, bubbles up the ancestor chain via
-/// `attention_descendant_count`, and is a fire condition for the "When agent
-/// needs me" trigger, so it is also what can notify the
-/// user. Parking is therefore the COST when the work is finished (the reason
-/// for the forbidding half) and the POINT when the agent is blocked. A prose
-/// question is not the gentle middle option the model reads it as: the turn
-/// ends, nothing is marked, and the thread is indistinguishable from a
-/// completed one, so the user never learns anyone is waiting.
+/// needs-attention badge, keeps the thread in `DisplaySection::Current` once
+/// archived, bubbles up the ancestor chain via `attention_descendant_count`, and
+/// fires the "When agent needs me" trigger. Parking is therefore the COST when
+/// the work is finished and the POINT when the agent is blocked. A prose
+/// question marks nothing, so the thread reads as completed and the user never
+/// learns anyone is waiting.
 ///
-/// This shared rule is kept ENVIRONMENT-GENERIC (no "Apply" / "the change be
-/// proposed" / "Diff") because it is interpolated into external-repo prompts
-/// too, where there is no Apply — those sessions push and open PRs. The
-/// Apply-specific sharpening lives in [`APPLY_CONFIRMATION_NOTE`], added only by
-/// the Apply-based prompt builders. Applies to chat-style prompts only;
-/// hardening and merge-conflict sessions don't dialogue with the user. The
-/// regression test `chat_style_prompts_nudge_use_of_ask_user_question` pins both
-/// halves.
+/// This shared rule is kept ENVIRONMENT-GENERIC, naming no "Apply" or "Diff",
+/// because external-repo prompts interpolate it too and those sessions push and
+/// open PRs. The Apply-specific sharpening lives in [`APPLY_CONFIRMATION_NOTE`].
+/// Chat-style prompts only: hardening and merge-conflict sessions do not
+/// dialogue with the user. Pinned by
+/// `chat_style_prompts_nudge_use_of_ask_user_question`.
 ///
 /// The "NEVER AUTHOR AN \"OTHER\" OPTION" paragraph exists to CONTRADICT Claude
-/// Code's own built-in tool description, which promises "there should be no
-/// 'Other' option, that will be provided automatically". CC's TUI provides one;
-/// Lucidos does not. The card renders exactly the options passed, and
+/// Code's own built-in tool description, which promises that an "Other" option
+/// is provided automatically. CC's TUI provides one; Lucidos does not. The card
+/// renders exactly the options passed, and
 /// `agent_question::answer_kind_to_hook_value` resolves a `Selected` answer to
-/// the option's LABEL (via `lookup_option_label`), so an "Other, I'll type it"
-/// button hands that literal phrase back as the user's decision. The two real escapes (typing in the prompt
-/// textarea, which routes to the pending question as `FreeText`, and Cancel)
-/// are on every card already and are named to the user by the prompt row:
-/// typing by the textarea's own placeholder while a question is pending
-/// (`PLACEHOLDER_ANSWERING`), Cancel by the Cancel button's tooltip
-/// (`ANSWER_CANCEL_TOOLTIP`). Mirrored into [`CODEX_ASK_USER_QUESTION_RULE`] (which
-/// REPLACES this whole constant for Codex, so the ban must be restated there,
-/// not appended here) and into the chat-side rule + `ask_user_question` tool
-/// description in `llm::tools::misc`; change them together.
+/// the option's LABEL. An "Other, I'll type it" button therefore hands that
+/// literal phrase back as the user's decision.
+///
+/// The two real escapes are on every card already, and the prompt row names
+/// both to the user: typing in the textarea, by its own placeholder
+/// (`PLACEHOLDER_ANSWERING`), and Cancel, by its tooltip
+/// (`ANSWER_CANCEL_TOOLTIP`). Mirrored into [`CODEX_ASK_USER_QUESTION_RULE`],
+/// which REPLACES this whole constant for Codex, and into the chat-side rule
+/// and the `ask_user_question` tool description. Change them together.
 const ASK_USER_QUESTION_RULE: &str =
     "ASKING USERS: Use the `AskUserQuestion` tool when you need a DECISION from the \
      user to move forward — which of two approaches to take, an ambiguous requirement, a \
@@ -613,7 +625,7 @@ const NAMES_NOT_IDS_RULE: &str = "\n\n\
 
 /// One-line mirror of the chat agent's
 /// `chat::process::system_prompt::NO_IMPERSONATION_RULE`, which carries the
-/// full reasoning and the 2026-08-06 incident it comes from. A coding agent
+/// full reasoning and the incident it comes from. A coding agent
 /// holds the same Bash capability and the same `lucidos` CLI, so it can reach
 /// the engine's API by hand exactly as the chat agent did; it is short here
 /// because a coding-agent session's own scope makes the temptation rarer.
@@ -757,12 +769,13 @@ pub(super) fn external_repo_system_prompt(
          {background_process}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
-         Running `exit` in bash can crash the host application.{process_safety}",
+         Running `exit` in bash can crash the host application.{process_safety}{build_slot}",
         commit_cadence = COMMIT_CADENCE_RULE,
         ask_user_question = ASK_USER_QUESTION_RULE,
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
+        build_slot = BUILD_SLOT_RULE,
     )
 }
 
@@ -785,7 +798,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          {ask_user_question}\n\n\
          {task_lifecycle}\n\n\
          {background_process}\n\n\
-         CRITICAL: Never run `exit` as a bash command.{process_safety}",
+         CRITICAL: Never run `exit` as a bash command.{process_safety}{build_slot}",
         branch = branch_name,
         repo = repo_name,
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
@@ -794,6 +807,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         task_lifecycle = TASK_LIFECYCLE_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
         process_safety = process_safety_rule(false),
+        build_slot = BUILD_SLOT_RULE,
     )
 }
 
@@ -1104,12 +1118,11 @@ mod tests {
         // (asserted separately, by the `exempt` list in
         // `lucidos_source_prompts_carry_implementation_plan_rule_for_both_backends`;
         // this list is checked against the external-repo prompts only).
-        // Neither token was named here until 2026-08-04, and the shared
-        // (environment-generic) `ASK_USER_QUESTION_RULE` briefly grew a
-        // "revise the plan file, then run `lucidos planned approve`" clause
-        // that rode into external prompts through the back door: the same
-        // leak `APPLY_CONFIRMATION_NOTE` was split out to prevent, via a
-        // different constant. Keep marker machinery in the plan rule.
+        // Keep marker machinery in the plan rule. Left unnamed here, a
+        // "then run `lucidos planned approve`" clause rides into external
+        // prompts through the shared, environment-generic
+        // `ASK_USER_QUESTION_RULE`. That is the same leak
+        // `APPLY_CONFIRMATION_NOTE` was split out to prevent.
         "lucidos planned",
         "docs/plans/",
     ];
@@ -1396,6 +1409,15 @@ mod tests {
                 "WAIT IN AS FEW CALLS AS YOU CAN",
                 "`timeout: 600000`",
                 "`block: true`",
+                // Fewer calls only helps if each call is small, and
+                // `TaskOutput` is not a delta: it replays the task's whole
+                // accumulated output every time. Without the redirect half,
+                // ~4 blocking waits on a chatty build still cost ~4 copies of
+                // its log, so pin both the fact and the fix. Pin the fix by its
+                // instruction rather than by the example path, which is free to
+                // change without weakening the rule.
+                "re-dumps the task's ENTIRE accumulated output",
+                "REDIRECT ITS OUTPUT TO A LOG FILE",
             ] {
                 assert!(
                     prompt.contains(needle),
@@ -1432,10 +1454,10 @@ mod tests {
     /// The engine-side counterpart of `scripts/check-context-budget.sh`, which
     /// gates the OTHER unconditional surface (`CLAUDE.md` plus the unscoped
     /// `.claude/rules/*.md`) and deliberately does not look at this one. Two
-    /// surfaces reach every session before it has read a line of code; until
-    /// 2026-08-06 only one of them was gated, so this file could grow forever
-    /// without anything objecting. `docs/agent-config.md` § Which surface owns
-    /// a rule says which content belongs here at all.
+    /// surfaces reach every session before it has read a line of code, and
+    /// both must be gated or this file grows forever without anything
+    /// objecting. `docs/agent-config.md` § Which surface owns a rule says which
+    /// content belongs here at all.
     ///
     /// A RATCHET, the same convention as `CONTEXT_BUDGET_CEILING`: lowering a
     /// number is the point and needs no ceremony, raising one needs a reason in
@@ -1452,18 +1474,23 @@ mod tests {
     /// Backend labels are `CodingAgent::as_str()` values, kebab-case, so the
     /// table reads the same as every other public surface naming a backend.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
-        ("worktree", "claude-code", 21420),
-        ("worktree", "codex", 20128),
-        ("external_repo", "claude-code", 14345),
-        ("external_repo", "codex", 13053),
-        ("recovery", "claude-code", 20015),
-        ("recovery", "codex", 18723),
-        ("external_repo_recovery", "claude-code", 14221),
-        ("external_repo_recovery", "codex", 12929),
-        ("app_worktree", "claude-code", 17555),
-        ("app_worktree", "codex", 16263),
-        ("app_worktree_recovery", "claude-code", 16119),
-        ("app_worktree_recovery", "codex", 14827),
+        ("worktree", "claude-code", 21668),
+        ("worktree", "codex", 20380),
+        // The four external-repo rows are 569 bytes higher than they were, for
+        // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
+        // Lucidos-source session is already covered, because `make lint` and
+        // `make test` take a slot themselves. Carrying it there would pay for
+        // an instruction the session cannot use.
+        ("external_repo", "claude-code", 15163),
+        ("external_repo", "codex", 13875),
+        ("recovery", "claude-code", 20263),
+        ("recovery", "codex", 18975),
+        ("external_repo_recovery", "claude-code", 15039),
+        ("external_repo_recovery", "codex", 13751),
+        ("app_worktree", "claude-code", 17804),
+        ("app_worktree", "codex", 16516),
+        ("app_worktree_recovery", "claude-code", 16368),
+        ("app_worktree_recovery", "codex", 15080),
         ("conflict_resolution", "claude-code", 5343),
         ("conflict_resolution", "codex", 6577),
     ];
@@ -1565,6 +1592,37 @@ mod tests {
                 conflict_resolution_system_prompt().to_string(),
             ),
         ]
+    }
+
+    #[test]
+    fn only_external_repo_sessions_are_taught_the_build_slot_wrapper() {
+        // The wrapper is how a session in SOMEBODY ELSE'S repo joins the pool:
+        // nothing there wraps a build for it. A Lucidos-source or app session
+        // must NOT carry it. Those builds go through `make` and the build
+        // scripts, which take a slot already. The text would be bytes on every
+        // request buying nothing (ADR 0070).
+        let taught = ["external_repo", "external_repo_recovery"];
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &all_prompt_flavors() {
+                let full = append_backend_rules(base.clone(), agent);
+                let has = full.contains("HEAVY BUILDS TAKE A BUILD SLOT");
+                assert_eq!(
+                    has,
+                    taught.contains(label),
+                    "{label}/{} carries the build-slot rule: {has}, expected the opposite",
+                    agent.as_str()
+                );
+                if has {
+                    assert!(
+                        full.contains("lucidos build-slot -- "),
+                        "{label} must show the wrapper's exact prefix, not just name it"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1761,8 +1819,8 @@ mod tests {
             );
             // Plan approval is the case the DON'T half over-reached and swallowed:
             // a committed plan reads as work already done, so the agent asked in
-            // prose and the thread sat idle until the user typed "approve"
-            // (2026-08-02). The carve-out must survive, with the concrete option
+            // prose and the thread sits idle until the user types "approve"
+            // by hand. The carve-out must survive, with the concrete option
             // pair that makes it actionable (the tool needs 2-4 options, so a lone
             // `Approve` is not expressible).
             for needle in ["APPROVE A PLAN OR AN", "`Approve` and `Request changes`"] {
@@ -1777,7 +1835,7 @@ mod tests {
             // (`Approve` / `Frontend only` / `Request changes`) whose last
             // button meant only "I will type what I want changed", which the
             // NEVER AUTHOR AN "OTHER" OPTION paragraph in the same rule bans
-            // (2026-08-04). A real fork satisfies the two-option minimum on its
+            // A real fork satisfies the two-option minimum on its
             // own, so `Request changes` must be dropped rather than pushed to a
             // third slot.
             // Needle is ask-rule-specific on purpose: `IMPLEMENTATION_PLAN_RULE`
@@ -1942,7 +2000,7 @@ mod tests {
                 // The approval must be ASKED with the question tool, not written
                 // as prose. Told only to "present the plan and wait", the agent
                 // ended the turn and the thread sat idle until the user typed
-                // "approve" by hand (2026-08-02). The tool is named indirectly
+                // "approve" by hand. The tool is named indirectly
                 // ("the ASKING USERS section") because the two backends call it
                 // different things and `append_backend_rules` swaps only that
                 // section, never this rule.
@@ -1951,7 +2009,7 @@ mod tests {
                 // The pair is a FLOOR: a plan that offers a real fork puts the
                 // fork in the second slot instead of pushing `Request changes`
                 // to a third, where it would mean only "I will type what I want
-                // changed" (2026-08-04). And a fork answer is an approval, so
+                // changed". And a fork answer is an approval, so
                 // the rule that owns `lucidos planned approve` has to say the
                 // agent may flip the marker after revising the plan to match.
                 "that fork takes the second slot",
@@ -2011,7 +2069,7 @@ mod tests {
     /// same prompt forbade confirmations about "work you've ALREADY done". A
     /// committed plan looks exactly like already-done work, so the agent
     /// classified approval as forbidden and asked in prose. The thread then sat
-    /// idle for 20 minutes until the user typed "approve" by hand (2026-08-02).
+    /// idle until the user typed "approve" by hand.
     ///
     /// Each backend must name its OWN tool: `append_backend_rules` swaps the
     /// whole `ASK_USER_QUESTION_RULE` for the Codex variant, so a CC tool name
@@ -2036,7 +2094,7 @@ mod tests {
             // because the Codex swap replaces the whole CC rule and would
             // otherwise keep prescribing an unconditional pair. Stated
             // unconditionally, it produced a three-option card whose last
-            // button was the dead-end shape the same rule bans (2026-08-04).
+            // button was the dead-end shape the same rule bans.
             for needle in [
                 "make that fork the second option",
                 "Picking a fork is still an approval",

@@ -42,10 +42,9 @@ pub fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/lucidos".to_string())
 }
 
-/// Process-lifetime cache of `pg_env_vars(&database_url())`. The DATABASE_URL
-/// env var doesn't change once the engine starts, so we parse the URL once and
-/// hand callers a slice they can either iterate (`runtime::claude_code` borrows
-/// `&String` into `cmd.env`) or clone-extend (`build_script_env_vars`).
+/// Process-lifetime cache of `pg_env_vars(&database_url())`. DATABASE_URL does
+/// not change once the engine starts, so the URL is parsed once and callers get
+/// a slice they can iterate or clone-extend.
 pub fn pg_env_vars_cached() -> &'static [(String, String)] {
     static CACHED: std::sync::LazyLock<Vec<(String, String)>> =
         std::sync::LazyLock::new(|| pg_env_vars(&database_url()));
@@ -55,24 +54,18 @@ pub fn pg_env_vars_cached() -> &'static [(String, String)] {
 /// Parse a `postgres(ql)://user:password@host[:port]/dbname[?...]` URL into the
 /// libpq env-var bundle (`PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE`).
 ///
-/// The point is to inject these into every subprocess we spawn (engine bash
-/// tool, Python tool, scheduled scripts, coding-agent sessions) so callers can run
-/// `psql -c '…'` bare without ever putting the password in argv. argv is what
-/// gets persisted into `CodingAgentToolCalled`/`ToolCalled` event payloads and
-/// rendered in the steps UI; env vars are not, so the password never leaks
-/// through the events table or the modal.
+/// These are injected into every subprocess the engine spawns, so a caller can
+/// run `psql -c '…'` bare and never put the password in argv. argv is
+/// persisted into tool-call event payloads and rendered in the steps UI; env
+/// vars are not.
 ///
-/// Returns an empty Vec if the URL doesn't match the expected shape — we'd
-/// rather skip the injection than emit a half-broken bundle that confuses
-/// libpq.
+/// An unrecognized URL yields an empty Vec. Skipping the injection beats
+/// emitting a half-broken bundle that confuses libpq.
 pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
-    // The `:password` segment is OPTIONAL: the gateway's embedded (packaged)
-    // Postgres backend uses trust auth on loopback and hands the engine a
-    // passwordless URL (`postgres://lucidos@127.0.0.1:<port>/lucidos`). Without
-    // the optional group the regex wouldn't match and `apply_pg_env` would reject
-    // the URL, breaking `pg_restore`/`psql` for a picker restore on a packaged
-    // build. An `@` is still required, so a malformed `postgres://no-at-sign/db`
-    // remains empty.
+    // The `:password` segment is OPTIONAL. The packaged Postgres backend uses
+    // trust auth on loopback and hands the engine a passwordless URL. A
+    // required group would reject it, breaking a picker restore. An `@` is
+    // still required, so `postgres://no-at-sign/db` stays empty.
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"^postgres(?:ql)?://([^:@/?]+)(?::([^@/?]*))?@([^:/?]+)(?::(\d+))?/([^?]+)",
@@ -94,10 +87,9 @@ pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
         .into_owned();
     let mut vars = vec![("PGUSER".to_string(), user)];
-    // Only emit PGPASSWORD when the URL carried a password segment. A
-    // passwordless (trust-auth) URL omits it so libpq doesn't try to send one;
-    // an explicit empty password (`user:@host`) still emits an empty PGPASSWORD,
-    // preserving prior behavior.
+    // Only when the URL carried a password segment, so libpq does not try to
+    // send one for a trust-auth URL. An explicit empty password (`user:@host`)
+    // still emits an empty PGPASSWORD.
     if let Some(pw) = caps.get(2) {
         let password = urlencoding::decode(pw.as_str())
             .unwrap_or_default()
@@ -114,19 +106,13 @@ pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
 /// `{NAME}` segment of an injected env var (`CRED_{NAME}`, `OAUTH_{NAME}_…`):
 /// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`.
 ///
-/// Sanitizes by character CLASS rather than a fixed list. The list this
-/// replaced was `-` / `.` / space, which is every separator a hand-typed
-/// service name uses and none of the ones the engine generates itself: a
-/// namespaced name (`oauth:google`, `email:work`) kept its colon, and an
-/// address-shaped one kept its `@`. `CRED_OAUTH:GOOGLE` is a legal entry in
-/// `environ` and an illegal shell identifier, so it was set but unreadable from
-/// bash (`$CRED_OAUTH:GOOGLE` parses as `$CRED_OAUTH` then a literal
-/// `:GOOGLE`), while Python could still reach it through `os.environ` with the
-/// literal key. A silent asymmetry between two of the three script runtimes is
-/// worse than either outcome alone, which is why this is a class and not three
-/// more characters.
+/// Sanitizes by character CLASS, never a fixed list. A name like
+/// `CRED_OAUTH:GOOGLE` is a legal `environ` entry and an illegal shell
+/// identifier. Bash reads it as `$CRED_OAUTH` then a literal `:GOOGLE`, while
+/// Python still reaches it through `os.environ`. That silent asymmetry between
+/// two script runtimes is worse than either outcome alone.
 ///
-/// No leading-digit guard: every caller prefixes `CRED_` / `OAUTH_`, so the
+/// No leading-digit guard: every caller prefixes `CRED_` or `OAUTH_`, so the
 /// full variable name always starts with a letter.
 ///
 /// Non-ASCII collapses to `_` per `char`, so the result is always ASCII and
@@ -145,11 +131,9 @@ pub fn env_var_segment(name: &str) -> String {
 }
 
 /// Mask the password segment of any `postgres(ql)://user:password@host…` URL
-/// occurring in `s`. Best-effort safety net for the path where the env-var
-/// injection (`pg_env_vars`) didn't take — a stray `psql "$DATABASE_URL"` from
-/// CC, a Python script that hardcoded the URI, an OAuth-style URL pasted into
-/// a curl call. Applied at the spawn-side log line and at the boundary where
-/// CC's bash `args` get persisted.
+/// in `s`. A best-effort safety net for wherever the env-var injection did not
+/// take: a hardcoded URI in a script, a URL pasted into a curl call. Applied at
+/// the spawn-side log line and where a tool call's `args` are persisted.
 pub fn redact_postgres_secrets(s: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(postgres(?:ql)?://[^:@/?\s]+):[^@/?\s]+@")
@@ -158,14 +142,13 @@ pub fn redact_postgres_secrets(s: &str) -> String {
     RE.replace_all(s, "$1:***@").into_owned()
 }
 
-/// Recursively apply `redact_postgres_secrets` to every string value inside a
-/// `serde_json::Value`. Used to scrub the `args` of `CodingAgentToolCalled`
-/// events before they reach the event store / SSE stream — the Bash tool's
-/// `command` field can carry a hardcoded `postgres://user:pass@…` URL.
+/// Recursively apply `redact_postgres_secrets` to every string inside a
+/// `serde_json::Value`. Scrubs a tool call's `args` before they reach the event
+/// store or the SSE stream, since a Bash `command` can carry a hardcoded URL.
 ///
-/// Hot path: every ToolCalled event walks every string. The `contains` guard
-/// short-circuits the regex + allocation for any string that doesn't even
-/// mention "postgres" (the vast majority of bash commands, file paths, etc.).
+/// Hot path: every tool-call event walks every string. The `contains` guard
+/// short-circuits the regex and the allocation for any string that never
+/// mentions "postgres".
 pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
@@ -198,12 +181,9 @@ pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
 pub const MIN_REDACTABLE_SECRET_LEN: usize = 4;
 
 /// Replace every occurrence of each known secret value in `text` with
-/// `[REDACTED]`. Used to keep credential material out of logs and surfaced
-/// error messages where untrusted code (a WASM signer's `log()` host import, a
-/// `script_handshake` script's stderr) could otherwise echo it. Secrets shorter
-/// than [`MIN_REDACTABLE_SECRET_LEN`] are skipped (see the const). Longest
-/// secrets are scrubbed first so a secret that is a substring of another doesn't
-/// leave a partial match behind.
+/// `[REDACTED]`. Keeps credential material out of logs and error messages that
+/// untrusted code could otherwise echo. Longest secrets are scrubbed first, so
+/// a secret that is a substring of another leaves no partial match behind.
 pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
     let mut ordered: Vec<&String> = secrets
         .iter()
@@ -230,12 +210,12 @@ pub const KNOWHOW_DIR: &str = "data/knowhow";
 pub const TRIGGERS_DIR: &str = "data/triggers";
 
 /// Ephemeral scratch, workspace-root-relative and OUTSIDE `data/`: gitignored,
-/// not indexed, safe to delete. `http_request(temp_path)`, `git_clone`'s tmp
-/// route and the plugin staging paths all land here, and every one of them
-/// prints this prefix back to the LLM, so the string the file tools resolve and
-/// the string those tools advertise must be the same one. Kept as a `/`-joined
-/// relative path (not a `PathBuf`) because it is matched against LLM-supplied
-/// path strings as often as it is joined onto the workspace root.
+/// not indexed, safe to delete. Several tools land files here and print this
+/// prefix back to the LLM. What the file tools resolve and what those tools
+/// advertise must be one string.
+///
+/// A `/`-joined relative path rather than a `PathBuf`, because it is matched
+/// against LLM-supplied path strings as often as it is joined onto a root.
 pub const TMP_DIR: &str = ".lucidos/tmp";
 
 /// Whether a normalized data path names a file inside [`TMP_DIR`]. Sibling of
@@ -429,10 +409,9 @@ pub use store::{
     ThreadEventRow, ThreadSummary,
 };
 
-/// Reset the index to match HEAD's tree before staging — drops any entries
-/// left behind by a previous `commit_*` call that staged but didn't commit
-/// (e.g. a crash partway through `commit_all_dirty`). No-op on a freshly
-/// created repo with no HEAD yet.
+/// Reset the index to match HEAD's tree before staging. Drops entries a
+/// previous `commit_*` staged without committing. No-op on a fresh repo with
+/// no HEAD yet.
 pub fn reset_index_to_head(
     repo: &git2::Repository,
     index: &mut git2::Index,
@@ -445,31 +424,54 @@ pub fn reset_index_to_head(
     Ok(())
 }
 
-/// Run a git2 index operation, retrying briefly while some other process holds
-/// the repository's `.git/index.lock`.
+/// Did this git2 error mean "another writer of the same repo got there first",
+/// rather than "the operation itself is wrong"? The single place both contended
+/// shapes are classified and documented, and what
+/// [`retry_while_repo_contended`] retries on.
 ///
-/// That lock is CROSS-PROCESS and non-blocking. Any other writer of the same
-/// repo (a merge or discard shelling out to the `git` CLI, a coding agent
-/// committing in the workspace, an operator's own `git add`) holds it for the
-/// length of its own index write, and a git2 write landing inside that window
-/// fails outright with `ErrorClass::Index` / `ErrorCode::Locked` rather than
-/// waiting for it. The window is milliseconds, so waiting it out is the only
-/// sane response: without this, a `POST /api/v1/data/edit` issued while a
-/// change applied returned a 500 that an immediate retry of the very same
-/// request would have satisfied (it fails ~half of full e2e API runs, where
-/// the suite's own git invocations are the competing writer).
+/// **`Index` / `Locked`, lost the index lock.** `.git/index.lock` is
+/// CROSS-PROCESS and non-blocking. Any other writer of the repo holds it for
+/// its own index write, and a git2 write inside that window fails outright
+/// rather than waiting.
 ///
-/// Two things bind on callers:
+/// **`Reference` / `Modified`, lost the HEAD compare-and-swap.** `commit_index`
+/// reads the parent with `repo.head()`, then asks libgit2 to move HEAD off
+/// exactly that parent. A commit landing on HEAD in between fails the swap. The
+/// competitor can be another git2 handle in THIS process or an out-of-process
+/// `git` CLI writer. It shows up as an intermittent 500 on an ordinary write:
 ///
-/// - `op` re-runs from the start on every attempt, so it must be idempotent.
-///   Stage INSIDE it, never before: each `commit_*` here opens with
-///   `reset_index_to_head`, which is what makes a repeat safe.
-/// - It sleeps the calling thread, so call it from a blocking context
-///   (`spawn_blocking`), never straight off an async task.
+/// ```text
+/// {"error":"old reference value does not match; class=Reference (4); code=Modified (-15)"}
+/// ```
+pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
+    matches!(
+        (e.class(), e.code()),
+        (git2::ErrorClass::Index, git2::ErrorCode::Locked)
+            | (git2::ErrorClass::Reference, git2::ErrorCode::Modified)
+    )
+}
+
+/// Run a git2 repository write, retrying briefly while another writer of the
+/// same repo keeps winning the race. See [`is_transient_repo_contention`] for
+/// the two shapes that counts as, and for why each one happens.
 ///
-/// Any other error returns at once, and the final `Locked` is returned once the
-/// budget is spent, so a genuinely stuck lock still surfaces instead of hanging.
-pub fn retry_while_index_locked<T>(
+/// Both windows are milliseconds, so waiting them out is the only sane
+/// response. Two things bind on callers:
+///
+/// - **`op` re-runs from the start every attempt, so it must be idempotent.**
+///   Stage INSIDE it, never before: every `commit_*` routed through this opens
+///   with `reset_index_to_head`, which makes a repeat safe. That reset also
+///   makes the retry CORRECT for the HEAD race. It re-reads the tree from the
+///   NEW head, so the attempt lands on top of the commit that beat it. A caller
+///   that deletes first must remove OUTSIDE the closure, stage tolerantly, and
+///   finish through [`commit_index_unless_unchanged`].
+/// - **It sleeps the calling thread.** Prefer a blocking context. A caller
+///   whose `Repository` guard is not `Send` runs inline, and only sleeps when
+///   contended.
+///
+/// The budget is sized for the LOCK case. Any other error returns at once, and
+/// the final contended error is returned once the budget is spent.
+pub fn retry_while_repo_contended<T>(
     mut op: impl FnMut() -> Result<T, git2::Error>,
 ) -> Result<T, git2::Error> {
     const ATTEMPTS: u32 = 25;
@@ -477,11 +479,7 @@ pub fn retry_while_index_locked<T>(
     let mut attempt = 1;
     loop {
         match op() {
-            Err(e)
-                if attempt < ATTEMPTS
-                    && e.class() == git2::ErrorClass::Index
-                    && e.code() == git2::ErrorCode::Locked =>
-            {
+            Err(e) if attempt < ATTEMPTS && is_transient_repo_contention(&e) => {
                 std::thread::sleep(BACKOFF);
                 attempt += 1;
             }
@@ -490,23 +488,18 @@ pub fn retry_while_index_locked<T>(
     }
 }
 
-/// Brand-new workspace: write `lucidos.toml` pinning the allocated vite
-/// port and commit it via the engine's git identity (see `commit_index`),
-/// so `git status` is clean from the first boot and the port survives any
-/// future `port-registry` drift.
+/// Brand-new workspace: write `lucidos.toml` pinning the allocated vite port
+/// and commit it. `git status` is then clean from the first boot, and the port
+/// survives any later port-registry drift.
 ///
-/// Returns `true` when a commit was made, `false` when `lucidos.toml`
-/// already exists (in which case the file is left strictly untouched —
-/// the user may have hand-edited a pin to a different port and we don't
-/// clobber that). The caller (engine startup) gates this on "the
-/// workspace was just git-init'd by us" so existing workspaces don't get
-/// surprised by a freshly-pinned port on a later engine boot.
+/// An existing `lucidos.toml` is left strictly untouched and reported as
+/// `false`, since the user may have hand-edited its pin. The caller gates this
+/// on having just git-init'd the workspace, so an existing one is never
+/// surprised by a freshly-pinned port.
 ///
-/// Crash-safety: if the commit phase fails after the file has been
-/// written, the file is removed so the working tree stays clean. The
-/// engine gate is one-shot — next boot won't retry the pin — but at
-/// least the workspace isn't left permanently dirty with an untracked
-/// lucidos.toml, which would defeat the whole point of the change.
+/// Crash-safety: a failure in the commit phase removes the file again, so the
+/// working tree stays clean. The engine gate is one-shot and will not retry the
+/// pin, but the workspace is at least not left dirty with an untracked file.
 pub fn pin_workspace_vite_port(
     workspace: &std::path::Path,
     vite_port: u16,
@@ -527,6 +520,11 @@ pub fn pin_workspace_vite_port(
     }
 }
 
+/// Deliberately NOT routed through `retry_while_repo_contended`: this runs once
+/// during engine startup on a workspace we just git-init'd, before any manager,
+/// timer or agent session exists to compete for HEAD. Its staging also happens
+/// outside any closure, so wrapping it would be unsafe without restructuring it
+/// for a re-run it cannot need.
 fn commit_new_lucidos_toml(
     workspace: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -554,9 +552,8 @@ pub fn commit_data_paths_added(
     data_relative_paths: &[String],
     message: &str,
 ) -> Result<String, git2::Error> {
-    let repo = git2::Repository::open(workspace_path)?;
-    let mut index = repo.index()?;
-    reset_index_to_head(&repo, &mut index)?;
+    // Validate before the retry loop: a rejected path is the caller's answer,
+    // not contention, so re-checking it on every attempt buys nothing.
     for p in data_relative_paths {
         if is_path_traversal(p) {
             return Err(git2::Error::from_str(&format!(
@@ -564,10 +561,17 @@ pub fn commit_data_paths_added(
                 p
             )));
         }
-        index.add_path(std::path::Path::new(&format!("data/{}", p)))?;
     }
-    index.write()?;
-    commit_index(&repo, message)
+    let repo = git2::Repository::open(workspace_path)?;
+    retry_while_repo_contended(|| {
+        let mut index = repo.index()?;
+        reset_index_to_head(&repo, &mut index)?;
+        for p in data_relative_paths {
+            index.add_path(std::path::Path::new(&format!("data/{}", p)))?;
+        }
+        index.write()?;
+        commit_index(&repo, message)
+    })
 }
 
 /// Open the workspace repo, stage the deletion of the given `data/`-relative
@@ -583,30 +587,38 @@ pub fn commit_data_paths_removed(
     message: &str,
 ) -> Result<Option<String>, git2::Error> {
     let repo = git2::Repository::open(workspace_path)?;
-    let mut index = repo.index()?;
-    reset_index_to_head(&repo, &mut index)?;
-    let mut staged_any = false;
-    for p in data_relative_paths {
-        if is_path_traversal(p) {
-            continue;
+    retry_while_repo_contended(|| {
+        let mut index = repo.index()?;
+        reset_index_to_head(&repo, &mut index)?;
+        let mut staged_any = false;
+        for p in data_relative_paths {
+            if is_path_traversal(p) {
+                continue;
+            }
+            // `remove_path` errors when the entry isn't in the index (untracked
+            // or never-committed file). Tolerate that and keep going.
+            if index
+                .remove_path(std::path::Path::new(&format!("data/{}", p)))
+                .is_ok()
+            {
+                staged_any = true;
+            }
         }
-        // `remove_path` errors when the entry isn't in the index (untracked /
-        // never-committed file) — tolerate that and keep going.
-        if index
-            .remove_path(std::path::Path::new(&format!("data/{}", p)))
-            .is_ok()
-        {
-            staged_any = true;
+        if !staged_any {
+            return Ok(None);
         }
-    }
-    if !staged_any {
-        return Ok(None);
-    }
-    index.write()?;
-    commit_index(&repo, message).map(Some)
+        index.write()?;
+        commit_index(&repo, message).map(Some)
+    })
 }
 
 /// Create a commit from the current index state.
+///
+/// The parent is re-read from HEAD on every call, and the HEAD update libgit2
+/// performs is compare-and-swap against exactly that parent. So this races any
+/// other writer of the repo, and a loser fails with `Reference` / `Modified`.
+/// Call it inside [`retry_while_repo_contended`], which turns that loss into a
+/// re-run onto the winner's head; see [`is_transient_repo_contention`].
 pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
@@ -622,13 +634,45 @@ pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, gi
     Ok(commit_id.to_string())
 }
 
+/// [`commit_index`], except that an index already identical to HEAD's tree
+/// reports HEAD's own sha instead of recording an empty commit.
+///
+/// This is what makes the DELETE helpers safe to retry, and they are the only
+/// callers. Each removes from the working tree BEFORE the retry closure and
+/// stages the removal inside it. A competing writer can therefore commit the
+/// same deletion in between. The retried attempt then resets onto that head,
+/// finds the path already untracked, and has nothing left to stage. Reporting an
+/// error there would deny a deletion that demonstrably happened, so this
+/// reports the head recording it instead. A path that was never tracked takes
+/// the same route.
+///
+/// Callers therefore stage the removal TOLERANTLY and let this decide, rather
+/// than propagating the staging error. `git2`'s `remove_path` errors on an
+/// entry that is not in the index.
+pub fn commit_index_unless_unchanged(
+    repo: &git2::Repository,
+    message: &str,
+) -> Result<String, git2::Error> {
+    let mut index = repo.index()?;
+    let tree_id = index.write_tree()?;
+    // `if let Ok` rather than `?`, matching `commit_all_dirty`: an unborn HEAD
+    // has no tree to compare against and must fall through to a root commit.
+    if let Ok(head) = repo.head() {
+        if let Ok(head_commit) = head.peel_to_commit() {
+            if head_commit.tree()?.id() == tree_id {
+                return Ok(head_commit.id().to_string());
+            }
+        }
+    }
+    commit_index(repo, message)
+}
+
 /// Reject paths that would escape the directory they get joined onto: any `..`
-/// component, or an absolute path (leading `/` or `\`). This is the single
-/// canonical traversal guard for the whole engine — HTTP handlers (`data_api`,
-/// `artifacts`, `apps`, `repositories`), LLM file tools (`search`, `import`,
-/// `image`, `email`, `intents`), the proxy script runner, and script triggers
-/// all funnel through it (directly, or via `crate::api::is_path_traversal`,
-/// which re-exports this), so the rule can never drift between call sites.
+/// component, or an absolute path.
+///
+/// The single canonical traversal guard for the whole engine. HTTP handlers,
+/// LLM file tools, the proxy script runner and script triggers all funnel
+/// through it, so the rule cannot drift between call sites.
 ///
 /// Deliberately conservative: it matches `..` anywhere in the string (so even a
 /// filename like `a..b` is rejected) and does not normalize or percent-decode
@@ -638,8 +682,7 @@ pub fn is_path_traversal(path: &str) -> bool {
     path.contains("..") || path.starts_with('/') || path.starts_with('\\')
 }
 
-/// Check if a file extension indicates a binary (non-text) file.
-/// Used to decide whether to read as bytes vs text, skip indexing, etc.
+/// Whether a file extension indicates a binary file.
 pub fn is_binary_extension(ext: &str) -> bool {
     matches!(
         ext,
@@ -677,15 +720,12 @@ pub fn is_binary_extension(ext: &str) -> bool {
     )
 }
 
-/// Lower-level split: pull the `---\n...\n---\n` YAML header off a markdown
-/// file. Returns the trimmed frontmatter block and the body, or None if the
-/// document doesn't start with a frontmatter delimiter or doesn't have a
-/// closing `---`. The two field-specific parsers below (`parse_md_frontmatter`
-/// for `name` + list field; `knowhow::parse_frontmatter` for `name` +
-/// scalar `description`) share this prefix; each parses its own fields
-/// because their downstream semantics diverge (list-vs-scalar field type;
-/// description has a derive-from-body fallback that knowhow needs but
-/// `parse_md_frontmatter`'s callers don't).
+/// Pull the `---\n...\n---\n` YAML header off a markdown file, returning the
+/// trimmed frontmatter block and the body.
+///
+/// The two field-specific parsers share this prefix, but each parses its own
+/// fields. Their downstream semantics diverge on the field type and on whether
+/// a missing value derives from the body.
 pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     if !text.starts_with("---") {
         return None;
@@ -700,9 +740,7 @@ pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     ))
 }
 
-/// Parse YAML frontmatter from a markdown file.
-/// Extracts `name:` and a configurable list field (e.g., `knowhow:`).
-/// Returns (name, list_values, body) or None if no valid frontmatter.
+/// Parse `name:` and a configurable list field out of markdown frontmatter.
 pub(crate) fn parse_md_frontmatter(
     text: &str,
     list_field: &str,
@@ -851,12 +889,10 @@ fn middle_truncate(s: &str, max: usize) -> String {
     format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
 }
 
-/// First non-empty line of a command, trimmed; the whole string when it has no
-/// non-empty line. A step label is one line of HTML, where a newline collapses
-/// to a space, so a multi-line script (a heredoc, a `&&` chain split across
-/// lines) must condense to its opening line rather than elide across newlines
-/// and render as a garbled run-on. Shared by the engine and coding-agent
-/// description paths so both condense a command the same way.
+/// First non-empty line of a command, trimmed. A step label is one line of
+/// HTML, and a newline collapses to a space there. A multi-line script must
+/// therefore condense to its opening line, rather than render as a garbled
+/// run-on. Shared by the engine and coding-agent description paths.
 fn first_command_line(cmd: &str) -> &str {
     cmd.lines()
         .find(|l| !l.trim().is_empty())
@@ -873,45 +909,34 @@ fn first_command_line(cmd: &str) -> &str {
 ///
 /// * A shell the GUARD knows must be one the label knows, or a payload would be
 ///   scanned and then displayed still wrapped.
-/// * The reverse is allowed, and `fish` is currently the whole difference.
-///   Over-recognizing costs a label nothing, but the guard discards the operands
-///   after the script as `$0` and positional parameters, and that is a POSIX rule
-///   fish does not follow: it collects EVERY `-c` and evaluates each in turn, so
-///   `fish -c 'ls' -c 'rm -rf /'` would hand the classifier `ls` alone. Teaching
-///   the guard fish means handling its whole script-carrying flag surface (`-c`
-///   and `-C`/`--init-command` at least), which is a security change on its own
-///   terms rather than a side effect of a labelling one.
+/// * The reverse is allowed, and `fish` is the whole difference.
+///   Over-recognizing costs a label nothing. The guard, though, discards
+///   operands after the script as positional parameters, and fish does not
+///   follow that POSIX rule: it evaluates EVERY `-c` in turn, so
+///   `fish -c 'ls' -c 'rm -rf /'` would hand the classifier `ls` alone.
+///   Teaching the guard fish means handling its whole script-carrying flag
+///   surface, which is a security change on its own terms.
 pub(crate) const WRAPPER_SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
 
 /// The script inside a login-shell wrapper, or `cmd` unchanged when there is no
 /// wrapper to see through.
 ///
-/// Codex reports a shell step as the whole invocation its harness built,
-/// `/bin/zsh -lc "<script>"`, where Claude Code's `Bash` reports the script on
-/// its own. Left alone the two backends read as different tools on every row of
-/// a transcript, and the wrapper is worse than noise: `describe_cc_tool`
-/// middle-truncates to 60 bytes and the prefix spends a quarter of that before
-/// the command starts, so the informative part is exactly what gets elided.
+/// Codex reports a shell step as the whole invocation its harness built, where
+/// Claude Code's `Bash` reports the script alone. Only Codex's
+/// `command_execution` goes through here: a Claude Code session that literally
+/// invokes `bash -lc "..."` chose to, and its row must show it.
 ///
-/// Only Codex's `command_execution` goes through here. A Claude Code session
-/// that literally invokes `bash -lc "..."` chose to, and its row must show it.
-///
-/// Conservative by construction: anything not recognizably
+/// Conservative by construction. Anything not recognizably
 /// `<shell> -<letters including c> <one quoted-or-bare script>` comes back
-/// untouched, and the result is always a suffix of `cmd` apart from unescaping,
-/// never a re-composition of it.
+/// untouched, and the result is always a suffix of `cmd`.
 ///
 /// # Why this is not `command_guard::unwrap_shell_command`
 ///
-/// That function unwraps the same shapes, and the two share [`WRAPPER_SHELLS`]
-/// so they cannot disagree about what a shell is. They are separate because
-/// their errors have opposite costs, and the difference is concrete rather than
-/// stylistic: on an UNQUOTED operand (`zsh -lc git status`) the guard returns
-/// `git status`, because a guard that reads too much only ever scans more, while
-/// POSIX `sh -c` actually runs `git` with `$0=status`. Showing that in a step row
-/// would name a command that never ran, so this declines and shows the
-/// invocation verbatim. The guard is deliberately generous; a label must be
-/// exact. Do not collapse them into one.
+/// Both unwrap the same shapes and share [`WRAPPER_SHELLS`], but their errors
+/// have opposite costs. On an UNQUOTED operand (`zsh -lc git status`) the
+/// guard returns `git status`, since reading too much only ever scans more.
+/// POSIX `sh -c` really runs `git` with `$0=status`, so a step row must
+/// decline instead of naming a command that never ran. Do not collapse them.
 fn shell_script_body(cmd: &str) -> Cow<'_, str> {
     let Some((shell, rest)) = cmd.trim_start().split_once(char::is_whitespace) else {
         return Cow::Borrowed(cmd);
@@ -936,15 +961,15 @@ fn shell_script_body(cmd: &str) -> Cow<'_, str> {
     }
     let script = script.trim();
     match script.as_bytes().first() {
-        // A quoted script has to be exactly ONE quoted word. `zsh -lc "a" && "b"`
-        // is two words and a pipeline, so no part of it is "the command" and the
-        // label shows the invocation verbatim rather than a confident half of it.
+        // A quoted script has to be exactly ONE quoted word. In
+        // `zsh -lc "a" && "b"` no part is "the command", so the label shows
+        // the invocation verbatim rather than a confident half of it.
         Some(b'\'' | b'"') => unquote_shell_word(script).unwrap_or(Cow::Borrowed(cmd)),
-        // An UNQUOTED suffix is the script only when it is a single word. POSIX
-        // `sh -c` reads ONE operand as the script and assigns the rest to `$0`,
-        // `$1`, ..., so `zsh -lc git status` runs `git` with `$0=status` and does
-        // NOT run `git status`. Reading it as the latter would put a command in
-        // the row that never ran, which is the one thing this must never do.
+        // An UNQUOTED suffix is the script only when it is a single word.
+        // POSIX `sh -c` reads ONE operand as the script and assigns the rest to
+        // the positional parameters. So `zsh -lc git status` runs `git` with
+        // `$0=status`, and reading it as `git status` would put a command in
+        // the row that never ran.
         Some(_) if !script.contains(char::is_whitespace) => Cow::Borrowed(script),
         _ => Cow::Borrowed(cmd),
     }
@@ -952,8 +977,8 @@ fn shell_script_body(cmd: &str) -> Cow<'_, str> {
 
 /// The contents of `s` when it is exactly ONE quoted shell word, unescaped for
 /// that quoting style. `None` when `s` is unquoted, unterminated, or carries
-/// anything after its closing quote, because `"a" && "b"` is two words and a
-/// pipeline rather than one script, and stripping its outer quotes would claim
+/// anything after its closing quote. `"a" && "b"` is two words and a pipeline
+/// rather than one script, and stripping its outer quotes would claim
 /// otherwise.
 fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
     let bytes = s.as_bytes();
@@ -965,9 +990,9 @@ fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
     let mut unescaped: Option<String> = None;
     let mut chunk_start = 1;
     let mut i = 1;
-    // Byte scanning is UTF-8-safe here because every byte compared against is
-    // ASCII, and a continuation byte is always >= 0x80, so a cut only ever lands
-    // on a char boundary.
+    // Byte scanning is UTF-8-safe here: every byte compared against is ASCII
+    // and a continuation byte is always >= 0x80, so a cut only ever lands on a
+    // char boundary.
     while i < bytes.len() {
         if bytes[i] == quote {
             // A single-quoted script cannot contain a quote, so the wrapper
@@ -992,8 +1017,7 @@ fn unquote_shell_word(s: &str) -> Option<Cow<'_, str>> {
             });
         }
         // Inside double quotes a backslash escapes exactly four characters plus
-        // a line continuation; before anything else it is a literal backslash
-        // and the character after it is read normally.
+        // a line continuation. Before anything else it is a literal backslash.
         if quote == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             if matches!(next, b'"' | b'\\' | b'$' | b'`' | b'\n') {
@@ -1023,9 +1047,8 @@ fn mcp_tool_suffix(name: &str) -> Option<&str> {
     rest.find("__").map(|sep| &rest[sep + 2..])
 }
 
-/// Summarize a `glob_files` / `grep_files` JSON result as "N items[, truncated]".
-/// Falls back to a char count if the JSON can't be parsed (e.g. the handler
-/// returned an "Error: ..." string).
+/// Summarize a `glob_files` or `grep_files` JSON result as
+/// "N items[, truncated]".
 fn describe_search_result(result: &str, items_key: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
     let count = parsed.get(items_key)?.as_array()?.len();
@@ -1069,12 +1092,11 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
 /// Human-friendly description of a tool call, used for progress steps in both
 /// live streaming (engine.rs) and session replay (store.rs).
 ///
-/// The `Executing <name>...` fallback exists only for names we genuinely cannot
-/// know: a third-party MCP tool arriving without the `mcp__` prefix, or a
-/// historical event replaying a tool name we have since retired. Everything the
-/// engine ships is labelled in [`tool_label`], and
-/// `every_known_tool_name_has_a_step_label` fails the build if one is not, so
-/// the fallback can never render a raw snake_case name for a registered tool.
+/// The `Executing <name>...` fallback exists only for genuinely unknowable
+/// names: a third-party MCP tool with no `mcp__` prefix, or a historical event
+/// replaying a retired tool. Everything the engine ships is labelled in
+/// [`tool_label`], and `every_known_tool_name_has_a_step_label` fails the build
+/// otherwise, so the fallback can never render a registered tool's raw name.
 pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
     tool_label(name, args).unwrap_or_else(|| format!("Executing {}...", name))
 }
@@ -1082,11 +1104,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
 /// Step label for a search action: the verb plus the query it was given.
 ///
 /// The query is quoted back because this label is the user's only view of what
-/// the agent went looking for, and a bare "Searching memory" reads as the agent
-/// rummaging. Bounded like every sibling that renders a model-supplied string
-/// (`await_event`'s reason, `generate_image`'s prompt): these schemas invite a
-/// full sentence, and an unbounded one becomes a step row as wide as the
-/// transcript.
+/// the agent went looking for. A bare "Searching memory" reads as rummaging.
+/// Bounded like every sibling that renders a model-supplied string: these
+/// schemas invite a full sentence, and an unbounded one becomes a step row as
+/// wide as the transcript.
 fn search_label(verb: &str, args: &serde_json::Value) -> String {
     match args["q"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
         Some(q) => format!("{verb} for \"{}\"...", middle_truncate(q, 50)),
@@ -1402,9 +1423,9 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             }
         }
         "list_event_waits" => "Checking what this thread is waiting for...".to_string(),
-        // Names WHAT is being stopped rather than an id: the row sits in the
-        // transcript beside the `EventWaitStarted` step that armed it, and a
-        // uuid there is a string the user cannot resolve to anything.
+        // Names WHAT is being stopped rather than an id. The row sits beside
+        // the step that armed the wait, and a uuid there is a string the user
+        // cannot resolve to anything.
         "cancel_event_wait" => match args.get("all").and_then(|v| v.as_bool()) {
             Some(true) => "Stopping every subscription on this thread...".to_string(),
             _ => "Stopping a subscription...".to_string(),
@@ -1417,9 +1438,9 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Saving image to {}...",
             args["path"].as_str().unwrap_or("artifacts")
         ),
-        // `image` is a thread reference like "thread:2" (`llm/tools/images.rs`),
-        // which is exactly how the conversation history labels the image, so it
-        // reads as an identifier the user can find rather than an internal id.
+        // `image` is a thread reference like "thread:2", exactly how the
+        // conversation history labels it. So it reads as something the user can
+        // find, rather than an internal id.
         "view_image" => format!("Viewing {}...", args["image"].as_str().unwrap_or("image")),
         "generate_image" => format!(
             "Generating image: {}...",
@@ -1437,9 +1458,9 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Running thread: {}...",
             middle_truncate(args["prompt"].as_str().unwrap_or("task"), 50)
         ),
-        // The message, never the `thread_id`: the id is a raw uuid the user has
-        // no way to resolve to a child they recognise, and the message is the
-        // one part of the call that says what is happening.
+        // The message, never the `thread_id`. A raw uuid resolves to no child
+        // the user recognises, and the message is the one part of the call that
+        // says what is happening.
         "follow_up_child_thread" => match args["message"].as_str() {
             Some(message) => format!(
                 "Following up with child thread: {}...",
@@ -1578,14 +1599,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("drop") => "Dropping queued entry...".to_string(),
             _ => "Listing Thread Queue...".to_string(),
         },
-        // Grouped `memory` tool exposes only the correction actions to the LLM
-        // (correct / correct_by_id); both render the same label.
-        // The GROUPED names are what the model actually emits (the flat ones
-        // are back-compat aliases, and `consolidated_flat_tools_are_not_advertised`
-        // pins that they are never offered), so a grouped arm that ignores
-        // `action` mislabels every action but one. Both of these read now, and
-        // rendering a read as "Updating memory..." tells the user their memory
-        // was written to when nothing was.
+        // The GROUPED names are what the model actually emits, since the flat
+        // ones are back-compat aliases that are never offered. So a grouped arm
+        // ignoring `action` mislabels every action but one, and rendering a
+        // read as "Updating memory..." claims a write that never happened.
         "memory" => match args["action"].as_str() {
             Some("search") => search_label("Searching memory", args),
             Some("source") => "Tracing a memory to its conversation...".to_string(),
@@ -1670,13 +1687,13 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
 /// The step-row verb a Codex `file_change` kind implies.
 ///
 /// The kind arrives as `{"type": "add"}` over the app-server protocol and as a
-/// bare `"add"` from older exec frames, so both shapes resolve; an unrecognized
-/// one reads "Change", which is true of every kind and claims nothing extra.
+/// bare `"add"` from older exec frames, so both resolve. An unrecognized one
+/// reads "Change", which is true of every kind and claims nothing extra.
 ///
-/// The vocabulary is deliberately Claude Code's (`Write` / `Edit` / `Delete`)
-/// rather than the sentence verbs `PermissionCard` uses ("wants to create
-/// /path"). That card builds a sentence; this is a step label, and it has to
-/// read like the label a Claude Code row carrying the same edit would.
+/// The vocabulary is deliberately Claude Code's, rather than the sentence verbs
+/// `PermissionCard` uses. That card builds a sentence. This is a step label,
+/// and it has to read like the label on a Claude Code row carrying the same
+/// edit.
 fn change_kind_verb(kind: Option<&serde_json::Value>) -> &'static str {
     let name = match kind {
         Some(serde_json::Value::String(s)) => s.as_str(),
@@ -1788,16 +1805,16 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                 format!("Edit {}", basename(p))
             }
         }
-        // Same label as Codex's `todo_list` below: the two backends' plan steps
-        // are the same thing to the user and should read alike (the frontend's
-        // `fullCommandForCCTool` already renders both with one marker list).
+        // Same label as Codex's `todo_list` below. The two backends' plan steps
+        // are one thing to the user and must read alike. The frontend already
+        // assumes that, rendering both with one marker list.
         "TodoWrite" => "Update plan".into(),
         "ExitPlanMode" => "Present plan for approval".into(),
-        // Codex item types (see runtime/codex_parse.rs) — Codex reports
-        // coarse-grained items, not named tools like CC. Each arm lands on the
-        // SAME sentence its Claude Code counterpart produces, because the two
-        // backends share every transcript component and a row that reads
-        // differently is the only thing left that can tell them apart.
+        // Codex item types (see runtime/codex_parse.rs). Codex reports
+        // coarse-grained items, not named tools. Each arm lands on the SAME
+        // sentence its Claude Code counterpart produces: the two backends share
+        // every transcript component, so a row that reads differently is the
+        // only thing left that can tell them apart.
         "command_execution" => {
             let script = shell_script_body(str_arg("command"));
             let line = first_command_line(&script);
@@ -1846,16 +1863,16 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             }
         }
         "todo_list" => "Update plan".into(),
-        // An MCP tool reaches both backends under the same `mcp__<server>__<tool>`
-        // name (Codex rebuilds it that way on purpose), and the server prefix is
-        // noise in a step row. Without this the raw identifier WAS the label.
+        // An MCP tool reaches both backends under the same
+        // `mcp__<server>__<tool>` name, and the server prefix is noise in a
+        // step row.
         _ if name.starts_with("mcp__") => {
             format!("MCP: {}", mcp_tool_suffix(name).unwrap_or(name))
         }
-        // Unlike `tool_label`, this fallback stays reachable: coding-agent tool
-        // names come from Anthropic and OpenAI, not from a registry we own, so
-        // a tool added upstream tomorrow has no arm here and never can have one
-        // before it ships. Showing its name beats showing nothing.
+        // Unlike `tool_label`, this fallback stays reachable. Coding-agent tool
+        // names come from the model vendors, not a registry we own. A tool
+        // added upstream tomorrow can have no arm here before it ships, and
+        // showing its name beats showing nothing.
         _ => name.to_string(),
     }
 }

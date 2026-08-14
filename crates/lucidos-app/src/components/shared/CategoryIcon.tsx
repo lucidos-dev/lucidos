@@ -1,3 +1,5 @@
+import { AppsIcon } from './icons';
+
 /**
  * Content-pane category icon — the small glyph that labels a destination by
  * what KIND of content it is (a thread, file, app, trigger, settings page,
@@ -8,6 +10,15 @@
  * Rendered as inline SVG (rather than pulled from icons.tsx) so the set stays
  * small and self-contained; every glyph strokes/fills with `currentColor` so a
  * caller tints the whole set via CSS.
+ *
+ * ONE exception to that inlining, and it is deliberate: `apps` delegates to
+ * `AppsIcon` in icons.tsx. Apps are the only category ALSO marked outside this
+ * set (the message route panel's fallback for an app whose manifest declares no
+ * icon), and a concept with two glyphs diverges on the next tweak. So the apps
+ * mark has one definition and this file reads it, rather than the two agreeing
+ * by hand. `AppsIcon` is authored in the same 16-unit stroke-1.5 box the spread
+ * below applies, so it sits at the family's weight. A future category that
+ * escapes this file the same way takes the same route.
  */
 export function CategoryIcon({ category }: { category: string }) {
   const props = { width: '1rem', height: '1rem', viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round' as const, 'stroke-linejoin': 'round' as const };
@@ -17,7 +28,7 @@ export function CategoryIcon({ category }: { category: string }) {
     case 'files':
       return <svg {...props}><path d="M9 2H5a1.5 1.5 0 0 0-1.5 1.5v9A1.5 1.5 0 0 0 5 14h6a1.5 1.5 0 0 0 1.5-1.5V6z" /><polyline points="9 2 9 6 12.5 6" /></svg>;
     case 'apps':
-      return <svg {...props}><rect x="3" y="3" width="4" height="4" rx="0.5" /><rect x="9" y="3" width="4" height="4" rx="0.5" /><rect x="3" y="9" width="4" height="4" rx="0.5" /><rect x="9" y="9" width="4" height="4" rx="0.5" /></svg>;
+      return <AppsIcon />;
     case 'plugins':
       return <svg {...props}><path d="M6 3.5a1.2 1.2 0 0 1 2.4 0c0 .5.4.8.9.8h1.7a.5.5 0 0 1 .5.5v1.7c0 .5.3.9.8.9a1.2 1.2 0 0 1 0 2.4c-.5 0-.8.4-.8.9v1.9a.5.5 0 0 1-.5.5H9.3c-.5 0-.9-.3-.9-.8a1.2 1.2 0 0 0-2.4 0c0 .5-.4.8-.9.8H3.5a.5.5 0 0 1-.5-.5V9.9c0-.5.3-.9.8-.9a1.2 1.2 0 0 0 0-2.4c-.5 0-.8-.4-.8-.9V4a.5.5 0 0 1 .5-.5h1.6c.5 0 .9-.3.9-.8z" /></svg>;
     case 'triggers':

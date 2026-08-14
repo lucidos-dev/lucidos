@@ -10,13 +10,13 @@
 //!
 //! * **The subscribability gate** (S3), via `validate_awaitable_event_type`.
 //! * **The consecutive-subscription cap** (S8): 10 registrations with no human
-//!   message in between. Catches a thread awaiting an event kind its own wake
-//!   emits, two threads ping-ponging, and a model simply stuck.
+//!   message in between. Catches a thread awaiting an event kind its own
+//!   re-entry emits, two threads ping-ponging, and a model simply stuck.
 //! * **The live-wait cap** (S6b): 25 simultaneous waits per thread. It bounds
-//!   how many separate wakes one burst of events can start on one thread, not
-//!   what a sleeping subscription costs, which is nothing.
+//!   how many separate re-entries one burst of events can start on one thread,
+//!   not what a sleeping subscription costs, which is nothing.
 //! * **The duplicate refusal** (S6b): the same `on` list twice on one thread.
-//!   One event would then produce two wakes.
+//!   One event would then be delivered twice.
 
 use chrono::{Duration, Utc};
 use serde_json::Value;
@@ -38,7 +38,7 @@ pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 
 /// How many waits one thread may hold at once (S6b).
 ///
-/// **It bounds outstanding WAKES, not accumulated watchers.** A sleeping wait
+/// **It bounds outstanding RE-ENTRIES, not accumulated watchers.** A sleeping wait
 /// is not a running anything: it costs one entry in the live cache, one
 /// `EventWaitStarted` row, and one name compare plus a condition eval per
 /// emitted event. What the number actually limits is how many separate turns
@@ -47,7 +47,7 @@ pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 ///
 /// It is NOT the guard against a runaway thread.
 /// [`MAX_CONSECUTIVE_SUBSCRIPTIONS`] is, and that one bounds a *loop*: a thread
-/// waking itself spends a turn per iteration with no human in it. This cap adds
+/// re-opening itself spends a turn per iteration with no human in it. This cap adds
 /// exactly one thing that one does not. The consecutive counter resets on a
 /// human message, so the standing set a thread carries ACROSS many messages is
 /// bounded here and nowhere else.
@@ -99,8 +99,8 @@ pub(crate) const ARMING_LOOKBACK_MAX_REPORTED: usize = 3;
 ///
 /// Both arms carry the tool result the model reads, and in both the turn
 /// carries on: `await_event` registers a subscription and returns, it does not
-/// end the turn. The wake arrives later as its own turn, so nothing is left
-/// dangling here.
+/// end the turn. The delivery arrives later, normally as its own turn, so
+/// nothing is left dangling here.
 pub(crate) enum AwaitEventOutcome {
     /// The wait is registered.
     Registered(String),
@@ -211,7 +211,7 @@ impl LucidosEngine {
     /// **The watermark must be read before whatever state decided the `on`
     /// list.** The catch-up scan is `sequence > watermark`, so any matching
     /// event that landed at or below it is invisible to this wait: it will not
-    /// wake, and the thread sits until the timeout. Reading the watermark
+    /// match, and the thread sits until the timeout. Reading the watermark
     /// afterwards leaves exactly that gap, sized by everything in between.
     ///
     /// `register_event_wait` has no gap to worry about, because the model's
@@ -252,8 +252,8 @@ impl LucidosEngine {
     /// was offered to a cache that did not yet hold this wait. It can therefore
     /// resolve the wait before this call returns, which is fine, and is why the
     /// caller's tool result is written in the future tense without promising
-    /// the thread is still subscribed by the time the model reads it. The wake
-    /// queues behind the current turn either way.
+    /// the thread is still subscribed by the time the model reads it. The
+    /// delivery queues behind the current turn either way.
     pub(super) async fn commit_wait(
         &self,
         wait: &LiveWait,
@@ -303,8 +303,8 @@ impl LucidosEngine {
         if live.iter().any(|w| w.on == on) {
             return Some(format!(
                 "Error: you are already waiting on exactly this ({}). That subscription is \
-                 still live and will wake this thread when it matches, so registering it \
-                 again would wake you twice for one event. Wait for it, or watch something \
+                 still live and will re-open this thread when it matches, so registering it \
+                 again would deliver one event to you twice. Wait for it, or watch something \
                  else.",
                 describe_subscriptions(on),
             ));
@@ -324,9 +324,9 @@ impl LucidosEngine {
         match consecutive_subscriptions(&self.pool, thread_id).await {
             Ok(n) if n >= MAX_CONSECUTIVE_SUBSCRIPTIONS => Some(format!(
                 "Error: this thread has subscribed {n} times in a row with no message from \
-                 the user, which is the limit. Either you are waking yourself, or what you \
-                 are waiting for is not coming. Report where things stand and let the user \
-                 decide."
+                 the user, which is the limit. Either this thread keeps re-opening itself, \
+                 or what you are waiting for is not coming. Report where things stand and \
+                 let the user decide."
             )),
             Ok(_) => None,
             Err(e) => {
@@ -426,16 +426,16 @@ impl LucidosEngine {
 ///
 /// The **arming lookback** leads when there is one, because it is the only part
 /// of this result the model has to act on within this turn: the subscription
-/// watches forward, so a match from before it was armed will never produce a
-/// wake and reading past it is how the 2026-08-06 change went unapplied.
+/// watches forward, so a match from before it was armed will never be delivered
+/// and reading past it is how the 2026-08-06 change went unapplied.
 pub(super) fn registered_tool_result_text(
     wait: &LiveWait,
     lookback: Option<&crate::engine::event_wait::ArmingLookback>,
 ) -> String {
     let subscribed = format!(
         "Subscribed to {}. Nothing is blocking: finish this turn and end your response \
-         normally. You will be woken as a NEW turn when it matches, or told it timed out \
-         at the deadline you set. Do not call await_event again for this.",
+         normally. The match reaches you as a NEW turn, or a timeout notice does at the \
+         deadline you set. Do not call await_event again for this.",
         describe_subscriptions(&wait.on),
     );
     match lookback.filter(|l| !l.is_empty()) {
@@ -449,12 +449,12 @@ pub(super) fn registered_tool_result_text(
 ///
 /// Written as an instruction rather than a fact because the fact alone is what
 /// the model already had and did not act on. It states the trap explicitly:
-/// this subscription will not wake it for these, so a turn that ends here ends
-/// with the event unhandled.
+/// this subscription will not deliver these, so a turn that ends here ends with
+/// the event unhandled.
 fn arming_lookback_notice(found: &crate::engine::event_wait::ArmingLookback) -> String {
     let mut text = String::from(
         "ALREADY HAPPENED, before this subscription existed. Your subscription watches \
-         FORWARD only, so it will NOT wake you for anything below. Decide now, in this \
+         FORWARD only, so it will NOT deliver anything below. Decide now, in this \
          turn: if one of these is what you were waiting for, act on it before you finish. \
          If you already handled it earlier in this turn, ignore it and carry on.\n",
     );
@@ -560,7 +560,7 @@ pub(crate) async fn delivered_event_ids(
 /// The S8 counter, derived from events, with no new state.
 ///
 /// Human specifically: an agent- or engine-authored `MessageReceived` (a child
-/// wake, a trigger fire, an event wake) is exactly the kind of traffic a
+/// callback, a trigger fire, an event delivery) is exactly the kind of traffic a
 /// ping-pong loop generates, so counting it would reset the very counter it
 /// should be tripping.
 ///
@@ -611,13 +611,13 @@ fn parse_subscriptions(args: &Value) -> Result<Vec<EventSubscription>, String> {
     let Some(entries) = args.get("on").and_then(|v| v.as_array()) else {
         return Err(
             "Error: `on` must be an array of {event_type, condition?} objects saying what \
-             to wake on."
+             to watch for."
                 .to_string(),
         );
     };
     if entries.is_empty() {
         return Err(
-            "Error: `on` is empty, so nothing could ever wake you. Name at least one event."
+            "Error: `on` is empty, so nothing could ever match. Name at least one event."
                 .to_string(),
         );
     }
@@ -645,7 +645,7 @@ fn parse_timeout_secs(args: &Value) -> Result<i64, String> {
         return Err(format!(
             "Error: `timeout_secs` is required (1 to {MAX_TIMEOUT_SECS}). There is no \
              unbounded wait: pick an upper bound for the thing you are waiting on and add \
-             margin. You are woken with a timeout if nothing matches."
+             margin. You get a timeout notice if nothing matches."
         ));
     };
     let Some(secs) = raw.as_i64() else {

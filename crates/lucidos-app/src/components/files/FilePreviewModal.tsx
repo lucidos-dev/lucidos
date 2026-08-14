@@ -8,8 +8,9 @@ import { viewportIsMobile } from '../../utils/viewport';
 import { Overlay } from '../shared/Overlay';
 import { CloseIcon } from '../shared/icons';
 import { trapDialogTab } from '../shared/dialogFocusTrap';
-import { FilePreviewInline, basename } from './FilePreviewInline';
+import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
+import { previewFilePath, previewFileName } from '../../utils/previewPath';
 
 type LineRange = { start: number; end: number } | null;
 
@@ -18,14 +19,16 @@ type LineRange = { start: number; end: number } | null;
  *  underneath. A repo locator is named by its repo-relative path, never by the
  *  raw encoding, which would read as uuid soup.
  *
+ *  Both halves come from `utils/previewPath`, the one place a preview locator is
+ *  turned into something displayable, so this modal, the content header's title
+ *  and the preview's own path row all name the same file the same way.
+ *
  *  Pure and exported so the naming is testable without a DOM. */
 export function filePreviewModalTitle(path: string, range: LineRange): { name: string; detail: string } {
-  const repo = parseRepoPath(path);
-  const detail = repo?.path ?? path;
   const lines = range === null
     ? ''
     : range.end > range.start ? `:${range.start}-${range.end}` : `:${range.start}`;
-  return { name: `${basename(detail)}${lines}`, detail };
+  return { name: `${previewFileName(path)}${lines}`, detail: previewFilePath(path) };
 }
 
 /** Which preview renders for a locator: the registered-repository one for a

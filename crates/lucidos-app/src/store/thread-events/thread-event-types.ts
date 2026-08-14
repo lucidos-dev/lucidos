@@ -65,22 +65,24 @@ export type MessageOrigin =
    *  engine-deliberate actions (hardening retrigger, scheduler, merge conflict). */
   | { kind: 'system' };
 
-/** Display label for engine-deliberate work (hardening, merging, scheduler).
- *  Its actor-chip icon is the Lucidos brand mark — the SAME glyph as the
- *  *Lucidos Agent* — resolved in the view layer (`<LucidosGlyph/>` in
- *  `ChatExchange.tsx`), so this store module stays free of UI components. The
- *  label is what distinguishes the two Lucidos actors at a glance. */
+/** The five actor labels below are the WHOLE of what this module says about the
+ *  actor chip. Every chip's glyph is a component and every one of them resolves
+ *  in the view layer, in `actorInitiator` / `describeExecutor`
+ *  (`ChatExchange.tsx`), so this store module stays free of UI components. Two
+ *  of the five used to break that rule as bare emoji string constants
+ *  (`SYSTEM_ICON`, `API_CALLER_ICON`), which read as store data only because a
+ *  string is not a component; both are gone and their reasoning now lives on the
+ *  icons themselves in `components/shared/icons.tsx`. Do not add a `*_ICON` here.
+ *
+ *  Display label for engine-deliberate work (hardening, merging, scheduler). Its
+ *  chip icon is the Lucidos brand mark, the SAME glyph as the *Lucidos Agent*,
+ *  so the label is what distinguishes the two Lucidos actors at a glance. */
 export const ENGINE_LABEL = 'Lucidos Engine';
 
 /** Display label for process killed by the host system (engine shutdown,
  *  safety-net catch, OS signal). Distinct from `ENGINE_LABEL`: the engine
  *  acts deliberately; the system just kills processes. */
 export const SYSTEM_LABEL = 'System';
-
-/** Icon paired with `SYSTEM_LABEL` — the ⚙ gear, reserved for the host system
- *  killing a process (shutdown, OS signal, crash). Distinct from the Lucidos
- *  brand mark used for engine-deliberate work. */
-export const SYSTEM_ICON = '⚙';
 
 /** Display label for work kicked off by a Lucidos LLM agent in another thread
  *  (parent_thread origin) — distinct from the engine, which only owns events
@@ -93,11 +95,6 @@ export const LUCIDOS_AGENT_LABEL = 'Lucidos Agent';
  *  says "API caller" so the user never sees an anonymous mutation rendered as
  *  "You". */
 export const API_CALLER_LABEL = 'API caller';
-
-/** Icon paired with `API_CALLER_LABEL` — plug signals "external integration
- *  plugging into the API", deliberately distinct from the 👤 person icon
- *  reserved for `kind: device` (the only origin that is unambiguously "You"). */
-export const API_CALLER_ICON = '🔌';
 
 /** Derive the ActorMode from a MessageOrigin. Mirrors the Rust
  *  `MessageOrigin::mode()` impl: device is intrinsic Human, engine and system
@@ -138,6 +135,36 @@ export type AbortCause =
   | 'session_dropped'
   | 'unknown';
 
+/** True when the abort is the engine's OWN teardown, whoever asked for it.
+ *
+ *  One of the two halves of the switch fingerprint below, and the one that says
+ *  the PROCESS is going down. It is a different claim from the other half (a
+ *  device actor, i.e. a user asked), and it licenses different things:
+ *
+ *  - **This one** says nothing can be running under the boundary, because there
+ *    is no engine left to run it. That is what the transcript's "is this turn
+ *    live" readings need (`abortTookEngineDown` in `exchange-render.ts`).
+ *  - **Both together** say the engine PROMISED to bring the turn back, which is
+ *    what the `paused` verdict, the "Paused by restart" wording, the withheld
+ *    Continue button and the auto-resume need.
+ *
+ *  Separated on 2026-08-13, because both live-ness readings were keyed on the
+ *  full fingerprint and so only ever applied to an attributed switch. An
+ *  UNATTRIBUTED shutdown (a terminal `stop.sh`, an external SIGUSR1, ctrl-c:
+ *  each leaves `LucidosEngine::teardown_actor` `None`) produces the identical
+ *  boundary and the identical drain, and kept the shimmering "Working" header
+ *  plus a derived live "Thinking" row over a subprocess that no longer existed.
+ *  Real thread b146c294: the abort at 12:29:27.801, its drain `"\n\n"` 12ms
+ *  later, then 24 seconds of "Thinking" while the engine was down.
+ *
+ *  Deliberately NOT "is this an abort at all". A `safety_net` abort fires on a
+ *  turn the watchdog only THOUGHT was stuck, the loop keeps going, and real work
+ *  lands under that boundary (real thread ebc787a4). Only a shutdown takes the
+ *  engine with it. */
+export function isEngineDownAbort(cause: AbortCause | undefined): boolean {
+  return cause === 'engine_shutdown';
+}
+
 /** True for the teardown boundary of a user-initiated *Switch to new version*:
  *  an `engine_shutdown` abort stamped with the device that clicked Switch.
  *
@@ -154,12 +181,14 @@ export type AbortCause =
  *  button exposed a stuck row (Stop / Apply / Discard / Archive / Interrupt).
  *  Nor is `engine_shutdown` alone: the shutdown fallback for a thread that
  *  started after the restart pre-emit carries a system actor, and no resume gate
- *  picks that up. */
+ *  picks that up. Built ON the cause half above rather than re-spelling it, so
+ *  "the engine went down" cannot come to mean two things; what this adds is the
+ *  actor. */
 export function isSwitchTeardownAbort(
   actor: MessageOrigin | undefined,
   cause: AbortCause | undefined,
 ): boolean {
-  return cause === 'engine_shutdown' && actor?.kind === 'device';
+  return isEngineDownAbort(cause) && actor?.kind === 'device';
 }
 
 /** Summary text for a `ResponseAborted` event. `stale_settle` (engine cleanup
@@ -354,6 +383,13 @@ export type ThreadEvent =
       /** Stamped by the snapshot endpoint when `sections` + `tools` were dropped. */
       sections_stripped?: boolean;
     }
+  // The engine's automatic pre-turn recall: it vector-searched memory with
+  // classifier-derived `queries` and injected the hits before the model ran.
+  // NOT the agent's own lookup, which arrives as a ToolCalled for the `memory`
+  // tool's `search` action. MemorySearched is the pre-rename name; old DB rows
+  // still surface it, and the snapshot endpoint serves the raw `event_type`
+  // column, so the serde alias on the Rust variant never reaches us.
+  | { type: 'MemoryRecalled'; results?: number; queries?: string[] }
   | { type: 'MemorySearched'; results?: number; queries?: string[] }
   | { type: 'ToolCalled'; name: string; args: unknown; description?: string }
   | {
@@ -437,14 +473,14 @@ export type ThreadEvent =
   // Both survive restart so startup cleanup can find dangling worktrees.
   | { type: 'MergeResolutionStarted'; change_id?: string; worktree_path?: string; temp_branch?: string }
   | { type: 'MergeResolutionCleared'; change_id?: string }
-  /** `delivered_event_id` is set ONLY on a detached event-wake anchor: the id
-   *  of the `EventWaitDelivered` this injection is the wake for. `text` spells
+  /** `delivered_event_id` is set ONLY on an event-delivery anchor: the id of
+   *  the `EventWaitDelivered` this injection carries. `text` spells
    *  the matched event out as pretty-printed JSON because it is the prompt the
    *  model reads, so rendering it verbatim gives the user a screen of raw JSON.
    *  Follow the id to that event instead and render its `event_type` /
    *  `payload` as a named event with the payload folded away. Absent on every
-   *  other injection, on an expiry wake, and on rows that pre-date the field,
-   *  where the prose IS the content. */
+   *  other injection, on an expiry re-entry, and on rows that pre-date the
+   *  field, where the prose IS the content. */
   | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string; delivered_event_id?: string }
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
@@ -501,11 +537,11 @@ export type ThreadEvent =
   // can pattern-match without `as` casts when the SSE stream delivers one.
   | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string }
   // ── Event-wait lifecycle ──────────────────────────────────────────────
-  // The thread subscribed to an event and parked; the engine wakes it on a
+  // The thread subscribed to an event and parked; the engine re-enters it on a
   // match, the deadline, or a user cancel. These DO render. `EventWaitStarted`
-  // becomes an *event row* in the transcript (the marker it shares with a wake,
-  // a child callback and a trigger fire), never an exchange divider, because
-  // the wake resumes the SAME exchange. A delivery and an expiry
+  // becomes an *event row* in the transcript (the marker it shares with a
+  // delivery, a child callback and a trigger fire), never an exchange divider,
+  // because the delivery resumes the SAME exchange. A delivery and an expiry
   // resolve that row in place by `wait_id`, adding the outcome to the same
   // subject line. A cancel never touches it: see the `EventWaitCanceled` note
   // below. They also feed `meta.liveEventWaits`, which backs the always-visible
@@ -550,6 +586,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ContextTokensMeasured: true,
   ContextAssembled: true,
   ContextCaptured: true,
+  MemoryRecalled: true,
   MemorySearched: true,
   ToolCalled: true,
   ToolResult: true,

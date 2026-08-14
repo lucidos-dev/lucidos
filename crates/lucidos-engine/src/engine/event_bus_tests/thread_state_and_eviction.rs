@@ -408,7 +408,7 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     teardown_test_db(&db_name).await;
 }
 
-/// Regression: a chat thread woken from `ChildThreadCompleted` (parent reacting
+/// Regression: a chat thread re-entered from `ChildThreadCompleted` (parent reacting
 /// to a child's finish) carries the CTC's id as `request_event_id` on every
 /// event in that turn. The eviction/restart abort must stamp the same CTC id,
 /// not the most recent `MessageReceived` from a previous turn. Without this,
@@ -453,7 +453,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     .unwrap();
 
     // Close out the old turn so the in-flight "thing being killed" is the CTC
-    // wake, not the MR. Without this the test would be ambiguous about which
+    // re-entry, not the MR. Without this the test would be ambiguous about which
     // originating event the eviction should pick.
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -472,7 +472,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     .await
     .unwrap();
 
-    // ChildThreadCompleted — the parent woke from a finished child. This is
+    // ChildThreadCompleted: the parent re-entered from a finished child. This is
     // the originating event of the now-in-flight turn that the eviction is
     // about to abort. Every event the chat agent emits in this turn carries
     // `request_event_id = ctc_id`.
@@ -533,9 +533,9 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     teardown_test_db(&db_name).await;
 }
 
-/// Sibling structural assertion for the CC branch — CC parents woken from a
+/// Sibling structural assertion for the CC branch. CC parents re-entered from a
 /// finished child carry `ChildThreadCompleted` as their turn's originating
-/// event (the `AgentUserInput { kind: WakeFromChild, origin_event_id: ctc_id }`
+/// event (the `AgentUserInput { kind: ReentryFromEngine, origin_event_id: ctc_id }`
 /// flows into `run_session`'s `EventMeta::request_event_id`). The eviction
 /// CC branch and the post-restart recovery use `CC_ORIGINATING_EVENT_TYPES`
 /// — verifying the constant covers CTC keeps the CC-side mirror of the
@@ -548,11 +548,11 @@ fn originating_event_type_lists_include_child_thread_completed() {
     assert!(
         CHAT_ORIGINATING_EVENT_TYPES.contains(&"ChildThreadCompleted"),
         "chat list missing CTC — restart/eviction/Continue would route aborts \
-         to the wrong exchange for child-wake turns"
+         to the wrong exchange for child re-entry turns"
     );
     assert!(
         CC_ORIGINATING_EVENT_TYPES.contains(&"ChildThreadCompleted"),
-        "CC list missing CTC — same bug as the chat case for CC parents woken \
+        "CC list missing CTC, same bug as the chat case for CC parents re-entered \
          from a finished child via notify_parent_of_child_completion"
     );
     assert!(

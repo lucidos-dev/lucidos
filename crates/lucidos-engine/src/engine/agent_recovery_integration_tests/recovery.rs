@@ -1032,7 +1032,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     // the device that clicked switch, inherited from the abort it withdraws,
     // because the restart it is reporting was that person's. Hardcoding
     // `system` here is what made a user's own *Switch to new version* come back
-    // as "⚙ System / Response interrupted" over a red thread, and it is the
+    // as "System / Response interrupted" over a red thread, and it is the
     // fourth site of that bug rather than the first: see
     // `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`
     // for the three teardown emits swept two days after this floor was written.
@@ -1328,7 +1328,7 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
 /// `completed_change_branches`, `SELECT DISTINCT branch_name FROM changes WHERE
 /// status IN ('applied','discarded')`, which had held that branch since 16:55.
 /// No resume was actuated, `settle_unresumed_switch_threads` withdrew the
-/// promise, and "Paused by restart" became "⚙ System / Response interrupted"
+/// promise, and "Paused by restart" became "System / Response interrupted"
 /// over a `failed` thread, reading to the user as a crash they had not caused.
 ///
 /// So the assertions are deliberately spread across all three reads the resume

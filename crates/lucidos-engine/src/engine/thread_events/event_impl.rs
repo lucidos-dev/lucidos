@@ -108,7 +108,7 @@ impl ThreadEvent {
             Self::TextStreamed { .. } => "TextStreamed",
             Self::ThoughtStreamed { .. } => "ThoughtStreamed",
             Self::ContextCaptured { .. } => "ContextCaptured",
-            Self::MemorySearched { .. } => "MemorySearched",
+            Self::MemoryRecalled { .. } => "MemoryRecalled",
             Self::ToolCalled { .. } => "ToolCalled",
             Self::ToolResult { .. } => "ToolResult",
             Self::TodoListWritten { .. } => "TodoListWritten",

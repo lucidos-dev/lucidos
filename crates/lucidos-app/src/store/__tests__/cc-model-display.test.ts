@@ -257,6 +257,57 @@ describe('exchangeReasoningEffort', () => {
   });
 });
 
+/** A trigger fire is a chat turn whose starter event is `TriggerStarted` rather
+ *  than `MessageReceived`: the fire resolves a model and an effort exactly like
+ *  a typed message does, and the engine stamps both on that event. Reading only
+ *  `MessageReceived` left the Executor popover with no Model and no Effort row
+ *  for the whole run, which is what the user reported. */
+describe('starter-event fallback on a trigger exchange', () => {
+  const FIRING: [number, StoredEvent][] = [
+    [1, {
+      type: 'TriggerStarted',
+      trigger_id: 'trg-1',
+      trigger_name: 'Email triage',
+      model: 'claude-opus-5',
+      reasoning_effort: 'high',
+      created: '2026-01-01T00:00:01Z',
+    }],
+    [2, { type: 'ToolCalled', name: 'load_knowhow', args: {}, created: '2026-01-01T00:00:02Z' }],
+    [3, { type: 'ToolResult', name: 'load_knowhow', result: 'ok', created: '2026-01-01T00:00:03Z' }],
+  ];
+
+  it('shows the fire\'s model and effort while the response is still streaming', () => {
+    const exchanges = groupIntoExchanges(eventsMap(FIRING));
+    expect(exchanges).toHaveLength(1);
+    expect(exchangeResponseModel(exchanges[0])).toBe('claude-opus-5');
+    expect(exchangeReasoningEffort(exchanges[0])).toBe('high');
+  });
+
+  it('prefers ResponseGenerated once the turn ends', () => {
+    const exchanges = groupIntoExchanges(eventsMap([
+      ...FIRING,
+      [4, {
+        type: 'ResponseGenerated',
+        text: 'triaged',
+        model: 'claude-sonnet-5',
+        reasoning_effort: 'medium',
+        created: '2026-01-01T00:00:04Z',
+      }],
+    ]));
+    expect(exchangeResponseModel(exchanges[0])).toBe('claude-sonnet-5');
+    expect(exchangeReasoningEffort(exchanges[0])).toBe('medium');
+  });
+
+  it('stays undefined on a legacy TriggerStarted that recorded neither', () => {
+    const exchanges = groupIntoExchanges(eventsMap([
+      [1, { type: 'TriggerStarted', trigger_id: 'trg-1', created: '2026-01-01T00:00:01Z' }],
+      [2, { type: 'ToolCalled', name: 'load_knowhow', args: {}, created: '2026-01-01T00:00:02Z' }],
+    ]));
+    expect(exchangeResponseModel(exchanges[0])).toBeUndefined();
+    expect(exchangeReasoningEffort(exchanges[0])).toBeUndefined();
+  });
+});
+
 describe('displayReasoningEffort', () => {
   it('maps known effort values to labels', () => {
     expect(displayReasoningEffort('none')).toBe('Off');

@@ -247,7 +247,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         }
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
-        "TextStreamed" | "ThoughtStreamed" | "MemorySearched" => EventClass::Activity,
+        "TextStreamed" | "ThoughtStreamed" | "MemoryRecalled" => EventClass::Activity,
         "ContextCaptured" => EventClass::Metadata,
         "ToolCalled" | "ToolResult" => EventClass::Activity,
         // Mid-turn snapshot of the Lucidos Agent's todo list — replace-whole-list
@@ -350,7 +350,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "TextStreamed",
         "ThoughtStreamed",
         "ContextCaptured",
-        "MemorySearched",
+        "MemoryRecalled",
         "ToolCalled",
         "ToolResult",
         "TodoListWritten",
@@ -585,7 +585,7 @@ pub fn resolve_transition(
         | "TextStreamed"
         | "ThoughtStreamed"
         | "ContextCaptured"
-        | "MemorySearched"
+        | "MemoryRecalled"
         | "ToolCalled"
         | "ToolResult"
         // Lucidos Agent todo list snapshot — legal on both Chat and CC
@@ -943,14 +943,15 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     // dispatcher emits one.
     "ContinuationRequested",
     // Step events (keep timestamp current during long agentic responses).
-    // Canonical names only — this constant is consulted via the
-    // deserialized variant (alias collapses legacy "Thinking" rows to
-    // ThoughtStreamed before the lookup).
+    // Canonical names only: this constant is consulted via the deserialized
+    // variant, so the serde aliases have already collapsed legacy rows
+    // ("Thinking" to ThoughtStreamed, "MemorySearched" to MemoryRecalled)
+    // before the lookup.
     "ToolCalled",
     "ToolResult",
     "TextStreamed",
     "ThoughtStreamed",
-    "MemorySearched",
+    "MemoryRecalled",
     "CodingAgentTextStreamed",
     "CodingAgentThoughtStreamed",
     "CodingAgentToolCalled",
@@ -1292,7 +1293,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         (
-            "MemorySearched",
+            "MemoryRecalled",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,

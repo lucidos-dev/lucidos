@@ -46,6 +46,27 @@ subprocess.run(['lucidos', 'data', 'write', 'artifacts/foo.json'],
 lucidos data write artifacts/report.html --from /tmp/report.html
 ```
 
+## Writing an HTML artifact: paste the type scale, never recall it
+
+A mockup, report or dashboard under `artifacts/` is a **standalone document**. It links no Lucidos stylesheet, so it has no tokens unless you write them, and no body default unless you write that too. Every such file written from memory so far has come out **one full step too large**, because a reconstructed "sensible scale" is calibrated to a 16px body and Lucidos is not: **`1rem` is `--font-size-xl`, a section heading. Body is `0.8125rem`.**
+
+Paste this into `:root` and use only these steps. Values are the ten in `crates/lucidos-app/src/styles/global/base.css`; if you are in the Lucidos repo, read them from there instead of trusting this copy.
+
+```css
+:root {
+  --font-size-3xs: 0.5625rem;  --font-size-2xs: 0.625rem;
+  --font-size-xs: 0.6875rem;   --font-size-sm: 0.75rem;
+  --font-size-md: 0.8125rem;   /* BODY */
+  --font-size-lg: 0.875rem;    --font-size-xl: 1rem;      /* heading */
+  --font-size-2xl: 1.125rem;   --font-size-3xl: 1.25rem;
+  --font-size-display: 2.25rem;
+}
+body { font-size: var(--font-size-md); line-height: 1.5; }
+input, textarea, select, button { font-family: inherit; font-size: inherit; }
+```
+
+Do **not** hardcode a scale percentage on `html` (`html { font-size: 125% }`): that bakes one device's UI-scale preference into a file the user opens on several. Size in `rem` and leave the root alone. Every `font-size` reads a step: no `0.9375rem`, no `1.05rem`, no `0.8rem`. Fuller version, including why the control line is needed, in `system-knowhow/best-practices.md` § Standalone HTML.
+
 ## Subcommands
 
 ### `lucidos data path <relative> [--mkdir]`

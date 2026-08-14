@@ -229,6 +229,27 @@
     gap: 0.5rem;
 }
 
+/* The progress dialog reuses .confirm-dialog's box, so only its own parts are
+   declared here. It narrates an operation that takes the workspace away, so
+   there is nothing to lay out beside the message except the readout. */
+.progress-dialog-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+.progress-dialog-bar {
+    /* Full width of the dialog: the bar IS the readout, unlike the toast's,
+       which shares its row with a message and a close button. */
+    width: 100%;
+}
+
+/* The indeterminate case. Centred rather than leading the message, because with
+   no percentage to read there is nothing for the eye to track along a line. */
+.progress-dialog-spinner {
+    align-self: center;
+}
+
 .confirm-actions-right {
     display: flex;
     gap: 0.5rem;
@@ -689,6 +710,118 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     --spinner-color: var(--toast-accent);
 }
 
+/* ─── Toast placement shapes (TEMPORARY: a comparison, see
+   docs/temporary-measures.md) ───
+
+   Four shapes, one of which survives. The pane columns above are the
+   `data-toast-placement="pane"` case and need no rule of their own, since they
+   are what the base CSS already draws. The other three are all ONE column, so
+   `toastLayout` answers `single` for them and only geometry differs here.
+
+   The problem the bleed shapes solve: a card narrower than the viewport sits ON
+   the pane divider, with the seam visible above and below it. A bar that runs
+   edge to edge COVERS the divider for its whole width instead, so the seam
+   emerges below the stack and reads as layering. */
+
+/* All three cross-pane shapes share one column spanning the container, so they
+   opt OUT of the desktop rule that absolutely positions a column over its pane.
+   Without this the lone column would shrink-wrap at the viewport's left edge
+   there, since it carries no [data-toast-pane] and so picks up no left/width.
+   Stated outside the media query because static is already the mobile value. */
+.toast-container[data-toast-placement="bottom-right"] .toast-column,
+.toast-container[data-toast-placement="top-bleed"] .toast-column,
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column,
+.toast-container[data-toast-placement="card"] .toast-column {
+    position: static;
+}
+
+/* Both bleed shapes: the bar IS the full width, so the side insets, the width
+   cap, the side borders and the corner radius all go. The bars butt against
+   each other with no gap, so a burst reads as one band rather than a scatter of
+   cards. Safe-area insets stay on the container, since a notch or a rounded
+   corner still eats the edge a full-bleed bar runs to. */
+.toast-container[data-toast-placement="top-bleed"],
+.toast-container[data-toast-placement="bottom-bleed"] {
+    left: env(safe-area-inset-left, 0px);
+    right: env(safe-area-inset-right, 0px);
+}
+
+.toast-container[data-toast-placement="top-bleed"] .toast-column,
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
+    gap: 0;
+}
+
+.toast-container[data-toast-placement="top-bleed"] .toast,
+.toast-container[data-toast-placement="bottom-bleed"] .toast {
+    width: 100%;
+    max-width: none;
+    border-radius: 0;
+    border-left-width: 0;
+    border-right-width: 0;
+}
+
+/* Bottom: anchored to the bottom edge instead of below the header, with the
+   column reversed so the newest bar is nearest the edge it enters from. The
+   thread pane's composer is bottom-docked on both layouts, so this shape sits
+   over the prompt input, which is exactly what the comparison is for. */
+.toast-container[data-toast-placement="bottom-bleed"] {
+    top: auto;
+    bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
+    flex-direction: column-reverse;
+}
+
+/* Card needs nothing beyond the static column above: the base .toast-column
+   already centres, and .toast keeps its 30rem cap. That IS the shape the
+   per-pane columns replaced, kept here so the comparison has its baseline. */
+
+/* Bottom-right corner, the spot VS Code and IntelliJ both default to. Anchored
+   to the WINDOW, not to a pane, so it holds still through a divider drag and
+   never meets the seam, because it never goes near the middle.
+
+   DESKTOP ONLY. On a phone the corner IS the full width and would land on the
+   composer, with the keyboard over it the moment the user types. So mobile
+   keeps the base top placement. That breakpoint split is what Material and
+   Carbon both call for, rather than an inconsistency between the two. */
+@media (min-width: 769px) {
+    .toast-container[data-toast-placement="bottom-right"] {
+        top: auto;
+        left: auto;
+        bottom: max(1rem, env(safe-area-inset-bottom, 0px));
+        right: max(1rem, env(safe-area-inset-right, 0px));
+        /* The container IS the toast's width here, so .toast fills it below.
+           Sizing the box rather than the toast is what puts the toast's right
+           edge exactly on the inset above. */
+        width: min(30rem, calc(100vw - 2rem));
+    }
+
+    /* Newest nearest the corner it enters from, so the stack grows upward and
+       the toast the user just caused is the one under their eye. */
+    .toast-container[data-toast-placement="bottom-right"] .toast-column {
+        flex-direction: column-reverse;
+    }
+
+    .toast-container[data-toast-placement="bottom-right"] .toast {
+        width: 100%;
+    }
+}
+
+/* A bottom-anchored stack has to rise INTO place: the shared `toast-in` drops
+   from above, which reads as the toast falling out of the stack it is joining.
+   Only the direction changes, so the duration and easing stay shared, and the
+   inline duration Toast.tsx sets for the animation-speed slider still lands. */
+@keyframes toast-in-up {
+    from { opacity: 0; transform: translateY(0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-container[data-toast-placement="bottom-right"] .toast,
+.toast-container[data-toast-placement="bottom-bleed"] .toast {
+    animation-name: toast-in-up;
+}
+
 @keyframes toast-in {
     from { opacity: 0; transform: translateY(-0.5rem); }
     to { opacity: 1; transform: translateY(0); }
@@ -856,6 +989,24 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* The changed-files list (ChangesFileList) renders each file's whole PATH where
+   the tree renders a bare name, and a path is what an ellipsis destroys:
+   `system-knowhow/thread-even…` and `system-knowhow/workspace-aud…` are the same
+   string right up to the cut, so the list stops telling its rows apart at
+   exactly the width a phone gives it. It wraps onto as many lines as it needs
+   instead. Modifies `.file-name` rather than replacing it, so the row keeps one
+   name box; it must therefore stay BELOW that rule, which it overrides at equal
+   specificity.
+
+   `anywhere` rather than `break-word`, deliberately: only `anywhere` also
+   shrinks the box's min-content width, which is what lets flexbox take the
+   width out of the path instead of squeezing the diffstat and the change badge
+   beside it. */
+.file-path {
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 /* Image thumbnails - clickable to show full size */

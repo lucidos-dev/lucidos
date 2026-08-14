@@ -136,21 +136,6 @@ fn uses_responses_api(model: &str) -> bool {
     model.contains("codex") || model.starts_with("gpt-5")
 }
 
-/// Map the unified `reasoning_effort` string to OpenAI's vocabulary, per model.
-/// GPT-5.6+ (Sol / Terra / Luna) accepts a distinct `"max"` reasoning effort
-/// (Sol's headline "Max reasoning effort"), so `max` passes through unchanged
-/// for those. Earlier OpenAI models top out at `"xhigh"`, so `"max" → "xhigh"`
-/// there to avoid sending an unsupported value. Every other value (`low`,
-/// `medium`, `high`, …) passes through unchanged for every model. Centralised so
-/// the Chat Completions builder and the Responses builder cannot drift.
-fn openai_reasoning_effort<'a>(effort: &'a str, model: &str) -> &'a str {
-    if effort == "max" && !model.starts_with("gpt-5.6") {
-        "xhigh"
-    } else {
-        effort
-    }
-}
-
 pub struct OpenAiProvider {
     api_key: String,
     model: String,
@@ -441,24 +426,6 @@ impl LlmProvider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// GPT-5.6 (Sol / Terra / Luna) accepts a distinct `max` reasoning effort,
-    /// so `max` passes through unchanged; earlier OpenAI models map `max` →
-    /// `xhigh`. Every other effort value passes through for every model.
-    #[test]
-    fn reasoning_effort_max_passthrough_for_gpt_5_6_only() {
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.6-sol"), "max");
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.6-terra"), "max");
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.6-luna"), "max");
-        // Alias id (routes to Sol) also carries the passthrough.
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.6"), "max");
-        // Pre-5.6 models keep the max → xhigh guard.
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.5-pro"), "xhigh");
-        assert_eq!(openai_reasoning_effort("max", "gpt-5.4"), "xhigh");
-        // Non-max efforts are untouched regardless of model.
-        assert_eq!(openai_reasoning_effort("high", "gpt-5.6-sol"), "high");
-        assert_eq!(openai_reasoning_effort("xhigh", "gpt-5.4"), "xhigh");
-    }
 
     /// Above-u32 token counts must clamp rather than panic — a single
     /// corrupt upstream usage block shouldn't tank the stream.

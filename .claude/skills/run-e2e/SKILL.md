@@ -42,26 +42,50 @@ it exists to replace.
    in `lucidos-engine` via `--features real-embedder-tests` (downloads
    ~465 MB from huggingface.co on first run; cached after).
 
-## Iteration tip — never block on long e2e commands
+## Iteration tip: background the run, and send its output to a log file
 
-Do NOT block on long e2e commands with `sleep + tail`. Spawn them with
-the Bash tool's `run_in_background: true` and poll with `TaskOutput`.
-That's per-session, doesn't time out at 10 minutes, and lets you keep
-working while the suite runs.
+Do NOT block on long e2e commands with `sleep + tail`. A fixed sleep ignores an
+early exit, so it wastes whatever time the suite finished ahead of your guess.
+Spawn them with the Bash tool's `run_in_background: true` and wait with
+`TaskOutput`, which is per-session and returns the instant the task exits.
 
-## Polling long-running tasks — `<retrieval_status>timeout</retrieval_status>` is NOT failure
+Redirect the output at spawn time, into the worktree's own gitignored
+`.lucidos/` rather than a shared `/tmp` name another session could truncate:
 
-When polling a still-running task with `TaskOutput`,
+```
+mkdir -p .lucidos && ./scripts/e2e.sh > .lucidos/e2e.log 2>&1
+```
+
+**`TaskOutput` is not a delta.** Every call replays the task's ENTIRE
+accumulated output, not just what arrived since your last call, so an
+un-redirected e2e run pours its whole log into your context on every single
+wait. With the output in a file the task itself stays quiet, each wait costs
+almost nothing, and you read exactly what you want:
+
+```
+tail -40 .lucidos/e2e.log
+grep -nE "passed|failed|Error|✘" .lucidos/e2e.log | tail -20
+```
+
+The suite's exit code still comes back on the `TaskOutput` result, so
+redirecting costs you nothing you were using. If you already launched a run
+without redirecting, don't re-call `TaskOutput` to inspect it: the Bash result
+printed the file the output is being written to, and `tail`-ing that path is
+bounded where `TaskOutput` is not.
+
+## Waiting on long-running tasks: `<retrieval_status>timeout</retrieval_status>` is NOT failure
+
 `<retrieval_status>timeout</retrieval_status>` paired with `<status>running</status>`
-means "no new output within the retrieval window" — the underlying task is
-fine. Don't tear it down, restart it, or tight-loop re-poll: each immediate
-re-poll burns a turn for nothing. Pass a longer retrieval `timeout`
-(30000–60000 ms) AND wait at least 30s before re-polling. The canonical
-slow case is the e2e workspace probe — `ensure_workspace_running` in
-`scripts/lib/e2e.sh` printing "Starting e2e workspace (LUCIDOS_MODEL=mock)...
-Probing" while it builds and boots the engine. The first build can take several
-minutes before the probe responds; full `cargo build` behaves the same way.
-(The e2e scripts boot that workspace themselves — never pre-start it with
+means the task did not finish inside that retrieval window. The task is fine.
+Don't tear it down, restart it, or tight-loop re-poll: each immediate re-poll
+burns a round-trip for nothing. Wait with `block: true` and `timeout: 600000`
+and re-issue that call until the task is done, rather than ticking on a short
+interval. The canonical slow case is the e2e workspace probe:
+`ensure_workspace_running` in `scripts/lib/e2e.sh` printing "Starting e2e
+workspace (LUCIDOS_MODEL=mock)... Probing" while it builds and boots the engine.
+The first build can take several minutes before the probe responds; full
+`cargo build` behaves the same way.
+(The e2e scripts boot that workspace themselves: never pre-start it with
 `web-dev.sh`, which launches the machine-global gateway and is refused from a
 coding-agent worktree. See ADR 0021.)
 

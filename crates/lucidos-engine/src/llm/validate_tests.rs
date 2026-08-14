@@ -237,11 +237,11 @@ fn missing_tool_result_when_next_user_is_text_gets_stub() {
     );
 }
 
-/// Mid-flight `WakeFromChild` injection (or any other `MessageContent::Text`
+/// Mid-flight `ReentryFromEngine` injection (or any other `MessageContent::Text`
 /// user message) lands AFTER tool_use+tool_result, then on the next loop the
 /// LLM emits a new tool_use whose result the next iteration provides. But if
 /// trim later removes that user(tool_result), the orphan tool_use ends up
-/// followed by the WakeFromChild Text message — exactly the bug shape.
+/// followed by the ReentryFromEngine Text message, which is exactly the bug shape.
 #[test]
 fn missing_tool_result_when_next_user_text_preserves_other_blocks() {
     // assistant has TWO tool_use blocks; next user has Text only — both stubs

@@ -179,7 +179,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join(REPO_MARKER), "#!/bin/bash\n").unwrap();
-        let exe = dir.join("target/debug/launch/plain/lucidos-gateway");
+        // The published launch dir (ADR 0022) lives OUTSIDE `target/`, so the
+        // ancestor walk must not be anchored on it. Keep in step with the
+        // engine's `paths::repo_root_above_is_independent_of_binary_depth`.
+        let exe = dir.join(".launch/debug/plain/lucidos-gateway");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
 
         assert_eq!(repo_root_above(&exe).as_deref(), Some(dir.as_path()));

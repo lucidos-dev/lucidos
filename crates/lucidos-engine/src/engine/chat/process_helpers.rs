@@ -382,9 +382,9 @@ pub(super) const REDIRECT_INTERRUPT_MAX_WAIT: Duration = Duration::from_secs(30)
 ///   is picked up immediately on either backend, so there is nothing to
 ///   interrupt and urgency does not manufacture a turn to stop.
 /// - `is_user_message`: the input is a genuine user follow-up, not an
-///   engine-internal child-wake (`AgentInputKind::WakeFromChild`). Child-wakes
-///   never redirect, urgent or not: they resume a thread that is waiting on a
-///   child.
+///   engine-internal re-entry (`AgentInputKind::ReentryFromEngine`). An engine
+///   re-entry never redirects, urgent or not: it resumes a thread that is
+///   waiting on something.
 /// - `urgent`: the caller marked the follow-up as one the child must act on
 ///   now, accepting that its current turn ends. See `FollowUpDelivery`.
 pub(super) fn should_redirect_followup(

@@ -14,7 +14,7 @@ const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
  *
  * An abort / cancel boundary is a statement about the turn that ENDED, not a
  * promise that nothing follows it. Work can legitimately land under one, and
- * the sharpest case is an event-wait wake: its anchor (a `UserPromptInjected`
+ * the sharpest case is an event delivery: its anchor (a `UserPromptInjected`
  * written beside the resolution) is routed by `request_event_id`, and when no
  * exchange owns that id the fold drops its whole turn into whichever boundary
  * is current. If that boundary is an abort, the turn lives there as steps.

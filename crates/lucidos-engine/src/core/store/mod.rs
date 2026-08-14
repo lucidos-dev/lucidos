@@ -19,6 +19,27 @@ pub use threads::{
 pub use types::*;
 use uuid::Uuid;
 
+/// User-facing step label for a `ThreadEvent::MemoryRecalled`.
+///
+/// Deliberately verb-first and free of the word "search". The `memory` tool's
+/// own step reads "Searching memory for ...", and until 2026-08-12 this one
+/// read "Memory searched", so the engine's automatic pre-turn recall and the
+/// agent's deliberate mid-turn lookup sat one word apart in the same step list
+/// and read as the same thing happening twice.
+///
+/// Two Rust callers (conversation time-travel, the messages projection) plus
+/// the frontend renderer in
+/// `crates/lucidos-app/src/store/thread-events/exchange-render.ts` all build
+/// this text. The Rust pair share this function; the frontend is pinned to the
+/// same strings by its own tests. Change one, change all three.
+pub(crate) fn memory_recalled_label(results: u64) -> String {
+    match results {
+        0 => "No memories recalled".to_string(),
+        1 => "Recalled 1 memory".to_string(),
+        n => format!("Recalled {} memories", n),
+    }
+}
+
 /// Escape SQL LIKE / ILIKE metacharacters so user-typed `\` `%` `_` match
 /// literally. Backslash is escaped first because it's the ESCAPE character
 /// — escaping it later would double-escape the inserted backslashes from

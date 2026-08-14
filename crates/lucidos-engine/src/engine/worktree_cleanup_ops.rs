@@ -11,7 +11,7 @@ use super::*;
 /// and the padded form would never match.
 pub(crate) fn parse_thread_short(dir_name: &str) -> Option<String> {
     let stripped = dir_name.strip_prefix("thread-")?;
-    if stripped.len() != THREAD_WORKTREE_ID_LEN {
+    if stripped.len() != SHORT_THREAD_ID_LEN {
         return None;
     }
     if !stripped.chars().all(|c| c.is_ascii_hexdigit()) {

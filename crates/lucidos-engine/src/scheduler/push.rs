@@ -12,56 +12,34 @@ use super::push_test_log;
 use crate::api::presence_pong::PresencePong;
 use crate::api::SharedEngine;
 
-/// Spec §3 — engine waits this long for pongs before deciding push.
+/// Spec §3: the engine waits this long for pongs before deciding push.
 ///
-/// Sized for an iOS PWA reaching the engine over cellular or a Tailscale
-/// tunnel. Two RTT bands appear in real traces:
+/// Sized for the slowest real band, a first packet after the phone radio
+/// resumes from idle over a tunnel (1100-1800 ms observed). A deadline inside
+/// that band fires an OS push on top of a toast the page already rendered.
 ///
-/// - **Steady-state cellular / Tailscale relay**: 400–800 ms round-trip
-///   for the SSE-out + pong-POST cycle.
-/// - **First-packet-after-radio-idle on Tailscale**: 1100–1800 ms.
-///   Tailscale's userspace WireGuard has to renegotiate the path when the
-///   phone radio resumes from idle, and the first packet through pays
-///   that handshake cost. This band is the one that breaks "engine waits
-///   then sends the OS push on top of the in-app toast" — the page renders
-///   the toast synchronously on PresenceCheck receipt, but its pong
-///   round-trips slower than the engine's deadline.
-///
-/// The previous value of 1000 ms covered the steady state but timed out
-/// inside the wake-from-idle band. 2000 ms leaves ~200–400 ms headroom
-/// over the observed worst-case wake RTT, so even a slow first-packet
-/// pong lands before the deadline fires.
-///
-/// The wait only blocks fan-out when a candidate fails to pong; the
-/// `notify_one` short-circuit in [`run_presence_check`] wakes immediately
-/// once every expected device has answered, so increasing this only costs
-/// latency when a `device_presence` row is stale (page killed without
-/// firing `DeviceHidden`).
+/// The wait only blocks fan-out when a candidate fails to pong. The short
+/// circuit in [`run_presence_check`] wakes once every expected device has
+/// answered, so a longer deadline costs latency only when a `device_presence`
+/// row is stale.
 pub const DEADLINE_MS: u32 = 2000;
 
-/// Spec §2 Step A — push_allowed iff no pong reports active.
+/// Spec §2 Step A: push_allowed iff no pong reports active.
 pub fn decide_push_allowed(pongs: &[PresencePong]) -> bool {
     !pongs.iter().any(|p| p.is_active)
 }
 
-/// Spec §2 Step A / §3 — how many pongs the engine should wait for, and
-/// (via `> 0`) whether to run the PresenceCheck at all.
+/// Spec §2 Step A / §3: how many pongs to wait for, and (via `> 0`) whether to
+/// run the PresenceCheck at all. The max of the two signals, because each
+/// covers the other's failure:
 ///
-/// `sse_connections` is the live count of open `GET /api/v1/events` streams —
-/// the ground truth for "a page is connected and will pong". `candidate_count`
-/// is the number of fresh `device_presence` heartbeat rows. We take the max:
+/// - Open SSE streams are the robust signal. iOS suspends the heartbeat on a
+///   foregrounded PWA, so an active page's `device_presence` row goes stale
+///   while its EventSource stays open and would pong `is_active`.
+/// - Fresh heartbeat rows cover the inverse: a page that heartbeated recently
+///   but whose SSE connection just dropped.
 ///
-/// - The SSE count is the robust signal. iOS suspends the 30s heartbeat while
-///   a PWA is foregrounded, so a genuinely-active page's `device_presence` row
-///   ages past the 120s window even though its EventSource is still open and
-///   would pong `is_active`. Gating only on heartbeat freshness then skipped
-///   the PresenceCheck and fired an OS push on top of the active page.
-/// - The candidate count covers the inverse failure: a page that heartbeated
-///   within the last 120s but whose SSE connection just dropped (network blip).
-///   Counting it keeps the deadline short-circuit waiting for its pong too.
-///
-/// `0` means nobody is reachable (no open stream, no fresh heartbeat) → skip
-/// the protocol and send the push directly (the "phone in your pocket" case).
+/// `0` means nobody is reachable, so skip the protocol and push directly.
 fn expected_pong_count(sse_connections: usize, candidate_count: usize) -> usize {
     sse_connections.max(candidate_count)
 }
@@ -89,8 +67,7 @@ pub struct VapidKeys {
 pub struct PushSubscriptionStore;
 
 impl PushSubscriptionStore {
-    /// Defensive double-write — the migration owns this CREATE TABLE
-    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
+    /// Defensive double-write: the migration owns this CREATE TABLE. Slated
     /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
     pub async fn init_schema(
         pool: &PgPool,
@@ -118,9 +95,9 @@ impl PushSubscriptionStore {
         pool: &PgPool,
         sub: &PushSubscription,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // If device_id is provided, replace any existing subscription for that device
-        // (browser generates a new endpoint on re-subscribe, so the old one is stale).
-        // Fall back to endpoint-based upsert for subscriptions without a device_id.
+        // A browser mints a new endpoint on re-subscribe, so the device's old
+        // row is stale. Without a device_id there is nothing to match on, and
+        // the endpoint upsert below is the whole story.
         if let Some(device_id) = &sub.device_id {
             sqlx::query("DELETE FROM push_subscriptions WHERE device_id = $1")
                 .bind(device_id)
@@ -154,12 +131,12 @@ impl PushSubscriptionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get push subscriptions filtered by device push_enabled setting. Each
-    /// subscription is paired with the owning device's `user_agent` so the
-    /// caller can gate engine-side scheduled wake-pushes (Layer 3 in
-    /// `system-knowhow/notifications.md` §4.5) on `is_mac_chromium`. Legacy
-    /// rows without a `device_id` and devices with no recorded UA both come
-    /// back as `None` on the second tuple element.
+    /// Push subscriptions whose device has push enabled, each paired with that
+    /// device's `user_agent`.
+    ///
+    /// The caller gates wake-pushes (Layer 3 in
+    /// `system-knowhow/notifications.md` §4.5) on the UA. A row with no
+    /// `device_id`, and a device with no recorded UA, both pair with `None`.
     pub async fn get_push_enabled(
         pool: &PgPool,
     ) -> Result<Vec<(PushSubscription, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
@@ -202,11 +179,10 @@ impl PushSubscriptionStore {
             .collect())
     }
 
-    /// Get push subscriptions for a single device. Used by the wake-push path
-    /// (`send_wake_push_to_device`, called from `schedule_mac_chromium_wakes`)
-    /// — the engine fans out a follow-up push to one device only so other
-    /// devices don't receive a duplicate notification just to unjam one SW.
-    /// Returns empty when the device has push disabled OR has no subscription.
+    /// Push subscriptions for a single device, for the wake-push path. The
+    /// wake reaches one device only, so unjamming its service worker does not
+    /// send every other device a duplicate notification. Empty when the device
+    /// has push disabled or has no subscription.
     pub async fn get_push_enabled_for_device(
         pool: &PgPool,
         device_id: &str,
@@ -247,22 +223,18 @@ pub async fn get_or_create_vapid_keys(
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePrivateKey;
 
-    // Check if keys already exist
     if let Some(keys_json) = PreferenceStore::get(pool, "vapid_keys").await? {
         let keys: VapidKeys = serde_json::from_str(&keys_json)?;
         return Ok(keys);
     }
 
-    // Generate new EC P-256 key pair
     let signing_key = SigningKey::random(&mut OsRng);
 
-    // PEM-encode the private key (PKCS#8)
     let private_key_pem = signing_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .map_err(|e| format!("Failed to encode private key: {}", e))?
         .to_string();
 
-    // Extract the uncompressed public key bytes and base64url-encode
     let verifying_key = signing_key.verifying_key();
     let pub_bytes = verifying_key.to_encoded_point(false);
     let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_bytes.as_bytes());
@@ -272,7 +244,6 @@ pub async fn get_or_create_vapid_keys(
         public_key,
     };
 
-    // Store in preferences
     let keys_json = serde_json::to_string(&keys)?;
     PreferenceStore::set_silent(pool, "vapid_keys", &keys_json).await?;
 
@@ -280,9 +251,8 @@ pub async fn get_or_create_vapid_keys(
     Ok(keys)
 }
 
-/// Send a push notification to all registered subscriptions.
-/// Non-fatal: logs errors but doesn't fail.
-/// If `notification_id` is provided, clicking the notification deep-links to it.
+/// Send a push notification to all registered subscriptions. With a
+/// `notification_id`, clicking the notification deep-links to it.
 pub async fn send_push_to_all(
     engine: &SharedEngine,
     title: &str,
@@ -305,19 +275,17 @@ pub async fn send_push_to_all(
 /// Fan out the OS surface for a notification per the §2 matrix in
 /// `system-knowhow/notifications.md`. The PresenceCheck pong protocol (§3) is
 /// the authoritative decision input:
-/// - `push_allowed = false` (an active device pong'd in) → emit
-///   `NotificationToastRequested` so active pages show the in-app toast.
-/// - `push_allowed = true` (no active device) → emit `NativePushRequested` so a
-///   connected Tauri desktop app shows a native macOS banner, AND fan out the
-///   web push to every browser / PWA subscription.
+/// - `push_allowed = false`, so an active device pong'd in: emit
+///   `NotificationToastRequested` and active pages show the in-app toast.
+/// - `push_allowed = true`: emit `NativePushRequested` for a connected Tauri
+///   desktop app, and fan the web push out to every browser subscription.
 ///
-/// The two emits are mutually exclusive by construction (opposite branches of
-/// one decision), so a device never gets both a toast and a push/native banner.
-/// The decision runs whenever ANY client is reachable — a web-push
-/// subscription OR an open SSE connection / fresh heartbeat — so a desktop-only
-/// (Tauri) workspace with zero web-push subscriptions still gets toasts and
-/// native banners. Non-fatal: every DB / SSE / web-push failure is logged and
-/// execution continues so a single bad subscription doesn't sink the fan-out.
+/// The two emits sit on opposite branches of one decision, so a device can
+/// never get both a toast and a push. The decision runs whenever ANY client is
+/// reachable, so a desktop-only workspace with no web-push subscription still
+/// gets toasts and native banners.
+///
+/// Non-fatal throughout: one bad subscription must not sink the fan-out.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_push_to_all_with_app(
     engine: &SharedEngine,
@@ -330,13 +298,10 @@ pub async fn send_push_to_all_with_app(
     tap: crate::scheduler::notifications::Tap,
 ) {
     let pool = engine.pool();
-    // Web-push subscriptions (browser / PWA endpoints). MAY be empty — a
-    // desktop-only (Tauri) workspace never creates one, because the embedded
-    // WKWebView can't subscribe to Web Push. We deliberately do NOT bail on
-    // empty here: a connected client still needs either the in-app toast
-    // (push suppressed) or a native desktop banner (push allowed), and both
-    // are decided below. The combined "nobody reachable" bail comes after we
-    // know the connected-client count.
+    // MAY be empty: a desktop-only workspace never creates one, because the
+    // embedded WKWebView cannot subscribe to Web Push. Do NOT bail on empty
+    // here. A connected client still needs the toast or the native banner, and
+    // the "nobody reachable" bail comes once the client count is known.
     let subs_with_ua = match PushSubscriptionStore::get_push_enabled(pool).await {
         Ok(subs) => subs,
         Err(e) => {
@@ -348,7 +313,7 @@ pub async fn send_push_to_all_with_app(
     let candidates = match crate::core::DevicePresenceStore::candidates(pool).await {
         Ok(c) => c,
         Err(e) => {
-            // Spec §3 failure handling: if we can't see candidates, the
+            // Spec §3 failure handling: with no view of the candidates, the
             // safer side is to send the push.
             log!(
                 "[Push] Failed to query device_presence candidates (sending push anyway): {}",
@@ -358,23 +323,13 @@ pub async fn send_push_to_all_with_app(
         }
     };
 
-    // §2 Step A / §3 — how many pongs to wait for, and (via `> 0`) whether to
-    // run the PresenceCheck at all. The robust signal is the live
-    // SSE-connection count: a page connected via SSE will pong even when its
-    // device_presence heartbeat has gone stale, which iOS does whenever it
-    // suspends the 30s timer on a foregrounded PWA. Gating only on heartbeat
-    // freshness skipped the check and fired an OS push on top of the active
-    // page. device_presence candidates cover the inverse failure mode (a
-    // freshly-heartbeated page whose SSE just dropped), so we take the max.
     let sse_connections = engine.sse_connections.count();
     let expected_pongs = expected_pong_count(sse_connections, candidates.len());
 
     // Nothing to deliver to at all: no web-push subscription AND nobody
-    // connected or recently heartbeating (no client to receive a toast or a
-    // native banner over SSE either). Bail before the PresenceCheck. Note the
-    // gate is now "no subs AND no reachable client", not the old "no subs" —
-    // a connected client with no subscription anywhere in the workspace is a
-    // valid recipient for the in-app toast / native push.
+    // connected or recently heartbeating, so no client for a toast or a native
+    // banner either. Both halves are required, because a connected client with
+    // no subscription anywhere is still a valid recipient.
     if subs_with_ua.is_empty() && expected_pongs == 0 {
         return;
     }
@@ -385,8 +340,7 @@ pub async fn send_push_to_all_with_app(
         subs_with_ua.into_iter().map(|(sub, _)| sub).collect();
 
     let push_allowed = if expected_pongs == 0 {
-        // Nobody connected and no fresh heartbeat → nobody to pong → push
-        // immediately (the common "phone in your pocket" case).
+        // Nobody to pong, so push immediately.
         true
     } else if let Some(nid) = notification_id {
         run_presence_check(
@@ -398,20 +352,16 @@ pub async fn send_push_to_all_with_app(
         )
         .await
     } else {
-        // No notification_id to scope the pong by — can't run the
-        // protocol, so send the push (legacy callers).
+        // No notification_id to scope the pong by, so the protocol cannot run.
         true
     };
 
     if !push_allowed {
-        // An active device pong'd in → the OS push is suppressed (§2 Step A).
-        // Tell active pages to render the in-app toast INSTEAD (§4). This is
-        // the only place the toast is triggered, and it is mutually exclusive
-        // with the push fan-out below by construction: the toast event and the
-        // push live on opposite branches of this `if`, so a device can never
-        // receive both for the same notification. `notification_id` is always
-        // Some here — `push_allowed` only goes false through the
-        // `run_presence_check` arm above, which requires it.
+        // An active device pong'd in, so the OS push is suppressed (§2 Step A)
+        // and active pages render the in-app toast instead (§4). This is the
+        // only place the toast is triggered. `notification_id` is always Some
+        // here: `push_allowed` only goes false through the arm above, which
+        // requires it.
         if let Some(nid) = notification_id {
             emit_toast_requested(
                 &engine.event_bus,
@@ -432,13 +382,11 @@ pub async fn send_push_to_all_with_app(
         return;
     }
 
-    // Native desktop surface (§1, §4). Broadcast on the push-ALLOWED branch so
-    // a connected Tauri desktop app renders a native macOS notification — it
-    // can't receive the web push below (WKWebView has no service-worker push).
-    // Browser / PWA clients ignore this frame; only a non-active Tauri client
-    // acts on it. It rides the same branch as the web-push fan-out (and the
-    // opposite branch from `emit_toast_requested`), so a device never gets both
-    // a native banner and an in-app toast for one notification.
+    // Native desktop surface (§1, §4). A connected Tauri app cannot receive
+    // the web push below, because its WKWebView has no service-worker push.
+    // Browser clients ignore this frame; only a non-active Tauri client acts
+    // on it. It rides the branch opposite `emit_toast_requested`, so a device
+    // never gets both a native banner and an in-app toast.
     if let Some(nid) = notification_id {
         emit_native_push_requested(
             &engine.event_bus,
@@ -453,16 +401,18 @@ pub async fn send_push_to_all_with_app(
         .await;
     }
 
-    // No web-push subscriptions (e.g. a desktop-only workspace) → the native
-    // broadcast above is the whole OS surface; skip the web-push machinery.
+    // No web-push subscriptions, so the native broadcast above is the whole OS
+    // surface.
     if subscriptions.is_empty() {
         return;
     }
 
-    // Current workspace unread count → declarative `app_badge` (see
-    // `build_push_payload`). Queried once for the whole fan-out (same value for
-    // every subscription). Best-effort: a failure just omits the badge field.
+    // Declarative `app_badge` (see `build_push_payload`). Both halves are
+    // resolved once for the whole fan-out; `app_badge_for` picks which one a
+    // subscription gets. Best-effort: a failure omits the badge field, or
+    // falls back to the own count.
     let unread_count = read_unread_count(pool).await;
+    let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
 
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
@@ -476,7 +426,11 @@ pub async fn send_push_to_all_with_app(
                 link_event_id,
                 &tap,
                 sub.scope_url.as_deref(),
-                unread_count,
+                app_badge_for(
+                    sub.scope_url.as_deref(),
+                    unread_count,
+                    cross_workspace_total,
+                ),
             )
             .to_string();
             (sub, payload_bytes)
@@ -486,49 +440,36 @@ pub async fn send_push_to_all_with_app(
     fan_out_payload(pool, deliveries, "notification", notification_id).await;
 
     // Layer 3 of the macOS-Chromium wedge mitigation (see
-    // `system-knowhow/notifications.md` §4.5). For every macOS-Chromium
-    // device that just got the real push, schedule a wake-push to land
-    // `MAC_CHROMIUM_WAKE_DELAY` later. The wake's only job is to be a
-    // second push event arriving at the SW — that drains any queued
-    // `notificationclick` (Chromium #370536109) regardless of whether
-    // the user has returned to the Lucidos tab. This is the sole
-    // recovery mechanism for the partial wedge today; if it misses, the
-    // next genuine push to the device is what eventually drains the
-    // queue.
+    // `system-knowhow/notifications.md` §4.5). The wake's only job is to be a
+    // second push event arriving at the service worker, which drains any
+    // queued `notificationclick`.
     //
-    // Gated on `notification_id` because `send_wake_push_to_device`
-    // loads the persisted notification to build the wake payload — a
-    // wake without an id has nothing to mirror. Empty `wake_targets`
-    // is a no-op inside `schedule_mac_chromium_wakes`.
+    // Gated on `notification_id`: `send_wake_push_to_device` loads the
+    // persisted notification to build the wake payload, so a wake without an
+    // id has nothing to mirror.
     if let Some(nid) = notification_id {
         schedule_mac_chromium_wakes(engine.clone(), wake_targets, nid, MAC_CHROMIUM_WAKE_DELAY);
     }
 }
 
-/// Delay between the original push and the engine-side follow-up wake-push
-/// for macOS-Chromium devices (Layer 3 in
-/// `system-knowhow/notifications.md` §4.5). Three seconds is short enough
-/// that a click queued in the wedged SW drains before the user gives up on
-/// the dead tap, and long enough that Chrome doesn't coalesce the two
-/// pushes as a single event (which would defeat the point — the wake needs
-/// to be a separate push dispatch to resurrect the SW worker).
+/// Delay between the original push and the follow-up wake-push (Layer 3 in
+/// `system-knowhow/notifications.md` §4.5).
+///
+/// Short enough that a click queued in the wedged service worker drains before
+/// the user gives up on the dead tap. Long enough that Chrome does not
+/// coalesce the two into one event, which would defeat the point: the wake
+/// must be a separate push dispatch to resurrect the worker.
 const MAC_CHROMIUM_WAKE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Spawn one delayed wake-push per device_id in `device_ids`. Fire-and-
-/// forget: each spawned task sleeps `delay`, then calls
-/// `send_wake_push_to_device` and logs the outcome. Failures are logged
-/// only — the wake is best-effort and the original push already landed,
-/// so a dropped wake leaves the user in the pre-Layer-3 state where the
-/// next genuine push to the device eventually drains the queued click.
+/// Spawn one delayed wake-push per device id. Fire and forget: the wake is
+/// best-effort, and a dropped one leaves the next genuine push to the device
+/// to drain the queued click.
 ///
-/// Survives engine shutdown probabilistically, not by design. The spawned
-/// task holds an `Arc<LucidosEngine>` that keeps the engine struct alive,
-/// but `tokio::spawn` returns a `JoinHandle` we drop — on tokio-runtime
-/// drop, the task is aborted at its next `await` regardless of strong-
-/// count. In practice the wake usually completes because graceful
-/// shutdown (`graceful_shutdown(10s)` in `main.rs`) outlasts the 3 s
-/// sleep, but a notification fired in the final ~3 s of a restart will
-/// see its wake aborted — the next genuine push is what drains then.
+/// **Surviving engine shutdown is incidental, never guaranteed.** The spawned
+/// task holds an `Arc<LucidosEngine>`, but its `JoinHandle` is dropped, so a
+/// runtime drop aborts it at the next `await` whatever the strong count.
+/// Graceful shutdown usually outlasts the sleep, so the wake usually completes
+/// anyway.
 fn schedule_mac_chromium_wakes(
     engine: SharedEngine,
     device_ids: Vec<String>,
@@ -564,16 +505,14 @@ fn schedule_mac_chromium_wakes(
     }
 }
 
-/// Broadcast a PresenceCheck and wait up to `DEADLINE_MS` for every
-/// candidate device to pong. Returns the `push_allowed` decision per §2
-/// Step A — true iff no pong reports `is_active`. Drains the tracker
-/// slot whether or not all pongs arrived.
+/// Broadcast a PresenceCheck and wait up to `DEADLINE_MS` for every candidate
+/// device to pong. Returns the `push_allowed` decision per §2 Step A: true iff
+/// no pong reports `is_active`. Drains the tracker slot either way.
 ///
-/// The PresenceCheck carries no toast content — the in-app toast is now
-/// triggered by [`emit_toast_requested`] AFTER this decision resolves, so
-/// the toast and the OS push can never both fire (see notifications.md
-/// §3-§4). `event_id` rides along only so the pong can report
-/// `event_in_viewport`.
+/// The PresenceCheck carries no toast content. [`emit_toast_requested`] fires
+/// AFTER this decision resolves, so the toast and the OS push can never both
+/// happen (notifications.md §3-§4). `event_id` rides along only so the pong
+/// can report `event_in_viewport`.
 async fn run_presence_check(
     event_bus: &crate::engine::event_bus::EventBus,
     presence_tracker: &crate::api::presence_pong::PresenceTracker,
@@ -595,9 +534,8 @@ async fn run_presence_check(
         ))
         .await
     {
-        // SSE broadcast failed — without pages knowing to pong we can't
-        // make an informed decision. Drain the slot and send the push
-        // (safer side, same as the candidates-query error branch).
+        // No page knows to pong, so no informed decision is possible. Drain
+        // the slot and send the push, the safer side.
         log!("[Push] Failed to broadcast PresenceCheck: {}", e);
         let _ = presence_tracker.collect(notification_id);
         return true;
@@ -614,12 +552,11 @@ async fn run_presence_check(
 }
 
 /// Broadcast a [`SystemEvent::NotificationToastRequested`] so active pages
-/// render the in-app toast for a notification whose OS push was suppressed
-/// (§2 Step A found an active device). Broadcast SSE — hidden pages ignore
-/// it via the §4 row matrix, active pages render the toast (or auto-read on
-/// Row 1). Non-fatal: a failed emit is logged; the worst case is the user
-/// sees the bell badge bump (driven by `NotificationCreated`) without the
-/// transient toast. See `system-knowhow/notifications.md` §4.
+/// render the in-app toast for a notification whose OS push was suppressed.
+///
+/// Broadcast SSE: hidden pages ignore it via the §4 row matrix. Non-fatal, and
+/// the worst case is the bell badge bumping without the toast. See
+/// `system-knowhow/notifications.md` §4.
 #[allow(clippy::too_many_arguments)]
 async fn emit_toast_requested(
     event_bus: &crate::engine::event_bus::EventBus,
@@ -656,15 +593,15 @@ async fn emit_toast_requested(
 }
 
 /// Broadcast a [`SystemEvent::NativePushRequested`] so a connected Tauri
-/// desktop app renders a NATIVE macOS notification for a notification whose OS
-/// push was allowed (§2 Step A found no active device). Broadcast SSE — browser
-/// / PWA pages ignore it (they receive the real web push), and a Tauri page
-/// shows the banner only when it is not currently active (§4 row matrix). This
-/// is the desktop counterpart of the web-push fan-out: the WKWebView the Tauri
-/// app embeds can't subscribe to Web Push, so the engine reaches it over the
-/// already-open SSE stream instead. Non-fatal: a failed emit is logged; the
-/// worst case is the desktop user sees only the bell badge (driven by
-/// `NotificationCreated`). See `system-knowhow/notifications.md` §1, §4.
+/// desktop app renders a native macOS banner for an allowed push.
+///
+/// The desktop counterpart of the web-push fan-out. A Tauri app's WKWebView
+/// cannot subscribe to Web Push, so the engine reaches it over the already-open
+/// SSE stream. Browser pages ignore the frame, and a Tauri page shows the
+/// banner only when it is not active (§4 row matrix).
+///
+/// Non-fatal, and the worst case is the desktop user seeing only the bell
+/// badge. See `system-knowhow/notifications.md` §1, §4.
 #[allow(clippy::too_many_arguments)]
 async fn emit_native_push_requested(
     event_bus: &crate::engine::event_bus::EventBus,
@@ -701,16 +638,15 @@ async fn emit_native_push_requested(
 }
 
 /// Broadcast a [`SystemEvent::NativePushDismissRequested`] so a connected Tauri
-/// desktop app REMOVES the already-delivered native macOS banner(s) for a
-/// notification that was just read (on this or another device). `notification_id
-/// = Some(id)` removes one banner; `None` removes all (the mark-all-read path).
-/// Broadcast SSE — browser / PWA pages ignore it (the open web can't silently
-/// remove a Web Push banner; Safari revokes a subscription after 3 silent
-/// pushes), so this is the macOS-desktop-only half of cross-device dismiss. The
-/// desktop app stays SSE-connected, so it acts on this deterministically.
-/// Non-fatal: a failed emit is logged; the worst case is a stale OS banner the
-/// user swipes away manually (the prior, pre-dismiss behaviour). See
-/// `system-knowhow/notifications.md` §4 and
+/// desktop app REMOVES banners for a notification just read on any device.
+/// `Some(id)` removes one banner; `None` removes all.
+///
+/// The macOS-desktop-only half of cross-device dismiss. Browser pages ignore
+/// it: the open web cannot silently remove a Web Push banner, and Safari
+/// revokes a subscription after three silent pushes.
+///
+/// Non-fatal, and the worst case is a stale OS banner the user swipes away.
+/// See `system-knowhow/notifications.md` §4 and
 /// `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md`.
 pub(crate) async fn emit_native_push_dismiss_requested(
     event_bus: &crate::engine::event_bus::EventBus,
@@ -734,17 +670,14 @@ pub(crate) async fn emit_native_push_dismiss_requested(
     }
 }
 
-/// Decides whether a device with the given `user_agent` is affected by
-/// Chromium #370536109 — the macOS-Chromium dispatcher bug where
-/// `notificationclick` is silently queued until a new push event drains
-/// the SW. Used to gate the engine-side scheduled follow-up wake-push
-/// (Layer 3 in `system-knowhow/notifications.md` §4.5) so Safari / iOS /
-/// non-macOS Chromium / Firefox don't pay an extra push per notification.
+/// Whether a device is affected by Chromium #370536109, the macOS-Chromium
+/// dispatcher bug that silently queues `notificationclick` until a new push
+/// event drains the service worker.
 ///
-/// `user_agent` is captured at `POST /api/v1/devices/register` time (see
-/// `api/settings.rs::register_device` → `DeviceStore::register`) and stored
-/// on the `devices` row, so the engine can decide purely from database
-/// state — no per-push round trip to the page.
+/// This gates the Layer 3 wake-push (`system-knowhow/notifications.md` §4.5),
+/// so every other browser avoids an extra push per notification. The UA is
+/// stored on the `devices` row at register time, so the decision needs no
+/// per-push round trip to the page.
 fn is_mac_chromium(user_agent: &str) -> bool {
     user_agent.contains("Macintosh")
         && user_agent.contains("Chrome/")
@@ -753,24 +686,16 @@ fn is_mac_chromium(user_agent: &str) -> bool {
         && !user_agent.contains("iPod")
 }
 
-/// Pure: from the just-pushed subscriptions paired with each device's
-/// `user_agent`, return the deduplicated device_ids that should receive a
-/// follow-up wake-push. Used by the engine-side scheduling layer to decide
-/// which devices need the Layer 3 wake (see `is_mac_chromium` above for the
-/// gate and `system-knowhow/notifications.md` §4.5 for the full mitigation
-/// stack).
+/// The deduplicated device ids that should receive a follow-up wake-push.
 ///
-/// Dedup matters: two browser tabs on the same device produce two
-/// subscriptions sharing the same `device_id`. `send_wake_push_to_device`
-/// already fans out to every subscription on that device, so spawning two
-/// delayed wake tasks would deliver the wake-push twice per SW. Once is
-/// enough to drain the queued `notificationclick`.
+/// **Dedup matters.** Two tabs on one device produce two subscriptions sharing
+/// a `device_id`, and `send_wake_push_to_device` already fans out to every
+/// subscription on the device. Once is enough to drain the queued
+/// `notificationclick`.
 ///
-/// Subscriptions with `device_id = None` (legacy rows) and devices with no
-/// recorded `user_agent` are conservatively skipped — both signal "we can't
-/// confidently target this device". The wake is the only recovery mechanism
-/// today, so a skipped device falls back to "next genuine push drains the
-/// queue" — same as a wake-task aborted at engine shutdown.
+/// A subscription with no `device_id`, or a device with no recorded
+/// `user_agent`, is skipped: neither can be targeted confidently, and the next
+/// genuine push drains the queue instead.
 fn pick_mac_chromium_wake_targets(
     subs_with_ua: &[(PushSubscription, Option<String>)],
 ) -> Vec<String> {
@@ -793,39 +718,25 @@ fn pick_mac_chromium_wake_targets(
 
 /// Whether a scheduled wake push should still fire once its delay elapses.
 ///
-/// A wake push exists for one reason: resurrect a wedged service worker
-/// (Chromium #370536109) so a queued `notificationclick` drains. A notification
-/// that is already `read` proves the user's tap on the original banner already
-/// landed — the SW was NOT wedged — so the wake has nothing to drain and would
-/// only re-pop an already-handled notification as a fresh unread banner (macOS
-/// won't replace a banner the tap already closed; it stacks a new one). The
-/// read flag is thus a precise proxy for "was the SW wedged": read ⇒ tap
-/// succeeded ⇒ skip; unread ⇒ either the user hasn't tapped yet or the tap was
-/// swallowed by a wedged SW ⇒ the wake is still the right thing.
+/// A wake push exists to resurrect a wedged service worker (Chromium
+/// #370536109) so a queued `notificationclick` drains. A notification already
+/// marked `read` proves the tap landed, so the worker was not wedged. Waking
+/// then has nothing to drain, and macOS stacks a fresh banner rather than
+/// replacing the one the tap closed.
 ///
-/// Pure so the decision is unit-testable without a DB; the caller re-fetches
-/// the live read state at fire time (the tap lands DURING the wake delay, so
-/// this cannot be decided when the wake is scheduled). See
-/// `system-knowhow/notifications.md` §4.5.
+/// The caller re-fetches the live read state at fire time, because the tap
+/// lands DURING the wake delay. See `system-knowhow/notifications.md` §4.5.
 fn wake_still_needed(notification: &crate::scheduler::notifications::Notification) -> bool {
     !notification.read
 }
 
-/// Send a wake-push to a single device — the workaround for Chromium
-/// #370536109 (`notificationclick` silently queued on macOS-Chrome). Looks up
-/// the notification by id, skips if it was read in the meantime (see
-/// [`wake_still_needed`]), builds a `wake: true` payload carrying the SAME
-/// content (so Chrome counts the push as visible, see §4.5), filters
-/// subscriptions to the requesting device, and fans out. Returns the number
-/// of subscriptions actually delivered to (0 when skipped).
+/// Send a wake-push to a single device, the workaround for Chromium #370536109.
+/// Returns how many subscriptions it delivered to, `0` when skipped.
 ///
-/// Per web.dev `push-notifications-common-issues`, sending a push is the
-/// canonical mechanism to wake an inactive SW — any push event resurrects
-/// the worker thread and drains queued `notificationclick` events as a side
-/// effect. The trigger is `schedule_mac_chromium_wakes` further down in this
-/// file: every real push to a macOS-Chrome subscription spawns a delayed
-/// `send_wake_push_to_device` MAC_CHROMIUM_WAKE_DELAY later so the queued
-/// click drains without the user having to come back to the tab.
+/// The payload carries the SAME content as the original, so Chrome counts the
+/// push as visible (§4.5). Sending a push is the canonical way to wake an
+/// inactive service worker: any push event resurrects the worker thread and
+/// drains queued `notificationclick` events as a side effect.
 pub(crate) async fn send_wake_push_to_device(
     engine: &crate::engine::LucidosEngine,
     device_id: &str,
@@ -838,9 +749,8 @@ pub(crate) async fn send_wake_push_to_device(
             None => return Ok(0),
         };
 
-    // Re-checked at fire time: if the user tapped the original banner during the
-    // wake delay, the notification is now read and the wake would only resurrect
-    // it as a fresh banner. See `wake_still_needed`.
+    // Re-checked at fire time: a tap during the wake delay marks the
+    // notification read, and the wake would only re-pop it as a fresh banner.
     if !wake_still_needed(&notification) {
         return Ok(0);
     }
@@ -851,12 +761,20 @@ pub(crate) async fn send_wake_push_to_device(
     }
 
     let unread_count = read_unread_count(pool).await;
+    let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
         .map(|sub| {
-            let payload_bytes =
-                build_wake_payload(&notification, sub.scope_url.as_deref(), unread_count)
-                    .to_string();
+            let payload_bytes = build_wake_payload(
+                &notification,
+                sub.scope_url.as_deref(),
+                app_badge_for(
+                    sub.scope_url.as_deref(),
+                    unread_count,
+                    cross_workspace_total,
+                ),
+            )
+            .to_string();
             (sub, payload_bytes)
         })
         .collect();
@@ -874,19 +792,16 @@ const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
 /// `system-knowhow/notifications.md` §4.5.
 const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
 
-/// Hard ceiling the web-push transport enforces, in BYTES of the plaintext we
-/// hand `set_payload`.
+/// Hard ceiling the web-push transport enforces, in BYTES of the plaintext
+/// handed to `set_payload`.
 ///
-/// Measured against the crate, not assumed: `web-push` 0.11's
-/// `HttpEce::encrypt` returns `WebPushError::PayloadTooLarge` when
-/// `content.len() > 3052`, and `content` is exactly the serialized JSON
-/// envelope we pass in (the check runs BEFORE encryption, so the encrypted size
-/// never enters into it). The crate renders that error as "maximum payload size
-/// of 3070 characters exceeded", which is both the wrong number and the wrong
-/// unit: budgeting against 3070 characters still overflows.
-/// `s4_5_crate_ceiling_constant_matches_what_build_actually_enforces` pins this
-/// constant against the real builder from both sides, so a crate bump that
-/// moves the threshold fails a test instead of silently dropping pushes.
+/// Measured against the crate, not assumed. The check runs BEFORE encryption
+/// on the serialized JSON envelope, so the encrypted size never enters into
+/// it. Do not trust the crate's own error text, which reports a different
+/// number in a different unit.
+/// `s4_5_crate_ceiling_constant_matches_what_build_actually_enforces` pins
+/// this from both sides, so a crate bump fails a test instead of silently
+/// dropping pushes.
 const MAX_PUSH_PAYLOAD_BYTES: usize = 3052;
 
 /// Reserve a payload we had to truncate leaves below [`MAX_PUSH_PAYLOAD_BYTES`].
@@ -917,11 +832,10 @@ const TRUNCATION_WHITESPACE_LOOKBACK: usize = 96;
 
 /// Cut `body` down to at most `budget` BYTES, [`TRUNCATION_MARKER`] included.
 ///
-/// UTF-8 safe by construction: the cut lands on a char boundary via
-/// `floor_char_boundary`, so the multi-byte characters real bodies carry (the
-/// "✅" in the 2026-08-05 case) are never split into invalid UTF-8. When a
-/// whitespace boundary sits within [`TRUNCATION_WHITESPACE_LOOKBACK`] bytes of
-/// the cut, we snap back to it so the banner ends on a word.
+/// UTF-8 safe by construction: the cut lands on a char boundary, so the
+/// multi-byte characters real bodies carry are never split. A whitespace
+/// boundary within [`TRUNCATION_WHITESPACE_LOOKBACK`] bytes of the cut wins,
+/// so the banner ends on a word.
 fn truncate_body_to_bytes(body: &str, budget: usize) -> String {
     if body.len() <= budget {
         return body.to_string();
@@ -947,24 +861,19 @@ fn truncate_body_to_bytes(body: &str, budget: usize) -> String {
 /// [`MAX_PUSH_PAYLOAD_BYTES`], shrinking the BODY (and only the body) by as
 /// much as it takes.
 ///
-/// `build` renders the whole envelope around a candidate body, so the budget is
-/// measured against the exact bytes the transport will see rather than against
-/// a hardcoded body length. That matters because the envelope's overhead is
-/// both substantial and VARIABLE: the absolute iOS `navigate` URL is built from
-/// the subscription's own `scope_url`, `data` carries a second (hash-form)
-/// navigate URL, and the Layer-3 wake variant adds a `wake: true` sibling on
-/// top. Every one of those fields survives the cut intact.
+/// `build` renders the whole envelope around a candidate body, so the budget
+/// is measured against the exact bytes the transport will see. The envelope's
+/// overhead is both substantial and VARIABLE: the iOS `navigate` URL comes
+/// from the subscription's own `scope_url`, `data` carries a second navigate
+/// URL, and the wake variant adds a `wake: true` sibling. All of those survive
+/// the cut intact.
 ///
-/// The budget is found by BINARY SEARCH on the rendered length rather than by
-/// arithmetic, because JSON escaping is not a fixed cost: a `"` or a newline
-/// serializes to two bytes and a control char to six, so "keep `ceiling minus
-/// envelope` bytes of body" is only an upper bound. Correcting a single
-/// estimate by the observed overflow is what breaks down at the extreme: on a
-/// control-char-dense body the overflow exceeds the body length itself, the
-/// correction saturates to zero and the banner ships EMPTY while hundreds of
-/// characters would have fitted. Both `truncate_body_to_bytes` and the rendered
-/// length are monotone in the budget, so the search is well defined and lands
-/// on the largest body that actually fits, whatever the escape density.
+/// The budget is found by BINARY SEARCH on the rendered length, never by
+/// arithmetic. JSON escaping is not a fixed cost, so "ceiling minus envelope"
+/// is an upper bound only. A single correction saturates to zero on a
+/// control-char-dense body, and the banner then ships EMPTY where hundreds of
+/// characters would have fitted. Truncation and rendered length are both
+/// monotone in the budget, so the search lands on the largest body that fits.
 fn fit_payload_body(
     body: &str,
     kind: &str,
@@ -972,26 +881,21 @@ fn fit_payload_body(
 ) -> serde_json::Value {
     let rendered_len = |candidate_body: &str| build(candidate_body).to_string().len();
 
-    // The overwhelmingly common case, so it renders the envelope ONCE and hands
-    // that same value back: byte-identical to what the pre-guard engine sent,
-    // and no second build on the hot path.
+    // The common case renders the envelope ONCE and hands that same value
+    // back, so there is no second build on the hot path.
     let full = build(body);
     if full.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES {
         return full;
     }
 
-    // The envelope with an empty body: everything the body has to share the
-    // ceiling with, measured for THIS subscription. Used to pick the target and
-    // to report the overhead; the search below does not trust it as an
-    // arithmetic budget.
+    // Everything the body shares the ceiling with, measured for THIS
+    // subscription. Used to pick the target and to report the overhead. The
+    // search below does not trust it as an arithmetic budget.
     let envelope_len = rendered_len("");
 
-    // Aim for the reserve when there is room for one. When the envelope alone
-    // already eats into it, aim at the hard ceiling instead: the reserve is
-    // deliberate slack, and slack must never cost the user deliverable text.
-    // Without this, an envelope between the target and the ceiling makes every
-    // candidate miss the target, so the body would be dropped entirely while
-    // the last few dozen bytes of it would have shipped fine.
+    // Aim for the reserve when there is room for one, and for the hard ceiling
+    // when the envelope already eats into it. The reserve is deliberate slack,
+    // and slack must never cost the user deliverable text.
     let target = if envelope_len <= TRUNCATED_PAYLOAD_TARGET_BYTES {
         TRUNCATED_PAYLOAD_TARGET_BYTES
     } else {
@@ -999,10 +903,9 @@ fn fit_payload_body(
     };
 
     // Largest byte budget whose rendered payload still fits the target. `lo`
-    // holds the best budget known to fit, `hi` the smallest known not to; the
-    // whole body is known not to fit from the check above. When even an empty
-    // body overshoots the hard ceiling, `lo` simply stays 0 and the
-    // classification below reports it.
+    // holds the best budget known to fit, `hi` the smallest known not to. When
+    // even an empty body overshoots, `lo` stays 0 and the branch below reports
+    // it.
     let (mut lo, mut hi) = (0usize, body.len());
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
@@ -1028,9 +931,9 @@ fn fit_payload_body(
             envelope_len
         );
     } else {
-        // Nothing left to give: the envelope alone overshoots. Return it anyway
-        // so the send loop's last-resort arm reports the real failure per
-        // subscription.
+        // Nothing left to give: the envelope alone overshoots. Returned anyway,
+        // so the send loop's last-resort arm reports the real per-subscription
+        // failure.
         log!(
             "[Push] Cannot fit the {} payload for this subscription: {} B with the body dropped \
              entirely, over the {} B ceiling. The envelope alone (title plus deep-link URLs) is \
@@ -1044,16 +947,11 @@ fn fit_payload_body(
 }
 
 /// Build the `key=value&…` deep-link param string shared by both navigate URL
-/// forms (see [`navigate_url_ios`] / [`navigate_url_sw`]). Empty when there's
-/// nothing to deep-link, so the callers can fall back to a bare `/`.
+/// forms. Empty when there is nothing to deep-link, so callers fall back to a
+/// bare `/`.
 ///
-/// The iOS declarative `navigate` field is built from the subscription's stored
-/// scope URL when available, so the engine does not have to guess the gateway
-/// workspace prefix from an APNs/FCM endpoint.
-///
-/// The `tap` JSON is only emitted for non-modal kinds — modal-kind URLs stay
-/// short, and the page safely demotes a missing `tap` param to the modal
-/// default.
+/// The `tap` JSON is emitted only for non-modal kinds. Modal-kind URLs stay
+/// short, and the page demotes a missing `tap` param to the modal default.
 fn build_navigate_params(
     notification_id: Option<uuid::Uuid>,
     link_thread_id: Option<uuid::Uuid>,
@@ -1085,29 +983,20 @@ fn build_navigate_params(
 ///
 /// Safari handles a declarative push in the parent process and reuses the
 /// already-open PWA window on tap. A same-document (hash-only) navigation is
-/// NOT applied to that open window — WebKit just focuses it, the URL never
-/// changes, and the page-side hash router finds nothing to route (the "tap
-/// nav to thread only focuses the app" bug). A query string changes the
-/// document, so iOS performs a real navigation the page picks up on load /
-/// resume via `parseDeepLinkFromUrl` (which reads query params). See
-/// `system-knowhow/notifications.md` §4.5.
+/// NOT applied to that window: WebKit focuses it, the URL never changes, and
+/// the page-side router finds nothing to route. A query string changes the
+/// document, so iOS performs a real navigation the page picks up on load or
+/// resume. See `system-knowhow/notifications.md` §4.5.
 ///
 /// TEMPORARY MEASURE (`docs/temporary-measures.md` § "Cross-document
-/// notification-tap reload on iOS"). Choosing a cross-document URL is what makes
-/// every iOS tap reload the PWA. It is the only channel WebKit actually applies
-/// today, not a preference: `launchQueue` / `launch_handler: focus-existing` are
-/// unimplemented and a same-document navigate is ignored. When WebKit ships a
-/// reload-free channel this function changes shape and the page-side `?notification=`
-/// DETECTION in `crates/lucidos-app/index.html` comes out with it. The quiet boot
-/// cover that detection turns on does NOT: it also serves a user-requested
-/// refresh, which no upstream fix affects.
+/// notification-tap reload on iOS"). The cross-document URL is what makes every
+/// iOS tap reload the PWA, and it is the only channel WebKit applies today.
+/// When WebKit ships a reload-free channel, this function changes shape and the
+/// page-side `?notification=` detection comes out with it.
 ///
-/// `scope_url` is the concrete service-worker scope captured by the page at
-/// subscription time, e.g. `https://host/dev/`. When it is present we emit an
-/// absolute URL (`https://host/dev/?notification=...`) instead of relying on
-/// WebKit/APNs to resolve a query-only relative value. Existing legacy rows that
-/// lack `scope_url` keep the relative fallback until the next page load refreshes
-/// their subscription.
+/// `scope_url` is the concrete service-worker scope the page captured at
+/// subscription time. With it, the URL is absolute; a legacy row without one
+/// keeps the relative fallback until its subscription refreshes.
 fn navigate_url_ios(params: &str, scope_url: Option<&str>) -> String {
     let relative = if params.is_empty() {
         ".".to_string()
@@ -1141,20 +1030,16 @@ fn normalize_scope_url(scope_url: &str) -> Option<String> {
     }
 }
 
-/// Chrome service-worker navigate URL — a **hash** URL, read off
-/// `notification.data.navigate` by the `notificationclick` handler. It feeds
-/// only the COLD `clients.openWindow()` path (no Lucidos tab open): the
-/// freshly-opened page's cold-start `handleHashLocation` reads the deep-link
-/// params off the hash. A warm, already-open tab is routed by `postMessage`
-/// instead of by this URL — Chrome doesn't fire `hashchange` for a fragment-
-/// only `client.navigate()`, so the SW posts the structured deep link straight
-/// to the page (see `routeToDeepLink` in `sw.js` and
-/// `system-knowhow/notifications.md` §4.5). The query-vs-hash split with
-/// [`navigate_url_ios`] is kept: iOS needs a cross-document (query) URL.
+/// Chrome service-worker navigate URL: a **hash** URL, read off
+/// `notification.data.navigate` by the `notificationclick` handler.
 ///
-/// This remains **scope-relative** (no leading slash) so it resolves inside the
-/// gateway `/<slug>/` scope. The Chrome SW always passes it through
-/// `resolveNavigate` in `sw.js` (which resolves against `origin + SCOPE_PATH`).
+/// It feeds only the COLD `clients.openWindow()` path. A warm tab is routed by
+/// `postMessage` instead, because Chrome fires no `hashchange` for a
+/// fragment-only `client.navigate()`. The query-vs-hash split with
+/// [`navigate_url_ios`] is deliberate: iOS needs a cross-document URL.
+///
+/// This stays **scope-relative** (no leading slash), so it resolves inside the
+/// gateway `/<slug>/` scope through `resolveNavigate` in `sw.js`.
 fn navigate_url_sw(params: &str) -> String {
     if params.is_empty() {
         ".".to_string()
@@ -1176,23 +1061,154 @@ async fn read_unread_count(pool: &sqlx::PgPool) -> Option<i64> {
     }
 }
 
-/// Build a `wake: true` push payload from a stored notification. Mirrors
-/// `build_push_payload` field-for-field so the SW path is symmetric — the
-/// only wire difference is the added top-level `wake: true` flag (sibling to
-/// `web_push` / `notification`, NOT inside the notification object) so Safari
-/// ignores it while the SW reads it to gate `renotify` / `silent`. Safari
-/// never sees wake pushes (filtered by `is_mac_chromium`); the flag is
-/// purely for Chrome's SW.
+/// How long the engine waits for the gateway's cross-workspace unread total
+/// before badging its own count. A push must never sit behind a badge
+/// refinement, so this is shorter than `workspace_label`'s deadline: the hop
+/// is one loopback request.
+const GATEWAY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether a subscription's recorded service-worker scope belongs to a
+/// GATEWAY-served install, i.e. one whose app-icon badge must be the
+/// cross-workspace total rather than this workspace's own count.
 ///
-/// The body is fitted to the transport ceiling exactly as on the original send
-/// (see [`fit_payload_body`]), and the fitting measures THIS envelope, `wake`
-/// flag included. That flag makes the wake strictly larger than the push it
-/// mirrors, so a body that just squeezes into the original send would otherwise
-/// blow the wake up: on 2026-08-05 both failed, three seconds apart.
+/// `scope_url` is the SW scope the page captured, validated at subscribe time
+/// against the forwarded prefix. It is `https://host/<slug>/` behind the
+/// gateway and `https://host:<engine-port>/` on a direct engine, so a path
+/// deeper than `/` means the gateway served the page.
+///
+/// The gateway re-stamps every manifest it serves with `scope: "/"`, so ONE
+/// installed icon covers the picker and every workspace on that origin. A
+/// legacy row with no `scope_url` keeps the own-count behaviour.
+fn is_gateway_scoped(scope_url: Option<&str>) -> bool {
+    let Some(raw) = scope_url else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(raw.trim()) else {
+        return false;
+    };
+    url.path() != "/"
+}
+
+/// The `app_badge` value one subscription should carry: the cross-workspace
+/// total for a gateway-served install, this workspace's own unread count
+/// otherwise. `None` leaves the badge untouched.
+///
+/// The aggregate falls back to the own count rather than to nothing. An
+/// unreachable gateway then leaves the icon slightly low, instead of frozen at
+/// whatever the previous push wrote.
+fn app_badge_for(
+    scope_url: Option<&str>,
+    own_unread: Option<i64>,
+    cross_workspace_total: Option<i64>,
+) -> Option<i64> {
+    if is_gateway_scoped(scope_url) {
+        cross_workspace_total.or(own_unread)
+    } else {
+        own_unread
+    }
+}
+
+/// The gateway's fresh cross-workspace unread total, for this fan-out.
+///
+/// Resolved ONCE per fan-out, and only when a subscription needs it. No
+/// gateway-scoped subscription, or no gateway at all, means no request.
+/// Best-effort throughout: `None` on every failure path, and the caller then
+/// badges the workspace's own count.
+async fn cross_workspace_unread_total(subscriptions: &[PushSubscription]) -> Option<i64> {
+    if !subscriptions
+        .iter()
+        .any(|sub| is_gateway_scoped(sub.scope_url.as_deref()))
+    {
+        return None;
+    }
+    let gateway_port = crate::api::base_path::gateway_port()?;
+    match tokio::time::timeout(
+        GATEWAY_TOTAL_TIMEOUT,
+        ask_gateway_unread_total(&gateway_port),
+    )
+    .await
+    {
+        Ok(total) => total,
+        Err(_) => {
+            log!(
+                "[Push] gateway on :{} did not answer the unread total within {:?}; \
+                 badging this workspace's own count",
+                gateway_port,
+                GATEWAY_TOTAL_TIMEOUT
+            );
+            None
+        }
+    }
+}
+
+/// The hop itself, unbounded: [`cross_workspace_unread_total`] owns the
+/// deadline. Resolved scheme first, the other protocol second, so a
+/// dev/packaged TLS mismatch still connects (`.claude/rules/rust.md`
+/// § Intra-host scheme).
+async fn ask_gateway_unread_total(gateway_port: &str) -> Option<i64> {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            log!(
+                "[Push] could not build the gateway client ({}); badging this workspace's own count",
+                e
+            );
+            return None;
+        }
+    };
+    for scheme in crate::net_config::peer_scheme_order() {
+        let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/unread-total");
+        let Ok(resp) = client.get(&url).send().await else {
+            continue; // unreachable on this scheme, so try the other protocol
+        };
+        if !resp.status().is_success() {
+            // The gateway answered and refused; the other scheme won't differ.
+            log!(
+                "[Push] gateway unread total returned {}; badging this workspace's own count",
+                resp.status()
+            );
+            return None;
+        }
+        let Ok(body) = resp.text().await else {
+            log!("[Push] gateway unread total body was unreadable; badging this workspace's own count");
+            return None;
+        };
+        return parse_unread_total(&body);
+    }
+    log!(
+        "[Push] gateway on :{} unreachable; badging this workspace's own count",
+        gateway_port
+    );
+    None
+}
+
+/// Pull the aggregate out of the gateway's `{"total": N}` answer. Pure, so the
+/// wire contract is pinned without a live gateway.
+fn parse_unread_total(body: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("total")?
+        .as_i64()
+}
+
+/// Build a `wake: true` push payload from a stored notification.
+///
+/// Mirrors `build_push_payload` field for field. The one wire difference is
+/// the top-level `wake: true` flag, a sibling of `web_push` rather than a
+/// field inside the notification object. The Chrome SW reads it to gate
+/// `renotify` and `silent`.
+///
+/// The fitting measures THIS envelope, `wake` flag included. That flag makes
+/// the wake larger than the push it mirrors. A body that just squeezed into
+/// the original send would otherwise blow the wake up.
 fn build_wake_payload(
     notification: &crate::scheduler::notifications::Notification,
     ios_scope_url: Option<&str>,
-    unread_count: Option<i64>,
+    app_badge: Option<i64>,
 ) -> serde_json::Value {
     fit_payload_body(&notification.message, "wake", |candidate_body| {
         let mut payload = build_push_payload(
@@ -1204,7 +1220,7 @@ fn build_wake_payload(
             notification.event_id,
             &notification.tap,
             ios_scope_url,
-            unread_count,
+            app_badge,
         );
         payload["wake"] = serde_json::Value::Bool(true);
         payload
@@ -1213,10 +1229,9 @@ fn build_wake_payload(
 
 /// [`build_push_payload`] with the body fitted to the transport ceiling.
 ///
-/// Every send path builds through this; `build_push_payload` stays the pure
-/// envelope builder underneath so the wire shape is testable without the size
-/// guard in the way, and so [`fit_payload_body`] has something to re-render
-/// while it searches for a body that fits.
+/// Every send path builds through this. `build_push_payload` stays the pure
+/// envelope builder underneath, so the wire shape is testable without the size
+/// guard in the way. It is also what [`fit_payload_body`] re-renders.
 #[allow(clippy::too_many_arguments)]
 fn build_push_payload_fitted(
     title: &str,
@@ -1227,7 +1242,7 @@ fn build_push_payload_fitted(
     link_event_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
     ios_scope_url: Option<&str>,
-    unread_count: Option<i64>,
+    app_badge: Option<i64>,
 ) -> serde_json::Value {
     fit_payload_body(body, "notification", |candidate_body| {
         build_push_payload(
@@ -1239,73 +1254,25 @@ fn build_push_payload_fitted(
             link_event_id,
             tap,
             ios_scope_url,
-            unread_count,
+            app_badge,
         )
     })
 }
 
 /// Build the JSON payload delivered to the push transport.
 ///
-/// Wire shape is the Declarative Web Push envelope (W3C Push API
-/// "Declarative Web Push", merged Aug 2025; WebKit blog
-/// `meet-declarative-web-push`):
+/// The wire shape is the Declarative Web Push envelope.
+/// `system-knowhow/notifications.md` § Layer 1 writes it out field by field,
+/// with each client's handling and one tested dead end nobody should retry.
 ///
-/// ```json
-/// {
-///   "web_push": 8030,
-///   "notification": {
-///     "title": "...",
-///     "body": "...",
-///     "navigate": "https://host/<slug>/?notification=...&thread=...&event=...&tap=...",
-///     "tag": "<notification_id or lucidos-notification>",
-///     "data": {
-///       "notification_id": "...",
-///       "thread_id": "...",
-///       "event_id": "...",
-///       "app_id": "...",
-///       "tap": { "kind": "modal" | "navigate", ... },
-///       "navigate": "#notification=...  (HASH form, for the Chrome SW notificationclick path)"
-///     }
-///   }
-/// }
-/// ```
+/// **Two navigate URL forms, same params.** `notification.navigate` is what
+/// iOS Safari reads, an absolute query URL when the subscription has a stored
+/// scope. `notification.data.navigate` is what the Chrome SW reads, a hash
+/// URL. See [`navigate_url_ios`] / [`navigate_url_sw`] for why they differ.
 ///
-/// **Two navigate URL forms, same params.** `notification.navigate` (consumed
-/// by iOS Safari) is an **absolute query** URL when the subscription has a
-/// stored scope; `notification.data.navigate` (consumed by the Chrome SW) is a
-/// **hash** URL. They carry identical deep-link params — see
-/// [`navigate_url_ios`] / [`navigate_url_sw`] for why.
-///
-/// **iOS Safari 18.5+** sees the `web_push: 8030` magic. NOTE: the SW `push`
-/// handler still FIRES on iOS (confirmed via the `[Client/sw] push` breadcrumb)
-/// — the earlier claim that iOS "bypasses the SW entirely" was wrong, and the
-/// SW's `showNotification` is what renders the visible banner on iOS. (We tested
-/// skipping `showNotification` on iOS so the OS would render the declarative
-/// notification natively + dodge the `notificationclick` deep-link bug — it
-/// showed NO banner at all, because iOS only uses the declarative fallback when
-/// the SW handler errors/times out, not when it cleanly resolves without showing.
-/// Reverted; the SW always displays. See notifications.md §4.5 seventeenth
-/// iteration — do not retry.) On tap the OS navigates the existing top-level
-/// traversable to `notification.navigate`. We build that URL from the stored
-/// service-worker scope (`https://host/<slug>/`) so the gateway prefix is
-/// preserved and WebKit does not have to accept a query-only relative URL. It
-/// MUST be a cross-document (query) URL: a same-document (hash-only) navigation
-/// is not applied to an already-open PWA window — WebKit just focuses it — so a
-/// hash URL silently no-ops the deep link. The page's `handleHashLocation` →
-/// `dispatchDeepLink` chain reads the query params on load/resume and marks-read
-/// + routes.
-///
-/// **Chrome / Firefox** don't recognize the magic, so the SW `push` handler
-/// fires as usual, reads `data.notification.*` to populate `showNotification`,
-/// and the `notificationclick` path runs on tap: an already-open tab is routed
-/// by `postMessage` (the structured deep link straight to the page), and the
-/// hash `data.navigate` URL feeds only the cold `clients.openWindow()` fallback
-/// (no tab open). See `system-knowhow/notifications.md` §4.5.
-///
-/// `tap` is ALWAYS encoded as part of the `data` block — the page's tap
-/// dispatcher routes on `tap.kind` (`modal` opens the inbox, `navigate`
-/// deep-links). Modal-kind taps are omitted from the `navigate` URL params to
-/// keep them short (the page demotes missing `tap` to modal).
+/// `tap` is ALWAYS encoded in the `data` block, because the page's dispatcher
+/// routes on `tap.kind`. Modal-kind taps are left out of the `navigate` URL to
+/// keep it short, and the page demotes a missing `tap` to modal.
 #[allow(clippy::too_many_arguments)]
 fn build_push_payload(
     title: &str,
@@ -1316,7 +1283,7 @@ fn build_push_payload(
     link_event_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
     ios_scope_url: Option<&str>,
-    unread_count: Option<i64>,
+    app_badge: Option<i64>,
 ) -> serde_json::Value {
     let params = build_navigate_params(notification_id, link_thread_id, link_event_id, tap);
     let navigate_ios = navigate_url_ios(&params, ios_scope_url);
@@ -1351,10 +1318,9 @@ fn build_push_payload(
         "tap".into(),
         serde_json::to_value(tap).expect("Tap serializes infallibly"),
     );
-    // HASH form inside `data` so the Chrome SW `notificationclick` handler can
-    // read the engine-built URL straight off `event.notification.data` for the
-    // cold `clients.openWindow()` path (no tab open) instead of rebuilding it.
-    // Warm taps route via postMessage, not this URL — see `navigate_url_sw`.
+    // HASH form, so the Chrome SW reads the engine-built URL straight off
+    // `event.notification.data` for the cold `clients.openWindow()` path
+    // instead of rebuilding it. Warm taps route via postMessage.
     data.insert("navigate".into(), serde_json::Value::String(navigate_sw));
 
     let mut payload = serde_json::json!({
@@ -1362,32 +1328,32 @@ fn build_push_payload(
         "notification": {
             "title": title,
             "body": body,
-            // QUERY form — iOS Safari's declarative-push parent-process
-            // navigation needs a cross-document URL to navigate an open window.
+            // QUERY form: iOS Safari's declarative-push navigation needs a
+            // cross-document URL to navigate an open window.
             "navigate": navigate_ios,
             "tag": tag,
             "data": serde_json::Value::Object(data),
         },
     });
-    // Declarative Web Push top-level `app_badge` (sibling of `web_push` /
-    // `notification`, NOT inside the notification object): iOS Safari reads it
-    // in its parent process and sets the installed PWA's home-screen badge
-    // WITHOUT running the service worker — the ONLY badge path for a CLOSED iOS
-    // PWA, since iOS may bypass the SW for declarative pushes (see the §1002
-    // note above). `0` clears the badge. The workspace engine's own unread
-    // count, so a per-workspace PWA badges its own workspace. Omitted only when
-    // the count couldn't be read (the badge then simply isn't touched).
-    if let Some(count) = unread_count {
+    // Top-level `app_badge`, a sibling of `web_push` rather than a field
+    // inside the notification object. iOS Safari reads it in its parent
+    // process and badges the installed PWA without running the service
+    // worker. That is the only badge path for a closed iOS PWA. The Chrome SW
+    // mirrors the same field. `0` clears the badge.
+    //
+    // WHICH count this is belongs to the caller, not the envelope: see
+    // `app_badge_for`. Omitted when neither count could be read, and the badge
+    // is then left untouched.
+    if let Some(count) = app_badge {
         payload["app_badge"] = serde_json::json!(count.max(0));
     }
     payload
 }
 
-/// Dispatch the per-subscription send loop. `kind` appears in log lines for
-/// grepping. Non-fatal — per-subscription failures are logged and the loop
-/// continues. Under `e2e-test-hooks` the network send is replaced with a
-/// write to `push_log` so browser e2e tests can assert delivery without
-/// waiting on APNs/FCM.
+/// Dispatch the per-subscription send loop. `kind` appears in log lines.
+/// Non-fatal: a per-subscription failure is logged and the loop continues.
+/// Under `e2e-test-hooks` the network send becomes a `push_log` write, so
+/// browser e2e tests assert delivery without waiting on APNs or FCM.
 async fn fan_out_payload(
     pool: &PgPool,
     deliveries: Vec<(PushSubscription, String)>,
@@ -1439,9 +1405,8 @@ async fn fan_out_to_web_push(
             &sub_info,
         ) {
             Ok(mut builder) => {
-                // VAPID `sub` claim is required by FCM (Chrome) and Apple push
-                // services. Must be a valid mailto: or https: URL — Apple
-                // rejects localhost.
+                // FCM and Apple both require the VAPID `sub` claim, as a valid
+                // mailto: or https: URL. Apple rejects localhost.
                 builder.add_claim("sub", "mailto:push@lucidos.app");
                 match builder.build() {
                     Ok(sig) => sig,
@@ -1467,14 +1432,11 @@ async fn fan_out_to_web_push(
         let message = match msg_builder.build() {
             Ok(m) => m,
             Err(e) => {
-                // Genuine last resort. `build_push_payload_fitted` /
-                // `build_wake_payload` already truncate the body so the payload
-                // fits `MAX_PUSH_PAYLOAD_BYTES`, so reaching here means
-                // something the guard cannot shrink (an oversized title, bad
-                // subscription keys, an unparseable endpoint). Say plainly that
-                // this device gets NOTHING: the old wording read like a
-                // per-message hiccup while every subscription was silently
-                // dying.
+                // Genuine last resort. The builders already truncate the body
+                // to fit `MAX_PUSH_PAYLOAD_BYTES`, so reaching here means
+                // something the guard cannot shrink: an oversized title, bad
+                // subscription keys, an unparseable endpoint. Say plainly that
+                // this device gets NOTHING.
                 log!(
                     "[Push] NO {} push delivered to {} ({} B payload): the encrypted message \
                      could not be built: {}. The notification row and bell badge are \
@@ -1496,7 +1458,7 @@ async fn fan_out_to_web_push(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                // 410 Gone means the subscription is no longer valid
+                // 410 Gone means the subscription is no longer valid.
                 if err_str.contains("410") || err_str.contains("Gone") {
                     log!(
                         "[Push] Subscription expired (410), will remove: {}",
@@ -1532,15 +1494,15 @@ async fn fan_out_to_push_log(
     notification_id: Option<uuid::Uuid>,
 ) -> usize {
     let Some(nid) = notification_id else {
-        // No notification_id to attribute the log row to — no caller does
-        // this today, and tests can't assert on an untagged row anyway.
+        // No notification_id to attribute the log row to, and a test cannot
+        // assert on an untagged row.
         return 0;
     };
     let mut delivered = 0usize;
     for (sub, payload) in &deliveries {
         let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
-        // Legacy rows without a device_id can't be attributed; skip so the
-        // test log only contains rows tests will actually assert against.
+        // A row without a device_id cannot be attributed, so the test log
+        // holds only rows a test can assert against.
         let Some(device_id) = sub.device_id.as_deref() else {
             continue;
         };

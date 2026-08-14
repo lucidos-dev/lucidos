@@ -10,6 +10,7 @@
       "Bash(./scripts/e2e.sh*)",
       "Bash(./scripts/new-migration.sh*)",
       "Bash(./scripts/check-em-dashes.sh*)",
+      "Bash(./scripts/check-prose.sh*)",
       "Bash(cargo check*)",
       "Bash(cargo build*)",
       "Bash(cargo test*)",
@@ -52,6 +53,10 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prose.sh"
           }
         ]
       },
@@ -61,6 +66,10 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prose.sh"
           }
         ]
       }

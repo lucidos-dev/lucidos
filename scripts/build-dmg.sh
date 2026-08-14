@@ -211,6 +211,13 @@ BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
 # (RESOURCE_NAMES) or the engine can't launch the CC permission MCP server.
 BUNDLED_EXECUTABLES=(lucidos-engine lucidos-gateway lucidos)
 RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
+# Hardened-runtime capabilities claimed by the OUTER .app signature, and by
+# nothing else in the bundle. Today that is the camera, which the composer's
+# Camera item reaches through getUserMedia in the WKWebView: the release path
+# signs with --options runtime, and the hardened runtime denies capture to a
+# binary that doesn't claim it, whatever Info.plist says. The file itself
+# documents why it stays minimal and why the loose Mach-O files never get it.
+APP_ENTITLEMENTS="$APP_DIR/Entitlements.plist"
 
 PG_VERSION="${PG_VERSION:-18.4.0}"   # match the dev/docker stack (pgvector/pgvector:pg18)
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
@@ -2701,13 +2708,39 @@ sign_app_bundle() {
 
     # Sign the outer .app LAST. Keep --deep as belt-and-suspenders (re-seals any
     # nested bundle), but the loose payload above is what makes notarization pass.
-    codesign --force --deep ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$app" \
+    #
+    # --entitlements lands HERE and only here. The ~200 files above capture
+    # nothing, and least privilege is the whole point of the file; the bundle
+    # carries no nested bundles, frameworks or XPC services, so --deep has
+    # nothing to propagate it to either. Missing file is fatal rather than
+    # skipped: silently signing without it is exactly how the shipped app ended
+    # up unable to open the camera, with the failure invisible until a user
+    # tapped Camera and got a black rectangle.
+    [ -f "$APP_ENTITLEMENTS" ] || die "expected entitlements at $APP_ENTITLEMENTS"
+    codesign --force --deep --entitlements "$APP_ENTITLEMENTS" \
+        ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$app" \
         || die "codesign failed for $app"
 
     # Verify the whole bundle, then spot-verify a couple of the Postgres binaries
     # that previously slipped through unsigned.
     codesign --verify --deep --strict --verbose=2 "$app" \
         || die "codesign --verify failed for $app"
+
+    # Prove BOTH halves the camera needs are on the bundle, at the one point in
+    # the build where both exist. The failure they guard is silent: a perfectly
+    # signed, perfectly notarized app whose Camera item opens a black rectangle
+    # and never errors, because getUserMedia waits forever on a consent prompt
+    # that cannot be shown. Read back from the artifact rather than trusting the
+    # arguments above, since either half can also be lost upstream (a dropped
+    # Tauri plist merge, an entitlements file that parsed to nothing).
+    local entitlements
+    entitlements="$(codesign -d --entitlements - "$app" 2>&1 || true)"
+    case "$entitlements" in
+        *com.apple.security.device.camera*) ;;
+        *) die "signed $app carries no camera entitlement (from $APP_ENTITLEMENTS)" ;;
+    esac
+    plutil -extract NSCameraUsageDescription raw "$app/Contents/Info.plist" >/dev/null 2>&1 \
+        || die "$app/Contents/Info.plist has no NSCameraUsageDescription (from $APP_DIR/Info.plist)"
     for bin in "${BUNDLED_EXECUTABLES[@]}"; do
         codesign --verify --strict --verbose=2 "$resources/$bin" \
             || die "codesign --verify failed for $resources/$bin"

@@ -193,7 +193,11 @@ impl VertexProvider {
         read_location(&self.location)
     }
 
-    fn is_claude_model(model: &str) -> bool {
+    /// Which of the two Vertex request paths a model id takes: Claude, or
+    /// (everything else) Gemini. `pub(crate)` because `llm::reasoning` decides
+    /// a Vertex model's reasoning tiers by the same split, and a second copy of
+    /// the rule would silently start offering a model the other path's tiers.
+    pub(crate) fn is_claude_model(model: &str) -> bool {
         model.starts_with("claude")
     }
 

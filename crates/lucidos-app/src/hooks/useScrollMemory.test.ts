@@ -34,10 +34,10 @@ import { installFakePage } from '../utils/__tests__/fakePage';
  *  follow on the way. */
 afterEach(() => setFollowLiveEdge(false));
 
-/** And un-say "the agent is running". `setThreadLive` is a module-global that
- *  `ChatExchange` normally owns, so a test that sets it true leaks a live thread
- *  into every later one, where the follow would then carry a reader the test
- *  never meant to arm. */
+/** And un-say "the agent is running". `setThreadLive` is a module-global
+ *  `ChatExchange` normally owns. A test that sets it true leaks a live thread
+ *  into every later one. The follow would then carry a reader the test never
+ *  meant to arm. */
 afterEach(() => setThreadLive(false));
 
 describe('isFullyRestorable', () => {
@@ -79,9 +79,9 @@ describe('parseSavedScroll', () => {
   });
 
   it('parses the live edge, which is a position and not an offset', () => {
-    // The second form a reading position takes: the reader had a standing follow
-    // armed when they left, so the thread opens at whatever its bottom is NOW
-    // rather than at the pixel offset that bottom happened to be back then.
+    // The second form a reading position takes. The reader had a standing
+    // follow armed when they left. So the thread opens at whatever its bottom
+    // is NOW, not at the pixel offset that bottom was back then.
     expect(parseSavedScroll(LIVE_EDGE_VALUE)).toEqual({ kind: 'live-edge' });
   });
 
@@ -141,20 +141,12 @@ describe('resetContentScroll', () => {
 });
 
 // ---------------------------------------------------------------------------
-// A saved position is never retired for being old.
+// **A saved position is never retired for being old.** Nothing scrolls to the
+// end on its own (ADR 0064). Retiring one would only convert "return the
+// reader where they were" into "send them to the top of the window".
 //
-// It used to be, and three describes lived here for the stamp that made it
-// answerable: `formatSavedScroll`'s `<offset>:<revision>` format,
-// `savedScrollIsStale`, and `dropStaleSavedScroll`. The whole mechanism served
-// the auto-scroll-to-bottom: once the thread had gained a turn, discarding the
-// position made the open fall through to the end, where the reader presumably
-// wanted to be. Nothing scrolls to the end on its own now, so retiring only
-// converts "return the reader where they were" into "send them to the top of
-// the window", which is the move the reader-owns-the-scroll rule exists to stop.
-//
-// One trace of it survives on purpose, covered below: a browser whose
-// localStorage still holds a stamped `"1500:12"` must keep its position rather
-// than lose it.
+// One trace of the retired stamp survives on purpose, covered below: a browser
+// whose localStorage still holds a stamped `"1500:12"` keeps its position.
 // ---------------------------------------------------------------------------
 describe('a stamped position written by an older build still parses', () => {
   it('reads the offset out and ignores the retired revision suffix', () => {
@@ -165,10 +157,9 @@ describe('a stamped position written by an older build still parses', () => {
 
 // ---------------------------------------------------------------------------
 // The teardown flush must write what THIS key observed, never what the next
-// render is holding. `attachScrollMemory` is the hook's whole body, extracted so
-// the lifecycle can be driven with a fake element (the shape `makeScrollObservers`
-// already uses), because the defect here is entirely about WHEN a value is read
-// and no assertion over the hook could reach it.
+// render is holding. `attachScrollMemory` is the hook's whole body, extracted
+// so the lifecycle can be driven with a fake element. The defect here is about
+// WHEN a value is read, which no assertion over the hook could reach.
 // ---------------------------------------------------------------------------
 describe('attachScrollMemory teardown', () => {
   function makeEl(scrollTop: number, scrollHeight = 5000) {
@@ -177,9 +168,9 @@ describe('attachScrollMemory teardown', () => {
       scrollTop,
       scrollHeight,
       clientHeight: 800,
-      // `isElementVisible` needs a box and an ancestor chain to walk, so the
-      // element can be registered as the active scroll target and reached by the
-      // chevron. A null parent ends the walk immediately.
+      // `isElementVisible` needs a box and an ancestor chain to walk. The
+      // element can then register as the active scroll target and be reached by
+      // the chevron. A null parent ends the walk immediately.
       parentElement: null,
       getBoundingClientRect: () => ({ width: 800, height: 800, top: 0, bottom: 800, left: 0, right: 800 }),
       addEventListener: (_t: string, fn: () => void) => { listeners.push(fn); },
@@ -211,9 +202,9 @@ describe('attachScrollMemory teardown', () => {
   }
 
   /** Swap in observers that hand the test their callbacks and drop them on
-   *  disconnect, so "the restore was retired" is observable rather than merely
-   *  "it happened not to fire". Used by the restore-window tests below and by
-   *  the deep-link describe further down, which is why it sits out here. */
+   *  disconnect. A retired restore is then observable, rather than merely not
+   *  firing. Used by the restore-window tests below and by the deep-link
+   *  describe further down, which is why it sits out here. */
   function captureObservers() {
     const callbacks: Array<(records: unknown[]) => void> = [];
     class Capturing {
@@ -265,11 +256,9 @@ describe('attachScrollMemory teardown', () => {
   });
 
   it('records a reader who ended up at the bottom, rather than forgetting them', () => {
-    // The transcript used to pass `shouldSave: () => scrolledUp.value`, so a
-    // reader at the live edge saved nothing: the auto-scroll-to-bottom on the
-    // next open would put them back there anyway. Nothing does that now, and
-    // declining to save would send someone who finished a thread to the TOP of
-    // it on re-entry, which is the app moving them rather than returning them.
+    // Nothing scrolls to the bottom on its own (ADR 0064). Declining to save at
+    // the live edge would send someone who finished a thread to the TOP of it
+    // on re-entry. That is the app moving them, not returning them.
     const el = makeEl(4200); // 4200 + 800 clientHeight == the 5000 bottom
     const detach = attachScrollMemory(el, 'k', { live: () => ({}) });
 
@@ -295,13 +284,11 @@ describe('attachScrollMemory teardown', () => {
   });
 
   it('ignores a scroll that lands after this key stopped being the current one', () => {
-    // Leaving a thread you were parked in used to lose your place in it, by two
-    // routes into the same window: the teardown is deferred past the render that
-    // changed the key, so the listener is still attached while the shared
-    // transcript already belongs to the next thread. Either the incoming
-    // thread's open-at-the-top reset moved it (it had no position of its own) or
-    // swapping in its content clamped it, and the scroll event carried the
-    // INCOMING thread's offset.
+    // Two routes reach the same window. The teardown is deferred past the
+    // render that changed the key. The listener is therefore still attached
+    // while the shared transcript belongs to the next thread. Either the
+    // incoming thread's open-at-the-top reset moved it, or swapping in its
+    // content clamped it. Either way the scroll carries the INCOMING offset.
     localStorage.setItem('k', '5000');
     // Tall enough that the restore completes on attach: until it does, the save
     // listener is gated behind `restoring` and the assertion would be vacuous.
@@ -395,14 +382,11 @@ describe('attachScrollMemory teardown', () => {
   // -------------------------------------------------------------------------
 
   it('never lands the reader on the live edge when the saved offset is out of reach', async () => {
-    // The report: open a long thread from a link, read the top of it for a
-    // moment, and get hauled to the end of the conversation. The deadline used
-    // to fall back to `Math.min(saved.top, max)`, and it can only ever run when
-    // the offset is UNREACHABLE, so `max` was the whole of that expression: the
-    // live edge, three seconds late. The transcript renders a 20-exchange TAIL
-    // (`threadWindow.INITIAL_WINDOW`), so a position recorded against a taller
-    // render (a session that scrolled up, a deep-link's render-all) is out of
-    // reach on the next open as a matter of course.
+    // Clamping to `Math.min(saved.top, max)` at the deadline is the live edge
+    // three seconds late, since the deadline only runs when the offset is
+    // UNREACHABLE. The transcript renders a 20-exchange TAIL
+    // (`threadWindow.INITIAL_WINDOW`). A position recorded against a taller
+    // render is therefore out of reach on the next open.
     vi.useFakeTimers();
     try {
       localStorage.setItem('k', '12000'); // recorded when far more was rendered
@@ -419,11 +403,11 @@ describe('attachScrollMemory teardown', () => {
   });
 
   it('parks the reader at the top while it waits, not on the outgoing offset', () => {
-    // `.thread-content` is one element, so a thread whose saved offset is not
-    // yet reachable used to spend the wait on the PREVIOUS thread's position,
-    // and a wait that never pays out left them there for good. Arriving in a
-    // shorter thread clamps that borrowed number to this thread's live edge, and
-    // the save listener then persists it as this thread's own.
+    // `.thread-content` is one element. A thread whose saved offset is not yet
+    // reachable would otherwise spend the wait on the PREVIOUS thread's
+    // position. A wait that never pays out leaves them there for good. Arriving
+    // in a shorter thread clamps that borrowed number to this thread's live
+    // edge, and the save listener then persists it as this thread's own.
     localStorage.setItem('k', '12000');
     const el = makeEl(4200, 5000); // the outgoing thread's offset, clamped in
     captureObservers();
@@ -445,18 +429,15 @@ describe('attachScrollMemory teardown', () => {
     detach();
   });
 
-  // The deadline's LAST LOOK. Isolating it needs nothing but inert observers:
-  // the attach's own attempt is synchronous, so any growth these arrange after
-  // it is growth only the deadline can answer for, which is the decoded-image
-  // case exactly.
+  // The deadline's LAST LOOK. Isolating it needs nothing but inert observers.
+  // The attach's own attempt is synchronous, so any growth arranged after it is
+  // growth only the deadline can answer for, which is the decoded-image case.
 
   it('takes one last look at the deadline, for growth neither observer saw', async () => {
-    // What the deadline is FOR, once the clamp is gone. An image decoding grows
-    // `scrollHeight` without mutating the DOM, and the container's own box is
-    // unchanged (it is a flex child of a fixed parent), so neither observer
-    // fires and a now-reachable offset would otherwise be dropped. The old
-    // deadline could not answer this at all for a container the open found
-    // anywhere but 0, which is most of them.
+    // What the deadline is FOR. An image decoding grows `scrollHeight` without
+    // mutating the DOM, and the container's own box is unchanged, being a flex
+    // child of a fixed parent. Neither observer fires, so a now-reachable
+    // offset would otherwise be dropped.
     vi.useFakeTimers();
     try {
       localStorage.setItem('k', '3200');
@@ -475,12 +456,10 @@ describe('attachScrollMemory teardown', () => {
 
   // ── Whose window is it ────────────────────────────────────────────────────
   //
-  // The wait runs for three seconds, which is long enough for the reader to
-  // have settled in and started reading, so the first thing they DO retires it.
-  // Asked as a gesture and never as a change in `scrollTop`: the app writes
-  // `scrollTop` all through this window (a clamp on shorter content, the reflow
-  // correction, the window-expansion's compensation, the iOS repaint nudge),
-  // and reading one of those as the reader abandons their position for good.
+  // The wait runs for three seconds, long enough for the reader to have settled
+  // in, so the first thing they DO retires it. Asked as a gesture and never as
+  // a change in `scrollTop`. The app writes `scrollTop` all through this
+  // window, and reading one of those as the reader abandons their position.
 
   it('retires the whole wait on the reader\'s first gesture', () => {
     localStorage.setItem('k', '3200');
@@ -517,13 +496,11 @@ describe('attachScrollMemory teardown', () => {
   });
 
   it('reads the app\'s own writes as untouched, gesture-less as they are', () => {
-    // Every mechanism that moves this container without the reader, standing in
-    // for the whole class: the iOS compositor nudge's ±1px (five times over the
-    // first second of every thread open, `utils/iosRepaint.ts`), a clamp when
-    // shorter content swaps into the shared element, `restoreAfterReflow`'s
-    // correction across a pane resize, the render window's compensation for the
-    // height it just prepended. None of them emits an input event, which is why
-    // the question is asked that way.
+    // Every mechanism that moves this container without the reader. The iOS
+    // compositor nudge (`utils/iosRepaint.ts`). A clamp when shorter content
+    // swaps into the shared element. `restoreAfterReflow`'s correction across a
+    // pane resize. The render window's compensation for prepended height. None
+    // of them emits an input event, which is why the question is asked so.
     localStorage.setItem('k', '3200');
     const el = makeEl(0, 3000);
     const observers = captureObservers();
@@ -539,10 +516,9 @@ describe('attachScrollMemory teardown', () => {
 
   it('defers the RESTORE to a deep-link that owns the open', () => {
     // A notification tap into a thread the reader has a saved position in. The
-    // restore is an observer that keeps retrying until the content is tall
-    // enough, so it can fire long after the deep-link has landed and snap the
-    // reader off the event they were sent to. It stands down for the whole
-    // resolve window.
+    // restore is an observer retrying until the content is tall enough. It can
+    // fire long after the deep-link landed, snapping the reader off the event.
+    // So it stands down for the whole resolve window.
     localStorage.setItem('k', '3200');
     const el = makeEl(4200, 20000);
     const detach = attachScrollMemory(el, 'k', {
@@ -558,13 +534,12 @@ describe('attachScrollMemory teardown', () => {
   //
   // The stand-down at attach reads the claim once, and answers only for the
   // ordering where the claim is already in place. Two ordinary orderings are
-  // not: a deep-link into the thread the reader is ALREADY in re-attaches
-  // nothing, and a thread whose events arrive while the tap is still resolving
-  // attaches BEFORE the claim. In both, the restore is mid-flight, waiting for
-  // the transcript to grow tall enough to hold the saved offset, and the claim's
-  // own render-all is exactly that growth. Re-asking is not enough either: the
-  // claim releases within a second of a synchronous landing while the restore
-  // stays armed for three.
+  // not. A deep-link into the thread the reader is ALREADY in re-attaches
+  // nothing. A thread whose events arrive while the tap resolves attaches
+  // BEFORE the claim. In both the restore is mid-flight, waiting for the
+  // transcript to grow, and the claim's own render-all is that growth.
+  // Re-asking is not enough either: the claim releases within a second of a
+  // synchronous landing, while the restore stays armed for three.
   //
   // These drive the REAL deep-link, not a stand-in predicate, so the wiring
   // between the two modules is what is pinned. That needs the observers to be
@@ -611,11 +586,10 @@ describe('attachScrollMemory teardown', () => {
 
     it('retires the restore DEADLINE with it', async () => {
       // The other half of an armed restore: at RESTORE_DEADLINE_MS it takes one
-      // last look, and the claim's own render-all is exactly the growth that
-      // makes the saved offset reachable. Here the link is still resolving and
-      // has moved nobody yet, so the container sits where the open found it and
-      // an un-retired deadline would write 3200 over a landing that has not
-      // happened.
+      // last look, and the claim's own render-all is the growth that makes the
+      // saved offset reachable. Here the link is still resolving and has moved
+      // nobody, so the container sits where the open found it. An un-retired
+      // deadline would write 3200 over a landing that has not happened.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '3200');
@@ -698,9 +672,9 @@ describe('attachScrollMemory teardown', () => {
 
     it('does not rescue a second link away from the first link\'s landing', async () => {
       // The rescue's reference point is captured from the FIRST claim and never
-      // re-read. Re-reading it would make a successful landing the new "nothing
-      // has moved here" baseline, so a dead SECOND link would haul the reader
-      // off the event the first one correctly took them to.
+      // re-read. Re-reading it would make a successful landing the new baseline
+      // for "nothing has moved here". A dead SECOND link would then haul the
+      // reader off the event the first one took them to.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '3200');
@@ -736,10 +710,10 @@ describe('attachScrollMemory teardown', () => {
      *  aimed at its last turn.
      *
      *  `opts.rectTop` puts it somewhere else, for the cases that need a landing
-     *  that actually MOVES: the container ends at `el.scrollTop + rectTop`.
-     *  `opts.reducedMotion` makes that landing a single synchronous write rather
-     *  than a tween, which is what lets a test see the value at the instant the
-     *  landing is announced. Returns the teardown. */
+     *  that MOVES: the container ends at `el.scrollTop + rectTop`.
+     *  `opts.reducedMotion` makes that landing a synchronous write rather than
+     *  a tween, so a test can see the value at the instant the landing is
+     *  announced. Returns the teardown. */
     function withFindableTarget(el: any, opts: { rectTop?: number; reducedMotion?: boolean } = {}) {
       const rectTop = opts.rectTop ?? 0;
       el.getBoundingClientRect = () => ({ width: 800, height: 800, top: 0, bottom: 800, left: 0, right: 800 });
@@ -770,8 +744,7 @@ describe('attachScrollMemory teardown', () => {
       // The announcement is made after the scroll it describes, and under
       // reduced motion that scroll IS the whole landing: one synchronous write.
       // Announced first, the recorder would be handed the offset the reader was
-      // leaving, and with no tween frames behind it nothing would ever correct
-      // that to where they ended up.
+      // leaving. With no tween frames behind it, nothing would correct that.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '200');
@@ -801,14 +774,13 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('arms no rescue when the link RESOLVED BEFORE this thread attached', async () => {
-      // The ordinary tap into a thread the reader is NOT in, which is the one
-      // ordering a broadcast cannot serve: the target renders and resolves on
-      // the microtask checkpoint of the commit that rendered it, while Preact
-      // defers the effect that would subscribe past that checkpoint. So the
-      // attach has to ASK what it missed. Arriving in a shorter thread clamps
-      // the shared container to its bottom (500 here) and the link to its last
-      // turn resolves to exactly there, so "has anything moved" says dead about
-      // a link the reader is looking at the target of.
+      // The ordinary tap into a thread the reader is NOT in, the one ordering a
+      // broadcast cannot serve. The target resolves on the microtask checkpoint
+      // of the commit that rendered it, while Preact defers the subscribing
+      // effect past that checkpoint. So the attach has to ASK what it missed.
+      // Arriving in a shorter thread clamps the shared container to its bottom,
+      // 500 here, and the link to its last turn resolves exactly there. The
+      // has-anything-moved test then says dead about a live link.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '200');
@@ -835,21 +807,20 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('does not rescue a link that RESOLVED without moving the container', async () => {
-      // The rescue's "has anything moved" test reads a landing with nowhere to
-      // move as a dead link, and a link that resolves to where the reader
-      // already sits is ordinary: arriving in a shorter thread clamps the shared
-      // container to its bottom and a link to that thread's last turn is right
-      // there, or (here) the open restored the saved position and the target is
-      // in it. So the inference says "dead" about a link the reader is already
-      // looking at the target of, and the resolve is told instead.
+      // The rescue's has-anything-moved test reads a landing with nowhere to
+      // move as a dead link. A link resolving to where the reader already sits
+      // is ordinary. Arriving in a shorter thread clamps the shared container
+      // to its bottom, and a link to that thread's last turn is right there.
+      // Here the open restored the saved position and the target is in it. So
+      // the inference says dead about a live link, and the resolve is told.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '3200');
-        // Out of reach at attach, so the open parks at the top and waits, which
-        // is what leaves a restore for the claim to stand down and therefore a
-        // rescue to arm. The growth below is the claim's own render-all, and it
-        // is what makes the rescue's write OBSERVABLE: without the resolve
-        // cancelling it, 3200 would be reachable by the time it fires.
+        // Out of reach at attach, so the open parks at the top and waits. That
+        // leaves a restore for the claim to stand down, and therefore a rescue
+        // to arm. The growth below is the claim's own render-all, which makes
+        // the rescue's write OBSERVABLE: without the resolve cancelling it,
+        // 3200 would be reachable by the time it fires.
         const el = makeEl(4200, 1000);
         const restoreDom = withFindableTarget(el);
         captureObservers();
@@ -875,18 +846,16 @@ describe('attachScrollMemory teardown', () => {
 
     // ── Going to a link SETS the memory ────────────────────────────────────
     //
-    // The landing is a reading position: the reader asked to be at that event,
-    // so coming back to the thread must return them there rather than to
-    // whatever they had parked on before following the link. The scroll listener
-    // cannot be left to notice it, because neither of these two landings writes
-    // a scroll event it will see.
+    // The landing is a reading position. The reader asked to be at that event.
+    // Coming back must return them there rather than to whatever they parked on
+    // before following the link. The scroll listener cannot be left to notice
+    // it: neither of these two landings writes a scroll event.
 
     it('records a landing that moved nobody as this thread\'s position', async () => {
-      // Nothing to move means no scroll event at all, so before this the thread
-      // kept the stale position and the next open undid the navigation. Here
-      // the saved offset is out of reach of what has rendered, so the open
-      // parks the reader at the top and waits, and the link finds its target
-      // right where they are.
+      // Nothing to move means no scroll event, so without this the thread keeps
+      // the stale position and the next open undoes the navigation. Here the
+      // saved offset is out of reach of what has rendered. The open parks the
+      // reader at the top and waits, and the link finds its target there.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', '30000');
@@ -912,23 +881,19 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('records a landing that moved nobody as the OFFSET on a LIVE thread, because the link ended the ride', async () => {
-      // A position is an offset OR the live edge, and the recorder has to answer
-      // the same way the scroll listener would. On a LIVE thread a deep-link
-      // landing always answers with the offset, and by construction rather than
-      // by luck: going to a link retires the standing follow, because the reader
-      // asked to be at ONE place and the transcript must stop moving under them
-      // there. So coming back returns them to the event they went to, rather
-      // than to a live edge they stopped riding when they followed the link.
+    it('records a landing that moved nobody as the OFFSET, because the link ended the ride', async () => {
+      // A position is an offset OR the live edge, and the recorder must answer
+      // the same way the scroll listener would. A deep-link landing always
+      // answers with the offset, by construction. Going to a link retires the
+      // standing follow: the reader asked to be at ONE place, and the transcript
+      // must stop moving under them there. So coming back returns them to the
+      // event they went to, not to a live edge they stopped riding.
       //
-      // This recorded the live edge until the retirement existed, and had to:
-      // the follow survived the landing, and the case this recorder exists for,
-      // a landing with nowhere to move, is exactly the state where the container
-      // has not left the follow's stamp. A same-thread deep-link is the way in,
-      // since `focusThread` retires the follow only for a DIFFERENT thread.
+      // A same-thread deep-link is the way into this case, `focusThread`
+      // retiring the follow only for a DIFFERENT thread.
       //
-      // LIVE is now half the premise rather than scenery, so it is said out
-      // loud. The idle case is the test below, and it answers the other way.
+      // The thread is LIVE here and IDLE in the test below. The pair pins that
+      // the answer does not depend on which.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
@@ -964,14 +929,19 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('keeps the LIVE EDGE for the same landing on an IDLE thread', async () => {
-      // The mirror of the test above, and the reason the recorder asks the
-      // POSITION rather than "did a link land". On an idle thread the landing
-      // retires nothing (following a link into a finished thread is browsing),
-      // and this link lands the reader exactly where the follow already had
-      // them. So they have not moved, they are still riding, and the live edge
-      // is the honest record: re-entering the thread resumes the ride rather
-      // than pinning them to a bottom that will have moved on by then.
+    it('answers the same for that landing on an IDLE thread', async () => {
+      // The mirror of the test above, and it agrees with it. The landing retires
+      // the ride whatever the agent is doing, so the same same-thread link with
+      // nowhere to move records the same offset.
+      //
+      // Answering the other way would cost the reader the event. A quiet thread
+      // is routinely one about to run, a question card being quiescent by
+      // `isRenderedThreadIdle`. The first thing the wake does is carry an armed
+      // reader to the live edge.
+      //
+      // The recorder still asks the POSITION rather than whether a link landed.
+      // The reason is listener ORDER inside `.thread-content`'s two scroll
+      // handlers, not deep links (see `currentPosition`).
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
@@ -988,8 +958,10 @@ describe('attachScrollMemory teardown', () => {
         try {
           scrollToEventAndPulse('e1');
           await vi.advanceTimersByTimeAsync(200);
-          expect(isFollowScroll(el)).toBe(true);
-          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+          expect(followingLiveEdge.value).toBe(false);
+          expect(isFollowScroll(el)).toBe(false);
+          expect(localStorage.getItem('k')).toBe(String(el.scrollTop));
+          expect(localStorage.getItem('k')).not.toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
           stopFollowingBottom();
@@ -1059,9 +1031,9 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('leaves a container the claim is not about alone', () => {
-      // The content pane and the thread drawer share this hook and pass no
-      // `shouldRestore`, so a transcript deep-link must not retire their
-      // restores: they answer "ours" and keep waiting for their own content.
+      // The content pane and the thread drawer share this hook. They pass no
+      // `shouldRestore`. A transcript deep-link must therefore not retire their
+      // restores: they answer "ours" and wait for their own content.
       localStorage.setItem('k', '3200');
       const el = makeEl(0, 1000);
       const observers = captureObservers();
@@ -1103,20 +1075,18 @@ describe('attachScrollMemory teardown', () => {
 
     // ── The link owns the POSITION, not the REQUEST ────────────────────────
     //
-    // A *standing follow* is one global flag that `focusThread` retires on every
-    // open, and the resume that answers it lives in the positioning branch this
-    // stand-down replaces. So a deep-linked open was the one open with a retire
-    // and no resume, and a notification tap into a thread the reader was riding
-    // landed them on the event with the toggle dark. It is resumed here instead,
-    // writing nothing, because both answers hold: the link decides where they
-    // look, the record decides whether they are riding.
+    // A *standing follow* is one global flag `focusThread` retires on every
+    // open, and the resume answering it lives in the positioning branch this
+    // stand-down replaces. A deep-linked open is therefore the one open with a
+    // retire and no resume. It is resumed here instead, writing nothing,
+    // because both answers hold: the link decides where the reader looks, the
+    // record decides whether they are riding.
 
-    /** Arrive at a thread the way a NOTIFICATION TAP does: `focusThread` retires
-     *  the global follow on the way in, the target renders and the link resolves
+    /** Arrive at a thread the way a NOTIFICATION TAP does. `focusThread` retires
+     *  the global follow on the way in. The target renders and the link resolves
      *  on the microtask checkpoint of that commit, and only then does Preact run
      *  the effect that attaches this. `rectTop` is what makes the landing MOVE
-     *  the reader, which is the ordinary case and the one that used to record an
-     *  offset over the request. */
+     *  the reader, which is the ordinary case. */
     function tapNotificationInto(el: any, opts: { live?: boolean } = {}) {
       const restoreDom = withFindableTarget(el, { rectTop: 1000, reducedMotion: true });
       captureObservers();
@@ -1131,10 +1101,16 @@ describe('attachScrollMemory teardown', () => {
       return () => { detach(); restoreDom(); };
     }
 
-    it('resumes the ride the IDLE thread recorded, without moving the reader off the event', async () => {
-      // The report. The thread is parked on a question (or a permission card,
-      // which is the same state), so nothing will carry the reader anywhere and
-      // the ride costs them nothing: they get the event AND the lit toggle.
+    it('ends the ride on an IDLE thread too, because the LANDING answered it', async () => {
+      // The case a liveness gate gets wrong, and the COMMON one rather than a
+      // corner. A "needs your answer" notification points at a thread parked on
+      // a question card by construction, and that thread is quiescent:
+      // `isRenderedThreadIdle` counts `waiting_for_user_answer` as idle. A gated
+      // landing would decline to retire and this resume would re-arm over it.
+      // The reader answers, the thread wakes, and `honourWake` writes them to
+      // the live edge, off the event the notification existed to show them.
+      //
+      // An idle thread is not a finished one. The ride ends here.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
@@ -1142,11 +1118,10 @@ describe('attachScrollMemory teardown', () => {
         const done = tapNotificationInto(el);
 
         try {
-          expect(followingLiveEdge.value).toBe(true);
+          expect(followingLiveEdge.value).toBe(false);
           expect(el.scrollTop).toBe(5200); // the landing, and nothing written over it
-          // And the landing is still recorded as an OFFSET: the reader asked to
-          // be at one place, so coming back returns them to it. The in-place
-          // resume takes no held stamp precisely so this stays true.
+          // And the landing is recorded as an OFFSET: the reader asked to be at
+          // one place, so coming back returns them to it.
           await vi.advanceTimersByTimeAsync(200);
           expect(isFollowScroll(el)).toBe(false);
           expect(localStorage.getItem('k')).toBe('5200');
@@ -1158,10 +1133,10 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('leaves the ride retired when the thread is LIVE', async () => {
-      // The other half, and the blind spot the landing's own retire exists for:
-      // a link into a streaming thread is a request to be at ONE place, and the
-      // next token would carry the reader off it.
+    it('ends it on a LIVE thread as well, which is the unchanged half', async () => {
+      // A link into a streaming thread is a request to be at ONE place, and the
+      // next token would carry the reader off it. Same answer as the idle case
+      // above, which is the point: the landing decides, not the agent.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
@@ -1179,10 +1154,12 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('lets the follow seed speak for a thread with no reading position', async () => {
-      // The seed answers the no-record case and only that one, and a deep link
-      // does not change that this thread has none. Without it, every first open
-      // reached by a link would cost a reader who rides everything their ride.
+    it('does not let the follow SEED arm over a landing either', async () => {
+      // The same bug by its other route. The seed answers the no-record case,
+      // and a thread reached by a link has none on a first open. An ungated
+      // seed would re-arm exactly where the recorded request would have. A link
+      // that LANDED is the reader naming one place, which outranks a standing
+      // preference about where threads start.
       vi.useFakeTimers();
       try {
         setFollowLiveEdge(true); // the press that records the seed
@@ -1191,10 +1168,44 @@ describe('attachScrollMemory teardown', () => {
         const done = tapNotificationInto(el);
 
         try {
-          expect(followingLiveEdge.value).toBe(true);
+          expect(followingLiveEdge.value).toBe(false);
           expect(el.scrollTop).toBe(5200);
         } finally {
           done();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps the ride for a link still IN FLIGHT, which is what the resume is for', async () => {
+      // The half that survives, and the reason the guard asks about the LANDING
+      // rather than deleting the in-place resume. `focusThread` retires the
+      // follow on the way in, so a deep-linked open is the one open with a
+      // retire and no resume. While the link resolves nobody has positioned the
+      // reader, so the ride is held open. A DEAD link costs them nothing, and a
+      // landing takes the ride away.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 20000);
+        // Claim a link whose target never renders: no `withFindableTarget`, so
+        // nothing resolves and `deepLinkHasResolved()` stays false.
+        captureObservers();
+        stopFollowingBottom();
+        setThreadLive(false);
+        scrollToEventAndPulse('never-renders');
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          expect(el.scrollTop).toBe(4200); // and nothing written over them
+        } finally {
+          detach();
         }
       } finally {
         vi.useRealTimers();
@@ -1220,8 +1231,8 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('never arms a container that cannot ride a live edge', async () => {
-      // The content pane and the thread drawer share this hook and the follow is
-      // one global, so the gate has to hold on this path too: a deep link in the
+      // The content pane and the thread drawer share this hook, and the follow
+      // is one global. The gate must hold on this path too: a deep link in the
       // transcript must not arm a follow because a file preview was scrolled.
       vi.useFakeTimers();
       try {
@@ -1260,14 +1271,13 @@ describe('attachScrollMemory teardown', () => {
   it('defers the top RESET to a deep-link too, then rescues a dead one', async () => {
     // The reset stands down for the same reason the restore does: the attach
     // cannot be assumed to precede the landing. It is parked on `paused` until
-    // the events load, and `eventsLoaded` arrives in the same store write as
-    // the rendered exchanges, so the deep-link's MutationObserver (a microtask
-    // on that commit) resolves before Preact's deferred effect attaches. Under
-    // reduced motion the landing is one synchronous write with nothing to
-    // re-assert it, so an ungated reset simply overwrote it.
+    // the events load. `eventsLoaded` arrives in the same store write as the
+    // rendered exchanges, so the deep-link's MutationObserver resolves before
+    // Preact's deferred effect attaches. Under reduced motion the landing is
+    // one synchronous write, so an ungated reset would overwrite it.
     //
     // Standing down alone would strand a DEAD link on the outgoing thread's
-    // offset forever, so the attach waits out the deep-link's budget and then
+    // offset. So the attach waits out the deep-link's budget and then
     // positions, but only if the container has not moved at all.
     vi.useFakeTimers();
     try {
@@ -1310,11 +1320,10 @@ describe('attachScrollMemory teardown', () => {
   });
 
   it('rescues to the TOP, never the live edge, when the saved offset is out of reach', async () => {
-    // The rescue owes the reader a position, because a dead link leaves nobody
-    // else to give them one and the shared container is still showing the
-    // outgoing thread's offset. What it owes them is not the bottom: clamping
-    // an unreachable offset to `max` is the same "scroll to the live edge, late"
-    // the restore deadline used to do, reached down the other branch. A position
+    // The rescue owes the reader a position. A dead link leaves nobody else to
+    // give them one, and the shared container still shows the outgoing thread's
+    // offset. What it owes them is not the bottom. Clamping an unreachable
+    // offset to `max` is scrolling to the live edge, late (ADR 0064). A position
     // that cannot be honoured opens the thread where a thread with no position
     // at all opens, at the top of what is rendered.
     vi.useFakeTimers();
@@ -1428,12 +1437,10 @@ describe('attachScrollMemory teardown', () => {
 
   // -------------------------------------------------------------------------
   // The second form a reading position takes. A standing follow is the reader
-  // asking to ride the live edge until they say otherwise, and it used to end
-  // the moment they looked at another thread: the flag is one global that
-  // `focusThread` retires on every open, so coming back landed on the pixel
-  // offset the transcript had when they walked away, with everything the agent
-  // produced meanwhile below them and nothing following. Recording the request
-  // here is what gives it the same lifetime the offset already had.
+  // asking to ride the live edge until they say otherwise. The flag itself is
+  // one global `focusThread` retires on every open. Without a record, the ride
+  // would end the moment they looked at another thread. Recording the request
+  // here gives it the same lifetime the offset already had.
   // -------------------------------------------------------------------------
   describe('a standing follow survives leaving the thread', () => {
     /** Arm the follow the way the FOLLOW TOGGLE does. Not a test-only hatch:
@@ -1444,10 +1451,10 @@ describe('attachScrollMemory teardown', () => {
     function armViaToggle(el: any) {
       setActiveScrollElement(el);
       // Park on the live edge FIRST. The toggle glides there when the reader is
-      // not already on it, and this environment's `requestAnimationFrame` stub
-      // hands every frame the same timestamp, so a tween would never reach t=1.
-      // These tests are about what the arm RECORDS, not about how it travels;
-      // the travelling is `scroll-follow-the-live-edge.test.ts`.
+      // not on it. This environment's `requestAnimationFrame` stub hands every
+      // frame the same timestamp, so a tween never reaches t=1. These tests are
+      // about what the arm RECORDS, not how it travels. The travelling is
+      // `scroll-follow-the-live-edge.test.ts`.
       el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
       setFollowLiveEdge(true);
     }
@@ -1455,10 +1462,10 @@ describe('attachScrollMemory teardown', () => {
     beforeEach(() => { stopFollowingBottom(); setActiveScrollElement(null); });
     afterEach(() => { stopFollowingBottom(); setActiveScrollElement(null); });
 
-    /* ── The follow SEED: what a thread with NO record starts as ─────────────
-     *  The per-thread record stays authoritative wherever it exists, because it
-     *  is the reader's own last act on that thread. The seed answers the case the
-     *  record cannot: a thread it has never been written for. */
+    /* ── The follow SEED ─────────────────────────────────────────────────────
+     *  What a thread with NO record starts as. The per-thread record stays
+     *  authoritative wherever it exists, being the reader's own last act on that
+     *  thread. The seed answers the one case the record cannot. */
 
     it('arms a thread with NO reading position when the seed is on', () => {
       // The brand-new thread, and the whole point of the toggle being reachable
@@ -1481,15 +1488,15 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('records the seeded arm, so the thread owns the answer from then on', () => {
-      // The seed decides a thread's FIRST open and no more: from then on the
-      // thread has a record like any other, and turning the seed off changes
-      // what NEW threads do rather than what this one does.
+      // The seed decides a thread's FIRST open and no more. From then on the
+      // thread has a record like any other. Turning the seed off changes what
+      // NEW threads do, not what this one does.
       //
-      // It has to be recorded from the ARM rather than from a scroll, because
-      // whether arming moves the container is incidental: a shared
-      // `.thread-content` arriving on the outgoing thread's offset moves, a
-      // thread already at its live edge does not. Recording off the scroll gave
-      // those two readers different persistence for the same act.
+      // It has to be recorded from the ARM rather than from a scroll. Whether
+      // arming moves the container is incidental: a shared `.thread-content`
+      // arriving on the outgoing thread's offset moves, a thread already at its
+      // live edge does not. Recording off the scroll would give those two
+      // readers different persistence for the same act.
       setFollowLiveEdge(true);
       stopFollowingBottom();
 
@@ -1556,7 +1563,7 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('never seeds a container that is not the transcript', () => {
-      // The follow is one global and this hook serves three containers, so the
+      // The follow is one global and this hook serves three containers. The
       // seed is read inside the same `followsLiveEdge` opt-in the record's own
       // live-edge form is. Without it, opening a file preview arms the follow.
       setFollowLiveEdge(true);
@@ -1570,9 +1577,9 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('records the live edge rather than the offset the follow happened to reach', () => {
-      // Every growth round writes scrollTop, so recording the number would
-      // overwrite the request with a pixel value on the next token and re-entry
-      // would land wherever the stream had got to.
+      // Every growth round writes scrollTop. Recording the number would
+      // overwrite the request on the next token, and re-entry would land
+      // wherever the stream got to.
       const el = makeEl(100, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
 
@@ -1586,10 +1593,10 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('records the request even when arming produced no scroll event at all', () => {
-      // The ordinary idle case, not an exotic one: a reader already at the live
-      // edge who presses the chevron gets a write the browser clamps to where
-      // they already are, and an idle thread then grows nothing. Nothing ever
-      // fires, so a save driven only by scroll events would lose the request.
+      // The ordinary idle case, not an exotic one. A reader already at the live
+      // edge who presses the chevron gets a write the browser clamps. An idle
+      // thread grows nothing. Nothing fires, so a save driven only by scroll
+      // events would lose the request.
       const el = makeEl(4200, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
 
@@ -1600,12 +1607,11 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('records the offset the reader landed on when they scroll away, follow still armed', () => {
-      // The listener-order case. `.thread-content` carries two scroll listeners:
-      // the disarm lives in `makeScrollObservers` and this save lives here. No
-      // observers are wired in this test, so the flag is STILL armed when the
-      // save runs, which is exactly the order that would break a save asking
-      // "is the follow armed". Asking where the container is instead answers the
-      // same in either order.
+      // The listener-order case. `.thread-content` carries two scroll
+      // listeners: the disarm in `makeScrollObservers` and this save. No
+      // observers are wired here, so the flag is STILL armed when the save
+      // runs. That is the order that breaks a save asking whether the follow is
+      // armed. Asking where the container is answers the same in either order.
       const el = makeEl(100, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
 
@@ -1663,9 +1669,8 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('returns the reader to TODAY\'s live edge, not the offset it was when they left', () => {
-      // The whole report. The thread grew from 5000 to 20000 while they were
-      // away; the old behaviour restored 4200 and stranded them 15000px above
-      // the work they came back to watch.
+      // The thread grew from 5000 to 20000 while they were away. Restoring the
+      // offset would strand them 15000px above the work they came back for.
       localStorage.setItem('k', LIVE_EDGE_VALUE);
       const el = makeEl(120, 20000);
       const detach = attachScrollMemory(el, 'k', {
@@ -1680,9 +1685,9 @@ describe('attachScrollMemory teardown', () => {
     });
 
     it('leaves an UNARMED reader at the bottom exactly where they were', () => {
-      // The distinction the whole feature rests on: a position is not a request.
-      // This reader is at the identical place as the one above and is recorded
-      // as an offset, so re-entry returns them to it and follows nothing.
+      // The distinction the whole feature rests on: a position is not a
+      // request. This reader is at the identical place as the one above, yet is
+      // recorded as an offset. Re-entry returns them to it and follows nothing.
       const el = makeEl(100, 5000);
       const detach = attachScrollMemory(el, 'k', { live: () => ({}), followsLiveEdge: true });
       el.scrollTop = 4200; // the live edge, reached by hand
@@ -1784,10 +1789,9 @@ describe('attachScrollMemory teardown', () => {
     }
 
     it('lands on the live edge the thread reached WHILE the app was away', () => {
-      // The report. Nothing remounts across a background, so without a wake
-      // signal the reader comes back to the offset the transcript had when the
-      // app was frozen, with the whole batch the resync just delivered below
-      // them and nothing following.
+      // Nothing remounts across a background. Without a wake signal the reader
+      // comes back to the offset the transcript had when the app froze. The
+      // whole batch the resync delivered then sits below them.
       const el = makeEl(0, 5000);
       const detach = arriveFollowing(el);
       expect(el.scrollTop).toBe(4200);
@@ -1803,9 +1807,9 @@ describe('attachScrollMemory teardown', () => {
 
     it('moves a reader who scrolled away BEFORE backgrounding zero pixels', () => {
       // The direction that does damage, and the reason the wake reads the
-      // record rather than the follow flag. Note what has NOT happened here:
-      // the 150ms debounce never fired, so the offset reached storage only
-      // because the hide flushed it, and without that flush the stale live edge
+      // record rather than the follow flag. Note what has NOT happened here.
+      // The 150ms debounce never fired, so the offset reached storage only
+      // because the hide flushed it. Without that flush the stale live edge
       // would still be there for the wake to act on.
       const el = makeEl(0, 20000);
       const detach = arriveFollowing(el);

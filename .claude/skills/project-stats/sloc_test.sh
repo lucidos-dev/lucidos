@@ -245,11 +245,108 @@ EOF
 expect_warns "unterminated block comment fails loud" \
     "$TMP/unterminated.rs" "unterminated block comment"
 
-cat > "$TMP/case.py" <<'EOF'
-print("hi")
+cat > "$TMP/case.zig" <<'EOF'
+const std = @import("std");
 EOF
 expect_warns "unknown extension fails loud" \
-    "$TMP/case.py" "unknown extension"
+    "$TMP/case.zig" "unknown extension"
+
+# Python: a docstring is comment, and the statement that opens an assigned one
+# stays code. The last two lines are the shapes a triple-quote scanner must not
+# claim: adjacent empty strings, and a # that is inside a string.
+cat > "$TMP/case.py" <<'EOF'
+#!/usr/bin/env python3
+"""Module docstring.
+
+Second paragraph.
+"""
+# a real comment
+def f():
+    """One liner."""
+    return 1
+text = """opens here
+and closes here"""
+pair = "" ""
+print("# not a comment")
+EOF
+expect_count "python: docstrings are comments, # in a string is code" \
+    "$TMP/case.py" "code=7 comment=5 blank=1 total=13 files=1"
+
+# Position decides. A run opening after code is data, so its lines are code:
+# this is where a Python project keeps its SQL, templates and prompts.
+cat > "$TMP/data_str.py" <<'EOF'
+SQL = """
+SELECT 1
+FROM t
+"""
+def h():
+    """A real docstring."""
+    return SQL
+EOF
+expect_count "python: a triple-quoted run after code is data, not a docstring" \
+    "$TMP/data_str.py" "code=6 comment=1 blank=0 total=7 files=1"
+
+# The same string wrapped in parentheses opens its own line, so position alone
+# would call it a docstring. The unclosed bracket on the line before is what
+# says otherwise. The def below it must still get a real docstring.
+cat > "$TMP/paren_str.py" <<'EOF'
+SQL = (
+    """SELECT 1
+    FROM t"""
+)
+def h():
+    """A real docstring."""
+    return SQL
+EOF
+expect_count "python: a bracket left open makes the next line's quote data" \
+    "$TMP/paren_str.py" "code=6 comment=1 blank=0 total=7 files=1"
+
+printf '"""opened and never closed\nstill swallowed\n' > "$TMP/open_doc.py"
+expect_warns "unterminated docstring fails loud" \
+    "$TMP/open_doc.py" "unterminated docstring"
+
+# A prefix belongs to the opener, so an r-string docstring is still a comment.
+# The assigned form on the last line keeps its statement as code.
+cat > "$TMP/prefix.py" <<'EOF'
+r"""Raw docstring with a \d regex."""
+def g():
+    rb"""Two-character prefix."""
+    return 2
+val = r"""assigned, so this line is code"""
+EOF
+expect_count "python: a string prefix opens a docstring, an assignment does not" \
+    "$TMP/prefix.py" "code=3 comment=2 blank=0 total=5 files=1"
+
+# An escaped delimiter is content. Closing on it would hand the rest of the
+# docstring back as code and let the real terminator open a second one.
+cat > "$TMP/escaped_doc.py" <<'EOF'
+"""Shows a literal \""" inside the prose.
+
+Still the same docstring.
+"""
+x = 1
+EOF
+expect_count "python: an escaped triple quote does not close the docstring" \
+    "$TMP/escaped_doc.py" "code=1 comment=3 blank=1 total=5 files=1"
+
+# Kotlin is listed in the table rather than left to the fallback, so measuring a
+# JVM tree stays silent and its canaries stay readable.
+cat > "$TMP/case.kt" <<'EOF'
+// comment
+fun main() {
+    val s = "don't // trip on the apostrophe"
+}
+EOF
+expect_count "kotlin: known extension, apostrophe in a string is not a quote" \
+    "$TMP/case.kt" "code=3 comment=1 blank=0 total=4 files=1"
+
+cat > "$TMP/case.scss" <<'EOF'
+// line comment
+.a { color: red; }
+.b { content: '/* not a comment */'; }
+EOF
+expect_count "scss: // line comments, single-quoted block token is code" \
+    "$TMP/case.scss" "code=2 comment=1 blank=0 total=3 files=1"
 
 # per_file mode: one line per file, in input order, with the path last.
 CASES=$((CASES + 1))

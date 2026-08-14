@@ -9,7 +9,7 @@ use futures::StreamExt;
 use std::time::Duration;
 
 use super::{
-    openai_reasoning_effort, AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
+    AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
     DEFAULT_MAX_COMPLETION_TOKENS,
 };
 
@@ -196,11 +196,14 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Map unified reasoning_effort to OpenAI's per-model vocabulary
-        // (GPT-5.6 keeps "max"; earlier models map "max" → "xhigh").
+        // Verbatim, deliberately. Which tiers this model supports is decided
+        // once, in `llm::reasoning`, and enforced by `RoutingProvider`'s clamp.
+        // This builder also serves OpenRouter and local servers, so it cannot
+        // tell whose vocabulary applies from the model id alone: rewriting
+        // `max` into `xhigh` here because the id was not `gpt-5.6` is what 400'd
+        // a local turn on 2026-08-12 (see `llm/reasoning.rs`).
         if let Some(effort) = reasoning_effort {
-            body["reasoning_effort"] =
-                serde_json::Value::String(openai_reasoning_effort(effort, model).to_string());
+            body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
         }
 
         body
@@ -593,5 +596,41 @@ mod tests {
             .get("stream_options")
             .expect("stream_options must be sent");
         assert_eq!(opts["include_usage"], serde_json::Value::Bool(true));
+    }
+
+    /// The effort reaches the body exactly as handed in, for every model.
+    ///
+    /// This builder also serves OpenRouter and local servers, so it cannot tell
+    /// whose vocabulary applies from the model id. It used to rewrite `max`
+    /// into `xhigh` whenever the id was not `gpt-5.6`, which sent an
+    /// OpenAI-proprietary tier to a local server that rejected it (400,
+    /// 2026-08-12). Deciding what a model supports belongs to `llm::reasoning`
+    /// and is enforced by `RoutingProvider`; a second rule here is drift.
+    #[test]
+    fn chat_body_sends_the_reasoning_effort_verbatim() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.4",
+            "muse-glimmer:30b-mlx",
+            "z-ai/glm-5.2",
+        ] {
+            for effort in crate::llm::reasoning::EFFORT_LADDER {
+                let body = provider.build_chat_body(model, &[], &[], None, Some(effort));
+                assert_eq!(
+                    body["reasoning_effort"], *effort,
+                    "{model} rewrote {effort}"
+                );
+            }
+        }
+    }
+
+    /// No effort means no key at all, so the server applies its own default
+    /// rather than being told a value the caller never chose.
+    #[test]
+    fn chat_body_omits_reasoning_effort_when_none_is_given() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
+        let body = provider.build_chat_body("gpt-4o", &[], &[], None, None);
+        assert!(body.get("reasoning_effort").is_none());
     }
 }

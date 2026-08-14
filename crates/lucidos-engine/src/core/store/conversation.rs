@@ -76,19 +76,19 @@ impl EventStore {
                         tool_called_event_id: None,
                     });
                 }
-                "MemorySearched" => {
-                    let has_results = event
+                // "MemorySearched" is the legacy DB string; the variant was
+                // renamed to MemoryRecalled so it stops mirroring the `memory`
+                // tool's own "Searching memory" step. New rows store
+                // "MemoryRecalled"; old rows are unchanged. Match both so
+                // legacy snapshots still render.
+                "MemorySearched" | "MemoryRecalled" => {
+                    let results = event
                         .payload
                         .get("results")
                         .and_then(|v| v.as_u64())
-                        .is_some_and(|n| n > 0);
-                    let desc = if has_results {
-                        "Memory searched"
-                    } else {
-                        "Memory: no results"
-                    };
+                        .unwrap_or(0);
                     current_steps.push(Step {
-                        description: desc.to_string(),
+                        description: super::memory_recalled_label(results),
                         tool_name: None,
                         success: true,
                         context_tokens: None,

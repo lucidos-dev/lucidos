@@ -14,12 +14,15 @@ import { pushOverlay, removeOverlay } from '../../store/overlayStack';
 import { CollapsingActions, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
-/** The content row's three zones. Stable identity so the collapse effect's deps
- *  do not re-fire every render. */
+/** The boxes the content row's collapse is measured against: the row, and the
+ *  title cluster centred on it. No leading entry, because there is nothing to
+ *  measure there: the cluster is centred, so the room these actions get is half
+ *  of what it leaves rather than the row's leftover, and the hamburger leading
+ *  the row is inside that half by a box and a half. Stable identity so the
+ *  collapse effect's deps do not re-fire every render. */
 const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   container: '.content-header-elements',
-  leading: '.hamburger-panel',
-  centre: '.header-title-span',
+  centre: '.pane-header-content-title',
   anchor: '.notifications-bell',
 };
 
@@ -280,20 +283,29 @@ export function ContentHeaderActions({ layout }: Props) {
   }
 
   // ── Collapse ──
-  // Desktop collapses PROGRESSIVELY: when the header row runs out of room the
-  // leading context actions (nearest the title) move into a ⋯ overflow menu,
-  // two first and then one more per step, until only ⋯ + the bell remain; the
-  // title starts ellipsizing only after that.
+  // Desktop collapses PROGRESSIVELY: as the pane narrows the leading context
+  // actions (nearest the title) move into a ⋯ overflow menu, two first and then
+  // one more per step, until only ⋯ + the bell remain.
+  //
+  // What it is giving way TO changed on 2026-08-13, even though the steps did
+  // not. The title used to be the flex middle of the row, so folding an icon
+  // handed it that width; it is a box centred on the row now, clearing a
+  // constant reserve at each end (--content-side-reserve in panels/shell.css),
+  // so folding frees the cluster's own room and nothing else. Which means the
+  // fold only has to fire where that reserve stops holding: the clamp's
+  // min-span arm, a Canvas pane at or near its floor, where the box's ends do
+  // reach the clusters. Above it the reserve is sized for the widest cluster
+  // this row can carry and the measurement finds everything fits.
   //
   // Mobile collapses EVERYTHING, at every width and every action count, so the
   // trailing cluster is always ⋯ + the bell (or the bell alone, for a view with
-  // no context actions). Constant is the point rather than compact: a trailing
-  // cluster whose width tracked the current view's action count moved the
-  // centred nav cluster with it, so the chevrons sat somewhere different on
-  // every content view and somewhere different again from the thread pane. With
-  // it constant, the chevrons are pinned in CSS and the two panes agree. This
-  // is also why mobile collapses a lone action, which the desktop rule
-  // deliberately never does (⋯ replaces it 1:1 and saves nothing).
+  // no context actions). It predates the desktop row being centred and is a
+  // different answer to the same question: a phone's row cannot afford a
+  // reserve wide enough for a variable cluster, so it makes the cluster
+  // constant instead, which is what lets the chevrons be pinned to a fixed span
+  // that agrees with the thread pane's. This is also why mobile collapses a
+  // lone action, which the desktop rule deliberately never does (⋯ replaces it
+  // 1:1 and saves nothing).
   const hostRef = useRef<HTMLDivElement>(null);
   // Three or more context actions fold whole, at any width: see
   // `alwaysCollapseFrom`. Two still ride the row when there is room for them.

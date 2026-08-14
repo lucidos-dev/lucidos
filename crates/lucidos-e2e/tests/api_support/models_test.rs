@@ -120,6 +120,88 @@ async fn context_window_round_trips_over_http() {
     delete_model(&client, &api, &id).await;
 }
 
+/// Every row carries the reasoning tiers its provider supports, and the picker
+/// filters against exactly this list.
+///
+/// It is derived, not stored: `llm::reasoning::supported_efforts` keyed on the
+/// row's provider and id, the SAME function `RoutingProvider` clamps a request
+/// with. That shared derivation is the point. When the picker derived its own
+/// answer from the model id, it offered a local model `max`, the wire layer
+/// rewrote that into `xhigh` because the id was not `gpt-5.6`, and the local
+/// server rejected it (400, 2026-08-12).
+///
+/// The sharp case is `local` / `openrouter`: `xhigh` is OpenAI-proprietary, so
+/// an arbitrary third-party server must never be offered it whatever its id
+/// looks like. Asserted here rather than only in the unit tests because the
+/// wire shape is what the picker consumes, and `#[serde(flatten)]` means a
+/// refactor could nest or drop the field without any Rust test noticing.
+#[tokio::test]
+async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
+    let client = http_client();
+    let api = base_url();
+
+    for (id, expected) in [
+        // Adaptive Claude sends the effort verbatim, so every tier is distinct.
+        (
+            "claude-opus-5@default",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        // The Claude budget path deliberately omits xhigh.
+        (
+            "claude-sonnet-4-6",
+            vec!["none", "low", "medium", "high", "max"],
+        ),
+        // Gemini collapses everything above high onto high.
+        ("gemini-3.5-flash", vec!["none", "low", "medium", "high"]),
+        // GPT-5.6 has a real max; earlier OpenAI families top out at xhigh.
+        (
+            "gpt-5.6-sol",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        ("gpt-5.5", vec!["none", "low", "medium", "high", "xhigh"]),
+        // A third-party OpenAI-compatible server: no xhigh, no max.
+        ("z-ai/glm-5.2", vec!["none", "low", "medium", "high"]),
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        let tiers: Vec<&str> = m["reasoning_efforts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{id} must carry reasoning_efforts at the top level"))
+            .iter()
+            .map(|v| v.as_str().expect("tier is a string"))
+            .collect();
+        assert_eq!(tiers, expected, "{id}");
+    }
+}
+
+/// A user-added local model gets the conservative set the moment it is created,
+/// with nothing for the user to declare. Asking someone adding a local server
+/// to name the reasoning tiers it validates would be asking for something they
+/// cannot know, and a wrong answer would fail their turns.
+#[tokio::test]
+async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
+    let client = http_client();
+    let api = base_url();
+    let id = unique_marker("e2e-model-local");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({ "id": id, "label": "Local", "provider": "local" }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(
+        listed["reasoning_efforts"],
+        json!(["none", "low", "medium", "high"])
+    );
+
+    delete_model(&client, &api, &id).await;
+}
+
 /// A model added without the field is simply undeclared — the engine infers a
 /// window from the id. This is the back-compat path every existing row takes.
 #[tokio::test]

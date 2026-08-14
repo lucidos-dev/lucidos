@@ -8,13 +8,13 @@ import { ComposeIcon, HelpIcon, SearchIcon } from '../shared/icons';
 import { CollapsingActions, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
-/** The thread row's zones. The centre one is CENTRED on the region rather than
- *  being a flex zone, so the room these actions have is half of what the centred
- *  cluster leaves, not the row's leftover (see `centred`). No `leading`: the
- *  row's leading control is the drawer toggle, which is positioned against the
- *  header rather than being a member of this region, and `centred` derives the
- *  leading width arithmetically anyway. Stable identity so the collapse effect's
- *  deps do not re-fire every render. */
+/** The boxes the thread row's collapse is measured against: the region, and the
+ *  brand cluster centred on it. The room these actions have is half of what
+ *  that cluster leaves, not the region's leftover. Nothing to measure at the
+ *  leading end either way: the row's leading control is the drawer toggle,
+ *  which is positioned against the header rather than being a member of this
+ *  region. Stable identity so the collapse effect's deps do not re-fire every
+ *  render. */
 const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   container: '.pane-header-brand',
   centre: '.pane-header-brand-label',
@@ -23,7 +23,6 @@ const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   // bell. It is a bare glyph rather than an icon button, which is why the
   // anchor is measured at its own width.
   anchor: '.recovery-indicator',
-  centred: true,
 };
 
 /** The thread pane header's actions, as data, so a narrowing pane can fold them

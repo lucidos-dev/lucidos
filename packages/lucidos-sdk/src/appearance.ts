@@ -1,37 +1,21 @@
 /**
- * The appearance boot contract: the single source for what a device's theme,
- * UI font, ligature settings and UI scale resolve to.
+ * The appearance boot contract: the single source for what a device's theme, UI
+ * font, ligature settings and UI scale resolve to.
  *
- * **Why this module exists.** Four surfaces have to agree on these values, and
- * until this module they each carried their own copy:
+ * Four surfaces must agree on these values: the host store
+ * (`store/actions/preferences.ts`), the host's inline FOUC script
+ * (`index.html`), the app-iframe FOUC script (`api/sdk_prefs.rs`, served as
+ * `/api/v1/sdk-prefs.js`), and the SDK's `ui.ts`. They paint at different
+ * moments of one page load, so a disagreement between any two is a visible
+ * flash. The two FOUC scripts are parser-blocking and cannot `import` at
+ * runtime, which forces two self-contained programs. Both are built from
+ * `boot/appearanceBoot.ts`, which reads this file like everyone else.
  *
- *   1. the host store (`crates/lucidos-app/src/store/actions/preferences.ts`),
- *   2. the host's inline FOUC script (`crates/lucidos-app/index.html`),
- *   3. the app-iframe FOUC script (`crates/lucidos-engine/src/api/sdk_prefs.rs`,
- *      served as `/api/v1/sdk-prefs.js`),
- *   4. the SDK (`ui.ts`), which repaints an iframe when preferences change.
- *
- * Two of those are parser-blocking scripts that must run before any module
- * loads, so they genuinely cannot `import` **at runtime**. That forces two
- * self-contained programs; it never forced four sources. Both are now built
- * from `boot/appearanceBoot.ts`, which reads this file like everyone else.
- *
- * They paint at different moments of one page load, so a disagreement between
- * any two of them is a visible flash: the FOUC script paints first, the store
- * or the SDK repaints a moment later. That is what makes one source worth the
- * indirection here.
- *
- * **This module is pure.** No DOM, no storage, no network, so every rule in it
- * is unit-testable without a browser and the boot script stays a thin shell
- * over it. Anything that touches `document` belongs in `boot/`.
- *
- * It lives in the SDK package because that is the one place both bundles reach:
- * `ui.ts` is its sibling, and the app resolves it through the
- * `@lucidos/appearance` alias (`vite.config.ts` + the app's `tsconfig.json`
- * paths). It is deliberately NOT re-exported from `index.ts`: nothing here
- * belongs on the `window.lucidos` surface, and keeping it off the barrel also
- * keeps the whole SDK out of the host store's module graph, which initialises
- * a theme listener at import time.
+ * **This module is pure**: no DOM, no storage, no network, so every rule is
+ * unit-testable without a browser. Anything touching `document` belongs in
+ * `boot/`. It is deliberately NOT re-exported from `index.ts`: nothing here
+ * belongs on `window.lucidos`. That also keeps the whole SDK out of the host
+ * store's module graph, which initialises a theme listener at import time.
  */
 
 export type ThemePref = 'light' | 'dark' | 'system';
@@ -63,12 +47,10 @@ export const THEME_BG: Record<ResolvedTheme, string> = {
  * The CSS value each `font-family` option resolves to.
  *
  * Fira Code's chain is the FULL system-mono stack rather than a bare
- * `monospace`, because it is the default: the tail is what paints in the moment
- * before the web font decodes, and on any device where it fails to load
- * altogether. Bare `monospace` is Courier, visibly worse than the `monospace`
- * option this default replaced. The other web fonts keep short chains, since a
- * user who picked one has opted into the wait, and they are proportional or
- * other-mono faces whose natural fallback is not this stack.
+ * `monospace`, because it is the default (ADR 0077). The tail is what paints
+ * before the web font decodes, and on any device where it never loads, and bare
+ * `monospace` is Courier. The other three keep short chains: a user who picked
+ * one opted into the wait, and their natural fallback is not this stack.
  */
 export const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
   monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
@@ -80,21 +62,17 @@ export const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
 };
 
 /** What an unset `font-family` preference means. Served by the local engine
- *  (`api/sdk_fonts.rs`) rather than a CDN, so the default needs no internet. */
+ *  (`api/sdk_fonts.rs`) rather than a CDN, so it needs no internet (ADR 0077). */
 export const DEFAULT_FONT_FAMILY: FontFamily = 'fira-code';
 
 /**
  * Opt-in web fonts, fetched from Google the first time one is selected.
  *
  * Fira Code is deliberately absent, and the asymmetry is the point: it is the
- * DEFAULT, and a Lucidos workspace is a self-contained local install, so its
- * ordinary appearance must not depend on a third-party origin being reachable.
- * Off the CDN, an offline workspace would render the whole UI in the browser's
- * generic `monospace` and every boot would announce itself to Google. It is
- * vendored instead: the host declares an `@font-face` in
- * `styles/global/base.css` (Vite hashes it into `assets/`, which the service
- * worker's shell cache covers), and app iframes get the same bytes from the
- * engine. A font the user opted into may take the CDN and the wait.
+ * DEFAULT, so it must render offline and announce no boot to a third party.
+ * It is vendored instead (ADR 0077), declared as an `@font-face` in
+ * `styles/global/base.css` for the host and served from the engine to app
+ * iframes.
  */
 export const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
   inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
@@ -110,19 +88,19 @@ export interface FontFeaturePair {
 }
 
 /**
- * Programming ligatures belong to CODE, never to prose, so the pair is
- * published as two custom properties and the stylesheets decide where each
- * applies (`styles/global/base.css` and the engine's `api/sdk_iframe.css`).
+ * Programming ligatures belong to CODE, never to prose. The pair is published
+ * as two custom properties, and the stylesheets decide where each applies
+ * (`styles/global/base.css` and the engine's `api/sdk_iframe.css`).
  *
- * The OFF value is the explicit zeros and MUST NOT be spelled `normal`: `liga`
- * and `calt` are default-ON features in CSS, so `normal` means "the font's
- * defaults" and renders byte-identically to `1`, leaving Fira Code's `calt`
- * free to re-space a typed `...` into what reads as two dots
- * (tonsky/FiraCode#1561). Merely dropping the declaration disables nothing.
+ * The OFF value is the explicit zeros and MUST NOT be spelled `normal`. `liga`
+ * and `calt` are default-ON in CSS, so `normal` means the font's defaults and
+ * renders identically to `1`. That leaves Fira Code's `calt` free to re-space a
+ * typed `...` (tonsky/FiraCode#1561), and dropping the declaration disables
+ * nothing.
  *
  * Every non-Fira font resolves BOTH to `normal`, which leaves its rendering
- * exactly as it was: an unconditional `"liga" 0` would also kill the `fi`/`fl`
- * ligatures a proportional face like Inter legitimately wants.
+ * untouched: an unconditional `"liga" 0` would also kill the `fi` and `fl`
+ * ligatures a proportional face like Inter wants.
  */
 export const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
 const FONT_FEATURES: Partial<Record<FontFamily, FontFeaturePair>> = {
@@ -132,13 +110,13 @@ const FONT_FEATURES: Partial<Record<FontFamily, FontFeaturePair>> = {
 export const UI_SCALE_MIN = 75;
 export const UI_SCALE_MAX = 200;
 /** 12.5% keeps the root font-size on integer pixels (16 x 0.125 = 2px per
- *  step), so every `rem` resolves to an integer and 1px borders don't
+ *  step). Every `rem` then resolves to an integer, so 1px borders do not
  *  anti-alias at varying widths across the layout. */
 export const UI_SCALE_STEP = 12.5;
 export const UI_SCALE_DEFAULT = 100;
 
-/** Pre-grid enum values, still present in old stored preferences. `medium` was
- *  113 before the 12.5 grid existed; it snaps to 112.5. */
+/** Pre-grid enum values, still present in old stored preferences. `medium`
+ *  snaps to 112.5 on the 12.5 grid. */
 export const LEGACY_UI_SCALES: Record<string, number> = {
   small: 100,
   medium: 112.5,
@@ -154,14 +132,13 @@ export const LEGACY_UI_SCALES: Record<string, number> = {
  *   4. else {@link DEFAULT_THEME}, follow the OS.
  *
  * Load-bearing invariant: a MISSING server theme must NEVER clobber the value
- * the synchronous client resolver already settled on. A previous
- * `prefs['theme'] || 'dark'` violated this, and a device with no server-scoped
- * theme (an iPhone PWA that only stored `ui-scale`) flipped every app iframe to
- * dark even when localStorage said light.
+ * the synchronous client resolver already settled on. A `prefs['theme'] ||
+ * 'dark'` breaks it, flipping every app iframe to dark on a device that stored
+ * only `ui-scale` while localStorage said light.
  *
- * `getAttr` is a thunk so the DOM is read only as a last resort, keeping the
- * common path side-effect-free and the function testable without a DOM.
- * Returns a raw preference; the caller resolves `system` via matchMedia.
+ * `getAttr` is a thunk so the DOM is read only as a last resort, which keeps
+ * the common path side-effect-free. Returns a raw preference, and the caller
+ * resolves `system` via matchMedia.
  */
 export function resolveThemePreference(
   server: string | undefined,
@@ -185,9 +162,9 @@ export function resolveTheme(theme: ThemePref, prefersLight: boolean): ResolvedT
  * Which font a stored value selects, defaulting to {@link DEFAULT_FONT_FAMILY}.
  *
  * Every surface resolves the KEY once and then reads both maps with it, rather
- * than defaulting each lookup separately. That is not tidiness: a stored value
+ * than defaulting each lookup separately. That is not tidiness. A stored value
  * absent from the family map would take the default STACK while the feature
- * lookup fell through to `normal`, and `normal` means the font's defaults, so
+ * lookup fell through to `normal`. And `normal` means the font's defaults, so
  * Fira Code's ligatures would come back on for prose.
  */
 export function resolveFontKey(stored: string | null | undefined): FontFamily {
@@ -212,10 +189,10 @@ export function fontFeaturesFor(font: FontFamily): FontFeaturePair {
  * The same value read out of `FONT_FEATURES` is a function rather than a pair,
  * so `features.text` would be `undefined`.
  *
- * `hasOwnProperty` off the prototype rather than `Object.hasOwn`: this module is
- * bundled to es2015 for the boot script, and esbuild transforms syntax but does
- * not polyfill built-ins, so an ES2022 method would simply be missing on an old
- * WebView, in the one script that has nothing to fall back to.
+ * `hasOwnProperty` off the prototype rather than `Object.hasOwn`: this module
+ * is bundled to es2015 for the boot script, and esbuild transforms syntax
+ * without polyfilling built-ins. An ES2022 method would simply be missing on an
+ * old WebView, in the one script that has nothing to fall back to.
  */
 function hasOwn(obj: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(obj, key);
@@ -246,18 +223,18 @@ export function parseUiScale(raw: string | null | undefined): number | null {
 // --- The live style remote ---
 //
 // A `style_overrides` preference holds a JSON object of custom property name to
-// value, applied straight onto `<html>`. That is what lets a design value be
-// retuned on a running app with no rebuild and no Apply, since preferences
-// already fan out live over the `PreferencesChanged` SSE.
+// value, applied straight onto `<html>`. Preferences fan out over the
+// `PreferencesChanged` SSE, so a design value can be retuned on a running app
+// with no rebuild and no Apply.
 //
-// That reach is why the validation below exists. Preferences are writable by
-// any app through `lucidos.preferences.set` and by the chat agent over the HTTP
-// API, so the map is an UNTRUSTED input path into the host's own inline style.
-// Everything that reaches `setProperty` passes through here first.
+// That reach is why the validation below exists. Any app can write preferences
+// through `lucidos.preferences.set`, and the chat agent can over the HTTP API.
+// The map is therefore an UNTRUSTED input path into the host's own inline
+// style, and everything reaching `setProperty` passes through here first.
 //
-// It lives in this contract because the boot script has to apply the same map
-// before any module can run, and it must not reach a different verdict than the
-// app does a moment later. `utils/styleOverrides.ts` re-exports these.
+// It lives in this contract because the boot script applies the same map before
+// any module can run. The two must not reach different verdicts a moment apart.
+// `utils/styleOverrides.ts` re-exports these.
 
 /** Workspace-scoped localStorage key for the FOUC seed. Scoping is automatic in
  *  the app realm (`workspaceStorage.ts` overrides `Storage.prototype`); the boot
@@ -281,18 +258,20 @@ export const MAX_STYLE_VALUE_LENGTH = 120;
 const NAME_RE = /^--[a-z][a-z0-9-]*$/;
 
 /**
- * Rejected value shapes, and why each one is here:
- *   `;`        closes the declaration, so the rest of the value becomes a
- *              SECOND declaration. The whole injection vector in one character.
- *   `{` `}`    closes the rule and opens a new selector block.
- *   `<` `>`    `</style>` breaks out of an inlined stylesheet context.
- *   `@`        `@import` pulls in a remote stylesheet.
- *   `\`        CSS escapes (`\3b`) spell any of the above past a naive scan.
- *   `url(`     issues a request to an origin the value's author chose, which
- *              leaks the fact of a page view to them. `image-set(` is the same
- *              hazard by another name.
- *   `expression(` legacy IE dynamic properties, still parsed by some engines.
- *   `/*`       opens a comment that swallows the rest of the block.
+ * Rejected value shapes, and why each one is here.
+ *
+ * | Shape | Why |
+ * |---|---|
+ * | `;` | closes the declaration, so the rest becomes a SECOND one |
+ * | `{` `}` | closes the rule and opens a new selector block |
+ * | `<` `>` | `</style>` breaks out of an inlined stylesheet context |
+ * | `@` | `@import` pulls in a remote stylesheet |
+ * | `\` | CSS escapes (`\3b`) spell any of the above past a naive scan |
+ * | `url(` | requests an origin the value's author chose, leaking the page view |
+ * | `image-set(` | the same hazard by another name |
+ * | `expression(` | legacy IE dynamic properties, still parsed by some engines |
+ * | `/*` | opens a comment that swallows the rest of the block |
+ *
  * `var(`, `color-mix(`, `rgba(`, `calc(` and the gradient functions are all
  * fine and deliberately allowed: they are what the real tokens are made of.
  */

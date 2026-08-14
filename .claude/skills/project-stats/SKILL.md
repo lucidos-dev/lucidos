@@ -30,8 +30,8 @@ only the LAST batch's total. Measuring VS Code caught it in the act, reporting 9
 lines for a tree that has 2,474,634. It undercounts without any sign that it did. With `-v per_file=1` it prints
 `code comment blank total path` per file instead.
 
-It does four things beyond splitting on a comment token, each because the naive version
-was measurably wrong here:
+It does five things beyond splitting on a comment token, each because the naive version
+was measurably wrong:
 
 - **Skips string literals.** The `/*` inside `engine/command_guard.rs`'s `"/" | "/*"`
   match arm reads as a block-comment open otherwise, and with no `*/` later in the file
@@ -42,8 +42,11 @@ was measurably wrong here:
   deleting `#!/usr/bin/env bash` changes what runs it: 110 scripts.
 - **Reads `{/* … */}` as a comment in TSX.** Those braces exist only to host the comment:
   151 comment-only lines here were reading as code.
+- **Books a Python docstring as comment**, which is cloc's rule. This tree holds one
+  Python file, so it earns its place on foreign repos: without it a scanner reads every
+  `#` line as code, which is most of what a Python tree writes.
 
-Fixtures for all four, and for the shapes that must NOT trigger them (`<<<` here-strings,
+Fixtures for all five, and for the shapes that must NOT trigger them (`<<<` here-strings,
 `1 << 20` shifts, a `<<` inside a quoted string, `<div>{/* x */}`, `} /* note */`), are in
 [`sloc_test.sh`](sloc_test.sh); run it after touching the counter. Three canaries turn a
 misparse into a non-zero exit plus a named file rather than a quietly wrong number:
@@ -151,6 +154,17 @@ Measuring a foreign repo needs two flags this repo never does: run the counter u
 aborts awk outright otherwise), and read stderr, since fixture files that embed `/*`
 inside a string trip the unterminated-block warning and make that project's comment
 column unreliable.
+
+Stderr carries a third thing there: an extension missing from `set_style`'s table falls
+back to `//` plus `/* */` and warns per file. Treat that warning as a result, not noise.
+For a C-family language the fallback is right, so list the extension and the warning
+stops drowning the canaries. Otherwise the column is wrong until the language is added.
+That is why `.py` is in the table rather than left to the fallback.
+
+Compare production code with production code. A path split on `src/test/`, `tests/` and
+`*.test.ts` gets most of it. Rust hides its unit tests inline, so the Rust side needs the
+region from each `#[cfg(test)]` to end of file counted separately. Skip that and a repo
+with inline tests looks larger than one keeping them in a test tree.
 
 ## Reporting Shape
 

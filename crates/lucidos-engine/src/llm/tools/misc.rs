@@ -392,14 +392,14 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a wake.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it wakes you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "on": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Any entry matching wakes you, and the result names which fired. Same shape as a trigger's `on_event`.",
+                        "description": "Any match delivers, and the result names which fired. Same shape as a trigger's `on_event`.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -419,7 +419,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 86400,
-                        "description": "REQUIRED. Seconds before giving up; there is no unbounded wait. Add margin: waking early costs one turn, waking late costs the whole wait."
+                        "description": "REQUIRED. Seconds before giving up; there is no unbounded wait. Add margin: expiring early costs one turn, expiring late costs the whole wait."
                     },
                     "reason": {
                         "type": "string",
@@ -451,7 +451,7 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::CANCEL_EVENT_WAIT.to_string(),
-            description: "Stand down a subscription this thread armed with `await_event`: one by `wait_id`, the ones watching an event type with `on`, or all with `all: true`. THIS IS HOW YOU STOP WATCHING, and one you leave live wakes this thread later whatever you told the user. Stopping is silent, so carry straight on in this turn. Pass exactly one argument.".to_string(),
+            description: "Stand down a subscription this thread armed with `await_event`: one by `wait_id`, the ones watching an event type with `on`, or all with `all: true`. THIS IS HOW YOU STOP WATCHING, and one you leave live re-opens this thread later whatever you told the user. Stopping is silent, so carry straight on in this turn. Pass exactly one argument.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

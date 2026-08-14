@@ -48,6 +48,10 @@ mod injection_coalescing_unit_tests;
 mod question_reask_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/todo_wake_nudge.rs"]
+mod todo_wake_nudge_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_unit_tests/failure_breaker.rs"]
 mod failure_breaker_unit_tests;
 

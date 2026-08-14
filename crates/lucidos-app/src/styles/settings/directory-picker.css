@@ -106,9 +106,19 @@
     background: var(--bg-hover);
 }
 
+/* Holds an inline SVG (FolderIcon / FolderUpIcon), so it is sized rather than
+   font-sized: a `font-size` does nothing for an SVG, which takes its box from
+   width/height. It carried one while the slot held a 📂 emoji. */
 .dir-picker-icon {
-    font-size: var(--font-size-lg);
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
     flex-shrink: 0;
+}
+
+.dir-picker-icon svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
 }
 
 .dir-picker-name {

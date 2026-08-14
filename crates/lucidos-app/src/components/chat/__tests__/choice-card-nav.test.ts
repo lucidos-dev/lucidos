@@ -1,10 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   CHOICE_CARD_ROLE,
   claimSeedForCard,
+  handleChoiceCardKeyDown,
   nextChoiceIndex,
   shouldSeedChoiceFocus,
 } from '../choiceCardNav';
+import { isNavigationScroll, setActiveScrollElement } from '../scrollState';
 
 const key = (
   k: string,
@@ -127,5 +129,55 @@ describe('shouldSeedChoiceFocus', () => {
     // the id on arrival). `seedChoiceCardFocus` asks `isElementOnScreen` about
     // the CHOICE instead, which is the question that actually matters.
     expect(Object.keys(idle)).toEqual(['hoverPointer', 'promptHasText', 'activeIsIdle']);
+  });
+});
+
+describe('the arrow-key reveal announces itself as the app\'s own', () => {
+  afterEach(() => { setActiveScrollElement(null); });
+
+  /** The transcript, and a card holding two choices inside it. Only the pieces
+   *  `handleChoiceCardKeyDown` touches: the buttons it walks, the focus and
+   *  reveal it calls on them, and enough box for `isElementVisible`. */
+  function cardInATranscript() {
+    const transcript: any = {
+      parentElement: null,
+      scrollTop: 400,
+      getBoundingClientRect: () => ({ width: 400, height: 800, top: 0, bottom: 800, left: 0, right: 400 }),
+    };
+    const buttons = [0, 1].map(() => ({
+      focus() {},
+      scrollIntoView() { transcript.scrollTop = 900; },
+      hasAttribute: () => false,
+    }));
+    const root: any = { querySelectorAll: () => buttons };
+    setActiveScrollElement(transcript);
+    return { transcript, root, buttons };
+  }
+
+  it('marks the transcript, so nothing reads the reveal as the reader scrolling', () => {
+    // `scrollIntoView` moves the transcript without writing `scrollTop`, and the
+    // keydown lands on the BUTTON rather than on the transcript, so neither of
+    // the two signals that tell the app's scrolls from the reader's sees it. The
+    // mobile header slid away under an arrow step because of that, the render
+    // window read it as a request for older turns, and the *standing follow*'s
+    // platform-scroll correction wrote an armed reader back to the live edge,
+    // taking the option they had just stepped to off the screen. Found by the
+    // second hardening reviewer, 2026-08-13.
+    const { transcript, root } = cardInATranscript();
+    const origActive = (globalThis.document as any).activeElement;
+    (globalThis.document as any).activeElement = null;   // focus on no choice: the arrow seeds
+    try {
+      expect(isNavigationScroll(transcript)).toBe(false);
+
+      handleChoiceCardKeyDown(
+        { key: 'ArrowDown', metaKey: false, ctrlKey: false, altKey: false, preventDefault() {} } as any,
+        root,
+      );
+
+      expect(transcript.scrollTop).toBe(900);            // the reveal happened
+      expect(isNavigationScroll(transcript)).toBe(true); // and it is ours
+    } finally {
+      (globalThis.document as any).activeElement = origActive;
+    }
   });
 });

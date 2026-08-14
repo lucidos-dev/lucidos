@@ -116,7 +116,7 @@ impl LucidosEngine {
     /// The CC process stays alive and enters waiting state.
     ///
     /// `actor` flows onto the `ResponseCanceled` emitted by the no-session
-    /// settle fallback so the panel reads "You" instead of "⚙ System".
+    /// settle fallback so the panel reads "You" instead of "System".
     ///
     /// Fallbacks when no live Claude Code subprocess exists for `thread_id`:
     ///   1. Cancel the in-process agentic loop via the `active_threads` token

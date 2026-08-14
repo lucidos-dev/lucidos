@@ -12,7 +12,7 @@ import { markSwUpdateDismissed } from '../../../hooks/sw-update';
 vi.mock('../../../hooks/sw-update', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../hooks/sw-update')>()),
   markSwUpdateDismissed: vi.fn(),
-  markSwitchDismissed: vi.fn(),
+  markEngineVersionDismissed: vi.fn(),
 }));
 
 /** Walk a vnode tree, returning every node whose className contains `cls`. */

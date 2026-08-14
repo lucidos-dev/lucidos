@@ -78,6 +78,20 @@ export function cssRules(css: string): CssRule[] {
 }
 
 /**
+ * A rule's selector list, one member per entry, trimmed.
+ *
+ * Use this rather than `selector.split(',')` for the same reason
+ * `rulesTargeting` does below: a plain split cannot tell a selector-list comma
+ * from one inside `:is(.a, .b)`, so it hands back two halves of one member and
+ * a scan asking "does this rule name `.x`" answers against a selector nobody
+ * wrote. Exported because asserting on the MEMBERS of a grouped rule is its own
+ * common shape, separate from asking which rules target a class.
+ */
+export function selectorList(selector: string): string[] {
+  return postcss.list.comma(selector).map(s => s.trim());
+}
+
+/**
  * Top-level combinators replaced by spaces, so the subject split below can be
  * a plain space split. Depth-aware, so `:is(.a > .b)` keeps its inner
  * combinator and `[class~="x"]` keeps its `~`.

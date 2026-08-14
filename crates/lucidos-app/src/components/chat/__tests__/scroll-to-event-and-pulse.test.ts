@@ -415,20 +415,55 @@ describe('a deep-link landing retires a standing follow while the agent is LIVE'
 
     expect(container.scrollTop).toBe(19200);
   });
+
+  it('does not write the live edge over a link that is still resolving', () => {
+    // The follow puts an armed reader back on the live edge when the PLATFORM
+    // scrolls them off it (`keepTheLiveEdge`, pinned in
+    // `scroll-follow-the-live-edge.test.ts`). A deep link owns the position for
+    // its whole resolve window, and for most of that window there is no tween to
+    // stand down for: the thread is still loading and the target has not
+    // rendered. So the claim is the guard, exactly as it is for the box-change
+    // branch, and without it the reader would be hauled to the bottom by any
+    // scroll arriving while their tap was still being answered.
+    restore = installFakeDom({}); // the target has not rendered yet
+    const { onScroll } = makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    onScroll();                   // the glide's own event, recording them on the edge
+    expect(container.scrollTop).toBe(9200);
+
+    scrollToEventAndPulse('e-7'); // the tap, still resolving
+    expect(hasPendingEventScroll()).toBe(true);
+
+    container.scrollTop = 0;      // and the platform moves the container meanwhile
+    onScroll();
+
+    expect(container.scrollTop).toBe(0);
+  });
 });
 
-describe('a deep-link landing leaves the ride alone on an IDLE thread', () => {
-  /** The other half of the block above, and the same rule the scroll disarm,
-   *  the up chevron and turn stepping already followed: if nothing is running,
-   *  nothing touches the toggle. Following a link into a finished thread is
-   *  browsing, so the reader keeps the lit toggle and their next submit still
-   *  takes them to the live edge.
+describe('a deep-link landing ends the ride on an IDLE thread too', () => {
+  /** The other half of the block above, and the one place the follow does NOT
+   *  follow the idle rule the scroll disarm, the up chevron and turn stepping
+   *  share.
    *
-   *  What makes that safe is the follow's OTHER live term: it does not write on
-   *  an idle thread either (`followIsCarrying`). Without it, the render-all a
-   *  deep-link triggers would resize the transcript and haul the reader straight
-   *  off the event they had just landed on, which is why these two live in one
-   *  block rather than one per rule. */
+   *  Those three describe a moment: where the reader happens to be looking on a
+   *  thread that is doing nothing. Keeping the ride costs them nothing, because
+   *  nothing is running to carry them anywhere. A LINK is different in kind: it
+   *  names ONE event and expects to still be on it later, so the ask has to
+   *  survive the thread waking.
+   *
+   *  It did not. `waiting_for_user_answer` is quiescent (`isRenderedThreadIdle`),
+   *  so a thread parked on a question card reads as IDLE here, and a "needs your
+   *  answer" notification points at exactly such a thread. The reader tapped it,
+   *  landed on the question, kept the lit toggle, answered, and `honourWake`
+   *  wrote them to the live edge the instant the agent picked the answer up. Off
+   *  the event the notification existed to show them, one beat after they got
+   *  there. Reported 2026-08-12; the tests below used to assert that outcome.
+   *
+   *  A DEAD link still keeps the ride (the block above): retiring belongs to the
+   *  landing, not to the tap. */
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -471,16 +506,16 @@ describe('a deep-link landing leaves the ride alone on an IDLE thread', () => {
     return observers;
   }
 
-  it('keeps the follow armed, so the lit toggle still means something', () => {
+  it('turns the toggle off, because the reader named a place', () => {
     armThenLandOnAnOldTurn();
-    expect(followingLiveEdge.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(false);
   });
 
   it('is not undone by the growth the link itself causes', () => {
     // The deep-link renders the FULL exchange list so a windowed-out target can
-    // be found, which is a large resize arriving right around the landing. An
-    // armed follow that wrote on an idle thread would spend it teleporting the
-    // reader to the bottom, one beat after they tapped the notification.
+    // be found, which is a large resize arriving right around the landing. It
+    // must not teleport the reader to the bottom one beat after they tapped the
+    // notification.
     const { onResize } = armThenLandOnAnOldTurn();
 
     container.scrollHeight = 20000; // render-all, a decoded image, markdown settling
@@ -489,17 +524,18 @@ describe('a deep-link landing leaves the ride alone on an IDLE thread', () => {
     expect(container.scrollTop).toBe(3000);
   });
 
-  it('carries the reader again the moment the thread wakes', () => {
-    // Armed is armed. The idle spell suspends the writing, it does not end the
-    // request, so a trigger firing or the reader submitting picks them back up
-    // with no second press.
+  it('and the reader STAYS on the event when the thread wakes', () => {
+    // The report, as a test. A question card is a quiescent thread that is about
+    // to run: the reader answers, the agent picks it up, and this resize is the
+    // first thing the woken turn produces. With the ride still armed it wrote
+    // them to the live edge here. Now nothing does.
     const { onResize } = armThenLandOnAnOldTurn();
 
     setThreadLive(true);
     container.scrollHeight = 20000;
     onResize();
 
-    expect(container.scrollTop).toBe(19200);
+    expect(container.scrollTop).toBe(3000);
   });
 });
 

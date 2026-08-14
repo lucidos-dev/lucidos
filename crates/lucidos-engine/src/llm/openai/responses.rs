@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::{
-    openai_reasoning_effort, AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
+    AccumulatedToolCall, OpenAiProvider, StreamMeta, CHUNK_TIMEOUT_SECS,
     DEFAULT_MAX_COMPLETION_TOKENS,
 };
 
@@ -174,11 +174,12 @@ impl OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
-        // Map unified reasoning_effort to OpenAI's per-model vocabulary
-        // (GPT-5.6 keeps "max"; earlier models map "max" → "xhigh").
+        // Verbatim, deliberately. Which tiers this model supports is decided
+        // once, in `llm::reasoning`, and enforced by `RoutingProvider`'s clamp;
+        // a second per-model rule here is what let the picker and the wire
+        // disagree (see `llm/reasoning.rs`).
         if let Some(effort) = reasoning_effort {
-            body["reasoning"] =
-                serde_json::json!({ "effort": openai_reasoning_effort(effort, model) });
+            body["reasoning"] = serde_json::json!({ "effort": effort });
         }
 
         body
@@ -502,6 +503,24 @@ mod tests {
         let body = provider.build_responses_body("gpt-5.5", &messages, &[], None, None);
 
         assert_eq!(body["store"], false);
+    }
+
+    /// Sibling of `chat_body_sends_the_reasoning_effort_verbatim`: the two
+    /// builders shared the per-model rewrite, so they must both stay verbatim
+    /// or they drift apart again. `llm::reasoning` decides the tiers;
+    /// `RoutingProvider` enforces them.
+    #[test]
+    fn responses_body_sends_the_reasoning_effort_verbatim() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
+        for model in ["gpt-5.6-sol", "gpt-5.5-pro", "gpt-5.4"] {
+            for effort in crate::llm::reasoning::EFFORT_LADDER {
+                let body = provider.build_responses_body(model, &[], &[], None, Some(effort));
+                assert_eq!(
+                    body["reasoning"]["effort"], *effort,
+                    "{model} rewrote {effort}"
+                );
+            }
+        }
     }
 
     /// The Responses API `response.completed` terminal event carries the

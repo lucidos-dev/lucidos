@@ -54,7 +54,7 @@ CONTEXT_BUDGET_CEILING=48113
 # comfortably under the ceiling. Adding a name here is the deliberate act of
 # saying "this must be in front of the agent before it touches any file".
 #
-# `CLAUDE.md` plus the five rules that genuinely cannot be gated on a path:
+# `CLAUDE.md` plus the six rules that genuinely cannot be gated on a path:
 # safety rules and rules that govern prose and chat replies as well as code.
 # Each one states its own reason in its opening line; see also
 # `.claude/rules/` and the always-loaded section of `CLAUDE.md`.
@@ -65,6 +65,7 @@ CONTEXT_BUDGET_EXPECTED_ALWAYS=(
     ".claude/rules/no-em-dashes.md"
     ".claude/rules/no-private-data.md"
     ".claude/rules/philosophy.md"
+    ".claude/rules/prose.md"
     ".claude/rules/temporary-measures.md"
 )
 

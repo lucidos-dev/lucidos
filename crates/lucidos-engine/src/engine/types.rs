@@ -195,28 +195,32 @@ pub struct AgentUserInput {
     pub images: Option<Vec<crate::api::ChatImage>>,
     /// UUID of the exchange-starter event already emitted before routing
     /// (`MessageReceived` for user follow-ups; `ChildThreadCompleted` for
-    /// child-wake follow-ups). `None` for auto-harden and other internally
+    /// engine re-entry follow-ups). `None` for auto-harden and other internally
     /// generated messages where no caller-side event exists.
     pub origin_event_id: Option<uuid::Uuid>,
     /// What kind of input this is. CC's `run_session` reads this to decide
-    /// whether to emit `CodingAgentPromptSent` — `User` does, `WakeFromChild`
+    /// whether to emit `CodingAgentPromptSent`: `User` does, `ReentryFromEngine`
     /// doesn't (the `ChildThreadCompleted` event already on the parent's
     /// history is the exchange-starter; emitting another start event would
     /// split the response into a duplicate exchange).
     pub kind: AgentInputKind,
 }
 
-/// Discriminates a user-typed follow-up from an engine-synthesized child-wake.
+/// Discriminates a user-typed follow-up from an engine-synthesized re-entry.
 /// CC's `run_session` and the chat fast-paths use this to suppress duplicate
-/// exchange-starter events for wakes (`ChildThreadCompleted` is the start).
+/// exchange-starter events for re-entries (`ChildThreadCompleted` is the start
+/// for the child case, the delivery anchor for an *event wait*).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentInputKind {
     /// User-typed follow-up. Emit `CodingAgentPromptSent` as the audit trail.
     User,
-    /// Engine-synthesized wake from a completed child thread. Suppress
-    /// `CodingAgentPromptSent` so the response groups under
-    /// `ChildThreadCompleted` (the real exchange-starter).
-    WakeFromChild,
+    /// Engine-synthesized re-entry: a completed child thread, a resolved *event
+    /// wait*, a continuation rerun's note. Suppress `CodingAgentPromptSent` so
+    /// the response groups under the event that already started the exchange
+    /// (`ChildThreadCompleted`, the delivery anchor). Every
+    /// `PreEmittedOrigin::is_engine_reentry` origin lands here, which is why the
+    /// name says engine rather than child.
+    ReentryFromEngine,
 }
 
 /// Cached CC slash commands (builtin + skill).

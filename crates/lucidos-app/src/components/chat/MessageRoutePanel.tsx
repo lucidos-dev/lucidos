@@ -1,4 +1,6 @@
 import { useRef } from 'preact/hooks';
+import type { ComponentChildren } from 'preact';
+import { AppsIcon } from '../shared/icons';
 import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -639,10 +641,18 @@ export function renderExecutorSection(
 
 /** App icon + name for the App row on app coding-agent threads (rendered above
  *  the Branch row). Distinguishes the four `Loadable` states so a failed
- *  appsList fetch doesn't render identically to a loading one (per frontend.md). */
-function resolveAppInfo(
+ *  appsList fetch doesn't render identically to a loading one (per frontend.md).
+ *
+ *  `icon` is `ComponentChildren` rather than `string` because the slot holds two
+ *  different KINDS of thing. An app's own `manifest.json` icon is user-authored
+ *  content, almost always an emoji, and passes through verbatim: it is not ours
+ *  to restyle. The fallback for an app that declares none is ours, and it is
+ *  `<AppsIcon/>`, the single apps mark that also labels a Search Everywhere app
+ *  hit and an app entry in the content-pane history menu. Exported for the unit
+ *  test that pins exactly that split. */
+export function resolveAppInfo(
   folder: string | undefined,
-): { icon: string; name: string; failed?: boolean } | undefined {
+): { icon: ComponentChildren; name: string; failed?: boolean } | undefined {
   if (!folder) return undefined;
   const appId = folder.split('/').filter(Boolean).pop();
   if (!appId) return undefined;
@@ -651,16 +661,16 @@ function resolveAppInfo(
   // `loading` synchronously (setLoadingIfFresh), so the next render no longer
   // sees `not-loaded` and won't re-fetch — exactly one fetch fires.
   if (apps.status === 'not-loaded') void loadApps();
-  const FALLBACK_ICON = '\u{1F4E6}'; // 📦 — neutral "app" pictogram
+  const fallbackIcon = <AppsIcon />;
   if (apps.status === 'failed') {
-    return { icon: FALLBACK_ICON, name: `${appId} (apps failed to load)`, failed: true };
+    return { icon: fallbackIcon, name: `${appId} (apps failed to load)`, failed: true };
   }
   if (apps.status !== 'loaded') {
-    return { icon: FALLBACK_ICON, name: appId };
+    return { icon: fallbackIcon, name: appId };
   }
   const match = apps.data.find(a => a.id === appId);
   return {
-    icon: match?.icon || FALLBACK_ICON,
+    icon: match?.icon || fallbackIcon,
     name: match?.name || appId,
   };
 }

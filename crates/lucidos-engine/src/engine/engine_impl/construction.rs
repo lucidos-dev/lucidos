@@ -103,7 +103,7 @@ impl LucidosEngine {
 
                             // Load the originating ContinuationRequested's actor +
                             // reason. The actor stamps the resume boundary so
-                            // it reads "You restarted" rather than "⚙ System".
+                            // it reads "You restarted" rather than "System".
                             // The reason gates the boundary itself: only the
                             // user-clicked-continue path opens a "Resumed
                             // after engine restart" exchange — an
@@ -379,7 +379,7 @@ impl LucidosEngine {
                                 //
                                 // Actor: the device that triggered the
                                 // continuation (Switch / Continue), so the chip
-                                // reads "You" rather than "⚙ System". The cause is
+                                // reads "You" rather than "System". The cause is
                                 // `StaleSettle`, NOT `EngineShutdown`, so this can
                                 // never be mistaken for a switch teardown by
                                 // `switch_was_user_initiated`.
@@ -1218,6 +1218,7 @@ impl LucidosEngine {
             source_behind_cache: std::sync::Mutex::new(Default::default()),
             disk_direction_cache: std::sync::Mutex::new(Default::default()),
             pending_commits_cache: std::sync::Mutex::new(Default::default()),
+            head_sha_cache: std::sync::Mutex::new(Default::default()),
             self_heal_state: std::sync::Mutex::new(Default::default()),
             build_task: std::sync::Mutex::new(None),
             build_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1297,9 +1298,9 @@ impl LucidosEngine {
                 m
             },
             live_waits: Arc::new(crate::engine::event_wait::LiveWaits::new()),
-            event_wake_tx: {
+            wait_reentry_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                crate::engine::EVENT_WAKE_RX.with(|cell| cell.borrow_mut().replace(rx));
+                crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().replace(rx));
                 tx
             },
             last_cc_spawn: std::sync::Mutex::new(HashMap::new()),

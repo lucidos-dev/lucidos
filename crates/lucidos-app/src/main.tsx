@@ -1,5 +1,5 @@
 // MUST be first: installs per-workspace localStorage namespacing before any
-// module-init localStorage read (e.g. store/store.ts) — see the module's docs.
+// module-init localStorage read (for example store/store.ts).
 import './utils/workspaceStorage.install';
 import { render } from 'preact';
 import { App } from './App';
@@ -38,161 +38,125 @@ import './styles/drawer.css';
 import './store/effects';
 import './store/actions/wipPreview';
 
-// The inline pre-hydration watchdog owns the failure case where this module
-// graph never evaluates (for example, a stale hashed entry bundle). Handing over
-// tells it the graph is live: it clears the 15s stall timer AND the entry-script
-// error listener, so from that call on, a boot that dies is the application's to
-// recover. Also clears the watchdog's guarded retry state.
+// The inline pre-hydration watchdog owns the case where this module graph never
+// evaluates, for example a stale hashed entry bundle. Handing over tells it the
+// graph is live: it clears the 15s stall timer, the entry-script error listener
+// and the guarded retry state. From here on, a boot that dies is the
+// application's to recover.
 function handOverBootOwnership(): void {
   (window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
 }
 
-// The app path hands over here, because reaching this line really does mean its
-// whole root is in memory. The PICKER path does NOT: its root arrives in a
-// second chunk (see WorkspacePicker below), so handing over here would disarm
-// the watchdog while the thing it guards is still in flight. That matters
-// because the watchdog is the ONLY recovery a picker document has: the gateway
-// escape link is deliberately offered to direct-port documents alone (see
-// revealGatewayEscape in index.html), leaving the picker with the inline
-// retry-once + tap-to-retry, which is also the only way back for an iOS PWA
-// with no reload button. `lazyComponent`'s own stale-chunk reload does not
-// substitute for it: it stands down whenever sessionStorage is unavailable or
-// it already reloaded in the last 30s, and its fallback toast cannot render on
-// a document whose only component is the chunk that failed. So the picker hands
-// over once its chunk resolves, and a chunk that never arrives falls back to
-// exactly the recovery a static import used to get. The two paths cannot both
-// fire: `isTauriPreGatewayEntry()` (the one boot() path that renders nothing)
-// is false whenever IS_PICKER is true, since the picker context is a
-// gateway-stamped `<base href="/~/">` and the pre-gateway shell has no base.
+// The app path hands over here: reaching this line means its whole root is in
+// memory. The PICKER path must NOT, since its root arrives in a second chunk
+// (see WorkspacePicker below). Handing over here would disarm the watchdog
+// while the thing it guards is still in flight, and that watchdog is the
+// picker's only recovery.
+//
+// The gateway escape link is offered to direct-port documents alone
+// (revealGatewayEscape in index.html), and `lazyComponent`'s stale-chunk reload
+// stands down whenever sessionStorage is unavailable. So the picker hands over
+// once its chunk resolves. The two paths cannot both fire: the picker context
+// is a gateway-stamped `<base href="/~/">`, and the pre-gateway shell has no
+// base at all.
 if (!IS_PICKER) handOverBootOwnership();
 
 if (isTouchDevice()) {
   document.body.classList.add('is-touch');
 }
 
-// iPhone OLED panels emit saturated deep blues with a violet tint, so the
-// blue header chrome reads slightly purple in the iOS PWA while looking correct
-// on desktop. Tag the root so base.css can nudge the dark-mode brand blues
-// toward cyan for this context only — desktop/Android stay pixel-identical.
+// iPhone OLED panels tint saturated deep blues violet, so the blue header
+// chrome reads slightly purple in the iOS PWA. Tag the root so base.css can
+// nudge the dark-mode brand blues toward cyan here only, leaving desktop and
+// Android pixel-identical.
 if (isIOSPwa()) {
   document.documentElement.classList.add('ios-pwa');
 }
 
 installActionBtnBlurListener();
-// Suppress WebKit's saved-value autofill dropdown (+ its white→dark flash) and
-// autocorrect/autocapitalize on every text field — App and Picker both. See
-// utils/noAutofill.ts.
 installNoAutofill();
-// Tauri desktop only: stop WebKit's native content drag (the green-"+" copy
-// badge + translucent text/image ghost) that otherwise flashes while dragging
-// the window by the header. See utils/noDrag.ts. No-op off Tauri.
 installNoDrag();
-// Both render roots: swallow an OS file drop that lands outside a drop zone, so
-// a near-miss cannot navigate the document to the dropped file. The app root got
-// this from <DropZone/>; the picker root had nothing, which stopped mattering
-// only because the desktop shell used to eat every drop. See utils/strayFileDrop.ts.
+// Both render roots, so a near-miss drop cannot navigate the picker document
+// either (utils/strayFileDrop.ts).
 installStrayFileDropGuard();
 // Publish --scrollbar-gutter-width before the first render: the chat composer
-// sizes its horizontal inset off it to stay aligned with the transcript, whose
-// scrollbar takes that width out of the content box on classic-scrollbar
-// platforms. The inline FOUC script has already applied the UI scale, so the
-// rem-sized scrollbar measures at its final width here.
-//
-// Nothing is mounted yet, so this is the probe's estimate. ThreadView re-publishes
-// from the real transcript the moment one exists, which is the only answer that
-// holds on every engine (utils/scrollbarGutter.ts).
+// sizes its horizontal inset off it to stay aligned with the transcript.
+// Nothing is mounted yet, so this is the probe's estimate; ThreadView
+// re-publishes from the real transcript once one exists
+// (utils/scrollbarGutter.ts).
 publishScrollbarGutter();
 
-// E2E test hook — Playwright opens an app by id from `page.evaluate`. The
-// real `openApp(app: App)` requires an `App` object that the test doesn't
-// hold, and `openAppById` lives behind an ES import the browser can't reach
-// from `page.evaluate`. There is no `#app=<id>` hash route to fall back on
-// (the hash router only handles `#thread=` / `#notification=`), so this
-// window hook is the ONLY way the e2e suite can open an app from outside the
-// bundle.
+// E2E test hook: Playwright opens an app by id from `page.evaluate`. The real
+// `openApp(app: App)` needs an `App` object the test does not hold, and
+// `openAppById` sits behind an ES import `page.evaluate` cannot reach. There is
+// no `#app=<id>` hash route either, so this window hook is the suite's only way
+// to open an app from outside the bundle.
 //
-// Installed unconditionally. The hook MUST be in the e2e bundle, which since
-// ADR 0014 is a production `vite build` (the engine serves a fixed `dist/`;
-// there is no Vite dev server) — the previous `MODE !== 'production'` gate
-// silently stripped it from every e2e build, leaving app-open specs to time
-// out waiting for an iframe that never mounted. e2e also reuses a
-// checkout-shared `dist/` that may have been built by any path, so no
-// build-time flag reliably scopes the hook to e2e. Shipping it everywhere is
-// safe: `openAppById` only opens an already-installed app in the panel
-// overlay — a normal user action that carries no extra privilege.
+// Installed unconditionally, and it MUST stay that way: the e2e bundle is a
+// production `vite build` (ADR 0014) over a checkout-shared `dist/`, so no
+// build-time flag scopes the hook to e2e. Shipping it everywhere is safe, since
+// `openAppById` only opens an installed app in the panel overlay.
 (window as unknown as { __openApp?: (id: string) => Promise<void> }).__openApp =
   openAppById;
 
-// Decide the root component from the server-stamped `<base href>` (ADR 0014).
-// The gateway serves the picker context with `<base href="/~/">`; a workspace
-// (proxied) or a legacy direct engine gets `/<slug>/` or `/`. So `IS_PICKER`
-// decides synchronously — no probe of the control plane is needed, and the
-// old root-path ambiguity (gateway picker vs. legacy engine, both at `/`) is
-// gone because they now carry different base hrefs.
+// `IS_PICKER` picks the root component from the server-stamped `<base href>`
+// (ADR 0014): the gateway serves the picker context as `<base href="/~/">`,
+// while a proxied workspace or a legacy direct engine gets `/<slug>/` or `/`.
+// So the choice resolves synchronously, with no probe of the control plane.
 const appRoot = document.getElementById('app')!;
 
-// The picker and the app are MUTUALLY EXCLUSIVE render roots (see the render
-// call in `boot()`), so shipping the picker inside the eager entry chunk sent
-// every workspace document ~43 kB it could never mount. Code-split it: the app
-// path stops paying for it entirely, and the picker path fetches it while the
-// inline boot splash is still covering the screen. `lazyComponent` renders null
-// until the chunk lands, so the splash simply stays up one round trip longer,
-// and its stale-chunk arm (reload to the new build) already covers the failure
-// a hashed-URL 404 would otherwise strand the picker on. `<App/>` deliberately
-// stays static: it IS the eager graph (main.tsx pulls the store, the effects
-// and the actions in on its own), so splitting it would move bytes into a
-// second chunk without removing any from the critical path.
+// The picker and the app are MUTUALLY EXCLUSIVE render roots. Shipping the
+// picker in the eager entry chunk sent every workspace document ~43 kB it could
+// never mount. Code-split, the picker path fetches it while the inline boot
+// splash is still up. `lazyComponent`'s stale-chunk arm covers the hashed-URL
+// 404 that would otherwise strand it. `<App/>` deliberately stays static: it IS
+// the eager graph, so splitting it would move bytes into a second chunk without
+// shortening the critical path.
 const WorkspacePicker = lazyComponent(() =>
   import('./components/picker/WorkspacePicker').then((m) => {
-    // The picker's root is here now, so this is where the picker path proves
-    // its graph is live. See handOverBootOwnership above for why it waits.
+    // The picker path proves its graph is live here, not at the eager
+    // hand-over above.
     handOverBootOwnership();
     return m.WorkspacePicker;
   }),
 );
 
-// Defensive recovery (boot-recovery plan): a workspace bundle that loaded in a
-// malformed base-path context can't build valid URLs from it — every fetch + SW
-// registration throws WebKit's "string did not match the expected pattern" and
-// the app is a dead-end with no way back to the picker. Bounce ONCE to the
-// workspace picker (`/~/?pick`, which also stands the cold-start auto-open
-// redirect down) instead of rendering the broken app. One-shot guarded so it
-// can't loop (the `?pick` already prevents an auto re-open; this is belt-and-
-// suspenders). Returns true when it redirected — render is then skipped.
+// A workspace bundle loaded in a malformed base-path context cannot build valid
+// URLs from it: every fetch and SW registration throws WebKit's "string did not
+// match the expected pattern", leaving no way back to the picker. Bounce ONCE
+// to `/~/?pick` instead of rendering the broken app. The one-shot guard is what
+// keeps that bounce from looping. Returns true when it redirected, and render
+// is then skipped.
 const RECOVER_REDIRECT_KEY = 'lucidos-recover-redirect';
 function recoverFromBrokenContext(): boolean {
   if (WORKSPACE_ID === null || baseContextIsValid()) {
-    // Valid context — clear the one-shot so a future genuine failure can redirect.
+    // Valid context: clear the one-shot so a future genuine failure can redirect.
     try { sessionStorage.removeItem(RECOVER_REDIRECT_KEY); } catch { /* storage off */ }
     return false;
   }
   let alreadyTried = false;
   try { alreadyTried = sessionStorage.getItem(RECOVER_REDIRECT_KEY) === '1'; } catch { /* storage off */ }
-  if (alreadyTried) return false; // already bounced once — render rather than loop
+  if (alreadyTried) return false; // already bounced once, so render rather than loop
   try { sessionStorage.setItem(RECOVER_REDIRECT_KEY, '1'); } catch { /* storage off */ }
   location.replace('/~/?pick');
   return true;
 }
 
-/** Packaged desktop shell, BEFORE `desktop::launch()` has navigated the window to
- *  the gateway: the window is on Tauri's bundled asset scheme, where booting
- *  `<App/>` would fire API calls + a service-worker registration that all throw
+/** Packaged desktop shell, BEFORE `desktop::launch()` has navigated to the
+ *  gateway. The window is on Tauri's bundled asset scheme, where booting
+ *  `<App/>` would fire API calls and a service-worker registration. Both throw
  *  WebKit's "string did not match the expected pattern". Keep the inline boot
- *  splash up with a "Starting Lucidos…" status; `desktop::launch()` navigates this
- *  window to the gateway once the service is healthy (a full document load that
- *  replaces the splash with the real app). Heartbeat on the cadence `useStartup`
- *  would, so the WKWebView crash watchdog (lib.rs) doesn't reload the splash every
- *  ~60s while we wait. */
+ *  splash up instead; `desktop::launch()` navigates to the gateway once the
+ *  service is healthy. Heartbeat on the cadence `useStartup` would, so the
+ *  WKWebView crash watchdog (lib.rs) does not reload the splash while we wait. */
 function stayOnStartingSplash(): void {
-  // The opening line, painted now rather than a poll-tick from now. Matches
-  // `desktop::STARTING_LABEL`, which is also what the first poll answers, so a
-  // fast start never sees the text change at all.
+  // Painted now rather than a poll-tick from now, and matching
+  // `desktop::STARTING_LABEL`, so a fast start never sees the text change.
   setBootStatus('Starting Lucidos…');
   // As in useStartup: the `catch` is a local no-op, and `invoke` reports bridge
-  // failures to the engine log on its own (utils/ipcHealth). Note this splash
-  // runs on the bundled `tauri://localhost` origin, which the ACL treats as
-  // LOCAL — so a heartbeat working here says nothing about whether it will keep
-  // working after desktop::launch navigates to the (remote) gateway origin.
+  // failures to the engine log itself (utils/ipcHealth). This splash runs on the
+  // bundled `tauri://localhost` origin, which the ACL treats as LOCAL. A
+  // heartbeat working here says nothing about the gateway origin (ADR 0028).
   invoke('heartbeat').catch(() => {});
   window.setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000);
   // Separate from the heartbeat and deliberately faster: the heartbeat's job is
@@ -206,52 +170,45 @@ function stayOnStartingSplash(): void {
 }
 
 async function boot() {
-  // Frontend preview only (a dev-server bundle): adopt the `?device-id=` the
-  // preview link carried, BEFORE the first API call or preference read, so the
-  // preview resolves the same device-scoped preferences as the app the user came
-  // from instead of registering as a new device. A no-op everywhere else.
+  // Frontend preview only (ADR 0055): adopt the `?device-id=` the preview link
+  // carried, BEFORE the first API call or preference read. That resolves the
+  // same device-scoped preferences instead of registering a new device, and it
+  // is a no-op everywhere else.
   adoptDeviceIdFromUrl();
 
   // Packaged desktop: the shell keeps the launch window hidden until a page says
-  // it has something to paint (lib.rs `window_ready_to_show`). Signal here, not
-  // only from `applyTheme`, because EVERY boot path reaches this line while the
-  // theme is already resolved on the document (index.html's FOUC script ran
-  // before the bundle) and the inline boot splash is in the markup, so the next
-  // paint carries it. `applyTheme` covers neither of the two launches that
-  // matter: the pre-gateway shell below returns before `<App/>` mounts, so it
-  // never runs at all there, and in the workspace document `loadPreferences`
-  // deliberately skips it when the stored theme is unchanged. Waiting for it
-  // would mean sitting out the shell's fallback timer on every cold launch.
+  // it has something to paint (lib.rs `window_ready_to_show`). Signal here
+  // rather than from `applyTheme`, because EVERY boot path reaches this line
+  // with the theme resolved and the boot splash in the markup. Neither launch
+  // that matters reaches `applyTheme`: the pre-gateway shell below returns
+  // before `<App/>` mounts, and `loadPreferences` skips the repaint when the
+  // stored theme is unchanged.
   if (isTauri()) windowReadyToShow();
 
-  // Packaged desktop shell before it has navigated to the gateway: stay on the
-  // boot splash instead of booting a broken `<App/>` against the asset scheme
-  // (see stayOnStartingSplash). There is no workspace context here, so the
-  // device-id reconcile + broken-context recovery below would be no-ops anyway —
-  // returning early just avoids the invalid API/SW calls.
+  // Packaged desktop shell before it reaches the gateway: stay on the boot
+  // splash instead of booting a broken `<App/>` against the asset scheme (see
+  // stayOnStartingSplash). There is no workspace context here, so returning
+  // early only avoids the invalid API and SW calls.
   if (isTauriPreGatewayEntry()) {
     stayOnStartingSplash();
     return;
   }
 
-  // Desktop only: make the per-workspace device id durable across DMG reinstalls by
-  // reconciling it with the native store BEFORE the first API call (the id rides
-  // every request as `x-lucidos-device-id`). Browser/PWA skip this — their
-  // localStorage id is already durable, and an async function runs synchronously up
-  // to its first await, so the non-Tauri render below is unchanged in timing.
+  // Desktop only: reconcile the per-workspace device id with the native store
+  // BEFORE the first API call, so it survives a DMG reinstall. The id rides
+  // every request as `x-lucidos-device-id`. Browser and PWA skip this, their
+  // localStorage id being durable already. An async function runs synchronously
+  // up to its first await, so the non-Tauri render below is unchanged in timing.
   if (isTauri() && !IS_PICKER && WORKSPACE_ID) {
     await reconcileDesktopDeviceId(WORKSPACE_ID);
   }
 
   if (!recoverFromBrokenContext()) {
-    // Remember the workspace the user is in, so the gateway's smart root (`/`) can
-    // auto-open it next time (see lastWorkspace.ts / WorkspacePicker). Only inside a
-    // real workspace — never the picker (IS_PICKER) or legacy direct-engine root
-    // (WORKSPACE_ID null).
+    // Remember the workspace so the gateway's smart root (`/`) can auto-open it
+    // next time (see lastWorkspace.ts).
     if (!IS_PICKER && WORKSPACE_ID) rememberLastWorkspace(WORKSPACE_ID);
-    // Permanent perf debug tooling: surfaces the main-thread blocker behind any
-    // interaction lag. Quiet unless an interaction/task crosses the threshold;
-    // logs to the browser console only. See utils/perfProbe.ts.
+    // Permanent, not dev-only, and quiet until something crosses a threshold
+    // (utils/perfProbe.ts).
     if (!IS_PICKER) startPerfProbe();
     render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
   }
@@ -261,30 +218,25 @@ void boot();
 if (import.meta.hot) {
   import.meta.hot.accept();
 
-  // Server-side suppressMergeReload plugin detects git-merge file bursts and
-  // drops the HMR update before it reaches the client. It sends this custom
-  // event so the client can show an "update available" indicator.
+  // The server-side suppressMergeReload plugin drops the HMR update on a
+  // git-merge file burst, and sends this event in its place.
   import.meta.hot.on('lucidos:update-available', () => {
     updateAvailable.value = true;
   });
 
-  // Always suppress Vite full-reloads — show an "update available" indicator
-  // instead. Full-reloads lose UI state and, because all Vite instances share
-  // the same source directory, a rebuild in one workspace triggers reloads in
-  // every workspace's browser tab. Suppressing unconditionally keeps all tabs
-  // stable; the user reloads manually via the refresh button when ready.
+  // Always suppress Vite full-reloads, showing an "update available" indicator
+  // instead. A full reload loses UI state, and every Vite instance shares one
+  // source directory, so a rebuild in one workspace reloads every workspace's
+  // tab. The user reloads manually from the refresh button instead.
   import.meta.hot.on('vite:beforeFullReload', () => {
     updateAvailable.value = true;
     throw 'suppress-reload';
   });
 
-  // Suppress Vite's auto-reload on WebSocket disconnect. When the engine
-  // restarts, the Vite dev server also restarts. Vite's client polls until
-  // Vite comes back, then calls location.reload() directly (bypassing
-  // vite:beforeFullReload). This reload hits the engine port before the
-  // engine is ready, causing a "Can't connect to localhost" browser error.
-  // Throwing here prevents that reload — the health-check polling in
-  // connection.ts handles reconnection gracefully with the red status dot.
+  // Suppress Vite's auto-reload on WebSocket disconnect. Vite's client polls
+  // until the dev server returns, then calls location.reload() directly,
+  // bypassing vite:beforeFullReload. That reload hits the engine port before
+  // the engine is ready. Throwing here leaves reconnection to connection.ts.
   import.meta.hot.on('vite:ws:disconnect', () => {
     throw 'suppress-reload';
   });

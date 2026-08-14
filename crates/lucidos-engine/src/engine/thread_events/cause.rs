@@ -190,7 +190,7 @@ impl AbortCause {
 /// discard end the thread that holds it (and the archive asks first, naming
 /// what it would stop), and a stand-down is the agent retiring a watch it armed
 /// after the user told it to. A timeout is not here at all: that is
-/// `EventWaitExpired`, which wakes the thread rather than stopping it.
+/// `EventWaitExpired`, which re-opens the thread rather than stopping it.
 ///
 /// Two things are deliberately absent.
 ///

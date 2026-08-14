@@ -80,7 +80,12 @@ export function FilePreviewInline({ path, layout }: Props) {
  *  the user edit it in a textarea, and writes it back via PUT /api/v1/data.
  *  Mounted by FilePreviewInline only while `filePreviewEditing` is on for an
  *  editable path. Save/Cancel live here (not in the header) so the draft state
- *  stays local to the editor. */
+ *  stays local to the editor.
+ *
+ *  The toolbar is right-aligned with Save rightmost, and Save stays on the
+ *  neutral blue `action-btn` rather than the green `action-btn-confirm`: green
+ *  reads as accepting something already on screen (Apply / Accept), the same
+ *  reason the welcome CTA keeps the blue default. */
 function FileEditor({ path, url }: { path: string; url: string }) {
   // Freeze the fetch URL at mount. While editing, the editor is the source of
   // truth; a later artifactRevision bump (e.g. an SSE Artifact* event triggering
@@ -115,6 +120,12 @@ function FileEditor({ path, url }: { path: string; url: string }) {
     return showLoading ? <div class="loading-spinner" /> : null;
   }
 
+  // `loadable.data` is the content as fetched at mount and stays that way for
+  // the whole edit session: the fetch url is frozen (see `fetchUrl` above) and
+  // the draft is seeded from it exactly once. So it is a stable baseline for
+  // "no unsaved changes", not a value that can drift under the comparison.
+  const dirty = draft !== loadable.data;
+
   const save = async () => {
     setSaving(true);
     try {
@@ -132,11 +143,11 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   return (
     <div class="file-editor">
       <div class="file-editor-toolbar">
-        <button class="action-btn action-btn-confirm" onClick={save} disabled={saving}>
-          {saving ? 'Saving…' : 'Save'}
-        </button>
         <button class="action-btn action-btn-danger" onClick={() => { filePreviewEditing.value = false; }} disabled={saving}>
           Cancel
+        </button>
+        <button class="action-btn" onClick={save} disabled={saving || !dirty}>
+          {saving ? 'Saving…' : 'Save'}
         </button>
       </div>
       <textarea

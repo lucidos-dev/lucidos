@@ -29,11 +29,13 @@ import { formatBuildId } from '../../utils/buildId';
 import { clientVersionLabel } from '../../utils/clientVersion';
 import { isNewerVersion } from '../../utils/version';
 import { formatShortTime } from '../../utils/formatTime';
+import { connectionNotice } from '../../utils/connectionNotice';
 import { BackupSection } from './BackupSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
+import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
 import { restartControlHome } from './restartControl';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -43,7 +45,7 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
+export type SystemPanel = 'overview' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -75,8 +77,10 @@ function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
 
 export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const status = connectionStatus.value;
-  const connected = status === 'connected';
   const name = visibleWorkspaceName.value;
+  // Non-null for exactly the states that are not `connected`, which is what the
+  // Connection block below renders its state word AND its explanation from.
+  const notice = connectionNotice(status, name);
   const path = workspacePath.value;
   const startedAt = engineStartedAt.value;
   const release = lucidosRelease.value;
@@ -163,6 +167,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
       case 'disk-usage': return <DiskUsagePage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
       case 'debugging': return <DebuggingSection />;
+      case 'communication-surfaces': return <CommunicationSurfacesPage />;
       default: return renderOverview();
     }
   }
@@ -172,10 +177,19 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
       <>
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:connection">Connection</div>
-          <div class="system-status-row">
-            <span class={`status-dot ${status}`} />
-            <span>{status === 'connecting' ? 'Connecting...' : connected ? 'Connected' : 'Disconnected'}</span>
+          {/* The state, and what it MEANS for the app. The word alone was this
+              page's whole answer, and "Disconnected" beside a red dot says
+              nothing the dot had not already said in colour. Both halves come
+              from the one notice table (utils/connectionNotice.ts), so this page,
+              the Lucidos menu and the header bar cannot make different claims;
+              `connected` is deliberately absent from it, which is why that one
+              case keeps its own word and has nothing under it.
+              The dot is `aria-hidden`: the state is spelled out right beside it. */}
+          <div class={`system-status-row${notice ? ' has-note' : ''}`}>
+            <span class={`status-dot ${status}`} aria-hidden="true" />
+            <span>{notice ? notice.title : 'Connected'}</span>
           </div>
+          {notice && <p class="system-status-note">{notice.detail}</p>}
           <div class="system-info-list">
             <div class="system-info-row">
               <span class="system-info-label">Workspace</span>

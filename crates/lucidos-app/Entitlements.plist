@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the outer Lucidos.app signature ONLY.
+
+  NO DOUBLE HYPHEN ANYWHERE IN THIS COMMENT. codesign hands the file to
+  AMFIUnserializeXML, whose XML parser rejects a "- -" pair inside a comment
+  (strict XML forbids it) and dies with "syntax error near line 6". plutil
+  lints the same file as OK, so the breakage is invisible until a signing run.
+  Write flag names without their leading hyphens, or move the prose out of the
+  file entirely.
+
+  The release path signs with the hardened runtime, because notarization
+  requires it and the hardened runtime denies camera access to a binary that
+  does not claim it, whatever Info.plist says. So the composer's Camera item
+  needs BOTH halves: NSCameraUsageDescription for the consent prompt's copy
+  (Info.plist) and this entitlement for the runtime.
+
+  Deliberately minimal. Lucidos is not sandboxed, so nothing here is a
+  container permission; each key is a hardened-runtime capability we actually
+  exercise. getUserMedia is video-only, so there is no audio-input key: add one
+  only in the change that starts capturing audio.
+
+  It is applied to the outer .app and to nothing else. sign_app_bundle also
+  signs ~200 loose Mach-O files (the relocatable Postgres tree, the engine, the
+  gateway, the CLI), none of which capture anything, and the bundle carries no
+  nested bundles or XPC services for deep signing to propagate to.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

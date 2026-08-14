@@ -27,17 +27,15 @@ const SPACE_USAGE_URL: &str = "https://api.dropboxapi.com/2/users/get_space_usag
 const GET_METADATA_URL: &str = "https://api.dropboxapi.com/2/files/get_metadata";
 
 /// Dropbox's own cap on a single `POST /2/files/upload`. Over this the server
-/// does not answer with a JSON error, it closes the connection, so the caller
-/// sees a bare reqwest transport error with no Dropbox detail attached: the
-/// failure lands at `.send()`, before [`check_dropbox_status`] ever sees a
-/// response. That is how a 4.36 GB archive failed on 2026-08-07 after the whole
-/// dump / compress / encrypt pipeline had already run. Anything above this goes
+/// closes the connection instead of answering with a JSON error, so the caller
+/// sees a bare reqwest transport error. The failure lands at `.send()`, before
+/// [`check_dropbox_status`] ever sees a response. Anything above this goes
 /// through the upload session API instead.
 const SINGLE_SHOT_MAX: u64 = 150 * 1024 * 1024;
 
-/// Bytes per `upload_session/append_v2` call. 8 MiB matches the Drive
-/// provider's `RESUMABLE_CHUNK_SIZE`, and is a multiple of the 4 MiB Dropbox's
-/// performance guide recommends, so the two providers retry at one granularity.
+/// Bytes per `upload_session/append_v2` call. Matches the Drive provider's
+/// `RESUMABLE_CHUNK_SIZE`, so the two providers retry at one granularity. It is
+/// also a multiple of the 4 MiB Dropbox's performance guide recommends.
 const UPLOAD_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Per-chunk retry budget for transient failures (network, 5xx, 408, 429).
@@ -53,12 +51,12 @@ const MAX_RETRY_AFTER_SECS: u64 = 300;
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Per-request timeout for the two calls that commit a whole archive: the
-/// single-shot POST, and `upload_session/finish`. Deliberately far more
-/// generous than the chunk timeout, because both are all-or-nothing. A chunk
-/// that times out costs 8 MiB and resumes; a commit that times out throws away
-/// the entire transfer, and Dropbox assembles a multi-GB session server-side
-/// before it answers. The single-shot body is capped at [`SINGLE_SHOT_MAX`], so
-/// ten minutes still leaves it a floor of ~250 KB/s.
+/// single-shot POST, and `upload_session/finish`. Far more generous than the
+/// chunk timeout, because both are all-or-nothing. A chunk that times out costs
+/// 8 MiB and resumes, where a commit that times out throws away the entire
+/// transfer. Dropbox also assembles a multi-GB session server-side before it
+/// answers. The single-shot body is capped at [`SINGLE_SHOT_MAX`], so ten
+/// minutes still leaves it a floor of ~250 KB/s.
 const COMMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long to wait for a TCP/TLS connection before giving up. Safe as a
@@ -67,9 +65,9 @@ const COMMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// would kill every large restore.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bytes per GB for the free-space message. Dropbox allocates in binary GB (a
-/// "2 TB" plan reports 2 TiB) and labels them in decimal units, so divide by
-/// 1024³ to match the number the user sees in Dropbox's own UI.
+/// Bytes per GB for the free-space message. Dropbox allocates in binary GB and
+/// labels them in decimal units. Divide by 1024³ to match the number the user
+/// sees in Dropbox's own UI.
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Every Dropbox scope a working backup needs, and why:
@@ -81,12 +79,12 @@ const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 ///
 /// This IS the provider registry's `required_scopes` entry, so the readiness
 /// verdict the Settings page renders and the preflight below check one list.
-/// Two lists would let an account holding only the first scope read as ready,
-/// hiding *Grant access* behind a *Back up now* that fails at preflight.
+/// Two lists would let a partly-scoped account read as ready, hiding *Grant
+/// access* behind a *Back up now* that fails at preflight.
 ///
 /// `account_info.read` is deliberately NOT here. It only names the connected
-/// account in Settings, so its absence costs an email address, never a backup,
-/// and requiring it would make an otherwise working account read as broken. The
+/// account in Settings, so its absence costs an email address, never a backup.
+/// Requiring it would make an otherwise working account read as broken. The
 /// request set in `backupProviderScopes.ts` asks for it anyway.
 pub const BACKUP_SCOPES: &[&str] = &[
     "files.content.write",
@@ -113,9 +111,8 @@ pub const GRANT_SCOPES: &[&str] = &[
 /// Pull the scope name out of a Dropbox permission error, whichever shape it
 /// arrives in. Dropbox reports the same condition two ways: a structured
 /// `{"error": {".tag": "missing_scope", "required_scope": "..."}}` body, and a
-/// prose 400 naming the scope in quotes (the shape a user reported on
-/// 2026-08-05: *does not have the required scope 'files.content.write'*).
-/// `None` when the body is about something else entirely.
+/// prose 400 naming the scope in quotes, as in *does not have the required
+/// scope 'files.content.write'*. `None` when the body is about something else.
 pub fn missing_scope_from_body(body: &str) -> Option<String> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(scope) = json["error"]["required_scope"].as_str() {
@@ -123,8 +120,8 @@ pub fn missing_scope_from_body(body: &str) -> Option<String> {
         }
     }
     // Prose form. Take what sits between the first pair of single quotes after
-    // the phrase, rather than scanning the whole body, so an unrelated quoted
-    // string elsewhere in the message can't be reported as a scope name.
+    // the phrase, not from the whole body. An unrelated quoted string elsewhere
+    // in the message then cannot be reported as a scope name.
     let after = body.split_once("required scope")?.1;
     let inner = after.split_once('\'')?.1;
     let (scope, _) = inner.split_once('\'')?;
@@ -209,12 +206,11 @@ impl DropboxBackupProvider {
     /// Fail before any real work when the connected account's granted scopes
     /// can't support a backup.
     ///
-    /// Dropbox has no `tokeninfo` endpoint to introspect a token with (the way
-    /// `google_drive::verify_scope` does), but it does return the granted
-    /// `scope` in the token response, and `prepare_oauth_flow` stores exactly
-    /// that. So the account row is the authoritative record of what this token
-    /// can do, which is why this takes the stored scopes rather than making a
-    /// call: no network, and no second account lookup in preflight.
+    /// Dropbox has no `tokeninfo` endpoint to introspect a token with, the way
+    /// `google_drive::verify_scope` does. It does return the granted `scope` in
+    /// the token response, and `prepare_oauth_flow` stores exactly that. So the
+    /// account row is the authoritative record of what this token can do, which
+    /// is why this takes the stored scopes: no network, and no second lookup.
     fn verify_scopes(&self, granted: &str) -> Result<(), BoxError> {
         let missing = super::missing_scopes(granted, self.required_scopes);
         if missing.is_empty() {
@@ -259,10 +255,9 @@ impl DropboxBackupProvider {
     /// needs `account_info.read` and that scope is deliberately NOT required for
     /// a backup (see [`BACKUP_SCOPES`]): an account without it must not have a
     /// working backup turned into a failure, so anything short of a parsed
-    /// over-quota verdict passes. What it buys when the scope IS present (the
-    /// standard grant asks for it) is the fail-fast Drive already gets, namely
-    /// "Dropbox is full" in seconds instead of an `insufficient_space` after the
-    /// whole dump / compress / encrypt pipeline has run.
+    /// over-quota verdict passes. With the scope present, it buys the fail-fast
+    /// Drive already gets: "Dropbox is full" in seconds, rather than an
+    /// `insufficient_space` after the whole archive pipeline has run.
     async fn check_free_space(
         &self,
         token: &str,
@@ -322,10 +317,9 @@ impl DropboxBackupProvider {
     }
 
     /// One POST to a content-API upload endpoint: JSON args in the
-    /// `Dropbox-API-Arg` header, bytes in the body. A network-layer failure
-    /// (which is what a connection Dropbox closed looks like) becomes
-    /// [`ChunkError::Transient`], so the retry loop can recover from it rather
-    /// than surfacing the bare transport error the old single-shot POST did.
+    /// `Dropbox-API-Arg` header, bytes in the body. A network-layer failure,
+    /// which is what a connection Dropbox closed looks like, becomes
+    /// [`ChunkError::Transient`], so the retry loop can recover from it.
     async fn send_upload_post(
         &self,
         url: &str,
@@ -354,13 +348,10 @@ impl DropboxBackupProvider {
     ///
     /// Called before every chunk, not once per upload. Dropbox's short-lived
     /// tokens last four hours and `get_oauth_token` only refreshes inside the
-    /// last minute of that, so a backup that starts on a nearly-expired token
-    /// holds one good for as little as a minute. The single POST this replaced
-    /// authenticated exactly once, when the request opened, so it never met
-    /// that; a session runs for minutes to hours and authenticates on every
-    /// call, and would 401 partway through. The lookup is one indexed SELECT
-    /// (the token refresh itself happens at most once every four hours), which
-    /// is nothing beside the seconds of network each chunk costs.
+    /// last minute of that. A backup starting on a nearly-expired token holds
+    /// one good for as little as a minute. A session authenticates per call
+    /// over minutes to hours, so it would 401 partway through. The lookup is
+    /// one indexed SELECT, nothing beside the network each chunk costs.
     ///
     /// A failed lookup keeps the token already in hand rather than aborting: a
     /// database blip must not cost a multi-GB transfer that is otherwise fine.
@@ -390,10 +381,10 @@ impl DropboxBackupProvider {
     ///
     /// Tells a genuinely failed `finish` apart from one that committed and lost
     /// its response. The replay of an ambiguous `finish` hits a session Dropbox
-    /// has already closed, which comes back as a fatal 409, so without this
-    /// check a backup sitting safely in Dropbox is reported as a failure (and
-    /// retention pruning is skipped along with it). `None` on any doubt,
-    /// including a lookup that itself fails, so the original error still wins.
+    /// has already closed, which comes back as a fatal 409. Without this check,
+    /// a backup sitting safely in Dropbox is reported as a failure, and
+    /// retention pruning is skipped with it. `None` on any doubt, including a
+    /// lookup that itself fails, so the original error still wins.
     async fn committed_file_id(&self, token: &str, dropbox_path: &str) -> Option<String> {
         let resp = self
             .client
@@ -454,11 +445,10 @@ impl DropboxBackupProvider {
 
     /// Append one chunk at `offset`, and return the offset Dropbox expects next.
     ///
-    /// A 200 and a `409 incorrect_offset` answer the same question ("where is
-    /// the session now?"), so both come back as an offset. The 409 is not a
-    /// failure: Dropbox returns it when it already holds bytes we are about to
-    /// re-send, which is exactly what a retried append looks like after a
-    /// success whose response never reached us.
+    /// A 200 and a `409 incorrect_offset` answer the same question, so both
+    /// come back as an offset. The 409 is not a failure: Dropbox returns it when
+    /// it already holds bytes we are about to re-send. That is what a retried
+    /// append looks like after a success whose response never reached us.
     async fn append_chunk(
         &self,
         token: &str,
@@ -495,10 +485,9 @@ impl DropboxBackupProvider {
 
     /// Commit the session at `total` bytes and return the new file's id.
     ///
-    /// The commit args are the same ones the single-shot path passes as its
-    /// whole `Dropbox-API-Arg`, and the response is the same
-    /// [`DropboxFileMetadata`], so the returned id means the same thing however
-    /// the archive got there.
+    /// The commit args are the ones the single-shot path passes as its whole
+    /// `Dropbox-API-Arg`, and the response is the same [`DropboxFileMetadata`].
+    /// The returned id therefore means the same thing however it got there.
     async fn finish_upload_session(
         &self,
         token: &str,
@@ -511,10 +500,10 @@ impl DropboxBackupProvider {
             "commit": commit_args(dropbox_path),
         });
         retry_transient("finish the backup upload", || async {
-            // Resolved per attempt rather than closed over, because a retry
-            // chain here can outlive a token that had under a minute of life
-            // left when the last chunk went up, and this is the one call whose
-            // failure discards the whole transfer.
+            // Resolved per attempt rather than closed over: a retry chain here
+            // can outlive a token that had under a minute of life left when the
+            // last chunk went up. This is the one call whose failure discards
+            // the whole transfer.
             let token = self
                 .current_token()
                 .await
@@ -553,18 +542,16 @@ impl DropboxBackupProvider {
     /// [`UPLOAD_CHUNK_SIZE`] chunk, then `finish` with the commit info.
     ///
     /// Peak memory is one chunk. The file is opened once and each chunk read
-    /// into a fresh buffer at its own offset, rather than the whole archive
-    /// being pulled into a single `Vec<u8>` as the old single-shot path did.
-    /// That mattered beyond the waste: 4.36 GB resident is enough to hard-freeze
-    /// a swap-less machine, during the very backup meant to protect it.
+    /// into a fresh buffer at its own offset, never the whole archive into one
+    /// `Vec<u8>`. Multiple GB resident is enough to hard-freeze a swap-less
+    /// machine, during the very backup meant to protect it.
     ///
     /// The loop is flat where Drive's resumable one is nested, because Dropbox
-    /// has no separate "where are you?" call: a session that has drifted reports
-    /// its own offset in the `409 incorrect_offset` body of the append that
-    /// drifted, so recovery is just the next iteration reading from there.
-    /// `stalls` counts consecutive rounds that gained no ground, so a session
-    /// that keeps failing (or keeps resyncing to the same byte) gives up instead
-    /// of spinning; an accepted chunk resets it.
+    /// has no separate "where are you?" call. A session that has drifted reports
+    /// its own offset in the `409 incorrect_offset` body, so recovery is the
+    /// next iteration reading from there. `stalls` counts consecutive rounds
+    /// that gained no ground, so a session that keeps failing gives up instead
+    /// of spinning. An accepted chunk resets it.
     async fn session_upload(
         &self,
         file_path: &Path,
@@ -714,9 +701,9 @@ fn chunk_len(offset: u64, total: u64, chunk_size: u64) -> u64 {
     chunk_size.min(total.saturating_sub(offset))
 }
 
-/// The commit info for a backup archive. Shared by the single-shot POST (as its
-/// entire `Dropbox-API-Arg`) and by `upload_session/finish` (as its `commit`
-/// field), so the two paths land a file with identical semantics.
+/// The commit info for a backup archive. Shared by the single-shot POST, as its
+/// entire `Dropbox-API-Arg`, and by `upload_session/finish` as its `commit`
+/// field. The two paths therefore land a file with identical semantics.
 fn commit_args(dropbox_path: &str) -> serde_json::Value {
     serde_json::json!({
         "path": dropbox_path,
@@ -811,9 +798,8 @@ fn classify_upload_failure(
     }
     // A token that went stale mid-session IS recoverable: the next round picks
     // up a fresh one (see [`DropboxBackupProvider::refresh_token`]). Only the
-    // session path can reach this, and only because it authenticates once per
-    // chunk over minutes or hours where the single POST it replaced
-    // authenticated once, at the start.
+    // session path reaches this, because only it authenticates once per chunk
+    // over minutes or hours.
     let stale_token = status == StatusCode::UNAUTHORIZED && is_stale_token_body(body);
     if stale_token
         || status.is_server_error()
@@ -834,9 +820,9 @@ fn classify_upload_failure(
 /// [`MAX_RETRIES_PER_CHUNK`] attempts, transient failures only, [`backoff_secs`]
 /// between them.
 ///
-/// Only `start` and `finish` use it. Both carry no bytes, so replaying one is
-/// just re-sending a small JSON header, and retrying `finish` in particular is
-/// what stops a single 503 discarding a multi-GB upload that already landed.
+/// Only `start` and `finish` use it. Both carry no bytes, so replaying one
+/// re-sends a small JSON header. Retrying `finish` is what stops a single 503
+/// discarding a multi-GB upload that already landed.
 /// The per-chunk append cannot use it: its retry has to re-read the file at
 /// whatever offset the session resynced to, which is the loop in
 /// [`DropboxBackupProvider::session_upload`].
@@ -877,12 +863,12 @@ where
     }
 }
 
-/// Decide whether the estimated upload fits in the account's free space (with
-/// the same 10% headroom the Drive provider applies), returning the over-quota
+/// Decide whether the estimated upload fits in the account's free space, with
+/// the same 10% headroom the Drive provider applies. Returns the over-quota
 /// message when it does not.
 ///
-/// An absent or zero `allocated` means Dropbox reported no usable allocation
-/// (team accounts can, and so can a response we could only partly read), so it
+/// An absent or zero `allocated` means Dropbox reported no usable allocation,
+/// which a team account or a partly-read response can both produce. It then
 /// always fits: preflight blocks only on clear evidence of insufficient space.
 fn space_check(
     allocated: Option<u64>,
@@ -911,8 +897,8 @@ fn space_check(
 /// message says which leg failed. A permission failure is rewritten into
 /// [`missing_scope_message`]; everything else keeps the status and body, which
 /// is all Dropbox gives us to go on. Preflight normally catches the scope case
-/// first, so reaching this branch means a scope was revoked mid-life or the
-/// stored grant over-reports what the token can do.
+/// first, so reaching this branch means a revoked scope or an over-reporting
+/// stored grant.
 async fn check_dropbox_status(
     resp: reqwest::Response,
     context: &str,
@@ -929,8 +915,8 @@ async fn check_dropbox_status(
 }
 
 /// Build the Dropbox web URL for the backups folder. The Dropbox web app
-/// addresses folders by path under `/home`; the folder path is fixed, so this is
-/// always a real deep link (no id lookup needed). Pure for unit-testability.
+/// addresses folders by path under `/home`, and the folder path is fixed. So
+/// this is always a real deep link, with no id lookup.
 fn dropbox_folder_url() -> String {
     let mut url =
         reqwest::Url::parse("https://www.dropbox.com/home").expect("static base URL is valid");
@@ -966,16 +952,15 @@ impl BackupProvider for DropboxBackupProvider {
         //    token, so step 2 reads the granted scopes off the same row instead
         //    of repeating the lookup.
         let account = super::get_oauth_account(&self.pool, "dropbox").await?;
-        // 2. Granted scopes. Before this existed the first Dropbox call a
-        //    backup made was the folder create, so a short-scoped token
-        //    surfaced as a raw 400 after the archive work had already run.
+        // 2. Granted scopes, checked before the folder create. A short-scoped
+        //    token would otherwise surface as a raw 400, after the archive
+        //    work had already run.
         self.verify_scopes(&account.scopes)?;
         // 3. Free space: `users/get_space_usage` IS a quota endpoint, so the
-        //    size hint has real work to do here rather than being a parameter
-        //    the signature takes and drops. Best-effort, because that endpoint
-        //    needs the one scope a backup deliberately does not require, so an
-        //    account without it is passed through untested (see
-        //    [`Self::check_free_space`]) rather than blocked.
+        //    size hint has real work to do here. Best-effort, because that
+        //    endpoint needs the one scope a backup does not require, so an
+        //    account without it passes untested (see
+        //    [`Self::check_free_space`]).
         self.check_free_space(&account.access_token, estimated_upload_bytes)
             .await?;
         // 4. Folder: verifies write access and warms the cache for the upload.
@@ -1217,7 +1202,7 @@ mod tests {
         );
     }
 
-    /// The prose 400 a user actually hit on 2026-08-05.
+    /// The prose 400 form, which names the scope in quotes.
     #[test]
     fn missing_scope_is_read_from_the_prose_body() {
         let body = "Error in call to API function \"files/create_folder_v2\": Your app (ID: 1234567) is not permitted to access this endpoint because it does not have the required scope 'files.content.write'. The owner of the app can enable the scope for the app using the Permissions tab on the App Console.";
@@ -1227,9 +1212,9 @@ mod tests {
         );
     }
 
-    /// An unrelated failure keeps its own message: quoting something is not the
-    /// same as naming a scope, and mislabelling a path error as a permission
-    /// problem would send the user to the App Console for nothing.
+    /// An unrelated failure keeps its own message. Quoting something is not
+    /// naming a scope. Mislabelling a path error as a permission problem would
+    /// send the user to the App Console for nothing.
     #[test]
     fn an_unrelated_error_body_names_no_scope() {
         assert_eq!(missing_scope_from_body("insufficient_space"), None);
@@ -1392,9 +1377,8 @@ mod tests {
 
     /// A scope revoked mid-upload keeps the App Console guidance
     /// `check_dropbox_status` produces, rather than degrading to a raw status.
-    /// It arrives on a 401, the same status a merely stale token uses, so this
-    /// also pins that a missing scope is never mistaken for something that will
-    /// fix itself on the next retry.
+    /// It arrives on a 401, the same status a merely stale token uses. So this
+    /// also pins that a missing scope is never read as transient.
     #[test]
     fn a_scope_lost_mid_upload_still_names_the_console() {
         let body = r#"{"error_summary":"missing_scope/.","error":{".tag":"missing_scope","required_scope":"files.content.write"}}"#;
@@ -1410,10 +1394,9 @@ mod tests {
     }
 
     /// A token that expires partway through a session is recoverable: the next
-    /// round refreshes it. Only the chunked path can hit this, because it
-    /// authenticates once per chunk over minutes or hours, where the single
-    /// POST it replaced authenticated once when the request opened. Classifying
-    /// it fatal would abandon a multi-GB upload over a token Lucidos can renew.
+    /// round refreshes it. Only the chunked path can hit this, because only it
+    /// authenticates once per chunk over minutes or hours. Classifying it fatal
+    /// would abandon a multi-GB upload over a token Lucidos can renew.
     #[test]
     fn a_token_that_expires_mid_session_is_refreshed_not_fatal() {
         for tag in ["expired_access_token", "invalid_access_token"] {

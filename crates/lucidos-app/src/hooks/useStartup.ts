@@ -4,7 +4,7 @@ import { loadArtifacts, openUrl } from '../store/actions/artifacts';
 import { openFilePreviewModal, filePreviewRequestError, filePreviewBlockedReason } from '../store/actions/filePreviewModal';
 import { syncAppFullscreenHost } from '../store/appFullscreenHost';
 import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
-import { syncWorkspaceAppBadge } from '../store/actions/app-badge';
+import { syncWorkspaceAppBadge, refreshOtherWorkspacesUnread } from '../store/actions/app-badge';
 import { loadApps } from '../store/actions/apps';
 import { loadCredentials } from '../store/actions/credentials';
 import { loadDevices, registerCurrentDevice } from '../store/actions/devices';
@@ -61,11 +61,38 @@ const COLD_START_BOUNCE_MS = 10_000;
 // notificationclick silently dropped) without churning the recovery path,
 // which is itself cooldown-debounced.
 const SW_PROBE_INTERVAL_MS = 5 * 60 * 1000;
+// How often a gateway-served page re-reads the OTHER workspaces' unread counts
+// for the app-icon badge (one installed icon covers the whole gateway origin,
+// see store/actions/app-badge.ts). Deliberately slow: a notification in another
+// workspace already repaints the icon through its own push, which carries the
+// fresh aggregate, so this is the backstop for the case with no signal at all
+// (a notification READ in another workspace, on another device). A no-op
+// outside a gateway workspace context.
+const CROSS_WORKSPACE_BADGE_INTERVAL_MS = 60 * 1000;
 // One iOS wake delivers `visibilitychange`, `focus` and `pageshow` together, so
 // the resume fan-out is gated to one pass per window. Only has to outlast the
 // burst (same tick, occasionally a few hundred ms apart); a genuine later wake
 // still gets its own pass. See `onResumeCoalesced`.
 const RESUME_COALESCE_MS = 1000;
+
+/** A `setInterval` that only ticks while the document is visible: `start()` on
+ *  visibility-visible, `stop()` when hidden, so a backgrounded tab burns no
+ *  wakes on work nobody is looking at. Both are idempotent, so the visibility
+ *  handler can call them unconditionally, and `stop()` doubles as teardown. */
+function visibleOnlyInterval(tick: () => void, everyMs: number): { start: () => void; stop: () => void } {
+  let id: number | null = null;
+  return {
+    start() {
+      if (id !== null) return;
+      id = window.setInterval(tick, everyMs);
+    },
+    stop() {
+      if (id === null) return;
+      clearInterval(id);
+      id = null;
+    },
+  };
+}
 
 export function useStartup(): void {
   useEffect(() => {
@@ -98,6 +125,11 @@ export function useStartup(): void {
     }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
     // Cold-start: load the unread set so the bell badge is correct.
     void loadUnreadNotifications();
+    // ...and the other workspaces' counts, which the bell never shows but the
+    // app ICON does: behind the gateway one installed icon covers every
+    // workspace on the origin. A no-op on a direct engine port. See
+    // store/actions/app-badge.ts.
+    void refreshOtherWorkspacesUnread();
     loadPreferences().then(() => {
       // Notifications must load after preferences so the persisted filter is
       // applied. The "Unread" tab renders `unreadNotifications` (loaded above via
@@ -542,6 +574,10 @@ export function useStartup(): void {
       // (absolute-navigate URL on iOS, notificationclick elsewhere), so there's
       // no in-app rescue toast to surface here.
       void loadUnreadNotifications();
+      // The icon's cross-workspace half went unwatched while we slept (the
+      // interval is visible-only, and another workspace's notifications never
+      // reach this page's SSE), so re-read it now rather than at the next tick.
+      void refreshOtherWorkspacesUnread();
       // Re-send any preference write the engine never received. WebKit aborts
       // in-flight fetches when it suspends the page, so a settings change made
       // just before backgrounding is applied on this device but missing on the
@@ -615,32 +651,33 @@ export function useStartup(): void {
 
     // Closes the gap where focus/visibilitychange triggers don't fire (tab
     // already visible) but the SW has wedged — Chromium issue #370536109.
-    // Started/stopped on visibility so hidden tabs don't burn CPU wakes.
-    let swProbeInterval: number | null = null;
-    function startSwProbe() {
-      if (swProbeInterval !== null) return;
-      swProbeInterval = window.setInterval(() => {
-        checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
-      }, SW_PROBE_INTERVAL_MS);
-    }
-    function stopSwProbe() {
-      if (swProbeInterval === null) return;
-      clearInterval(swProbeInterval);
-      swProbeInterval = null;
-    }
+    const swProbe = visibleOnlyInterval(() => {
+      checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
+    }, SW_PROBE_INTERVAL_MS);
+
+    // Keeps the app-icon badge's cross-workspace half honest while the page sits
+    // open (see CROSS_WORKSPACE_BADGE_INTERVAL_MS).
+    const crossWorkspaceBadge = visibleOnlyInterval(() => {
+      void refreshOtherWorkspacesUnread();
+    }, CROSS_WORKSPACE_BADGE_INTERVAL_MS);
 
     function handleVisibilityChange() {
       if (document.visibilityState === 'visible') {
         onResumeCoalesced();
-        startSwProbe();
+        swProbe.start();
+        crossWorkspaceBadge.start();
       } else {
-        stopSwProbe();
+        swProbe.stop();
+        crossWorkspaceBadge.stop();
       }
     }
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', onResumeCoalesced);
     window.addEventListener('pageshow', onResumeCoalesced);
-    if (document.visibilityState === 'visible') startSwProbe();
+    if (document.visibilityState === 'visible') {
+      swProbe.start();
+      crossWorkspaceBadge.start();
+    }
 
     // Periodic health polling as connection watchdog.
     const connectionInterval = setInterval(() => {
@@ -683,7 +720,8 @@ export function useStartup(): void {
       stopLiveness();
       clearInterval(connectionInterval);
       clearTimeout(coldStartBounceTimer);
-      stopSwProbe();
+      swProbe.stop();
+      crossWorkspaceBadge.stop();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       stopAppUpdateChecks();
       unsubscribeFromTailscaleServeProgress();

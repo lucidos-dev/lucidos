@@ -66,19 +66,14 @@ fn safari_user_agent() -> &'static str {
 
 /// Hand `url` to the OS default handler.
 ///
-/// Errs rather than logging, because every caller of the command that wraps this
-/// is user-initiated and every JS caller of `openExternal` already toasts the
-/// rejection (`openUrl`, `openLocalFile`, `popOutApp`). This used to log the
-/// spawn failure and return `()`, so those three `.catch` handlers could never
-/// fire and a launcher that was simply not there (no `xdg-open` on a headless
-/// Linux install) read to the user as the button doing nothing, which is exactly
-/// the class of bug the popout fix exists to remove.
+/// Errs rather than logging, because every caller is user-initiated and every JS
+/// caller of `openExternal` already toasts the rejection. A missing launcher
+/// otherwise reads to the user as the button doing nothing.
 ///
-/// The spawn failure is the ONLY failure observable here: the launcher is a
-/// fire-and-forget child, so one that starts and then fails (no handler for the
-/// scheme, missing file) exits after this has returned. Waiting on it would mean
-/// blocking, and a synchronous `#[tauri::command]` runs on the main thread, so
-/// that trade buys a rare error message at the price of a freezable window.
+/// The spawn failure is the ONLY failure observable here. The launcher is a
+/// fire-and-forget child, so one that starts and then fails exits after this has
+/// returned. Waiting on it would block the main thread, since a synchronous
+/// `#[tauri::command]` runs there.
 fn open_in_default_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let cmd = std::process::Command::new("open").arg(url).spawn();
@@ -100,16 +95,12 @@ struct PanelContentChannel(Mutex<Option<std::sync::mpsc::Sender<(String, String)
 struct PanelWebview(Mutex<Option<String>>);
 
 /// Sender that wakes the unread-indicator loop (`desktop::launch`) for an
-/// immediate recompute. The frontend's `nudge_dock_badge` command sends on it when
-/// a notification SSE arrives, so the menu-bar tray title (and the dock badge, when
-/// a window is open) updates the instant a notification is read (in-app or from
-/// another device) instead of on the next poll tick. The receiver lives in that
-/// loop's thread (macOS, packaged); a send is a harmless no-op when there's no
-/// consumer (dev / non-macOS).
+/// immediate recompute, so the tray title and dock badge update the instant a
+/// notification is read rather than on the next poll tick. A send is a harmless
+/// no-op where there is no consumer (dev, and off macOS).
 ///
-/// The `dock badge` in this name and in `nudge_dock_badge` predates the tray
-/// surface, and is kept because the command name is a wire contract with the
-/// frontend: it is spelled in `permissions/app-ipc.json`, in the generated
+/// The "dock badge" in this name is a wire contract with the frontend: it is
+/// spelled in `permissions/app-ipc.json`, in the generated
 /// `gen/schemas/acl-manifests.json`, and in `utils/tauri.ts`. What it nudges is
 /// the unread indicator as a whole.
 struct DockBadgeNudge(Mutex<std::sync::mpsc::Sender<()>>);
@@ -147,10 +138,9 @@ const MAX_RELOAD_BACKOFF_DOUBLINGS: u32 = 5;
 /// consecutive reloads have already failed to bring it back.
 ///
 /// A reload that produces no heartbeat did not fix anything, and repeating it on
-/// the base interval is how the 2.11 ACL regression turned into 6232 silent
-/// reloads (one per minute for weeks). Backing off — rather than giving up —
-/// kills the thrash while still recovering if the cause was temporary, e.g. the
-/// page failing to load because the gateway was briefly down.
+/// the base interval is how a broken IPC bridge becomes a silent reload every
+/// minute for weeks. Backing off rather than giving up kills the thrash while
+/// still recovering if the cause was temporary.
 fn reload_threshold(futile_reloads: u32) -> std::time::Duration {
     HEARTBEAT_TIMEOUT * 2u32.pow(futile_reloads.min(MAX_RELOAD_BACKOFF_DOUBLINGS))
 }
@@ -202,21 +192,14 @@ impl ReloadWatchdog {
     }
 }
 
-/// Window state the app persists/restores via `tauri-plugin-window-state`.
-/// Deliberately EXCLUDES `VISIBLE` and `DECORATIONS`:
-/// - `VISIBLE`: the packaged client *hides* (never closes) its window — the
-///   always-on launchd service keeps the process resident. A geometry flush taken
-///   while the window is hidden would persist `visible: false`, and the plugin
-///   would then restore the window hidden on the next launch (the user opens the
-///   app and sees nothing). Leaving `VISIBLE` out means the plugin never forces
-///   the window hidden on restore; the config-declared `main` window stays visible.
-/// - `DECORATIONS`: toggling decorations on macOS rebuilds the NSWindow style mask
-///   and can drop our `titleBarStyle: "Overlay"` + hidden-title configuration,
-///   turning the reclaimed title-bar band back into an opaque bar after restore.
-///
-/// What's left — size, position, maximized, fullscreen — is exactly what the user
-/// expects remembered, including which screen (the plugin restores position only
-/// when a currently-connected monitor still contains the saved rect).
+/// Window state the app persists and restores via `tauri-plugin-window-state`.
+/// Deliberately EXCLUDES two flags:
+/// - `VISIBLE`: the packaged client hides its window rather than closing it. A
+///   flush taken while hidden would persist `visible: false`, and the plugin
+///   would restore the window hidden on the next launch.
+/// - `DECORATIONS`: toggling it on macOS rebuilds the NSWindow style mask and
+///   can drop the `titleBarStyle: "Overlay"` configuration, turning the
+///   reclaimed title-bar band back into an opaque bar.
 fn window_state_flags() -> StateFlags {
     StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
 }
@@ -227,21 +210,18 @@ fn window_state_flags() -> StateFlags {
 /// disk on every intermediate `Moved`/`Resized` event.
 const GEOMETRY_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
-/// Coordinates the debounced geometry flush. The window-state plugin only writes
-/// to disk on `RunEvent::Exit`, which the packaged client deliberately never
-/// reaches (closing the window hides it; exit is prevented while the launchd
-/// service runs). So without this, a moved/resized window is remembered only
-/// in-memory and is lost on the next client launch. `Moved`/`Resized` events mark
-/// `dirty` + stamp `last_change`; a background thread flushes once the window has
-/// been quiet for [`GEOMETRY_SAVE_DEBOUNCE`] (see [`should_persist_geometry`]).
+/// Coordinates the debounced geometry flush. The window-state plugin writes to
+/// disk only on `RunEvent::Exit`, which the packaged client never reaches.
+/// Without this, a moved or resized window is remembered in memory alone. A
+/// background thread flushes once the window has been quiet for
+/// [`GEOMETRY_SAVE_DEBOUNCE`] (see [`should_persist_geometry`]).
 struct GeometrySaver {
     dirty: AtomicBool,
     last_change: Mutex<Instant>,
 }
 
-/// Whether the debounced flush should run now: there is unsaved geometry (`dirty`)
-/// and the window has been quiet at least [`GEOMETRY_SAVE_DEBOUNCE`]. Pure so the
-/// debounce threshold is unit-testable without the background thread.
+/// Whether the debounced flush should run now: there is unsaved geometry and
+/// the window has been quiet at least [`GEOMETRY_SAVE_DEBOUNCE`].
 fn should_persist_geometry(dirty: bool, since_last_change: std::time::Duration) -> bool {
     dirty && since_last_change >= GEOMETRY_SAVE_DEBOUNCE
 }
@@ -249,16 +229,12 @@ fn should_persist_geometry(dirty: bool, since_last_change: std::time::Duration) 
 /// Persist window geometry, forcing the work onto the MAIN thread.
 ///
 /// `tauri-plugin-window-state::save_window_state` holds an internal cache lock
-/// while it reads each window's live geometry (`inner_size` / `outer_position` /
-/// `is_maximized` / …). Off the main thread those getters block on a round-trip
-/// to the event loop — so a worker-thread save holds the cache lock across a wait
-/// for the main thread, while the main thread (delivering a `Moved`/`Resized`/
-/// `CloseRequested` to the plugin's own handlers) blocks taking that same lock:
-/// a full-UI deadlock. The plugin avoids it by only saving from `RunEvent::Exit`
-/// (after the loop stops). Callers NOT already on the main thread (the debounce
-/// thread, async commands) must route through here; the getters then resolve
-/// inline and the lock is never held across a cross-thread wait. Fire-and-forget
-/// — the save runs on the next main-loop turn.
+/// while it reads each window's live geometry. Off the main thread those getters
+/// block on a round-trip to the event loop. So a worker-thread save holds the
+/// cache lock across a wait for the main thread, while the main thread blocks
+/// taking that same lock: a full-UI deadlock. Every caller NOT already on the
+/// main thread must route through here. Fire-and-forget, so the save runs on the
+/// next main-loop turn.
 fn persist_window_state_on_main(app: &tauri::AppHandle) {
     let handle = app.clone();
     if let Err(e) = app.run_on_main_thread(move || {
@@ -292,51 +268,31 @@ pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 /// injection in `on_page_load`) can tell the two apart.
 const APP_WINDOW_PREFIX: &str = "window-";
 
-/// Default macOS window background tint, applied before the frontend reports the
-/// active theme. It's the dark-theme header-top blue — the first stop of
-/// `--header-gradient` in `crates/lucidos-app/src/styles/global/base.css`; dark
-/// is the app's default theme. Under `titleBarStyle: "Overlay"` the webview owns
-/// the full window height and paints the reclaimed title-bar band itself (the
-/// `.titlebar-strip` element); this NSWindow background is the pre-paint /
-/// behind-the-webview fallback so that band reads blue, not black, before the
-/// page paints. The frontend's `applyTheme` refines it to the exact per-theme
-/// blue via the `set_titlebar_color` command.
+/// Default macOS window background tint, the dark-theme header-top blue. Under
+/// `titleBarStyle: "Overlay"` the webview paints the reclaimed title-bar band
+/// itself. This NSWindow background is the behind-the-webview fallback, so the
+/// band reads blue rather than black before the page paints.
 ///
-/// The FALLBACK only. Once the frontend has reported a color it is remembered
-/// (see [`TITLE_BAR_COLOR_FILE`]) and that value is what a later launch paints
-/// with, so a light-theme user is not launched into the dark-theme blue; this
-/// constant covers a first run and an unreadable file.
+/// The FALLBACK only: once the frontend has reported a color it is remembered
+/// (see [`TITLE_BAR_COLOR_FILE`]), so this constant covers a first run and an
+/// unreadable file.
 const TITLE_BAR_DEFAULT_COLOR: &str = "#15549e";
 
-/// JS appended to every app window's startup injection. On macOS it sets the
-/// `--titlebar-inset` CSS variable (the macOS standard title-bar height) before
-/// the page paints, so under `titleBarStyle: "Overlay"` the reclaimed title-bar
-/// band, drawn by the `.titlebar-strip` element which sizes to
-/// `var(--titlebar-inset, 0px)`, appears with no layout shift while the header
-/// content below keeps its position. Empty on every other platform and the web
-/// build, where there is no native title bar: `--titlebar-inset` stays unset
-/// (0px) and the strip collapses to nothing.
+/// JS appended to every app window's startup injection, and empty off macOS.
+/// It stamps three facts pre-paint, so the header's first frame lays out right.
 ///
-/// It also stamps `--titlebar-lights-x`, the x we place the traffic lights at
-/// ([`traffic_lights::LIGHTS_X_PX`], applied to the real window by
-/// [`traffic_lights::place`]). That is what makes the horizontal room the header
-/// row keeps clear DERIVED rather than guessed: `styles/panels/shell.css`
-/// computes `--titlebar-lights-reserve` as this x plus the cluster's measured
-/// width plus a gap, so the reserve moves with the placement instead of standing
-/// as an independent estimate of where the OS left buttons we did not control.
-/// It is stamped here, pre-paint, alongside the inset, because the reserve is
-/// read by the first frame the header lays out.
+/// `--titlebar-inset` is the macOS title-bar height the `.titlebar-strip`
+/// element sizes to. `--titlebar-lights-x` is the x
+/// [`traffic_lights::place`] puts the buttons at, which is what makes
+/// `--titlebar-lights-reserve` in `styles/panels/shell.css` derived rather than
+/// an independent guess.
 ///
-/// And it stamps `data-titlebar-overlay`, which is the same fact as a SELECTOR
-/// rather than a length. Two things need it, and neither can be expressed with
-/// the vars alone. The header's leading control steps right by
-/// `--titlebar-lights-reserve`, which has no `--titlebar-inset` term in it to
-/// collapse to nothing off this build (and a fallback x, so it resolves even
-/// unstamped): keyed on a var, a web header would be indented by the width of
-/// lights it does not have. And the header is SHORTENED by the band here, so the
-/// two desktop builds show one bar; that subtraction is only correct where a
-/// band exists. See the `[data-titlebar-overlay]` block in
-/// `styles/panels/shell.css`.
+/// `data-titlebar-overlay` is the same fact as a SELECTOR rather than a length,
+/// and two rules need it that way. The header's leading control steps right by
+/// the reserve, which has a fallback x and so resolves even unstamped: keyed on
+/// a var, a web header would be indented by lights it does not have. And the
+/// header is SHORTENED by the band, a subtraction that is only correct where a
+/// band exists.
 fn titlebar_inset_script() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -354,7 +310,6 @@ fn titlebar_inset_script() -> String {
     }
 }
 
-/// Get the main window. Tries get_window first, falls back to get_webview_window.
 fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
     if let Some(w) = app.get_window("main") {
         return Some(w);
@@ -370,12 +325,9 @@ pub(crate) fn is_app_window(label: &str) -> bool {
 }
 
 /// Paint the macOS window background of every top-level app window the given
-/// color. Sets the WINDOW-layer background only (`Window::set_background_color`),
-/// never the webview's — so the page background is never tinted (no load flash).
-/// Under `titleBarStyle: "Overlay"` this is the pre-paint / behind-the-webview
-/// fallback for the reclaimed title-bar band (the visible band is the CSS
-/// `.titlebar-strip`). Panel preview webviews (`url-preview-*`) are skipped.
-/// Best-effort per window: a failure on one is logged, not fatal.
+/// color. Sets the WINDOW-layer background only, never the webview's, so the
+/// page background is never tinted and there is no load flash. Panel preview
+/// webviews are skipped, and a failure on one window is logged, not fatal.
 fn paint_title_bars(app: &tauri::AppHandle, color: tauri::utils::config::Color) {
     for (label, window) in app.windows() {
         if is_app_window(&label) {
@@ -386,12 +338,9 @@ fn paint_title_bars(app: &tauri::AppHandle, color: tauri::utils::config::Color) 
     }
 }
 
-/// Frontend-driven window-background tint. The app's `applyTheme` calls this with
-/// the header-top blue for the active theme (`#1a6fd0` light / `#15549e` dark) so
-/// the behind-the-webview fallback for the reclaimed title-bar band tracks the
-/// in-app header across theme switches. `color` is a CSS hex string (`#rgb` /
-/// `#rrggbb` / `#rrggbbaa`). See `paint_title_bars` for why only the window layer
-/// is colored.
+/// Frontend-driven window-background tint. `applyTheme` calls this with the
+/// header-top blue for the active theme, so the behind-the-webview fallback
+/// tracks the in-app header across theme switches. `color` is a CSS hex string.
 #[tauri::command]
 fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String> {
     let parsed = color
@@ -404,30 +353,24 @@ fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String
     Ok(())
 }
 
-/// Remembers the last color the frontend asked for, so a cold launch can paint
-/// the window background in the user's theme instead of the compiled dark-theme
-/// default (a light-theme user otherwise watches dark blue correct itself once
-/// the frontend catches up). A bare hex string, no schema: one value, read back
-/// through the same color parse as any other, never trusted into anything else.
-///
-/// The file plumbing (where it lives, the trimmed read, the write that skips an
-/// unchanged value) is [`config_scalar`], shared with the header-bar height the
-/// traffic lights are placed against; what stays here is what the value MEANS.
+/// Remembers the last color the frontend asked for, so a cold launch paints the
+/// window background in the user's theme rather than the compiled default. A
+/// bare hex string, read back through the same color parse as any other.
+/// [`config_scalar`] owns the file plumbing.
 const TITLE_BAR_COLOR_FILE: &str = "titlebar-color";
 
 /// Write `color` for the next launch. Trimmed first, because the color parser
-/// tolerates surrounding whitespace while [`config_scalar::read`] strips it:
-/// storing the raw string would leave a value that never compares equal to what
-/// is read back, so the skip would miss and every theme apply would rewrite the
-/// file.
+/// tolerates surrounding whitespace while [`config_scalar::read`] strips it.
+/// Storing the raw string would leave a value that never compares equal to what
+/// is read back, so every theme apply would rewrite the file.
 fn persist_title_bar_color(app: &tauri::AppHandle, color: &str) {
     config_scalar::write_if_changed(app, TITLE_BAR_COLOR_FILE, color.trim(), "title-bar color");
 }
 
-/// Pure: which color string to paint with before a page can report its theme.
-/// `persisted` is the raw file content from the last `set_titlebar_color`; it
-/// wins only if it still parses as a color, so a truncated or hand-edited file
-/// degrades to [`TITLE_BAR_DEFAULT_COLOR`] rather than to no tint at all.
+/// Which color string to paint with before a page can report its theme.
+/// `persisted` wins only if it still parses as a color. A truncated or
+/// hand-edited file degrades to [`TITLE_BAR_DEFAULT_COLOR`] rather than to no
+/// tint at all.
 fn title_bar_color_or_default(persisted: Option<&str>) -> &str {
     persisted
         .filter(|c| c.parse::<tauri::utils::config::Color>().is_ok())
@@ -449,17 +392,14 @@ fn pre_paint_title_bar_color(app: &tauri::AppHandle) -> Option<tauri::utils::con
 
 /// Frontend-driven traffic-light placement. The app calls this with the height
 /// of the header bar it just measured, and the macOS window buttons are centred
-/// on that bar (see [`traffic_lights`] for the arithmetic and for why Tauri
-/// 2.11.4 leaves us to do this through AppKit).
+/// on that bar. See [`traffic_lights`] for the arithmetic.
 ///
-/// The bar height has to come from the page because only the page knows it:
-/// `--desktop-bar-height` is `3rem` and the root font size is the user's UI-scale
-/// preference, so the bar is 48px at 100% and 72px at 150%. It is also LIVE (the
-/// Style Remote retunes tokens over SSE), which is the whole reason this is a
-/// command rather than a value fixed when the window was built.
+/// The bar height has to come from the page, because only the page knows it:
+/// `--desktop-bar-height` is `3rem` against the user's UI-scale root font size,
+/// and the Style Remote retunes it live over SSE. That is why this is a command
+/// rather than a value fixed when the window was built.
 ///
 /// `window` is the calling window, so a New-Window child places its own lights.
-/// Remembered for the next cold launch, exactly as `set_titlebar_color` is.
 #[tauri::command]
 fn set_traffic_light_offset(
     app: tauri::AppHandle,
@@ -469,23 +409,20 @@ fn set_traffic_light_offset(
     traffic_lights::set_bar_height(&app, &window, bar_height_px)
 }
 
-/// Start a native window drag for the calling window. The frontend's
-/// `useWindowDragRegion` hook calls this once the pointer crosses a small
-/// movement threshold while pressed on a non-interactive area of the title-bar
-/// band, so plain clicks / double-clicks still reach the page's own handlers (the
-/// header's double-click → pane-maximize, etc.). This replaces
-/// `data-tauri-drag-region`, whose internal `plugin:window|start_dragging` IPC is
-/// denied by our capability ACL — only app-defined commands like this one bypass
-/// the ACL. `window` is the calling window, so New-Window windows drag themselves.
+/// Start a native window drag for the calling window. `useWindowDragRegion`
+/// calls this once the pointer crosses a small movement threshold, so plain
+/// clicks still reach the page's own handlers. An app command rather than
+/// `data-tauri-drag-region`, whose internal `plugin:window|start_dragging` IPC
+/// the capability ACL denies.
 #[tauri::command]
 fn start_window_drag(window: tauri::Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| format!("{e}"))
 }
 
-/// Toggle the calling window between maximized (macOS zoom) and restored. Bound to
-/// a double-click on the reclaimed title-bar strip only — the header keeps its own
-/// double-click → pane-maximize. Like `start_window_drag`, an app command so it
-/// isn't subject to the window-plugin ACL.
+/// Toggle the calling window between maximized and restored. Bound to a
+/// double-click on the reclaimed title-bar strip only, since the header keeps
+/// its own double-click. An app command, like `start_window_drag`, so the
+/// window-plugin ACL does not apply.
 #[tauri::command]
 fn toggle_window_maximize(window: tauri::Window) -> Result<(), String> {
     if window.is_maximized().map_err(|e| format!("{e}"))? {
@@ -513,19 +450,15 @@ fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String
     let counter = WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
 
-    // `titleBarStyle: "Overlay"` + hidden title is set per-window: the
-    // tauri.conf.json values only apply to the declared `main` window, so
-    // builder-made windows need them explicitly or they'd render the default
-    // opaque (black) bar. The builder methods are macOS-only, so they're applied
-    // via a cfg-gated shadow (the rest of this crate stays cross-platform
-    // compilable).
-    // `disable_drag_drop_handler` mirrors `dragDropEnabled: false` in
-    // tauri.conf.json for the same reason the title-bar values are repeated: the
-    // config only describes the declared `main` window. Left on, wry installs its
-    // own NSDraggingDestination handler on the WKWebView and consumes the drag
-    // rather than forwarding it, so no HTML5 `dragover`/`drop` ever reaches the
-    // page and every file drop in the window is silently dead. We listen for no
-    // Tauri drag-drop event, so nothing is given up by turning it off.
+    // The `tauri.conf.json` window values apply only to the declared `main`
+    // window, so a builder-made one repeats them or renders the default opaque
+    // bar. Two are repeated here.
+    //
+    // `disable_drag_drop_handler` mirrors `dragDropEnabled: false`. Left on, wry
+    // installs its own NSDraggingDestination handler and consumes the drag. No
+    // HTML5 `dragover` or `drop` then reaches the page, so every file drop is
+    // silently dead. Nothing listens for a Tauri drag-drop event, so turning it
+    // off gives up nothing.
     let builder = WebviewWindowBuilder::new(app, &label, url)
         .title("Lucidos")
         .inner_size(1024.0, 768.0)
@@ -535,24 +468,22 @@ fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
     builder.build().map_err(|e| format!("{e}"))?;
-    // Tint the bar immediately (window layer only) so it's not black for the
-    // moment before this window's frontend boots and calls `set_titlebar_color`.
-    // The window is registered by `build()`, so paint_title_bars now covers it.
+    // Tint the bar now, so it is not black for the moment before this window's
+    // frontend boots and calls `set_titlebar_color`. `build()` has registered
+    // the window, so `paint_title_bars` covers it.
     if let Some(color) = pre_paint_title_bar_color(app) {
         paint_title_bars(app, color);
     }
-    // And put this window's traffic lights on its bar before its frontend boots,
-    // for the same reason: at the remembered bar height, so they are not centred
-    // for the default scale for the moment before it reports in.
+    // Same for the traffic lights, at the remembered bar height rather than
+    // centred for the default scale.
     traffic_lights::place_all(app);
     Ok(())
 }
 
 /// The URL a freshly opened app window should load. Mirrors the main window's
-/// current URL when it has already navigated to the gateway (so the new window
-/// lands on the same workspace/route the user is viewing); falls back to the
-/// gateway on the stable packaged port, or the bundled entry
-/// in dev (the dev server is wired via `tauri.conf.json` `devUrl`).
+/// current URL once it has navigated to the gateway, so the new window lands on
+/// the workspace the user is viewing. Falls back to the gateway on the stable
+/// packaged port, or to the bundled entry in dev.
 fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
     if let Some(url) = app.get_webview_window("main").and_then(|w| w.url().ok()) {
         if url.scheme() == "http" || url.scheme() == "https" {
@@ -560,9 +491,9 @@ fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
         }
     }
     if !tauri::is_dev() {
-        // Same builder `desktop::launch` navigates the main window with, so a New
-        // Window opened before that navigation still lands on the exact origin the
-        // gateway ACL capability was pinned to (desktop::gateway_capability).
+        // The same builder `desktop::launch` navigates the main window with. So
+        // a New Window opened before that navigation still lands on the origin
+        // `desktop::gateway_capability` pinned the ACL to.
         if let Ok(url) = desktop::gateway_url(desktop::engine_port()).parse::<tauri::Url>() {
             return WebviewUrl::External(url);
         }
@@ -570,8 +501,8 @@ fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
     WebviewUrl::App("index.html".into())
 }
 
-/// Compute title bar gap: difference between Tauri's window logical height
-/// and the CSS viewport height (window.innerHeight from frontend).
+/// The difference between Tauri's window logical height and the CSS viewport
+/// height the frontend reported.
 fn title_bar_gap(app: &tauri::AppHandle, viewport_height: f64) -> f64 {
     get_main_window(app)
         .map(|window| {
@@ -585,7 +516,6 @@ fn title_bar_gap(app: &tauri::AppHandle, viewport_height: f64) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Helper: get the active panel webview, if any.
 fn get_panel_webview(app: &tauri::AppHandle) -> Option<tauri::Webview> {
     let state = app.state::<PanelWebview>();
     let label = state.0.lock().unwrap().clone()?;
@@ -638,11 +568,10 @@ fn create_panel_webview(
             tauri::webview::NewWindowResponse::Deny
         })
         .on_page_load(move |wv, payload| {
-            // on_page_load fires only for MAIN FRAME navigations (backed by
-            // WKWebView's didCommitNavigation/didFinishNavigation on macOS).
+            // Fires only for MAIN FRAME navigations.
             match payload.event() {
                 PageLoadEvent::Started => {
-                    // Grab title early from <head> — reduces visible delay
+                    // Grab the title early from <head>, to cut the visible delay.
                     if let Err(e) = wv.eval(TITLE_OBSERVER_JS) {
                         eprintln!("[Tauri] Failed to inject title observer: {e}");
                     }
@@ -650,7 +579,7 @@ fn create_panel_webview(
                 PageLoadEvent::Finished => {
                     let url = payload.url().to_string();
                     let _ = page_load_app.emit_to("main", "panel-url-changed", url);
-                    // Re-inject to catch final title + set up observer for SPA changes
+                    // Re-inject for the final title, and observe SPA changes.
                     if let Err(e) = wv.eval(TITLE_OBSERVER_JS) {
                         eprintln!("[Tauri] Failed to inject title observer: {e}");
                     }
@@ -753,8 +682,8 @@ fn webview_go_forward(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// JS injected on page load: reports title immediately, then observes for SPA title changes.
-/// No polling — uses MutationObserver on <title> (and on <head> to detect late-appearing <title>).
+/// Reports the title immediately, then observes SPA title changes with a
+/// `MutationObserver` on `<title>`, and on `<head>` for a late-appearing one.
 const TITLE_OBSERVER_JS: &str = r#"(function(){
     if(window.__lucidos_title_cleanup) window.__lucidos_title_cleanup();
     var lastTitle='',titleObserver,headObserver;
@@ -781,9 +710,9 @@ const TITLE_OBSERVER_JS: &str = r#"(function(){
     };
 })()"#;
 
-/// JS injected on page load: reports URL changes from back/forward navigation (popstate)
-/// and SPA client-side routing (pushState/replaceState). These navigations don't trigger
-/// WKWebView's on_page_load, so without this the frontend's panelUrl gets out of sync.
+/// Reports URL changes from back and forward navigation, and from SPA routing.
+/// Those do not trigger WKWebView's `on_page_load`, so without this the
+/// frontend's `panelUrl` drifts out of sync.
 const URL_OBSERVER_JS: &str = r#"(function(){
     if(window.__lucidos_url_cleanup) window.__lucidos_url_cleanup();
     var T=window.__TAURI_INTERNALS__;
@@ -818,9 +747,9 @@ fn __panel_url_report(app: tauri::AppHandle, url: String) -> Result<(), String> 
     Ok(())
 }
 
-/// Extract the text content and title from the panel webview.
-/// Uses a sync channel: eval JS → JS calls __panel_content_report → channel resolves.
-/// Runs on a blocking thread so it doesn't block the main thread while waiting.
+/// Extract the text content and title from the panel webview. Evals JS that
+/// calls `__panel_content_report`, which resolves a sync channel. Runs on a
+/// blocking thread, so the main thread is free while it waits.
 #[tauri::command]
 async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let wv = get_panel_webview(&app).ok_or("panel webview not found")?;
@@ -831,7 +760,6 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
         *state.0.lock().unwrap() = Some(tx);
     }
 
-    // Extract text content from the page body, truncated to 100K chars
     wv.eval(
         r#"(function(){
             var title = document.title || '';
@@ -845,7 +773,6 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
     )
     .map_err(|e| e.to_string())?;
 
-    // Wait up to 5 seconds for the JS callback (blocking receive with timeout)
     let (title, content) = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| "content extraction timed out".to_string())?;
@@ -860,24 +787,22 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
 ///
 /// A packaged build relaunches through LaunchServices so the new instance comes
 /// back FRONTMOST ([`desktop::schedule_relaunch_after_exit`] explains why a
-/// direct respawn does not). Every other case (dev, an unbundled binary, a
-/// watcher we could not spawn) falls back to replacing this process with a fresh
-/// one, which is what this command always did.
+/// direct respawn does not). Every other case falls back to replacing this
+/// process with a fresh one.
 ///
 /// Sync command, so it runs on the main thread: both `save_window_state` and
 /// `cleanup_before_exit` require that.
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("Failed to get current exe: {e}"))?;
-    // Minus `--login`: a restart must come back the way any restart does, with
-    // its window, even for a client that originally started at login.
+    // Minus `--login`: a restart must come back with its window, even for a
+    // client that originally started at login.
     let args = desktop::relaunch_args();
 
     eprintln!("[Tauri] Restarting app: {:?} {:?}", exe, args);
 
-    // Persist geometry before we go. The plugin's exit-time flush does not run on
-    // the exec path at all, so without this an in-session move/resize would be
-    // lost across the restart.
+    // The plugin's exit-time flush never runs on the exec path, so without this
+    // an in-session move or resize is lost across the restart.
     if let Err(e) = app.save_window_state(window_state_flags()) {
         eprintln!("[Tauri] Failed to persist window state before restart: {e}");
     }
@@ -895,8 +820,6 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     }
 
     app.cleanup_before_exit();
-
-    // On Unix, exec() replaces the process in-place. On other platforms, spawn + exit.
     restart_process(&exe, &args)
 }
 
@@ -904,21 +827,19 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 /// never come back.
 ///
 /// For a caller on the async runtime that has already arranged its own relaunch
-/// ([`desktop::schedule_relaunch_after_exit`]). Both halves need the main thread:
-/// `save_window_state` deadlocks off it (see [`persist_window_state_on_main`]),
-/// and `cleanup_before_exit` tears down webviews.
+/// ([`desktop::schedule_relaunch_after_exit`]). Both halves need the main
+/// thread: `save_window_state` deadlocks off it (see
+/// [`persist_window_state_on_main`]), and `cleanup_before_exit` tears down
+/// webviews.
 ///
 /// The save is explicit because `cleanup_before_exit` does NOT dispatch
-/// `RunEvent::Exit`, which is what normally drives the window-state plugin's own
-/// exit-time write. `app.restart()` went out through the real exit event and got
-/// that write for free; this path has to do it itself or a move/resize inside the
-/// debounce window would be lost across the relaunch. It runs inline rather than
-/// through [`persist_window_state_on_main`] because that helper posts its own
-/// main-thread task, which would never be reached: this closure exits first.
+/// `RunEvent::Exit`, which is what drives the plugin's own exit-time write. It
+/// runs inline rather than through [`persist_window_state_on_main`], whose
+/// posted main-thread task would never be reached: this closure exits first.
 ///
-/// Parks instead of returning: the caller's next move would be its fallback
-/// respawn, and that would launch a second client alongside the one the watcher
-/// is about to bring up.
+/// Parks instead of returning. The caller's next move would be its fallback
+/// respawn, which would launch a second client alongside the one the watcher is
+/// about to bring up.
 pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
     let handle = app.clone();
     if let Err(e) = app.run_on_main_thread(move || {
@@ -928,10 +849,10 @@ pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
         handle.cleanup_before_exit();
         std::process::exit(0);
     }) {
-        // The event loop is unreachable, so nothing will run the clean exit for
-        // us. Go without it: geometry is already on disk as of the last debounced
-        // flush, and a client that refuses to die would leave the watcher
-        // activating the version we just replaced.
+        // The event loop is unreachable, so nothing will run the clean exit.
+        // Geometry is already on disk as of the last debounced flush. A client
+        // that refuses to die leaves the watcher activating the version we just
+        // replaced.
         eprintln!("[Tauri] Could not marshal the exit onto the main thread: {e}");
         std::process::exit(0);
     }
@@ -940,40 +861,31 @@ pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
     }
 }
 
-/// Open a URL in the system default browser (not the embedded webview). Reached
-/// by every "leave the shell" path: the Mobile Access page's Tailscale download
-/// link, `openUrl` with the in-app browser off, `openLocalFile`, and the app
-/// popout. Rejects when the launcher could not be started, which the callers
-/// turn into a toast; see [`open_in_default_browser`] for what that does and
-/// does not cover.
+/// Open a URL in the system default browser rather than the embedded webview.
+/// Reached by every "leave the shell" path. Rejects when the launcher could not
+/// be started, which the callers turn into a toast.
 #[tauri::command]
 fn open_url_external(url: String) -> Result<(), String> {
     open_in_default_browser(&url)
 }
 
-/// Restart the always-on gateway service via launchd (`launchctl kickstart -k`).
-/// The packaged "Restart" control routes here (the dev `/api/v1/restart` script
-/// isn't in the bundle). The supervisor catches the SIGTERM, tears the bundled
-/// gateway and its spawned workspace engines down gracefully, and launchd
-/// respawns the service.
+/// Restart the always-on gateway service via launchd. The supervisor catches
+/// the SIGTERM, tears the bundled gateway and its spawned workspace engines
+/// down gracefully, and launchd respawns the service.
 #[tauri::command]
 fn restart_service() -> Result<(), String> {
     desktop::restart_service()
 }
 
-/// Full teardown: confirm with the user, then stop the always-on gateway service
-/// (`launchctl bootout`) and exit the client. This is the ONLY path that stops
-/// the service — closing the window / Cmd+Q merely hide the client (it stays
-/// resident in the menu bar), so triggers, scheduled tasks, coding-agent
-/// sessions, and push keep running. Reached from the menu-bar "Quit and Stop
-/// Background Service" item and the app-menu item of the same name.
+/// Full teardown: confirm with the user, then stop the always-on gateway
+/// service and exit the client. This is the ONLY path that stops the service.
+/// Closing the window merely hides the client, so triggers, scheduled tasks,
+/// coding-agent sessions and push keep running.
 ///
-/// Because stopping the service silently halts all of that background work until
-/// the next launch, a native confirm spells out the consequence and points at
-/// the non-destructive alternative (close the window). Only on confirm does it
-/// set `QUITTING` (so the `ExitRequested` guard lets this exit through), stop the
-/// service, and exit. The next app launch re-installs and re-bootstraps the
-/// service.
+/// Stopping the service silently halts all of that. So a native confirm spells
+/// out the consequence and points at closing the window instead. Only on
+/// confirm does it set `QUITTING`, which is what lets this exit past the
+/// `ExitRequested` guard.
 #[tauri::command]
 fn quit_lucidos(app: tauri::AppHandle) {
     let quit_app = app.clone();
@@ -991,7 +903,7 @@ fn quit_lucidos(app: tauri::AppHandle) {
         ))
         .show(move |proceed| {
             if !proceed {
-                return; // Cancel / Escape — leave the client and service running.
+                return;
             }
             QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
             desktop::stop_service();
@@ -999,16 +911,15 @@ fn quit_lucidos(app: tauri::AppHandle) {
         });
 }
 
-/// Fully uninstall Lucidos from the GUI — modeled on Docker Desktop's uninstall
-/// so a non-developer never needs a terminal. A two-step native confirm (the
-/// `tauri_plugin_dialog` plugin caps at two buttons, so the keep-vs-delete choice
-/// is its own dialog): first confirm the uninstall, then choose whether to also
-/// delete all data. The plugin can't make a non-default button the native
-/// default, so the affirmative button is highlighted; the scary copy + explicit
-/// two-button choice + result dialog provide the safety. On success the result
-/// dialog dismisses into a hard process exit (NOT `app.exit`, which would run
-/// Tauri's on-exit handlers and let the window-state plugin re-create the data
-/// dir we just deleted); on error the app keeps running so the user can retry.
+/// Fully uninstall Lucidos from the GUI, so a non-developer never needs a
+/// terminal. Two native confirms, because `tauri_plugin_dialog` caps at two
+/// buttons and the keep-versus-delete choice needs its own dialog.
+///
+/// The plugin cannot make a non-default button the native default, so the
+/// affirmative one is highlighted and the copy carries the warning. Success
+/// dismisses into a HARD process exit, never `app.exit`, whose on-exit handlers
+/// would let the window-state plugin re-create the data dir just deleted. An
+/// error keeps the app running so the user can retry.
 #[tauri::command]
 fn uninstall_lucidos(app: tauri::AppHandle) {
     let confirm_app = app.clone();
@@ -1024,11 +935,11 @@ fn uninstall_lucidos(app: tauri::AppHandle) {
         ))
         .show(move |proceed| {
             if !proceed {
-                return; // Cancel / Escape — no-op.
+                return;
             }
-            // Step 2: data fate. The cancel-slot ("Keep My Data", false) is the
-            // SAFE choice, so Escape here keeps data and still proceeds with the
-            // uninstall (the user already committed by clicking Continue).
+            // The cancel slot ("Keep My Data") is the SAFE choice. Escape here
+            // keeps data and still proceeds with the uninstall the user already
+            // committed to.
             let fate_app = confirm_app.clone();
             confirm_app
                 .dialog()
@@ -1043,26 +954,20 @@ fn uninstall_lucidos(app: tauri::AppHandle) {
                     "Keep My Data".to_string(),
                 ))
                 .show(move |delete_data| {
-                    // The uninstall is committed (both data-fate buttons proceed —
-                    // only the data deletion differs). Hide the client window(s)
-                    // NOW, before the destructive steps tear down the engine +
-                    // service: otherwise the user stares at a window whose backend
-                    // is dying and the frontend spews "engine unreachable" errors.
-                    // The result/error dialogs are app-level, so they still show
-                    // with no window visible; on failure `run_uninstall` re-shows
-                    // the main window so the user can retry.
+                    // Both buttons proceed with the uninstall, and differ only
+                    // over the data. Hide the windows BEFORE the destructive
+                    // steps tear the service down, or the user stares at a
+                    // window whose backend is dying. The result dialogs are
+                    // app-level, so they show with no window visible.
                     hide_all_windows(&fate_app);
                     run_uninstall(fate_app.clone(), delete_data);
                 });
         });
 }
 
-/// Hide every Lucidos client window (the declared `main` plus any New-Window
-/// children). Called the instant an uninstall is confirmed so the about-to-be-torn
-/// -down backend can't surface a cascade of frontend errors behind the result
-/// dialog. Best-effort: a hide failure must not abort the uninstall. Window
-/// messages are proxied to the main event loop, so this is safe from the dialog
-/// callback thread.
+/// Hide every Lucidos client window. Best-effort, since a hide failure must not
+/// abort the uninstall. Window messages are proxied to the main event loop, so
+/// this is safe from the dialog callback thread.
 fn hide_all_windows(app: &tauri::AppHandle) {
     for window in app.webview_windows().values() {
         let _ = window.hide();
@@ -1101,11 +1006,10 @@ fn run_uninstall(app: tauri::AppHandle, delete_data: bool) {
                     .message(body)
                     .title("Uninstall Lucidos")
                     .buttons(MessageDialogButtons::Ok)
-                    // Hard-exit rather than app.exit(0): a normal exit runs
-                    // Tauri's RunEvent::Exit handlers, and the window-state
-                    // plugin would re-persist `.window-state.json` into a freshly
-                    // re-created `~/Library/Application Support/com.lucidos.app`,
-                    // leaving residue after a full "Delete Everything".
+                    // Hard-exit rather than `app.exit(0)`. A normal exit runs
+                    // the `RunEvent::Exit` handlers, and the window-state plugin
+                    // would re-persist into a freshly re-created app-support
+                    // dir, leaving residue after "Delete Everything".
                     .show(|_| std::process::exit(0));
             }
             Err(e) => report_uninstall_error(&app, &e),
@@ -1113,10 +1017,9 @@ fn run_uninstall(app: tauri::AppHandle, delete_data: bool) {
     });
 }
 
-/// Surface an uninstall failure in a native dialog (and the logs). Does NOT
-/// exit — the user can retry. Re-shows the main window, which was hidden when the
-/// uninstall was confirmed, so the user isn't stranded with no window to retry
-/// from.
+/// Surface an uninstall failure in a native dialog and the logs. Does NOT exit,
+/// so the user can retry. Re-shows the main window, hidden when the uninstall
+/// was confirmed, so they are not stranded with no window to retry from.
 fn report_uninstall_error(app: &tauri::AppHandle, msg: &str) {
     eprintln!("[Tauri] Uninstall failed: {msg}");
     show_main_window(app);
@@ -1168,32 +1071,23 @@ fn startup_status(app: tauri::AppHandle) -> String {
 ///
 /// Exposed to the page for the one flow that finishes somewhere else: an OAuth
 /// authorization the user completes in a browser. Without it they approve the
-/// provider's consent screen and are left staring at the callback tab with
-/// Lucidos behind it.
+/// consent screen and are left staring at the callback tab.
 ///
-/// It fronts `window`, the window whose webview invoked the command, and
-/// deliberately NOT [`show_main_window`], which this used to call while it was
-/// named `focus_main_window`. That targeted the window labelled `main`
-/// specifically, and built a NEW one when it was gone, so an authorization
-/// finished from a New Window (`window-<n>`) raised a different window over the
-/// one the user was working in: each app window can sit on its own workspace, and
-/// a packaged close only HIDES `main`, so a window the user had dismissed came
-/// back carrying a workspace they had not asked for ("it opened the workspace
-/// again in another window", 2026-08-06). The caller's window exists by
-/// construction, so there is no create-a-window branch here at all. Leaving
-/// menu-bar-only first is kept: the calling page may live in a hidden window,
-/// and `Accessory` cannot front anything.
+/// It fronts `window`, and deliberately NOT [`show_main_window`], which targets
+/// `main` and builds a new one when it is gone. Each app window can sit on its
+/// own workspace, so fronting `main` would raise a workspace the user had not
+/// asked for. The caller's window exists by construction, so there is no
+/// create-a-window branch. Leaving menu-bar-only first is kept, since the
+/// calling page may live in a hidden window and `Accessory` fronts nothing.
 ///
 /// Still NOT a general "focus me" the page may call whenever it likes. Its one
-/// caller (`handleOAuthAccountConnected`) fires only in the page that OPENED the
-/// authorization URL, seconds after the user's own click, and only once. A window
-/// that fronts itself on a background event is a nuisance, so keep new callers
-/// to that shape.
+/// caller fires in the page that OPENED the authorization URL, seconds after the
+/// user's own click, and once. Keep new callers to that shape.
 #[tauri::command]
 fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window) {
-    // Restore `Regular` BEFORE showing, for the reason on `show_main_window`:
-    // the AppKit `Accessory`->`Regular` transition otherwise leaves the app
-    // behind other apps with an unclickable menu bar.
+    // Restore `Regular` BEFORE showing: the AppKit `Accessory` to `Regular`
+    // transition otherwise leaves the app behind other apps with an unclickable
+    // menu bar.
     set_menu_bar_only(&app, false);
     let _ = window.unminimize();
     let _ = window.show();
@@ -1219,74 +1113,60 @@ fn __panel_content_report(
 
 /// Show a native macOS notification and route a tap to the page.
 ///
-/// Delegates to the [`notifications`] module, which drives Apple's modern
-/// `UserNotifications` framework (`UNUserNotificationCenter`). `link` is the
-/// SW-message shape (`notification_id` / `thread_id` / `event_id` / `tap`) plus
-/// the calling page's `workspace` (its gateway slug), which is what lets a tap
-/// be routed back to the workspace that raised it instead of into whichever one
-/// happens to be loaded; on tap the delegate emits `native-notification-tapped`
-/// carrying it, and the page routes it through the SAME `dispatchDeepLink` the
-/// web-push tap uses (see `store/actions/native-push.ts`). The workspace also
-/// composes the UN request identifier, see `notifications::show`.
-/// No-op in `tauri dev` (unbundled binary) and
-/// on non-macOS — see `notifications.rs` and `system-knowhow/notifications.md`
-/// §4.
+/// `link` is the service-worker message shape plus the calling page's
+/// `workspace`, its gateway slug. That slug routes a tap back to the workspace
+/// that RAISED it, not whichever one happens to be loaded. It also composes the
+/// UN request identifier. On tap the delegate emits
+/// `native-notification-tapped`, and the page routes it through the same
+/// `dispatchDeepLink` the web-push tap uses.
+///
+/// No-op in `tauri dev` and off macOS. See `notifications.rs` and
+/// `system-knowhow/notifications.md` §4.
 #[tauri::command]
 fn show_native_notification(title: String, body: String, link: serde_json::Value) {
     notifications::show(&title, &body, link);
 }
 
-/// Remove an already-delivered native banner — the cross-device dismiss
-/// counterpart of [`show_native_notification`]. `id = Some(notification_id)`
-/// removes that one banner; `None` removes every delivered banner `workspace`
-/// raised (the mark-all-read path), leaving the other workspaces' banners alone.
-/// Driven by the engine's `NativePushDismissRequested` SSE when a notification
-/// is read on any device (`store/actions/native-push.ts`). `workspace` is the
-/// calling page's gateway slug, the same one [`show_native_notification`]
-/// stamped into the link, and BOTH arms need it: `Some(id)` rebuilds the
-/// composite request identifier, `None` scopes the sweep.
-/// Delegates to the [`notifications`] module, which also drops the stashed deep
-/// link so a tap on a now-removed banner can't route. No-op in `tauri dev`
-/// (unbundled binary) and on non-macOS, see `notifications.rs`.
+/// Remove an already-delivered native banner, the cross-device dismiss
+/// counterpart of [`show_native_notification`]. `Some(id)` removes one banner,
+/// and `None` removes every delivered banner `workspace` raised, leaving the
+/// other workspaces alone.
+///
+/// `workspace` is the same gateway slug [`show_native_notification`] stamped
+/// into the link, and BOTH arms need it: `Some(id)` rebuilds the composite
+/// request identifier, and `None` scopes the sweep. The stashed deep link goes
+/// with the banner, so a tap on a removed one cannot route. No-op in
+/// `tauri dev` and off macOS.
 #[tauri::command]
 fn dismiss_native_notification(workspace: Option<String>, id: Option<String>) {
     notifications::dismiss(workspace, id);
 }
 
-/// Wake the unread-indicator loop for an immediate recompute. The frontend calls
-/// this (under `isTauri()`) from its notification SSE handler so the macOS count
-/// updates the instant a notification is read, in-app or from another device,
-/// instead of waiting for the periodic poll. Best-effort: a send failure (no
-/// receiver in dev / non-macOS, where there is neither a tray nor a dock tile) is
-/// ignored. The recompute itself reads the gateway's fresh `unread-total`
-/// aggregate. See `desktop::launch` and `system-knowhow/notifications.md`
-/// § App-icon badge.
+/// Wake the unread-indicator loop for an immediate recompute, so the macOS
+/// count updates the instant a notification is read rather than on the next
+/// poll. Best-effort: a send failure with no receiver is ignored. The recompute
+/// reads the gateway's fresh `unread-total` aggregate.
 #[tauri::command]
 fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
     let _ = state.0.lock().unwrap().send(());
 }
 
-/// Report whether the main app window is currently *active* — focused AND
-/// on-screen (visible, not minimized). The frontend pulls this at startup to
-/// SEED its `native-window-active` cache BEFORE registering the event listener
-/// (`utils/nativeWindow.ts`): Tauri does not replay the transition events
-/// emitted from `on_window_event` to a listener that registers after the fact,
-/// and the cache defaults to `true`. Without the seed, a freshly (re)loaded
-/// page that is actually backgrounded/trayed — crash-watchdog reload, version
-/// refresh, cold/unfocused launch — keeps the `true` default and wrongly pongs
-/// the device as active, so the engine suppresses the OS push into an invisible
-/// in-app toast (no banner). See `system-knowhow/notifications.md` §3/§4.
+/// Report whether the main app window is ACTIVE: focused and on-screen.
 ///
-/// Any state read that fails resolves to the SAFE direction (inactive →
-/// `false`), so an uncertain seed surfaces the banner rather than suppressing
-/// it. No-op-ish off the main window (returns `false`).
+/// The frontend pulls this at startup to SEED its `native-window-active` cache
+/// before registering the event listener. Tauri does not replay the transition
+/// events to a listener that registers after the fact, and the cache defaults to
+/// `true`. Without the seed, a freshly loaded page that is really backgrounded
+/// keeps that default and pongs the device as active. The engine then suppresses
+/// the OS push into an invisible in-app toast.
+///
+/// Any state read that fails resolves to the SAFE direction, inactive, so an
+/// uncertain seed surfaces the banner rather than suppressing it.
 #[tauri::command]
 fn get_native_window_active(app: tauri::AppHandle) -> bool {
     get_main_window(&app)
         .map(|w| {
             let focused = w.is_focused().unwrap_or(false);
-            // Conservative on read failure: treat unknown visibility as not
-            // visible so we never wrongly report active (which would suppress).
             let visible = w.is_visible().unwrap_or(false);
             let minimized = w.is_minimized().unwrap_or(false);
             focused && visible && !minimized
@@ -1295,70 +1175,56 @@ fn get_native_window_active(app: tauri::AppHandle) -> bool {
 }
 
 /// Drain the deep links from native-banner taps the page may not have been
-/// listening for (see `notifications::take_pending_taps`). The frontend calls
-/// this at startup (cold path), on each `native-notification-tapped` signal
-/// (warm path), and when its window regains focus / visibility; the drain is
-/// atomic, so each tap routes exactly once. Naturally empty in `tauri dev` /
-/// off-macOS.
+/// listening for. The drain is atomic, so each tap routes exactly once.
 ///
-/// `workspace` is the calling page's gateway slug (`null` on a legacy engine
-/// with no gateway). It scopes the drain: a page takes only the taps raised by
-/// the workspace it is actually serving, plus unattributable ones. Without it a
-/// window on one workspace could swallow another workspace's tap, which is what
-/// made which-window-handles-a-tap a race. See `store/actions/native-push.ts`.
+/// `workspace` is the calling page's gateway slug, and it scopes the drain: a
+/// page takes only the taps raised by the workspace it is serving, plus
+/// unattributable ones. Without it a window on one workspace could swallow
+/// another workspace's tap.
 #[tauri::command]
 fn take_pending_native_taps(workspace: Option<String>) -> Vec<serde_json::Value> {
     notifications::take_pending_taps(workspace.as_deref())
 }
 
-/// Bridge the native window's *active* state (focused AND on-screen) to that
-/// window's webview as a `native-window-active` event (a bare bool). The embedded
-/// WKWebView can't observe macOS `orderOut:` — a window dismissed to the menu-bar
-/// tray keeps `document.visibilityState='visible'` and `document.hasFocus()=true`
-/// — and its `hasFocus()` is unreliable generally, so the page can't tell "in
-/// use" from "trayed / behind another app" on its own. The frontend caches this
-/// and feeds it into `isPageActive()` so a non-active desktop client gets the OS
-/// native banner instead of a suppressed, invisible in-app toast. Targeted to the
-/// specific window so a secondary New-Window client keeps its own state. See
-/// `utils/nativeWindow.ts` and `system-knowhow/notifications.md` §1, §4.
+/// Bridge the native window's ACTIVE state, focused and on-screen, to that
+/// window's webview as a `native-window-active` event.
+///
+/// The embedded WKWebView cannot observe macOS `orderOut:`. A window dismissed
+/// to the tray keeps `visibilityState` visible and `hasFocus()` true, so the
+/// page cannot tell in-use from trayed on its own. The frontend feeds this into
+/// `isPageActive()`, so a non-active client gets the OS banner rather than a
+/// suppressed in-app toast. Targeted to one window, so a secondary New-Window
+/// client keeps its own state.
 fn emit_window_active(app: &tauri::AppHandle, label: &str, active: bool) {
     let _ = app.emit_to(label, "native-window-active", active);
 }
 
-/// True while the packaged macOS client is running menu-bar-only: it has no
-/// visible app window, so it uses the `Accessory` activation policy and is absent
-/// from the Dock and the Cmd+Tab app switcher, living only in the menu-bar tray.
-/// Flipped by [`set_menu_bar_only`]; read by [`apply_unread_indicator`] to tell
-/// whether there is a Dock tile to badge with the unread count (the menu-bar tray
-/// carries the count either way). Starts `false`, so an ordinary launch is a normal
-/// `Regular` Dock app; a login start flips it in `setup` (see
-/// [`should_show_window_at_startup`]) instead of ever showing a window.
+/// True while the packaged macOS client is running menu-bar-only: no visible app
+/// window, the `Accessory` activation policy, and absent from the Dock and
+/// Cmd+Tab. [`apply_unread_indicator`] reads it to tell whether there is a Dock
+/// tile to badge, since the tray carries the count either way. Starts `false`,
+/// so an ordinary launch is a normal `Regular` Dock app.
 static MENU_BAR_ONLY: AtomicBool = AtomicBool::new(false);
 
-/// The most recent aggregate unread total, so a `Regular`↔`Accessory` transition
-/// can re-apply the SAME count to the Dock tile that just appeared or vanished,
-/// without waiting for the next badge-loop poll. Written by
-/// [`apply_unread_indicator`].
+/// The most recent aggregate unread total. An activation-policy transition
+/// re-applies the SAME count to the Dock tile that just appeared or vanished,
+/// rather than waiting for the next badge-loop poll.
 static LAST_UNREAD: AtomicU64 = AtomicU64::new(0);
 
-/// Pure: the client should be menu-bar-only exactly when no app window is visible.
-/// Split out so the rule is unit-testable without a running app.
+/// The client should be menu-bar-only exactly when no app window is visible.
 fn should_be_menu_bar_only(visible_app_windows: usize) -> bool {
     visible_app_windows == 0
 }
 
-/// Pure: should this launch put its window on screen?
+/// Should this launch put its window on screen?
 ///
-/// The `main` window is declared `"visible": false` in `tauri.conf.json` and is
-/// shown here instead, so the ONE launch that wants no window never has to flash
-/// one first. That launch is the login agent's: it passes
-/// [`desktop::LOGIN_FLAG`], and the client comes up menu-bar-only (tray item, no
-/// window, no Dock icon), which is the same resident state closing the window
-/// leaves it in.
+/// `main` is declared `"visible": false` and shown from here instead, so the ONE
+/// launch that wants no window never has to flash one first. That launch is the
+/// login agent's, which passes [`desktop::LOGIN_FLAG`] and comes up
+/// menu-bar-only.
 ///
 /// In dev the answer is always yes. `install_tray` is skipped there, so a hidden
-/// dev window would have nothing to reopen it (see [`close_all_to_tray`] for the
-/// same reasoning), and nothing in dev passes the flag anyway.
+/// dev window would have nothing to reopen it.
 fn should_show_window_at_startup(args: &[std::ffi::OsString], is_dev: bool) -> bool {
     is_dev
         || !args
@@ -1369,33 +1235,26 @@ fn should_show_window_at_startup(args: &[std::ffi::OsString], is_dev: bool) -> b
 /// How long `setup` waits for [`window_ready_to_show`] before putting the window
 /// on screen unpainted.
 ///
-/// A healthy launch signals in well under a second: the first document is the
-/// bundled boot splash, which needs no network. So three seconds elapses only
-/// when the frontend is genuinely not coming (a webview crash, a JS exception
-/// before the signal, a bad bundle), and the cost of waiting it out is that the
-/// launch feels slow, never that it fails. It is also far below the 30s the
-/// WKWebView crash watchdog sleeps before its first check, so the window is on
-/// screen long before recovery would even look at it.
+/// A healthy launch signals in well under a second, since the first document is
+/// the bundled boot splash and needs no network. So this elapses only when the
+/// frontend is genuinely not coming, and the cost is a launch that feels slow
+/// rather than one that fails. Well below the watchdog's first check too, so the
+/// window is up long before recovery looks at it.
 const STARTUP_SHOW_FALLBACK: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The one-shot gate on the deferred startup show.
 ///
-/// The `main` window is declared hidden and stays hidden until the frontend says
-/// it has something to paint, so a cold launch never shows a window filled with
-/// nothing but the window-layer tint. Two racers can end that wait, and both are
-/// required: the frontend's [`window_ready_to_show`], and the
-/// [`STARTUP_SHOW_FALLBACK`] timer that covers a frontend which never signals.
-/// Whichever arrives first shows the window; the other becomes a no-op, so the
-/// window is shown at most once and a user who has since dismissed it to the
-/// menu bar does not get it back.
+/// `main` stays hidden until the frontend says it has something to paint. A cold
+/// launch then never shows a window holding nothing but the window-layer tint.
+/// Two racers end that wait, and both are required: the frontend's
+/// [`window_ready_to_show`], and the [`STARTUP_SHOW_FALLBACK`] timer covering a
+/// frontend that never signals. Whichever arrives first shows the window and the
+/// other is a no-op, so a user who has since dismissed it does not get it back.
 ///
-/// `wanted` is the launch decision, taken once in `setup` from
-/// [`should_show_window_at_startup`], and it gates BOTH racers: a login start
-/// leaves it false and neither one may show anything. It starts false so a
-/// missing `arm` shows no window rather than defeating the login-start
-/// suppression. The client being menu-bar-only ALREADY gates them too, which
-/// covers the dismissal that lands inside the wait rather than after it (see
-/// [`StartupShow::claim`]).
+/// `wanted` is the launch decision and it gates BOTH racers. It starts false, so
+/// a missing `arm` shows no window rather than defeating the login-start
+/// suppression. Being menu-bar-only gates them too, which covers a dismissal
+/// that lands inside the wait (see [`StartupShow::claim`]).
 struct StartupShow {
     wanted: AtomicBool,
     shown: AtomicBool,
@@ -1415,18 +1274,15 @@ impl StartupShow {
             .store(wanted, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// True for exactly one caller of an armed gate, false for every caller of an
-    /// unarmed one. The racers are deliberately indistinguishable here: the rule
-    /// is "first one wins", which is what makes both arrival orders safe.
+    /// True for exactly one caller of an armed gate, false for every caller of
+    /// an unarmed one. The racers are indistinguishable here: first one wins,
+    /// which is what makes both arrival orders safe.
     ///
-    /// `menu_bar_only` stands both of them down, and it is read BEFORE the
-    /// one-shot is consumed so a legitimate later show can still have it. The app
-    /// menu is live from the moment the event loop starts, so the wait is long
-    /// enough for a user to Cmd+Q ("Close to Menu Bar"), or to open and close a
-    /// New-Window child, either of which drops the client to `Accessory` with no
-    /// visible window. Showing then would put a window on screen with no Dock
-    /// tile, behind the other apps and with an unclickable menu bar, which is the
-    /// state [`show_main_window`] restores `Regular` FIRST to avoid.
+    /// `menu_bar_only` stands both of them down, and is read BEFORE the one-shot
+    /// is consumed so a legitimate later show can still have it. The app menu is
+    /// live from the moment the event loop starts, so a user can drop the client
+    /// to `Accessory` inside the wait. Showing then would put a window on screen
+    /// with no Dock tile, behind the other apps and with an unclickable menu bar.
     fn claim(&self, menu_bar_only: bool) -> bool {
         self.wanted.load(std::sync::atomic::Ordering::SeqCst)
             && !menu_bar_only
@@ -1469,23 +1325,17 @@ fn window_ready_to_show(window: tauri::Window) {
     show_startup_window(window.app_handle());
 }
 
-/// Pure: which surfaces show the unread `count`, as `(dock_badge_label,
-/// tray_title)`. The menu-bar tray-icon title ALWAYS carries the count, so
-/// the menu bar is a constant read on how much is waiting whether or not a window
-/// is open. The Dock badge carries it as well while the client is a normal
-/// `Regular` Dock app, and stays `None` while menu-bar-only, where the app has no
-/// Dock tile to badge. `0` clears both; a count over 99 collapses to "99+" on both.
-/// Unit-testable without AppKit.
+/// Which surfaces show the unread `count`, as `(dock_badge_label, tray_title)`.
+/// The tray title ALWAYS carries the count. The Dock badge carries it while the
+/// client is a `Regular` Dock app, and stays `None` while menu-bar-only, where
+/// there is no tile to badge. Zero clears both, and a count over 99 collapses
+/// to "99+".
 ///
-/// **The two halves clear differently, which is why their types differ.** The Dock
-/// badge is an `Option`, because AppKit's `setBadgeLabel(None)` is what removes the
-/// badge bubble. The tray title is a plain `String` whose EMPTY value means "no
-/// count": `tray-icon`'s macOS `set_title` ignores a `None` outright (its
-/// `set_title_inner` only calls `setTitle:` inside `if let Some(..)`), so a cleared
-/// title has to be written as an empty string or the menu bar keeps showing the
-/// last number it was ever given. Modelling the tray side as an `Option` is
-/// therefore not a smaller version of the same thing, it is the bug: the count went
-/// to zero, the bell and the Dock tile cleared, and the menu bar sat at 8.
+/// **The two halves clear differently, which is why their types differ.** The
+/// Dock badge is an `Option`, because `setBadgeLabel(None)` removes the bubble.
+/// The tray title is a `String` whose EMPTY value means no count. `tray-icon`'s
+/// macOS `set_title` ignores a `None` outright. A cleared title must therefore
+/// be WRITTEN empty, or the menu bar keeps the last number it was given.
 fn unread_targets(menu_bar_only: bool, count: u64) -> (Option<String>, String) {
     if count == 0 {
         return (None, String::new());
@@ -1503,13 +1353,9 @@ fn unread_targets(menu_bar_only: bool, count: u64) -> (Option<String>, String) {
     (dock, label)
 }
 
-/// Show the aggregate unread `count` on every surface that exists right now: the
-/// menu-bar tray-icon title always, plus the Dock badge while a window is open
-/// (`Regular`). A menu-bar-only client (`Accessory`) has no Dock tile, so only the
-/// tray is written there. Stores `count` in [`LAST_UNREAD`] so a later activation
-/// transition can re-apply it to the Dock tile that just appeared or vanished.
-/// Called from the desktop badge loop (marshalled to the main thread) and from
-/// [`set_menu_bar_only`].
+/// Show the aggregate unread `count` on every surface that exists right now.
+/// Stores it in [`LAST_UNREAD`] so a later activation transition can re-apply it
+/// to the Dock tile that just appeared or vanished.
 pub(crate) fn apply_unread_indicator(app: &tauri::AppHandle, count: u64) {
     LAST_UNREAD.store(count, std::sync::atomic::Ordering::SeqCst);
     let menu_bar_only = MENU_BAR_ONLY.load(std::sync::atomic::Ordering::SeqCst);
@@ -1518,11 +1364,10 @@ pub(crate) fn apply_unread_indicator(app: &tauri::AppHandle, count: u64) {
     notifications::set_tray_title(app, &tray);
 }
 
-/// Switch the client between menu-bar-only (`Accessory`: gone from the Dock +
-/// Cmd+Tab) and normal (`Regular`: Dock + Cmd+Tab). On macOS this sets the
-/// NSApplication activation policy; on other platforms only the flag moves (the
-/// badge/tray writes are no-ops there). Then re-applies the unread indicator, so
-/// the Dock tile that just appeared or vanished agrees with the tray. See
+/// Switch the client between menu-bar-only and a normal Dock app. On macOS this
+/// sets the NSApplication activation policy; elsewhere only the flag moves. Then
+/// re-applies the unread indicator, so the Dock tile that just appeared or
+/// vanished agrees with the tray. See
 /// `docs/plans/2026-07-01-macos-client-menu-bar-only-on-window-close.md`.
 fn set_menu_bar_only(app: &tauri::AppHandle, menu_bar_only: bool) {
     #[cfg(target_os = "macos")]
@@ -1540,11 +1385,10 @@ fn set_menu_bar_only(app: &tauri::AppHandle, menu_bar_only: bool) {
     apply_unread_indicator(app, LAST_UNREAD.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-/// Drop the client to menu-bar-only IFF no app window is left visible. Called after
-/// a window is hidden (`CloseRequested` on `main`) or destroyed (a secondary
-/// New-Window closing), so closing the LAST window removes the app from the Dock +
-/// Cmd+Tab, while closing one of several leaves it a normal Dock app. `excluding`
-/// skips a window that is on its way out but might still be listed.
+/// Drop the client to menu-bar-only IFF no app window is left visible. Closing
+/// the LAST window removes the app from the Dock and Cmd+Tab, while closing one
+/// of several leaves it a normal Dock app. `excluding` skips a window that is on
+/// its way out but might still be listed.
 fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excluding: Option<&str>) {
     let visible = app
         .webview_windows()
@@ -1560,23 +1404,20 @@ fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excluding: Option<&
     }
 }
 
-/// Activate the app frontmost (macOS). No-op elsewhere. See [`show_main_window`].
+/// Activate the app frontmost on macOS. No-op elsewhere.
 fn activate_app_frontmost() {
     #[cfg(target_os = "macos")]
     notifications::activate_app();
 }
 
-/// Close the whole client to the menu-bar tray — the Cmd+Q / "Close to Menu Bar"
-/// action. Destroys secondary New-Window windows and HIDES `main` (so reopen is
-/// instant and preserves page state), then drops to menu-bar-only. The always-on
-/// launchd services are untouched — the only full teardown is [`quit_lucidos`].
+/// Close the whole client to the menu-bar tray. Destroys secondary windows and
+/// HIDES `main`, so reopen is instant and preserves page state, then drops to
+/// menu-bar-only. The launchd services are untouched, and the only full teardown
+/// is [`quit_lucidos`].
 ///
-/// Packaged only. In dev there is no always-on service and no menu-bar tray
-/// (`install_tray` is skipped in dev), so hiding + going `Accessory` would strand
-/// the window with no way to reopen it and leave `tauri-dev.sh` running headless.
-/// So in dev this closes the window(s) instead, matching the default close-quits
-/// behavior (the last window closing lets the process exit) — the same reason
-/// `CloseRequested`/`Destroyed` above are `!is_dev()`-guarded.
+/// Packaged only. Dev has no always-on service and no tray, so hiding and going
+/// `Accessory` would strand the window with no way to reopen it. Dev therefore
+/// closes the windows instead, matching the default close-quits behavior.
 fn close_all_to_tray(app: &tauri::AppHandle) {
     if tauri::is_dev() {
         for (label, window) in app.webview_windows() {
@@ -1586,8 +1427,8 @@ fn close_all_to_tray(app: &tauri::AppHandle) {
         }
         return;
     }
-    // Flush geometry now — the window-state plugin's exit-time write never runs
-    // (we hide, never exit), so this is the moment to remember size/position.
+    // The plugin's exit-time write never runs, because we hide rather than
+    // exit, so this is the moment to remember size and position.
     if let Err(e) = app.save_window_state(window_state_flags()) {
         eprintln!("[Tauri] Failed to persist window state on close-to-tray: {e}");
     }
@@ -1602,36 +1443,30 @@ fn close_all_to_tray(app: &tauri::AppHandle) {
     enter_menu_bar_only_if_no_windows(app, None);
 }
 
-/// Show + focus the main window, recreating it if it was destroyed. Backs the
-/// menu-bar "Open Lucidos" item, the macOS Dock-click (Reopen), and a
-/// native-notification tap, so a window hidden on close can always be brought
-/// back. Leaves menu-bar-only first (restores the `Regular` activation policy) so
-/// the window can come forward with a clickable app menu, then emits
-/// `native-window-active = true` so the reshown page immediately counts as active.
+/// Show and focus the main window, recreating it if it was destroyed. Backs the
+/// tray's "Open Lucidos" item, the Dock click, and a native-notification tap, so
+/// a window hidden on close can always be brought back.
 pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if app.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
         front_window(app, MAIN_WINDOW_LABEL);
         return;
     }
-    // Gone: build a replacement. Leaving menu-bar-only first for the same reason
-    // `front_window` does, since `Accessory` cannot front the new window either.
+    // Gone, so build a replacement. Leaving menu-bar-only first for the reason
+    // `front_window` does: `Accessory` cannot front the new window either.
     set_menu_bar_only(app, false);
     if let Err(e) = open_new_window(app) {
         eprintln!("[Tauri] Failed to open window: {e}");
     }
 }
 
-/// Show + focus one specific app window. The shared body of every "bring a
-/// window forward" path: [`show_main_window`] for the window it names, and
-/// `route_native_tap` for the one it picked for a banner tap.
+/// Show and focus one specific app window. The shared body of every "bring a
+/// window forward" path.
 ///
 /// Leaving menu-bar-only comes FIRST: the `Regular` activation policy has to be
-/// back before the window is fronted or the app menu is unclickable (the AppKit
-/// `Accessory` to `Regular` transition otherwise leaves the app behind others).
-/// For the same reason `set_focus` alone is not enough and the app is explicitly
-/// activated frontmost. `set_focus()` also fires `WindowEvent::Focused(true)`,
-/// but `native-window-active` is emitted explicitly so the reshow is
-/// deterministic regardless of event timing.
+/// back before the window is fronted, or the app menu is unclickable. For the
+/// same reason `set_focus` alone is not enough and the app is activated
+/// frontmost explicitly. `native-window-active` is emitted explicitly too, so
+/// the reshow is deterministic regardless of event timing.
 fn front_window(app: &tauri::AppHandle, label: &str) {
     set_menu_bar_only(app, false);
     if let Some(window) = app.get_webview_window(label) {
@@ -1648,12 +1483,9 @@ fn front_window(app: &tauri::AppHandle, label: &str) {
 ///
 /// One packaged process fronts the gateway and each app window can sit on its
 /// own workspace (ADR 0014), so "the window that is frontmost" and "the
-/// workspace the tap came from" are unrelated. This used to be
-/// [`show_main_window`] plus a page-side hop, which fronted `main` whatever it
-/// was showing and then let whichever page drained the tap navigate ITSELF to
-/// the raising workspace, taking a window off the workspace the user had it on.
-/// The decision lives here now because only this process can see every window,
-/// read what each is pointed at, and open one.
+/// workspace the tap came from" are unrelated. The decision lives here because
+/// only this process can see every window, read what each is pointed at, and
+/// open one.
 ///
 /// Returns the label of an already-loaded window to send the warm
 /// `native-notification-tapped` wake to, or `None` when the target is a page
@@ -1671,9 +1503,8 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
         .filter(|(label, _)| is_app_window(label))
         .map(|(label, window)| {
             let url = window.url().map(|u| u.to_string()).unwrap_or_else(|e| {
-                // An unreadable URL reads as "not navigated", which sends the tap
-                // down the boot path. Say so: it is otherwise a silently
-                // stranded tap.
+                // An unreadable URL reads as "not navigated", which sends the
+                // tap down the boot path. Say so, or it is silently stranded.
                 eprintln!("[Tauri] Could not read the URL of window {label}: {e}");
                 String::new()
             });
@@ -1737,19 +1568,15 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
     }
 }
 
-/// Install the macOS menu-bar (tray) status item — packaged builds only. It keeps
-/// the client resident after the window is dismissed: "Open Lucidos" re-shows the
-/// window and "Quit and Stop Background Service" is the only full teardown
-/// (`quit_lucidos` → `bootout` + exit). The always-on launchd service is
-/// unaffected by closing the window.
+/// Install the macOS menu-bar status item, in packaged builds only. It keeps the
+/// client resident after the window is dismissed, and hosts the only full
+/// teardown.
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
-    // macOS menu-bar status items are *template images*: a transparent-background
-    // silhouette the system renders monochrome and inverts for light/dark bars.
-    // The full-colour app icon (`default_window_icon`) would otherwise sit in the
-    // menu bar as a lone blue square among the system's monochrome items. We embed
-    // a dedicated silhouette (the logo glyph from public/icons/icon-source.svg,
-    // no background) and flag it `icon_as_template` so macOS uses only its alpha.
-    // Asset: icons/tray-template.png — regenerate with icons/gen-tray-template.py.
+    // macOS status items are TEMPLATE IMAGES: a transparent-background
+    // silhouette the system renders monochrome and inverts per bar. The
+    // full-colour app icon would sit there as a lone blue square. So this is a
+    // dedicated silhouette flagged `icon_as_template`, whose alpha is all macOS
+    // reads. Regenerate it with `icons/gen-tray-template.py`.
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
     let open = MenuItem::with_id(app, "tray_open", "Open Lucidos", true, None::<&str>)?;
     let status = MenuItem::with_id(
@@ -1794,9 +1621,8 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Nudge channel for the dock-badge loop: the `nudge_dock_badge` command holds
-    // the sender (managed state); the receiver is handed to `desktop::launch`,
-    // whose macOS badge thread owns it. Created here so both ends are in scope.
+    // Created here so both ends are in scope: `nudge_dock_badge` holds the
+    // sender as managed state, and `desktop::launch` takes the receiver.
     let (dock_badge_nudge_tx, dock_badge_nudge_rx) = std::sync::mpsc::channel::<()>();
     tauri::Builder::default()
         .plugin(
@@ -1864,72 +1690,67 @@ pub fn run() {
         .on_window_event(|window, event| {
             let app = window.app_handle();
             match event {
-                // Packaged: closing a window must NOT quit the client or stop the
-                // always-on service. Hide the main window instead of letting it
-                // close — the client stays resident in the menu bar (only the tray
-                // "Quit and Stop Background Service" tears down). Secondary windows
-                // close normally; dev keeps the default close-quits behavior so
-                // `tauri-dev.sh` returns when the window is closed.
+                // Packaged: closing a window must NOT quit the client or stop
+                // the always-on service, so the main window is hidden rather
+                // than closed. Secondary windows close normally, and dev keeps
+                // the default close-quits behavior.
                 //
-                // Flush window geometry synchronously here regardless of platform:
-                // the plugin's own disk write (RunEvent::Exit) is unreachable in the
-                // packaged client (we hide instead of exit), so this close is the
-                // moment the user expects their size/position remembered.
+                // Geometry is flushed synchronously here on every platform. The
+                // plugin's own disk write is unreachable in the packaged client,
+                // and this close is when the user expects it remembered.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     if let Err(e) = app.save_window_state(window_state_flags()) {
                         eprintln!("[Tauri] Failed to persist window state on close: {e}");
                     }
                     if !tauri::is_dev() && window.label() == "main" {
-                        // Red-X / Cmd+W on the main window: keep the client resident
-                        // — HIDE it (fast reopen, page state preserved) instead of
-                        // closing, then drop to the menu-bar tray if this was the
-                        // last visible window (out of the Dock + Cmd+Tab). Secondary
-                        // New-Window windows close normally (handled by Destroyed).
+                        // Keep the client resident: HIDE, for a fast reopen with
+                        // page state preserved, then drop to the tray if this was
+                        // the last visible window.
                         api.prevent_close();
                         let _ = window.hide();
-                        // Trayed via orderOut: — the WKWebView won't report this
-                        // (visibilityState stays 'visible', hasFocus() stays true)
-                        // and `Focused(false)` may not fire on orderOut, so this
-                        // is the load-bearing signal that the page is no longer
-                        // active. Lets the engine send the OS native banner instead
-                        // of a suppressed, invisible in-app toast.
+                        // The WKWebView cannot report an `orderOut:`, and
+                        // `Focused(false)` may not fire on one. This is the
+                        // load-bearing signal that the page is inactive. It is
+                        // what lets the engine send the OS banner rather than a
+                        // suppressed in-app toast.
                         emit_window_active(app, window.label(), false);
                         enter_menu_bar_only_if_no_windows(app, Some(window.label()));
                     }
                 }
-                // A secondary New-Window closed (red-X / Cmd+W). Re-evaluate: if that
-                // was the last visible window, drop the client to the menu-bar tray.
-                // Packaged only — dev has no menu-bar residency. `main` never reaches
-                // here (its close is prevented + hidden above).
-                tauri::WindowEvent::Destroyed
-                    if !tauri::is_dev() && is_app_window(window.label()) =>
-                {
-                    enter_menu_bar_only_if_no_windows(app, Some(window.label()));
+                // A secondary window closed. Drop its traffic-light resize
+                // observer, then re-evaluate the tray. The tray half is
+                // packaged-only; the observer half is not, because a leaked
+                // registration is keyed on the dead window's address in both
+                // builds. `main` never reaches here: its close is prevented.
+                tauri::WindowEvent::Destroyed if is_app_window(window.label()) => {
+                    traffic_lights::unwatch(window.label());
+                    if !tauri::is_dev() {
+                        enter_menu_bar_only_if_no_windows(app, Some(window.label()));
+                    }
                 }
-                // Native focus changed (app switch, behind another app, Space
-                // change, app-hide, minimize). Bridge it so isPageActive() honors
-                // the desktop "active = visible AND focused" rule using the
-                // authoritative AppKit state instead of the flaky WKWebView
-                // hasFocus(). The trayed (orderOut:) case is covered by the
-                // explicit emit in CloseRequested above. See emit_window_active.
+                // Bridge native focus so `isPageActive()` reads the AppKit state
+                // rather than the flaky WKWebView `hasFocus()`. The trayed case
+                // is covered by the explicit emit in `CloseRequested` above.
                 tauri::WindowEvent::Focused(focused) if is_app_window(window.label()) => {
                     emit_window_active(app, window.label(), *focused);
                 }
-                // Geometry changed — arm the debounced background flush. The plugin
-                // keeps its own in-memory cache up to date from these same events;
-                // we additionally schedule a disk write so the new geometry survives
-                // a relaunch even though RunEvent::Exit never fires.
+                // Arm the debounced background flush. The plugin keeps its own
+                // in-memory cache from these same events, and the disk write is
+                // what makes the geometry survive a relaunch.
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
                     if is_app_window(window.label()) =>
                 {
                     // A RESIZE puts the macOS window buttons back where AppKit
-                    // wants them (measured: x back to 9, the titlebar container
-                    // back to 32pt), discarding our placement, so re-apply it.
-                    // Fullscreen enter/exit is a resize, which is what covers
-                    // the known reset there; wry and tao run their own version
-                    // of this from a view's `drawRect:` for the same reason.
-                    // Not on `Moved`: the placement is a function of the
-                    // window's HEIGHT, so moving it changes nothing.
+                    // wants them, discarding our placement, so re-apply it.
+                    //
+                    // This is the LATE net, not the one that keeps a live drag
+                    // steady: tao queues the event, so it lands a run-loop turn
+                    // after AppKit's reset is already on screen, which is what
+                    // `traffic_lights::watch_resizes` fixes. It stays for the
+                    // moment the notification does not cover, tao's synthetic
+                    // resize on leaving fullscreen, where late is right.
+                    // Idempotent, so the overlap costs nothing. Not on `Moved`:
+                    // the placement is a function of the window's HEIGHT.
                     if matches!(event, tauri::WindowEvent::Resized(_)) {
                         traffic_lights::place(window);
                     }
@@ -1943,11 +1764,8 @@ pub fn run() {
             }
         })
         .on_menu_event(|app, event| {
-            // "Quit and Stop Background Service" (quit_lucidos) is the only teardown;
-            // "Close to Menu Bar" (Cmd+Q) closes every client window and drops to the
-            // menu-bar tray (services keep running); "New Window" opens another client
-            // window. Per-window close (red X / Cmd+W) is the standard Close Window
-            // item, handled in on_window_event above, not here.
+            // Per-window close is the standard Close Window item, handled in
+            // `on_window_event` above rather than here.
             if event.id() == "quit_lucidos" {
                 quit_lucidos(app.clone());
             } else if event.id() == "close_to_menu_bar" {
@@ -1963,8 +1781,8 @@ pub fn run() {
         .on_page_load(|webview, payload| {
             if is_app_window(webview.label()) && matches!(payload.event(), PageLoadEvent::Started) {
                 let version = env!("LUCIDOS_APP_VERSION");
-                // App version + (macOS) the title-bar inset, in one early eval so
-                // the reclaimed-band CSS var is set before first paint.
+                // One early eval, so the reclaimed-band CSS vars are set before
+                // the first paint.
                 let script = format!(
                     "window.__LUCIDOS_APP_VERSION__ = '{version}';{}",
                     titlebar_inset_script()
@@ -1975,66 +1793,46 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            // The window-state plugin has already written the saved rect onto
-            // `main` (its `on_window_ready` runs when the config window is
-            // built, which is before this callback), and nothing has shown the
-            // window yet: it is declared `visible: false` and waits for
-            // `show_startup_window`. This is therefore the one moment a
-            // corrupt or now-impossible rect can be corrected off screen. A
+            // The plugin has already written the saved rect onto `main`, and
+            // nothing has shown the window yet. This is therefore the one moment
+            // a corrupt or now-impossible rect can be corrected off screen. A
             // healthy rect makes it a no-op. See `window_restore`.
             window_restore::clamp_restored_geometry(app.handle(), MAIN_WINDOW_LABEL);
 
-            // Install the app menu. The standard edit/window items keep the
-            // usual shortcuts; Cmd+Q maps to "Close to Menu Bar" (closes all client
-            // windows to the menu-bar tray) and the explicit "Quit and Stop
-            // Background Service" item drives on_menu_event → quit_lucidos.
             // Best-effort: a menu build failure must not block app startup.
             if let Err(e) = install_app_menu(app) {
                 eprintln!("[Tauri] Failed to install app menu: {e}");
             }
 
-            // Tint the window background to match the in-app header (window layer
-            // only — no webview/page-bg flash). Under Overlay this is the
-            // behind-the-webview fallback for the reclaimed title-bar band. This is
-            // the color the frontend last asked for, so a light-theme user does not
-            // launch into the dark-theme blue; applyTheme refines it via
-            // set_titlebar_color once this launch's theme is known.
+            // The color the frontend last asked for, so a light-theme user does
+            // not launch into the dark-theme blue. `applyTheme` refines it once
+            // this launch's theme is known.
             if let Some(color) = pre_paint_title_bar_color(app.handle()) {
                 paint_title_bars(app.handle(), color);
             }
 
-            // Same idea, other half of the band: put the macOS traffic lights on
-            // the bar the frontend last measured, before it has booted to
-            // measure it again. Load first, then place, so the very first window
-            // is centred for the user's UI scale rather than for the compiled
-            // 48px default.
+            // The other half of the band: the traffic lights on the bar the
+            // frontend last measured. Load first, then place, so the very first
+            // window is centred for the user's UI scale.
             traffic_lights::load_persisted(app.handle());
             traffic_lights::place_all(app.handle());
 
-            // Packaged: a menu-bar status item keeps the client resident after the
-            // window is dismissed and hosts the only full-teardown action. No-op
-            // in dev (there is no always-on service to represent).
+            // No-op in dev, where there is no always-on service to represent.
             if !tauri::is_dev() {
                 if let Err(e) = install_tray(app) {
                     eprintln!("[Tauri] Failed to install tray icon: {e}");
                 }
             }
 
-            // Now that the tray exists to represent us, decide whether this
-            // launch gets a window. The config declares `main` hidden, so a
-            // login start (the login agent, which passes `--login`) simply never
-            // shows it and drops straight to menu-bar-only instead of flashing a
-            // window on screen at every boot. Every other launch shows it here.
-            // Ordered AFTER the tray on purpose: going `Accessory` with neither a
-            // window nor a tray item would leave the client with no surface at
-            // all.
+            // Decide whether this launch gets a window. Ordered AFTER the tray
+            // on purpose: going `Accessory` with neither a window nor a tray
+            // item would leave the client with no surface at all.
             //
-            // The DECISION stays here; only the moment of showing moves. Showing
-            // now would put an unpainted window on screen for as long as the
-            // webview takes to load, so the window waits for the frontend's
-            // `window_ready_to_show`, with the timer below as the safety net (see
-            // StartupShow). A login start arms the gate `false`, which stands both
-            // of them down.
+            // The DECISION is taken here, but showing waits for the frontend's
+            // `window_ready_to_show`, with the timer below as the safety net.
+            // Showing now would put an unpainted window on screen for as long as
+            // the webview takes to load. A login start arms the gate `false`,
+            // which stands both racers down.
             let launch_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
             let show_at_startup = should_show_window_at_startup(&launch_args, tauri::is_dev());
             STARTUP_SHOW.arm(show_at_startup);
@@ -2059,16 +1857,14 @@ pub fn run() {
                 set_menu_bar_only(app.handle(), true);
             }
 
-            // WKWebView crash recovery watchdog: if the JS heartbeat stops
-            // arriving, the content process likely crashed (white screen), so
-            // reload the webview to recover. A reload that brings back no
-            // heartbeat at all did not fix anything, so the interval backs off
-            // (see ReloadWatchdog) instead of thrashing once a minute forever —
-            // and says so, because a silent reload loop is what hid the 2.11 ACL
-            // regression for a month.
+            // WKWebView crash recovery. A heartbeat that stops arriving means
+            // the content process probably crashed, so reload to recover. A
+            // reload that brings back no heartbeat fixed nothing, so the
+            // interval backs off (see `ReloadWatchdog`) and says so: a silent
+            // reload loop hides the real fault for months.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                // Give the webview time to load before starting watchdog
+                // Let the webview load before the watchdog starts.
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 let mut watchdog = ReloadWatchdog::default();
                 loop {
@@ -2109,15 +1905,10 @@ pub fn run() {
                 }
             });
 
-            // Debounced window-geometry flush. The window-state plugin only writes
-            // `.window-state.json` to disk on RunEvent::Exit, which the packaged
-            // client deliberately never reaches (closing hides the window; exit is
-            // prevented while the launchd service runs). Without this, a moved or
-            // resized window — including onto another screen — is remembered only
-            // in memory and lost on the next launch. This flushes shortly after the
-            // user stops dragging/resizing (see should_persist_geometry). The save
-            // itself is marshalled onto the main thread (persist_window_state_on_main)
-            // — saving from this worker thread directly would deadlock the UI.
+            // Debounced window-geometry flush, shortly after the user stops
+            // dragging or resizing. See `GeometrySaver` for why the plugin's own
+            // exit-time write is not enough. The save is marshalled onto the
+            // main thread: saving from this worker would deadlock the UI.
             let geometry_handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2132,27 +1923,25 @@ pub fn run() {
                 }
             });
 
-            // Register the UserNotifications delegate + request notification
-            // authorization. No-op in dev (unbundled binary). See notifications.rs.
+            // Register the UserNotifications delegate and request notification
+            // authorization. No-op in dev. See `notifications.rs`.
             notifications::setup(app.handle());
 
-            // Packaged build: boot the bundled Postgres + engine and point the
-            // window at it. No-op in development (tauri-dev.sh supplies both). The
-            // nudge receiver lets the dock-badge loop recompute on demand.
+            // Packaged: boot the bundled Postgres and engine, then point the
+            // window at them. No-op in development.
             desktop::launch(app.handle(), dock_badge_nudge_rx);
-            // Update detection is surfaced INSIDE the workspace UI: the web app
-            // polls the `check_app_update` command and shows an in-app
-            // "Update & restart" toast (see updater.rs). No native launch dialog.
+            // Update detection surfaces INSIDE the workspace UI, as an in-app
+            // toast (see `updater.rs`). There is no native launch dialog.
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // The engine + Postgres run as a launchd service, independent of the
-            // client. Packaged: keep the client process alive when the last window
-            // is dismissed (so it can host the menu-bar item and be re-opened), and
-            // re-show the window on a Dock click. The explicit teardown
-            // (`quit_lucidos`) sets QUITTING so its app.exit(0) passes the guard.
+            // The engine and Postgres run as a launchd service, independent of
+            // the client. Packaged: keep the client process alive when the last
+            // window is dismissed, so it can host the menu-bar item. A Dock
+            // click re-shows the window. `quit_lucidos` sets `QUITTING` so its
+            // own exit passes the guard.
             match event {
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2172,25 +1961,16 @@ pub fn run() {
 
 /// Build and install the app menu.
 ///
-/// We DERIVE from Tauri's OS-default menu (`Menu::default`) rather than building
-/// every submenu by hand. This is load-bearing on macOS: the system only loads
-/// the standard text-editing key-binding dictionary for a WKWebView when the app
-/// exposes a *complete* native app menu (the default App menu — About, Services,
-/// Hide… — is what gets the first submenu recognized as the Apple menu). A fully
-/// hand-rolled menu that omitted those predefined items left the bindings
-/// inactive, so `interpretKeyEvents:` found no command for the arrow keys and
-/// fell back to `insertText:` — typing the raw arrow NSFunctionKey characters
-/// (U+F700–F703, rendered as tofu boxes) into the focused textarea instead of
-/// moving the cursor. Deriving from the default keeps that wiring; on macOS we
-/// then graft on our service-aware items.
+/// DERIVE from Tauri's OS-default menu rather than building every submenu by
+/// hand. This is load-bearing on macOS: the system loads the standard
+/// text-editing key bindings for a WKWebView only when the app exposes a
+/// COMPLETE native app menu. Without the default App menu's predefined items,
+/// `interpretKeyEvents:` finds no command for the arrow keys. It falls back to
+/// `insertText:`, typing raw NSFunctionKey characters into the focused textarea.
 ///
-/// macOS customizations: Cmd+Q maps to "Close to Menu Bar" — it closes every
-/// client window and drops the app to the menu-bar tray (out of the Dock +
-/// Cmd+Tab) while the always-on service keeps running; per-window close stays the
-/// default File/Window "Close Window" (Cmd+W). The deliberate full teardown is the
-/// separate, unshortcutted "Quit and Stop Background Service" (`on_menu_event` →
-/// `quit_lucidos`; also in the menu-bar tray); plus "Uninstall Lucidos…" and a
-/// File-menu "New Window". Other platforms keep the default menu unchanged.
+/// macOS then grafts on the service-aware items. Cmd+Q maps to "Close to Menu
+/// Bar", and the full teardown is the separate, unshortcutted "Quit and Stop
+/// Background Service". Other platforms keep the default menu unchanged.
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::default(app.handle())?;
 
@@ -2202,13 +1982,11 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         let items = menu.items()?;
 
         if let Some(MenuItemKind::Submenu(app_menu)) = items.first() {
-            // Drop the default Quit (its last item; Cmd+Q → terminate) so Cmd+Q is
-            // free for "Close to Menu Bar", and graft on our service-aware items.
-            // Removing only Quit leaves About/Services/Hide intact, so the menu is
-            // still recognized as the Apple menu (the arrow-key fix above). The
-            // default's item before Quit is a separator, so the grafted items start
-            // straight at Uninstall (no leading separator → no double rule).
-            // Per-window close stays the default File/Window "Close Window" (Cmd+W).
+            // Drop the default Quit, the last item, so Cmd+Q is free for "Close
+            // to Menu Bar". Removing only Quit leaves About, Services and Hide
+            // intact, so the menu is still recognized as the Apple menu, which
+            // is the arrow-key fix above. The item before Quit is a separator,
+            // so the grafted items start straight at Uninstall.
             let last = app_menu.items()?.len();
             if last > 0 {
                 app_menu.remove_at(last - 1)?;
@@ -2270,13 +2048,11 @@ mod tests {
         assert!(!is_app_window(""));
     }
 
-    /// The injected script carries THREE facts the desktop header depends on,
-    /// and it is a string nothing else parses: a typo in it fails silently in
-    /// the webview, where the only symptom is a header that quietly lays out
-    /// like the web build. The attribute is the gate every
-    /// `[data-titlebar-overlay]` rule in `styles/panels/shell.css` hangs off;
-    /// the lights x is what makes `--titlebar-lights-reserve` arithmetic on the
-    /// placement we actually applied rather than an estimate.
+    /// The injected script is a string nothing else parses. A typo in it fails
+    /// silently in the webview, and the only symptom is a header laid out like
+    /// the web build. The attribute is the gate every `[data-titlebar-overlay]`
+    /// rule hangs off, and the lights x is what makes
+    /// `--titlebar-lights-reserve` arithmetic rather than an estimate.
     #[test]
     #[cfg(target_os = "macos")]
     fn the_titlebar_script_sets_the_inset_the_lights_x_and_the_overlay_marker() {
@@ -2285,9 +2061,9 @@ mod tests {
         assert!(script.contains("28px"), "{script}");
         assert!(script.contains("data-titlebar-overlay"), "{script}");
         // The stamped x has to BE the x the placement uses, rendered as a CSS
-        // length. Built from the constant, so this catches the rendering (a
-        // stray `10` with no unit is not a length and the reserve's calc would
-        // be invalid), not the value.
+        // length. Built from the constant, so this catches the rendering rather
+        // than the value: a stray `10` with no unit is not a length, and the
+        // reserve's calc would be invalid.
         assert!(script.contains("--titlebar-lights-x"), "{script}");
         assert!(
             script.contains(&format!("'{}px'", traffic_lights::LIGHTS_X_PX)),
@@ -2302,9 +2078,9 @@ mod tests {
         );
     }
 
-    /// Off macOS there is no native title bar, so the script must stay empty:
-    /// stamping the marker anywhere else would move the Linux and Windows
-    /// header's leading control into a band that does not exist.
+    /// Off macOS there is no native title bar, so the script must stay empty.
+    /// Stamping the marker elsewhere would move that header's leading control
+    /// into a band that does not exist.
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn the_titlebar_script_is_empty_off_macos() {
@@ -2323,11 +2099,10 @@ mod tests {
 
     #[test]
     fn the_declared_main_window_starts_hidden() {
-        // The other half of `should_show_window_at_startup` and of
-        // [`StartupShow`]: WE put the window on screen, which is only a choice
-        // while the config keeps it hidden. Make this window `"visible": true`
-        // again and every login start flashes a window before hiding it, while
-        // every other launch is back to showing an unpainted one.
+        // WE put the window on screen, which is only a choice while the config
+        // keeps it hidden. Make this window `"visible": true` and every login
+        // start flashes a window before hiding it, while every other launch
+        // shows an unpainted one.
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(
@@ -2341,9 +2116,9 @@ mod tests {
         let os = |s: &str| std::ffi::OsString::from(s);
         let login = [os(desktop::LOGIN_FLAG)];
 
-        // The login agent's launch: menu bar only, no window, ever. The config
-        // declares `main` hidden, so this is the one launch that leaves it that
-        // way instead of flashing a window at every boot.
+        // The login agent's launch: menu bar only, no window, ever. This is the
+        // one launch that leaves `main` hidden, rather than flashing a window
+        // at every boot.
         assert!(!should_show_window_at_startup(&login, false));
         // Alongside other arguments it still counts.
         assert!(!should_show_window_at_startup(
@@ -2435,12 +2210,11 @@ mod tests {
 
     #[test]
     fn the_startup_color_prefers_the_value_the_frontend_last_asked_for() {
-        // The light-theme header blue, remembered from the last session: painting
-        // it is the whole point, so a cold launch is not dark blue correcting
-        // itself once the frontend catches up.
+        // The light-theme header blue, remembered from the last session, so a
+        // cold launch is not dark blue correcting itself.
         assert_eq!(title_bar_color_or_default(Some("#1a6fd0")), "#1a6fd0");
-        // Every shape the color parser accepts, since the file holds whatever the
-        // frontend sent.
+        // Every shape the color parser accepts, since the file holds whatever
+        // the frontend sent.
         assert_eq!(title_bar_color_or_default(Some("#fff")), "#fff");
         assert_eq!(title_bar_color_or_default(Some("#15549eff")), "#15549eff");
     }
@@ -2449,8 +2223,8 @@ mod tests {
     fn the_startup_color_falls_back_when_nothing_usable_was_remembered() {
         // First run, or an unreadable file.
         assert_eq!(title_bar_color_or_default(None), TITLE_BAR_DEFAULT_COLOR);
-        // Truncated, hand-edited, or not a color at all. The file is validated on
-        // read rather than trusted, and the value is only ever fed to a color
+        // Truncated, hand-edited, or not a color at all. The file is validated
+        // on read rather than trusted, and the value only ever reaches a color
         // parse, so garbage costs the default tint and nothing else.
         assert_eq!(
             title_bar_color_or_default(Some("")),
@@ -2472,10 +2246,9 @@ mod tests {
 
     #[test]
     fn the_compiled_default_title_bar_color_parses() {
-        // `title_bar_color_or_default` hands its answer straight to the parser, so
-        // a typo in the constant would leave a launch with NO tint rather than the
-        // wrong one, and only on the path that has no persisted value to fall back
-        // on (a first run).
+        // `title_bar_color_or_default` hands its answer straight to the parser.
+        // A typo in the constant would leave a first run with NO tint rather
+        // than the wrong one.
         assert!(TITLE_BAR_DEFAULT_COLOR
             .parse::<tauri::utils::config::Color>()
             .is_ok());
@@ -2483,8 +2256,8 @@ mod tests {
 
     #[test]
     fn unread_targets_always_titles_the_tray_and_badges_the_dock_only_under_regular() {
-        // Regular (a window is open): the count is on BOTH the Dock badge and the
-        // menu-bar tray title. The menu bar carrying it at all times is the point.
+        // A window is open, so the count is on BOTH the Dock badge and the tray
+        // title. The menu bar carrying it at all times is the point.
         assert_eq!(
             unread_targets(false, 5),
             (Some("5".into()), "5".to_string())
@@ -2511,11 +2284,10 @@ mod tests {
 
     #[test]
     fn a_cleared_tray_title_is_an_empty_string_the_tray_will_actually_write() {
-        // The reported bug: the bell read 0 and the Dock tile was blank while the
-        // menu bar still showed 8. Zero has to reach `set_tray_title` as a value it
-        // WRITES, because `tray-icon`'s macOS backend drops a `None` on the floor
-        // and leaves the last count on screen (see `notifications::set_tray_title`).
-        // An empty string takes the same path a real count does, so the item blanks.
+        // Zero has to reach `set_tray_title` as a value it WRITES, because
+        // `tray-icon`'s macOS backend drops a `None` and leaves the last count
+        // on screen. An empty string takes the same path a real count does, so
+        // the item blanks.
         for menu_bar_only in [false, true] {
             let (dock, tray) = unread_targets(menu_bar_only, 0);
             assert_eq!(dock, None, "the Dock badge clears with None, which works");
@@ -2532,8 +2304,8 @@ mod tests {
     #[test]
     fn safari_ua_carries_the_version_and_webkit_suffix() {
         let ua = safari_ua("18.5");
-        // The whole point: WKWebView's default UA lacks the Version/… Safari/…
-        // suffix; ours must carry both, plus the AppleWebKit token.
+        // WKWebView's default UA lacks the Version and Safari suffix, so ours
+        // must carry both, plus the AppleWebKit token.
         assert!(ua.contains("Version/18.5 Safari/605.1.15"), "{ua}");
         assert!(ua.contains("AppleWebKit/605.1.15"), "{ua}");
         assert!(ua.starts_with("Mozilla/5.0 (Macintosh;"), "{ua}");
@@ -2547,8 +2319,8 @@ mod tests {
         // Below and at the threshold: no reload (15s heartbeat cadence).
         assert_eq!(watchdog.on_tick(Duration::from_secs(59), 100), None);
         assert_eq!(watchdog.on_tick(HEARTBEAT_TIMEOUT, 100), None);
-        // Strictly past the 60s timeout: reload. The first one is never "futile"
-        // — there is no earlier reload for it to have failed to improve on.
+        // Strictly past the timeout: reload. The first one is never futile,
+        // since there is no earlier reload for it to have failed to improve on.
         assert_eq!(
             watchdog.on_tick(Duration::from_secs(61), 100),
             Some(ReloadDecision {
@@ -2575,9 +2347,9 @@ mod tests {
 
     #[test]
     fn reloads_that_never_restore_the_heartbeat_back_off_instead_of_thrashing() {
-        // The 2.11 ACL regression: the page loads and runs, but `invoke` is
-        // rejected, so the count NEVER advances. Before the backoff this reloaded
-        // once a minute forever (6232 times in the field) and said nothing new.
+        // A rejected `invoke`: the page loads and runs, but the count NEVER
+        // advances. Without the backoff this reloads once a minute forever and
+        // says nothing new.
         let mut watchdog = ReloadWatchdog::default();
         let mut thresholds = Vec::new();
         for _ in 0..8 {
@@ -2593,12 +2365,12 @@ mod tests {
         assert_eq!(
             thresholds,
             vec![
-                HEARTBEAT_TIMEOUT,      // 60s  — first attempt
+                HEARTBEAT_TIMEOUT,      // 60s, the first attempt
                 HEARTBEAT_TIMEOUT * 2,  // 2m
                 HEARTBEAT_TIMEOUT * 4,  // 4m
                 HEARTBEAT_TIMEOUT * 8,  // 8m
                 HEARTBEAT_TIMEOUT * 16, // 16m
-                HEARTBEAT_TIMEOUT * 32, // 32m — ceiling
+                HEARTBEAT_TIMEOUT * 32, // 32m, the ceiling
                 HEARTBEAT_TIMEOUT * 32,
                 HEARTBEAT_TIMEOUT * 32,
             ]
@@ -2641,15 +2413,15 @@ mod tests {
 
     #[test]
     fn should_persist_geometry_waits_for_quiet_then_fires() {
-        // Nothing changed → never flush, however long it's been.
+        // Nothing changed, so never flush, however long it has been.
         assert!(!should_persist_geometry(false, Duration::from_secs(10)));
-        // Dirty but the user is still moving/resizing (within the debounce) → wait.
+        // Dirty, but the user is still moving or resizing, so wait.
         assert!(!should_persist_geometry(true, Duration::from_millis(0)));
         assert!(!should_persist_geometry(
             true,
             GEOMETRY_SAVE_DEBOUNCE - Duration::from_millis(1)
         ));
-        // Dirty and quiet for at least the debounce window → flush to disk.
+        // Dirty and quiet for at least the debounce window, so flush.
         assert!(should_persist_geometry(true, GEOMETRY_SAVE_DEBOUNCE));
         assert!(should_persist_geometry(
             true,
@@ -2660,7 +2432,7 @@ mod tests {
     #[test]
     fn window_state_flags_remembers_geometry_not_visibility() {
         let flags = window_state_flags();
-        // The whole point: remember where/how big the window is, on which screen.
+        // Remember where the window is, how big, and on which screen.
         assert!(flags.contains(StateFlags::SIZE));
         assert!(flags.contains(StateFlags::POSITION));
         assert!(flags.contains(StateFlags::MAXIMIZED));
@@ -2672,21 +2444,18 @@ mod tests {
     }
 }
 
-/// Regression coverage for the Tauri ACL, which is what stands between the
-/// packaged window and every one of our IPC commands.
+/// Regression coverage for the Tauri ACL, which stands between the packaged
+/// window and every one of our IPC commands.
 ///
-/// These tests drive the REAL resolver — `Resolved::resolve` +
-/// `RuntimeAuthority::resolve_access`, the exact pair `Webview::on_message`
-/// consults — over the REAL artifacts (`gen/schemas/*.json`, regenerated by
-/// `tauri_build` on every build, and the runtime capability from
-/// `desktop::gateway_capability`). So they fail for the same reason the packaged
-/// app would, without needing a bundle.
+/// These drive the REAL resolver over the REAL artifacts: the same
+/// `Resolved::resolve` and `RuntimeAuthority::resolve_access` pair
+/// `Webview::on_message` consults, the generated schemas, and the runtime
+/// capability. So they fail for the same reason the packaged app would.
 ///
-/// What they cannot prove is the origin STRING the OS produces: tauri derives it
-/// from the `Origin` header WebKit puts on the `ipc://` request
-/// (`tauri/src/ipc/protocol.rs`, `parse_invoke_request`). That the header for our
-/// window really is `http://localhost:<port>` is established by code inspection
-/// plus the field evidence, not by these tests.
+/// What they cannot prove is the origin STRING the OS produces, which tauri
+/// derives from the `Origin` header WebKit puts on the `ipc://` request. That
+/// the header really is `http://localhost:<port>` rests on code inspection and
+/// field evidence, not on these tests.
 #[cfg(test)]
 mod acl_tests {
     use super::*;
@@ -2697,7 +2466,7 @@ mod acl_tests {
     use tauri::utils::acl::resolved::Resolved;
     use tauri::utils::platform::Target;
 
-    /// The gateway port the tests pin the capability to. Any value works — the
+    /// The gateway port the tests pin the capability to. Any value works: the
     /// point is that the SAME one has to appear in the window's origin.
     const PORT: u16 = 5252;
 
@@ -2734,9 +2503,9 @@ mod acl_tests {
         }
     }
 
-    /// Build the authority the packaged client runs with: the static capabilities
-    /// plus, when `gateway_port` is set, the runtime capability `desktop::launch`
-    /// registers before navigating. Passing `None` reproduces the pre-fix state.
+    /// Build the authority the packaged client runs with: the static
+    /// capabilities, plus the runtime one `desktop::launch` registers before
+    /// navigating. Passing `None` leaves the runtime capability out.
     fn authority(gateway_port: Option<u16>) -> tauri::ipc::RuntimeAuthority {
         let acl = acl_manifests();
         let mut capabilities = static_capabilities();
@@ -2794,10 +2563,9 @@ mod acl_tests {
             .collect()
     }
 
-    /// Plugin commands the frontend depends on, keyed the way the ACL keys them.
-    /// `plugin:event|listen` is the load-bearing one: every `listen()` in the
-    /// frontend — native-notification taps, panel title/URL updates — goes
-    /// through it, so a denial there is silent and total.
+    /// Plugin commands the frontend depends on, keyed the way the ACL keys
+    /// them. `plugin:event|listen` is the load-bearing one: every `listen()` in
+    /// the frontend goes through it, so a denial there is silent and total.
     const PLUGIN_COMMANDS: &[&str] = &[
         "plugin:event|listen",
         "plugin:event|unlisten",
@@ -2810,10 +2578,8 @@ mod acl_tests {
     #[test]
     fn the_app_defines_an_acl_manifest() {
         // With no app ACL manifest, `has_app_acl_manifest` is false and app
-        // commands are unchecked on LOCAL origins — which is exactly the state
-        // that let the 2.11 remote-origin check break everything at once, because
-        // nothing had ever had to declare an app permission. Its presence is what
-        // makes every assertion below meaningful.
+        // commands go unchecked on LOCAL origins. Its presence is what makes
+        // every assertion below meaningful.
         assert!(
             acl_manifests().contains_key(tauri::utils::acl::APP_ACL_KEY),
             "permissions/app-ipc.json must produce an app ACL manifest"
@@ -2884,9 +2650,8 @@ mod acl_tests {
 
     #[test]
     fn without_the_gateway_capability_the_gateway_origin_is_denied() {
-        // The regression itself: static capabilities alone (`local: true`, no
-        // remote context) leave every command denied once the window leaves the
-        // Tauri asset origin. This is the state the shipped v0.16.0 is in.
+        // Static capabilities alone, with no remote context, leave every
+        // command denied once the window leaves the Tauri asset origin.
         let authority = authority(None);
         let origin = Origin::Remote {
             url: gateway_origin(),
@@ -2909,9 +2674,8 @@ mod acl_tests {
     #[test]
     fn the_gateway_capability_admits_only_the_resolved_origin() {
         let authority = authority(Some(PORT));
-        // A different local port (another server on this machine), a foreign
-        // host, and a different scheme must all stay out: the whole point of the
-        // upstream 2.11 change is that remote content can't reach custom commands.
+        // A different local port, a foreign host, and a different scheme must
+        // all stay out. Remote content cannot reach custom commands.
         for url in [
             "http://localhost:9999",
             "http://127.0.0.1:5252",
@@ -2948,8 +2712,7 @@ mod acl_tests {
                  would never reach the main window"
             );
         }
-        // Everything else stays out of reach of previewed content. Before 2.11
-        // (no app ACL manifest) all of these were callable from any previewed page.
+        // Everything else stays out of reach of previewed content.
         for command in [
             "heartbeat",
             "restart_app",
@@ -2988,11 +2751,10 @@ mod acl_tests {
 
     #[test]
     fn dev_keeps_working_on_the_local_origin() {
-        // Defining an app ACL manifest switches `has_app_acl_manifest` to true,
-        // which starts ACL-checking app commands on LOCAL origins too — dev
-        // (`devUrl`) and the bundled `tauri://localhost` splash included. Without
-        // `allow-app-ipc` in the default capability this would break `tauri dev`
-        // and the splash's own heartbeat.
+        // An app ACL manifest switches `has_app_acl_manifest` to true, which
+        // starts ACL-checking app commands on LOCAL origins too, dev and the
+        // bundled splash included. Without `allow-app-ipc` in the default
+        // capability that breaks `tauri dev` and the splash's own heartbeat.
         let authority = authority(None);
         for command in invoke_handler_commands() {
             if command.starts_with("__panel_") {
@@ -3018,9 +2780,8 @@ mod acl_tests {
     #[test]
     fn app_permissions_match_the_invoke_handler() {
         // The app ACL manifest makes an omission fatal: a command registered in
-        // `generate_handler!` but absent from permissions/app-ipc.json is denied
-        // on EVERY origin, dev included. This is the guard that turns that into a
-        // test failure instead of a shipped regression.
+        // `generate_handler!` but absent from `permissions/app-ipc.json` is
+        // denied on EVERY origin, dev included.
         let registered = invoke_handler_commands();
         let permitted: BTreeSet<String> = permission_commands("allow-app-ipc")
             .union(&permission_commands("allow-panel-report"))
@@ -3052,10 +2813,9 @@ mod acl_tests {
 
     #[test]
     fn gateway_capability_grants_what_the_default_capability_grants() {
-        // Same frontend, one reached over http and one off the bundled assets —
-        // if the two permission lists drift, a command works in dev and dies in
-        // the packaged build (or the reverse), which is precisely the class of
-        // bug that went unnoticed for a month.
+        // Same frontend, one reached over http and one off the bundled assets.
+        // If the two permission lists drift, a command works in dev and dies in
+        // the packaged build, or the reverse.
         let default_permissions: BTreeSet<String> = static_capabilities()["default"]
             .permissions
             .iter()

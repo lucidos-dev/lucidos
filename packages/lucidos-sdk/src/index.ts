@@ -1,4 +1,4 @@
-import { configure, SdkError } from './_fetch';
+import { apiUrl, configure, SdkError } from './_fetch';
 import { data } from './data';
 import { events } from './events';
 import { triggers } from './triggers';
@@ -15,6 +15,12 @@ import { oauth } from './oauth';
 
 export const lucidos = {
   configure,
+  // Public because an app has no other correct way to reach an engine endpoint
+  // no SDK method wraps: an app iframe carries no `<base href>`, so a relative
+  // URL resolves under `/<slug>/app/<id>/` and a root-absolute `/api/v1/…` reads
+  // its first segment as a workspace name. Both 404. See
+  // `system-knowhow/js-sdk.md` § lucidos.apiUrl.
+  apiUrl,
   data,
   events,
   triggers,

@@ -18,6 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
 mod await_event;
+mod build_slot;
 mod cc_bash_guard;
 mod cc_plan_gate;
 mod cc_read_coerce;
@@ -82,15 +83,15 @@ enum Command {
         action: EventsCmd,
     },
     /// Subscribe this thread to an event instead of polling for it, then FINISH
-    /// your session. Returns immediately: the engine wakes this thread with a
+    /// your session. Returns immediately: the engine re-opens this thread with a
     /// follow-up message when a matching event lands, or tells you the deadline
     /// passed. Nothing is blocked while you are subscribed, and you must not
     /// sit in a sleep-and-recheck loop waiting for it.
     ///
     /// Use it for anything the engine emits: a change appearing
     /// (`ChangeProposed`), a trigger firing, a workspace domain event. NOT for
-    /// external state with no Lucidos event, which has nothing to wake you, and
-    /// NOT for a thread you spawned as your own child: that one already wakes
+    /// external state with no Lucidos event, which has nothing to deliver, and
+    /// NOT for a thread you spawned as your own child: that one already re-opens
     /// this thread with its result when it finishes, so a wait on its
     /// `ChildThreadCompleted` buys nothing. Await a completion only for a thread
     /// that is not your own child, named with a `child_thread_id` condition. A
@@ -101,6 +102,18 @@ enum Command {
     /// rule that fires every time, create a trigger instead.
     #[command(name = "await-event")]
     AwaitEvent(AwaitEventArgs),
+    /// Run a heavy build under a *build slot*, so parallel worktrees cannot
+    /// pile N full compiles onto one host and OOM it.
+    ///
+    /// `lucidos build-slot -- <command>` waits for a free slot, runs the
+    /// command as its child, and frees the slot when it exits. The slot is an
+    /// OS lock, so a killed build releases it too and nothing goes stale.
+    ///
+    /// Wrap anything heavy: `cargo build`, `cargo test`, a Gradle or Xcode
+    /// build, a big webpack run. Do not wrap cheap work, which would sit in a
+    /// slot for minutes to save seconds.
+    #[command(name = "build-slot")]
+    BuildSlot(BuildSlotArgs),
     /// Read or stop this thread's own event subscriptions, the ones
     /// `await-event` armed.
     ///
@@ -109,7 +122,7 @@ enum Command {
     /// time out, and can be stopped by the user, none of which is announced to
     /// a session that is not running. `cancel` is how you stand one down when
     /// the user says to stop; without it a subscription is unrevokable and
-    /// wakes this thread later whatever you told them.
+    /// re-opens this thread later whatever you told them.
     ///
     /// Both act on `$LUCIDOS_THREAD_ID` and take no thread argument, so neither
     /// can reach another thread's subscriptions.
@@ -479,7 +492,7 @@ enum EventWaitsCmd {
     /// <EventType>` for the ones watching an event type, or `--all` for every
     /// one on this thread; exactly one of the three.
     ///
-    /// There is no wake, so nothing interrupts you: the subscription simply
+    /// There is no re-entry, so nothing interrupts you: the subscription simply
     /// stops, the user sees it leave the subscription indicator, and the
     /// transcript records what was stopped.
     Cancel {
@@ -500,8 +513,8 @@ enum EventWaitsCmd {
 
 #[derive(Args)]
 pub(crate) struct AwaitEventArgs {
-    /// Event name to wake on, PascalCase past tense. Repeat the flag to watch
-    /// several: any one of them wakes the thread.
+    /// Event name to watch for, PascalCase past tense. Repeat the flag to watch
+    /// several: any one of them re-opens the thread.
     #[arg(long = "on", required = true)]
     pub(crate) on: Vec<String>,
     /// Optional payload filter as a JSON object, applied to every `--on` name.
@@ -513,8 +526,8 @@ pub(crate) struct AwaitEventArgs {
     #[arg(long)]
     pub(crate) condition: Option<String>,
     /// How long to wait before giving up, in seconds (1 to 86400). Required:
-    /// there is no unbounded subscription. You are woken with a timeout if
-    /// nothing matches, so pick a real upper bound and add margin.
+    /// there is no unbounded subscription. You get a timeout notice if nothing
+    /// matches, so pick a real upper bound and add margin.
     #[arg(long = "timeout-secs")]
     pub(crate) timeout_secs: i64,
     /// One short line, in the user's language, saying what you are waiting for
@@ -522,6 +535,33 @@ pub(crate) struct AwaitEventArgs {
     /// they tell a sleeping thread from a stalled one.
     #[arg(long)]
     pub(crate) reason: String,
+}
+
+#[derive(Args)]
+pub(crate) struct BuildSlotArgs {
+    /// Print who holds each slot on this host, and where the count came from.
+    /// Takes no slot itself, so it is safe to run while the pool is full.
+    #[arg(long)]
+    pub(crate) status: bool,
+    /// Set the machine-wide slot count, persisted next to the pool. One number
+    /// for the host: setting it per workspace cannot work, because the pool
+    /// spans them.
+    #[arg(long = "set-capacity", value_name = "N")]
+    pub(crate) set_capacity: Option<usize>,
+    /// Give up after this many seconds instead of waiting indefinitely, exiting
+    /// 75. Omit it to wait: a second build is wanted, just not concurrently.
+    #[arg(long = "max-wait", value_name = "SECONDS")]
+    pub(crate) max_wait: Option<u64>,
+    /// What to call this build in the slot listing. Defaults to the command.
+    #[arg(long)]
+    pub(crate) label: Option<String>,
+    /// The command to run, after `--`.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub(crate) command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1058,6 +1098,15 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             )?;
             Ok(0)
         }
+        // No workspace is resolved here. A build slot is host state, so this
+        // must work in a plain checkout with no engine anywhere near it.
+        Command::BuildSlot(args) => build_slot::run(build_slot::BuildSlotArgs {
+            status: args.status,
+            set_capacity: args.set_capacity,
+            max_wait_secs: args.max_wait,
+            label: args.label,
+            command: args.command,
+        }),
         Command::EventWaits { action } => {
             let ws = resolve_from_env()?;
             match action {

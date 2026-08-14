@@ -1,100 +1,59 @@
-//! Where the macOS traffic lights sit.
+//! Where the macOS traffic lights sit. ADR 0074 records why we place them
+//! ourselves and re-apply from AppKit's own resize notification.
 //!
 //! Under `titleBarStyle: "Overlay"` the webview owns the full window height and
-//! the three window buttons float above it in an AppKit layer, so our HTML never
-//! reflows around them. That leaves two numbers to own, and this module owns
-//! both: the x the cluster starts at ([`LIGHTS_X_PX`], which
-//! `styles/panels/shell.css` turns into `--titlebar-lights-reserve`) and the y
-//! that puts the cluster's vertical centre on the centre of our own header bar,
-//! so the lights obey the same centring rule (`--header-band-lift`) as every
-//! other control in the row instead of being the one control sitting higher than
-//! its neighbours.
+//! the three window buttons float above it in an AppKit layer. That leaves two
+//! numbers to own, and this module owns both: the x the cluster starts at
+//! ([`LIGHTS_X_PX`]) and the y that centres the cluster on our header bar.
 //!
-//! **We place them ourselves, through `Window::ns_window()`, because Tauri
-//! 2.11.4 exposes no runtime setter.** `WebviewWindowBuilder::traffic_light_position`
-//! exists but is creation-time, and the `main` window is declared in
-//! `tauri.conf.json` rather than built with that builder, so it has no
-//! creation-time hook at all beyond a static config literal that could carry
-//! neither a persisted value nor the live UI scale. One rung down,
-//! `WindowDispatch::set_traffic_light_position` is declared in `tauri-runtime`
-//! and implemented in `tauri-runtime-wry`, but `tauri::Window` wraps no public
-//! method for it and its dispatcher is private. The crate already drives AppKit
-//! through `objc2` for the Dock badge and the tray (see `notifications.rs`), so
-//! doing the placement here costs one small function and buys the thing the
-//! builder cannot give: a value the frontend can re-push whenever the UI scale
-//! changes.
+//! **The geometry is measured, not assumed.** An AppKit probe against this
+//! build's style mask read back:
 //!
-//! Deliberately we do NOT also pass `traffic_light_position` to the builder for
-//! New-Window children. That would install wry's own `drawRect:` re-apply
-//! holding the CREATION-time value, which would then fight every later push.
-//! One mechanism, applied at every moment that needs it.
+//!  * a 14pt button frame carrying the 12pt drawn circle
+//!  * a 23pt pitch between buttons
+//!  * a frame origin of (9, 9) inside a 32pt `NSTitlebarContainerView`
 //!
-//! ## The geometry, measured rather than assumed
-//!
-//! An AppKit probe against a window with this build's style mask (`.titled`
-//! `.closable` `.miniaturizable` `.resizable` `.fullSizeContentView`,
-//! transparent titlebar, hidden title) reports: a 14pt button frame carrying the
-//! 12pt drawn circle, a 23pt pitch between buttons, a default frame origin of
-//! (9, 9) inside `NSTitlebarView`, a 32pt `NSTitlebarContainerView`, and
-//! therefore a cluster 60pt wide whose centre sits 16pt below the window's top
-//! edge. None of those are the numbers the old CSS comment carried (it said 12pt
-//! buttons 20pt apart starting at x 20, ending near x 66).
-//!
-//! Two consequences run through the rest of this file. The buttons' `origin.y`
-//! INSIDE the titlebar view is not ours to set: AppKit owns it, and resizing the
-//! container is what moves them, which is why [`container_height`] is the
-//! arithmetic rather than a y offset. And AppKit puts everything back the way it
-//! likes it on **every window resize** (measured: a plain `setFrame:` reverts
-//! x to 9 and the container to 32pt), fullscreen enter/exit included, which is
-//! why `on_window_event` re-applies on `Resized` and why both wry and tao run
-//! their own version of this from a view's `drawRect:`.
+//! So the cluster is 60pt wide, its centre 16pt below the window's top edge.
+//! The buttons' `origin.y` is AppKit's to set, which is why
+//! [`container_height`] is the arithmetic rather than a y offset. And AppKit
+//! reverts the placement on **every window resize**, so [`watch_resizes`] owns
+//! re-applying it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Where the LEFT edge of the traffic-light cluster goes, in logical px from the
-/// window's left edge. Ours to choose, and one pixel off AppKit's own, which
-/// puts this window style's close button frame at x 9.
+/// Where the LEFT edge of the traffic-light cluster goes, in logical px from
+/// the window's left edge. Ours to choose, and one pixel off AppKit's own.
 ///
 /// It is half of the slack in the 80px the header row keeps clear, the other
 /// half being `--titlebar-lights-gap` in `styles/panels/shell.css`. 10 and 10
 /// around a 60pt cluster is what centres the lights in that room: the 12pt
 /// circle sits 1pt inside its 14pt frame, so the drawn cluster spans 11 to 69
-/// and has the same 11px of air on each side. It used to be 20 with the gap at
-/// 0, which put all the slack in front of the lights and landed the leading
-/// control's box exactly where the zoom button's ended, and the user reported
-/// the row reading cramped against them.
+/// with the same air on each side.
 ///
 /// The single source for the number. [`crate::titlebar_inset_script`] stamps it
-/// into `--titlebar-lights-x` before first paint and
-/// `styles/panels/shell.css` derives `--titlebar-lights-reserve` from it, so the
-/// room the header row keeps clear is arithmetic on the x we actually applied
-/// instead of a guess at where the OS left the buttons. The cluster's own 60pt
-/// width is NOT here: it is a measured AppKit fact rather than a choice, this
-/// module never needs it (the pitch is read off the buttons at placement time),
-/// and CSS is the only consumer.
+/// into `--titlebar-lights-x` before first paint, and the CSS derives
+/// `--titlebar-lights-reserve` from it. The cluster's own 60pt width is NOT
+/// here: it is a measured AppKit fact rather than a choice, this module reads
+/// the pitch off the buttons instead, and CSS is the only consumer.
 ///
-/// Gated the way `notifications.rs` gates its own platform-free helpers: nothing
-/// off macOS has window buttons to place, so an ungated constant is dead code on
-/// any other target, and `test` keeps it available to the unit tests, which run
-/// everywhere.
+/// Gated the way `notifications.rs` gates its platform-free helpers. Nothing
+/// off macOS has window buttons to place, and `test` keeps it available to the
+/// unit tests, which run everywhere.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const LIGHTS_X_PX: f64 = 10.0;
 
 /// The bar height to place against before any frontend has reported one: the
-/// desktop bar at the default UI scale (`--desktop-bar-height`, `3rem`, on a
-/// 16px root). The FALLBACK only, for a first run and an unreadable file. Once
-/// the frontend has reported a height it is remembered ([`BAR_HEIGHT_FILE`]) and
-/// that is what the next cold launch places with, so a user at 150% is not
-/// launched into lights centred for 48px.
+/// desktop bar at the default UI scale. The FALLBACK only, for a first run and
+/// an unreadable file. A reported height is remembered in [`BAR_HEIGHT_FILE`],
+/// so a user at 150% is not cold-launched into lights centred for 48px.
 const DEFAULT_BAR_HEIGHT_PX: f64 = 48.0;
 
 /// Bounds on a bar height we are willing to place lights against. The supported
-/// UI-scale range (75% to 200%, `UI_SCALE_MIN` / `UI_SCALE_MAX` in
-/// `store/actions/preferences.ts`) puts the real bar between 36px and 96px;
-/// these are deliberately much wider, because the Style Remote can retune the
-/// tokens the bar is built from and this is not the place to second-guess the
-/// frontend's own measurement. They exist to reject a value that could only be a
-/// bug: a zero, a negative, a NaN, a misplaced decimal point.
+/// UI-scale range puts the real bar between 36px and 96px, and these are
+/// deliberately much wider: the Style Remote can retune the tokens the bar is
+/// built from, and this is not the place to second-guess the frontend's own
+/// measurement. They exist to reject a value that could only be a bug, such as
+/// a zero, a negative, a NaN or a misplaced decimal point.
 const MIN_BAR_HEIGHT_PX: f64 = 16.0;
 const MAX_BAR_HEIGHT_PX: f64 = 400.0;
 
@@ -105,10 +64,10 @@ const MAX_BAR_HEIGHT_PX: f64 = 400.0;
 /// is unambiguous, since `0.0` is not a plausible bar height.
 static BAR_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-/// Remembers the last bar height the frontend reported, so a cold launch can
-/// place the lights on the user's bar rather than on the compiled default. A
-/// bare number, no schema: one value, read back through the same plausibility
-/// check anything else is, never trusted into anything but arithmetic.
+/// Remembers the last bar height the frontend reported, so a cold launch places
+/// the lights on the user's bar rather than the compiled default. A bare
+/// number, no schema: one value, read back through the same plausibility check
+/// anything else is, and never trusted into anything but arithmetic.
 ///
 /// Beside `config/titlebar-color`, `config/engine-port` and
 /// `config/workspaces.json` in the app data dir, so a delete-data uninstall
@@ -125,17 +84,14 @@ fn is_plausible_bar_height(px: f64) -> bool {
 /// centre of our own bar. Pure, so the one piece of arithmetic in this file is
 /// testable without a window server.
 ///
-/// The container is pinned to the window's top edge and AppKit keeps the buttons
-/// vertically centred inside it, leaving their `origin.y` within the titlebar
-/// view untouched at whatever it laid them out at. So a button's centre sits
-/// `container_height - button_origin_y - button_height / 2` below the window's
-/// top edge, and solving that for the container height is this. Both AppKit
-/// terms are READ at the call site rather than baked in as the 9 and 14 the
-/// probe measured, so a macOS release that retunes the titlebar keeps the
-/// cluster centred instead of quietly drifting.
+/// The container is pinned to the window's top edge and AppKit keeps the
+/// buttons vertically centred inside it, leaving their `origin.y` untouched. So
+/// a button's centre sits `container_height - button_origin_y - button_height /
+/// 2` below the window's top edge, and this solves that for the height.
 ///
-/// The 14pt frame and the 12pt circle drawn inside it share a centre, so
-/// centring the frame centres the light.
+/// Both AppKit terms are READ at the call site rather than baked in, so a macOS
+/// release that retunes the titlebar keeps the cluster centred. The 14pt frame
+/// and the 12pt circle share a centre, so centring the frame centres the light.
 ///
 /// Gated like [`LIGHTS_X_PX`]: its only non-test caller is the macOS placement.
 #[cfg(any(target_os = "macos", test))]
@@ -145,7 +101,7 @@ fn container_height(bar_height_px: f64, button_origin_y: f64, button_height: f64
 
 /// Pure: which bar height to place with, given the raw file content from the
 /// last push. The persisted value wins only if it still parses and is still
-/// plausible, so a truncated or hand-edited file degrades to
+/// plausible. A truncated or hand-edited file degrades to
 /// [`DEFAULT_BAR_HEIGHT_PX`] rather than to lights placed off the window.
 fn bar_height_or_default(persisted: Option<&str>) -> f64 {
     persisted
@@ -162,9 +118,9 @@ fn format_bar_height(px: f64) -> String {
     format!("{px}")
 }
 
-/// Write `px` for the next launch. Best-effort: a failure is logged and dropped,
-/// because the cost is only that a cold launch places the lights for the default
-/// bar until the frontend reports in a moment later.
+/// Write `px` for the next launch. Best-effort: a failure is logged and
+/// dropped. The cost is only that a cold launch places for the default bar
+/// until the frontend reports a moment later.
 fn persist_bar_height(app: &tauri::AppHandle, px: f64) {
     crate::config_scalar::write_if_changed(
         app,
@@ -218,10 +174,10 @@ pub(crate) fn place_all(app: &tauri::AppHandle) {
 /// Apply a bar height the frontend just measured: remember it, place the calling
 /// window's lights, and persist it for the next cold launch.
 ///
-/// Only the CALLING window is placed. Every window resolves the same bar height
-/// (it is a function of the UI scale, which is one preference for the device),
-/// and each one reports for itself as it boots, so fanning out here would only
-/// re-place windows that are about to say the same thing.
+/// Only the CALLING window is placed. Every window resolves the same bar
+/// height, a function of the one device-wide UI scale, and each reports for
+/// itself as it boots. Fanning out here would only re-place windows that are
+/// about to say the same thing.
 pub(crate) fn set_bar_height(
     app: &tauri::AppHandle,
     window: &tauri::Window,
@@ -229,8 +185,8 @@ pub(crate) fn set_bar_height(
 ) -> Result<(), String> {
     // Off macOS there are no native window buttons to place. Inert rather than
     // an error: the frontend gates its push on `data-titlebar-overlay`, which
-    // only this build stamps, so nothing reaches here, and rejecting would turn
-    // a build difference into a visible IPC failure if anything ever did.
+    // only this build stamps. Rejecting would turn a build difference into a
+    // visible IPC failure if anything ever did reach here.
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
@@ -282,22 +238,141 @@ fn place_at(window: &tauri::Window, bar_height_px: f64) {
         }
     };
     // SAFETY: `ns_window` hands back an autoreleased `NSWindow` for this window,
-    // valid for the rest of this call, and `_mtm` is the evidence that forming a
+    // valid for the rest of this call. `_mtm` is the evidence that forming a
     // reference to a `MainThreadOnly` type here is sound.
     let ns_window: &objc2_app_kit::NSWindow = unsafe { &*ptr.cast() };
+    watch_resizes(window.label(), ns_window);
     inset_lights(ns_window, LIGHTS_X_PX, bar_height_px);
 }
 
-/// Move the three window buttons to `x` and centre them on a bar `bar_height_px`
-/// tall. The same shape as wry's and tao's `inset_traffic_lights`, which is the
-/// known-good way to do this: grow `NSTitlebarContainerView` and let AppKit
-/// re-centre the buttons inside it, rather than setting their `origin.y`, which
-/// AppKit owns and would fight.
+/// The opaque token `addObserverForName:object:queue:usingBlock:` hands back,
+/// which is the only handle that can remove that registration again.
+#[cfg(target_os = "macos")]
+type ResizeObserver =
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>;
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The observers [`watch_resizes`] installs, keyed by Tauri window label, so
+    /// a window is watched exactly once and can be unwatched when it goes away.
+    ///
+    /// A `thread_local!` rather than a `static` because a `Retained` is `!Send`
+    /// and every path that touches this map is on the main thread already.
+    /// Registration runs inside [`place_at`], which cannot reach it without
+    /// first forming a `&NSWindow`. Removal runs from the `Destroyed` arm of
+    /// `on_window_event`, and AppKit posts the notification on the main thread.
+    /// So there is exactly one map, owned by the thread that owns AppKit.
+    static RESIZE_OBSERVERS: std::cell::RefCell<std::collections::HashMap<String, ResizeObserver>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Keep one window's cluster placed through a live resize, by re-applying from
+/// AppKit's own `NSWindowDidResizeNotification`. Idempotent per window: the
+/// first placement installs the observer and every later one finds it there, so
+/// [`place_at`] can call this unconditionally.
 ///
-/// Idempotent, which is what makes the `Resized` re-apply safe to run on every
-/// event: the buttons' `origin.y` and the pitch between them are unchanged by a
-/// previous run, so a second call reads the same inputs and writes the same
-/// frames.
+/// ADR 0074 records why this hooks AppKit's notification rather than Tauri's
+/// `Resized` event, and which two tidier-looking hooks were probed and failed.
+///
+/// The notification is both late enough and early enough, which had to be
+/// measured rather than reasoned about. By the time it fires AppKit has already
+/// reverted BOTH numbers, so there is something to correct. No later layout
+/// pass reverts them again, so what we write gets committed.
+///
+/// `on_window_event`'s `Resized` arm stays, because it covers one moment this
+/// does not: tao emits a second, synthetic resize from
+/// `windowDidExitFullscreen:`. That one is late by construction, and late is
+/// right for it.
+///
+/// Called with a `&NSWindow` in hand, which is itself the evidence that we are
+/// on the main thread.
+#[cfg(target_os = "macos")]
+fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+
+    // Only app windows, so the map holds exactly the labels [`unwatch`] is
+    // called for. A `url-preview-*` panel webview is not one, and its
+    // `ns_window()` is the APP window hosting it. Watching under its label
+    // would register a second observer on a window that already has one.
+    if !crate::is_app_window(label) {
+        return;
+    }
+    if RESIZE_OBSERVERS.with_borrow(|observers| observers.contains_key(label)) {
+        return;
+    }
+
+    let block = block2::RcBlock::new(|notification: std::ptr::NonNull<NSNotification>| {
+        // AppKit posts this on the main thread and we registered with a nil
+        // queue, so the block runs there. Checked rather than assumed: reaching
+        // into AppKit off the main thread would be unsound, and skipping costs
+        // only the one placement.
+        if objc2::MainThreadMarker::new().is_none() {
+            return;
+        }
+        // SAFETY: the notification is alive for the duration of the call.
+        let Some(object) = (unsafe { notification.as_ref() }).object() else {
+            return;
+        };
+        // SAFETY: the observer below is scoped to a single window through the
+        // `object:` argument. The only sender that can reach this block is that
+        // `NSWindow`, and it is alive because it is the one posting.
+        let ns_window: &objc2_app_kit::NSWindow =
+            unsafe { &*objc2::rc::Retained::as_ptr(&object).cast() };
+        inset_lights(ns_window, LIGHTS_X_PX, current_bar_height());
+    });
+
+    let object: &objc2::runtime::AnyObject = ns_window;
+    // SAFETY: the name is AppKit's own notification constant, and the object is
+    // the window we want scoped notifications for. A nil queue asks for the
+    // block to run synchronously on the posting thread, which is the whole
+    // point: a queued block would land where the Tauri event already is.
+    let observer = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(objc2_app_kit::NSWindowDidResizeNotification),
+            Some(object),
+            None,
+            &block,
+        )
+    };
+    RESIZE_OBSERVERS.with_borrow_mut(|observers| observers.insert(label.to_string(), observer));
+}
+
+/// Off macOS no window was ever watched.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn unwatch(_label: &str) {}
+
+/// Drop a closed window's resize observer. Called from the `Destroyed` arm of
+/// `on_window_event`, and the only thing that stops the notification centre
+/// holding a registration keyed on a dead window's address. Another `NSWindow`
+/// can reuse that address, and the block would then place lights on somebody
+/// else's window.
+#[cfg(target_os = "macos")]
+pub(crate) fn unwatch(label: &str) {
+    // The map is the main thread's (see [`RESIZE_OBSERVERS`]) and
+    // `on_window_event` runs there. This checks the invariant rather than
+    // taking a branch we expect.
+    if objc2::MainThreadMarker::new().is_none() {
+        eprintln!("[Tauri] Traffic-light resize observer for {label} left registered: not on the main thread");
+        return;
+    }
+    let Some(observer) = RESIZE_OBSERVERS.with_borrow_mut(|observers| observers.remove(label))
+    else {
+        return;
+    };
+    let observer: &objc2::runtime::AnyObject = observer.as_ref();
+    // SAFETY: the token is what `addObserverForName:object:queue:usingBlock:`
+    // handed back for this window, on the same centre.
+    unsafe { objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(observer) };
+}
+
+/// Move the three window buttons to `x` and centre them on a bar
+/// `bar_height_px` tall. The same shape as wry's and tao's
+/// `inset_traffic_lights`: grow `NSTitlebarContainerView` and let AppKit
+/// re-centre the buttons inside it.
+///
+/// Idempotent, which is what makes the re-apply safe to run on every event. A
+/// previous run leaves the buttons' `origin.y` and their pitch unchanged, so a
+/// second call reads the same inputs and writes the same frames.
 #[cfg(target_os = "macos")]
 fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64) {
     use objc2_app_kit::NSWindowButton;
@@ -317,7 +392,7 @@ fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64)
     // carries the cluster's vertical position: it is pinned to the window's top
     // edge, so growing it is how the buttons move DOWN.
     // SAFETY: `superview` is unsafe in the generated bindings because it is
-    // unbounded in what it can return; we only read frames off the result, and
+    // unbounded in what it can return. We only read frames off the result, and
     // we are on the main thread.
     let Some(container) = (unsafe { close.superview().and_then(|view| view.superview()) }) else {
         return;
@@ -346,19 +421,18 @@ fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64)
 mod tests {
     use super::*;
 
-    /// The probe's measured case, end to end: AppKit lays the close button out
-    /// at y 9 in a 32pt container with a 14pt frame, and a 48px bar (3rem at the
-    /// default UI scale) wants its centre at 24. Both of those come out of a
-    /// 40pt container, which is exactly what the probe read back after applying
-    /// it.
+    /// The probe's measured case, end to end. AppKit lays the close button out
+    /// at y 9 in a 32pt container with a 14pt frame. A 48px bar wants its centre
+    /// at 24. Both come out of a 40pt container, which is what the probe read
+    /// back after applying it.
     #[test]
     fn a_48px_bar_centres_the_cluster_24px_down() {
         assert_eq!(container_height(48.0, 9.0, 14.0), 40.0);
     }
 
-    /// The property the arithmetic exists for, checked by inverting it: the
-    /// cluster's centre must land on the bar's centre at every UI scale the app
-    /// supports, from the 75% minimum (a 36px bar) to the 200% maximum (96px).
+    /// The property the arithmetic exists for, checked by inverting it. The
+    /// cluster's centre must land on the bar's centre at every supported UI
+    /// scale: the 75% minimum is a 36px bar, and the 200% maximum is 96px.
     #[test]
     fn the_cluster_centres_on_the_bar_at_every_supported_scale() {
         for bar in [36.0, 48.0, 54.0, 60.0, 66.0, 72.0, 84.0, 96.0_f64] {
@@ -393,7 +467,7 @@ mod tests {
     }
 
     /// A parseable number that could only be a bug degrades the same way an
-    /// unparseable one does, rather than placing the lights somewhere the user
+    /// unparseable one does. It must not place the lights somewhere the user
     /// cannot reach them.
     #[test]
     fn an_implausible_persisted_value_degrades_to_the_default() {
@@ -462,17 +536,17 @@ mod tests {
     }
 
     /// x is a number we chose, and the CSS reserve is arithmetic on it. If it
-    /// ever moves, the fallback literal in `styles/panels/shell.css` has to move
-    /// with it -- which the CSS suite checks from the other side, by reading
+    /// ever moves, the fallback literal in `styles/panels/shell.css` has to
+    /// move with it. The CSS suite checks that from the other side by reading
     /// this file, along with the other half of the pair: the reserve's slack is
     /// split evenly, so `--titlebar-lights-gap` has to equal this.
     #[test]
     fn the_chosen_x_is_half_the_reserves_slack() {
-        // Written as the property rather than as `== 10.0`, which it implies:
-        // our x, plus the measured 60pt cluster, plus a gap the CSS holds equal
-        // to the x, is the 80px the header row has always kept clear. So a
-        // change to the x cannot be absorbed by updating an expected number
-        // here; it has to say what happened to the reserve.
+        // Written as the property rather than as `== 10.0`, which it implies.
+        // Our x, plus the measured 60pt cluster, plus a gap the CSS holds equal
+        // to the x, is the 80px the header row keeps clear. So a change to the
+        // x cannot be absorbed by updating a number here. It has to say what
+        // happened to the reserve.
         assert_eq!(LIGHTS_X_PX + 60.0 + LIGHTS_X_PX, 80.0);
     }
 }

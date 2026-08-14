@@ -1,5 +1,5 @@
 /* ───────────────────────────────────────────────────────────────────────
-   The EVENT ROW: one transcript marker for an event wait, an event wake, a
+   The EVENT ROW: one transcript marker for an event wait, an event delivery, a
    child-thread callback and a trigger fire (components/chat/EventRow.tsx,
    docs/plans/2026-08-10-one-event-row-for-the-transcript.md).
 
@@ -120,7 +120,7 @@
 /* The state as a WORD. The tint only groups it: every state stays legible as
    text, so a colourblind reader and a screen reader get the same fact the
    colour carries. One vocabulary across all four kinds, which is what makes a
-   resolved wait, a delivered wake and a child's verdict comparable at a
+   matched wait, a delivered event and a child's verdict comparable at a
    glance. */
 .event-row-state {
     display: inline-flex;
@@ -140,7 +140,7 @@
     color: var(--accent-notable);
 }
 
-/* Something arrived (a wake, a woken wait, a trigger fire). */
+/* Something arrived (a delivery, a matched wait, a trigger fire). */
 .event-row-state[data-tone="arrived"] {
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
@@ -180,9 +180,9 @@
 }
 
 /* The event-type atom. THE one way an event type is spelled in the transcript,
-   used by an event wait's subscription list, a wake's delivered event and an
-   event-fired trigger alike. It was `.event-delivery-name` while the wake was
-   its only user. */
+   used by an event wait's subscription list, a delivery's matched event and an
+   event-fired trigger alike. It was `.event-delivery-name` while the delivery
+   card was its only user. */
 .event-name {
     padding: 0.0625rem 0.375rem;
     border-radius: 0.25rem;
@@ -222,7 +222,7 @@
 
 /* In flight. The chip keeps its NAME rather than swapping in a "Opening…"
    label, because the name is a fact the row states and not a button caption:
-   replacing it would delete the answer to "what woke this thread" for as long
+   replacing it would delete the answer to "what arrived here" for as long
    as the navigation takes. Dimmed and inert instead, which says "working" while
    leaving the fact on screen. */
 .event-name-link:disabled {

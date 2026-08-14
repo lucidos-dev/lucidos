@@ -12,7 +12,7 @@
 //!   types out of the store and diff started against resolved by eye, across
 //!   the whole store rather than the thread.
 //! * **"Stop watching for that."** There was no revoke. The honest answer was
-//!   that the subscription was unrevokable and would wake the thread later
+//!   that the subscription was unrevokable and would re-open the thread later
 //!   regardless.
 //!
 //! # Scoped to the calling thread, on three legs
@@ -179,13 +179,13 @@ pub(crate) fn resolve_cancel_target(
 /// means and what to do about it.
 pub(crate) fn render_event_wait_list(waits: &[EventWaitView]) -> String {
     if waits.is_empty() {
-        return "This thread has no live subscriptions. Nothing will wake it. \
+        return "This thread has no live subscriptions. Nothing will re-open it. \
                 If you told the user you were watching for something, that is no \
                 longer true: either subscribe again with await_event, or say so."
             .to_string();
     }
     let mut text = format!(
-        "{} live subscription(s) on this thread. Each wakes it once, then is spent:\n",
+        "{} live subscription(s) on this thread. Each re-opens it once, then is spent:\n",
         waits.len()
     );
     for w in waits {
@@ -209,14 +209,14 @@ pub(crate) fn render_event_wait_list(waits: &[EventWaitView]) -> String {
 /// **A partial stop is a refusal, not a success with a caveat**, which is the
 /// whole reason this is its own function. Such a stop is one emit per
 /// subscription, so one can fail while the rest land, and a failed one is
-/// re-armed and will still wake the thread. Reporting "nothing is subscribed
+/// re-armed and will still re-open the thread. Reporting "nothing is subscribed
 /// any more" there would be precisely the lie this surface exists to stop the
 /// agent telling: it would say a watch was stood down while the watch was
 /// still running.
 ///
 /// Pure over the two lists, so every arm is testable without an engine, and
 /// keyed on what is STILL LIVE rather than on a success count, because the
-/// cache is the thing that decides whether the thread wakes. Both lists are
+/// cache is the thing that decides whether the thread is re-opened. Both lists are
 /// scoped to what the call addressed, so an `on` stop is judged on the watches
 /// for that event type and is not made to look partial by the unrelated ones it
 /// deliberately left alone.
@@ -228,14 +228,14 @@ pub(crate) fn stop_outcome(
     if still_live.len() == before.len() {
         return CancelEventWaitOutcome::Refused(
             "Error: could not record the stop. The subscriptions are still live and \
-             will still wake this thread, so tell the user they are still running."
+             will still re-open this thread, so tell the user they are still running."
                 .to_string(),
         );
     }
     if !still_live.is_empty() {
         return CancelEventWaitOutcome::Refused(format!(
             "Error: stopped {} of {}, but {} could not be recorded and {} still live \
-             and will still wake this thread: {}. Tell the user which ones are still \
+             and will still re-open this thread: {}. Tell the user which ones are still \
              running, and try again for those.",
             // Saturating because this is arithmetic on two independent reads of
             // a shared cache. Nothing can grow the set mid-call today (a thread
@@ -293,7 +293,7 @@ impl LucidosEngine {
     /// Read from the dispatcher's live cache rather than from the event store,
     /// and that is the whole point: the cache IS the set of unresolved
     /// subscriptions, rebuilt from the store at boot, so it cannot disagree
-    /// with what will actually wake the thread. Diffing `EventWaitStarted`
+    /// with what will actually re-open the thread. Diffing `EventWaitStarted`
     /// against the three resolutions by hand is what the agent was reduced to,
     /// and it got the answer wrong.
     pub(crate) async fn list_event_waits_for_thread(&self, thread_id: Uuid) -> Vec<EventWaitView> {
@@ -347,7 +347,7 @@ impl LucidosEngine {
             .await
         {
             super::CancelWaitOutcome::Canceled => CancelEventWaitOutcome::Stopped(format!(
-                "Stopped watching for {}. It will not wake this thread.",
+                "Stopped watching for {}. It will not re-open this thread.",
                 named.unwrap_or_else(|| wait_id.to_string()),
             )),
             // A `wait_id` from another thread lands here too, and deliberately
@@ -360,7 +360,7 @@ impl LucidosEngine {
             )),
             super::CancelWaitOutcome::EmitFailed => CancelEventWaitOutcome::Refused(format!(
                 "Error: could not record the stop for {wait_id}. The subscription is still \
-                 live and will still wake this thread, so tell the user it is still \
+                 live and will still re-open this thread, so tell the user it is still \
                  running rather than that you stood it down."
             )),
         }
@@ -395,7 +395,7 @@ impl LucidosEngine {
         )
         .await;
         // Re-read for the same reason `all` does: the cache is what will or
-        // will not wake this thread, and a cancel whose emit failed is put
+        // will not re-open this thread, and a cancel whose emit failed is put
         // straight back into it. Split by scope, so the ones this call was
         // never allowed to touch are counted rather than read as survivors of a
         // partial stop.
@@ -410,7 +410,7 @@ impl LucidosEngine {
         if live.is_empty() {
             return CancelEventWaitOutcome::Refused(
                 "Error: this thread has no live subscriptions, so there was nothing to \
-                 stop. Nothing was going to wake it."
+                 stop. Nothing was going to re-open it."
                     .to_string(),
             );
         }
@@ -418,7 +418,7 @@ impl LucidosEngine {
         self.cancel_event_waits_for_thread(thread_id, EventWaitCancelCause::AgentStandDown, None)
             .await;
         // What is STILL live decides the answer, not how many emits reported
-        // success: the cache is the thing that will or will not wake this
+        // success: the cache is the thing that will or will not re-open this
         // thread, and a cancel whose emit failed is put straight back into it.
         let still_live: Vec<String> = self
             .live_waits

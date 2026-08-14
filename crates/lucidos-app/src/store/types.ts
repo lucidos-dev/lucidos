@@ -279,9 +279,15 @@ export type ResponseEvent =
       /** Empty on a stop row built from a pre-2026-08-07 `EventWaitCanceled`,
        *  which carries no deadline of its own. */
       expires_at: string;
-      state: 'waiting' | 'woke' | 'timed_out' | 'canceled';
-      /** Set on `woke`: the event that matched, for the card's summary line and
-       *  its deep link into the source event. */
+      /** `matched` rather than "woke": a delivery does not require an idle
+       *  thread. `resume_from_event_wake` injects into a live turn when there is
+       *  one, and the transcript cannot tell the two lanes apart, so the word
+       *  has to be true of the SUBSCRIPTION (it matched and is spent) rather
+       *  than of the thread's prior state. See
+       *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`. */
+      state: 'waiting' | 'matched' | 'timed_out' | 'canceled';
+      /** Set on `matched`: the event that matched, for the card's summary line
+       *  and its deep link into the source event. */
       matched_event_type?: string;
       matched_event_id?: string;
       /** Set on `canceled`: how it was stopped, which is what the row's note
@@ -627,6 +633,29 @@ export interface ConfirmState {
   resolve?: (value: boolean) => void;
   extraAction?: ToastAction;
   details?: ConfirmDetails;
+  /** An ACKNOWLEDGEMENT: news the user has to read, with nothing to decide. It
+   *  drops the Cancel button, because a second button that means the same as
+   *  the first is a choice the user does not have. Escape and an outside click
+   *  still resolve, and they resolve TRUE: there is no "no" to express. */
+  acknowledge?: boolean;
+}
+
+/** A long operation the user cannot work through, narrated as a modal.
+ *
+ *  Distinct from a toast, which is for something ignorable, and from a banner,
+ *  which is for a condition the user can keep working around. This one is for
+ *  the two flows that take the workspace away and bring it back: the packaged
+ *  update install, and an engine restart or version switch.
+ *
+ *  `progress` is a 0..1 fraction where the operation has an honest one, and
+ *  null where the spinner and the message carry it instead. `cancel` is present
+ *  only while cancelling is still possible. */
+export interface ProgressDialogState {
+  visible: boolean;
+  title: string;
+  message: string;
+  progress: number | null;
+  cancel?: ToastAction;
 }
 
 export interface ConfirmDetails {

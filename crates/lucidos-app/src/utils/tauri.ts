@@ -12,7 +12,7 @@ declare global {
         currentWebview?: { label?: string };
       };
     };
-    /** Injected by the Tauri app on page load — CalVer version at build time. */
+    /** Injected by the Tauri app on page load: CalVer version at build time. */
     __LUCIDOS_APP_VERSION__?: string;
   }
 }
@@ -20,14 +20,11 @@ declare global {
 /** Invoke a Tauri command via IPC. Only call when isTauri() is true.
  *
  *  Every command goes through here, so this is where the health of the bridge
- *  itself is observed: outcomes feed `recordIpcOutcome`, which writes a durable
+ *  itself is observed. Outcomes feed `recordIpcOutcome`, which writes a durable
  *  `[Client/ipc]` line to the engine log when calls start failing and another
- *  when they recover. Individual call sites are free to keep swallowing their own
- *  rejection (`.catch(() => {})` on the heartbeat, `console.warn` in the
- *  native-push handlers) — that no longer costs us the signal, which is what let
- *  a total ACL-driven bridge failure run silently for a month. See
- *  utils/ipcHealth. The returned promise is untouched: reporting must not change
- *  what callers see. */
+ *  when they recover. A call site is therefore free to swallow its own
+ *  rejection without costing the signal. See utils/ipcHealth. The returned
+ *  promise is untouched: reporting must not change what callers see. */
 export function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return window.__TAURI_INTERNALS__!.invoke<T>(cmd, args).then(
     (value) => {
@@ -80,11 +77,11 @@ export async function getWebviewContent(): Promise<{ title: string; content: str
 
 /**
  * Tint the macOS window background to match the in-app header. Under
- * `titleBarStyle: "Overlay"` the webview paints the reclaimed title-bar band (the
- * `.titlebar-strip`); this colors the behind-the-webview fallback so that band
- * reads blue, not black, before the page paints. `color` is a CSS hex string (the
- * header-gradient top stop for the active theme). Sets the window layer only, so
- * the page background isn't tinted. Only call when isTauri() is true. */
+ * `titleBarStyle: "Overlay"` the webview paints the reclaimed title-bar band.
+ * This colors the behind-the-webview fallback, so that band reads blue rather
+ * than black before the page paints. `color` is a CSS hex string. Sets the
+ * window layer only, so the page background is untinted. Only call when
+ * isTauri() is true. */
 export function setTitlebarColor(color: string): Promise<void> {
   return invoke('set_titlebar_color', { color });
 }
@@ -102,21 +99,19 @@ export function setTrafficLightOffset(barHeightPx: number): Promise<void> {
 }
 
 /** Tell the shell this document is about to paint, so it can show the window it
- *  deliberately kept hidden at launch (lib.rs `window_ready_to_show`). Shown in
- *  `setup()` as it used to be, the window is on screen for as long as the webview
- *  takes to load, which the user sees as a frame of bare window tint before the
- *  app appears.
+ *  deliberately kept hidden at launch (lib.rs `window_ready_to_show`). Showing
+ *  it from `setup()` instead leaves it on screen while the webview loads, which
+ *  reads as a frame of bare window tint.
  *
- *  ONE-SHOT per document, which is the load-bearing part. Both callers repeat:
- *  `applyTheme` runs again on every theme toggle and system-appearance change,
- *  and re-showing a window the user has since dismissed to the menu bar would be
- *  a bug. The flag lives here rather than at either call site because the two
- *  cover different boot paths and must share one shot (see the callers).
+ *  ONE-SHOT per document, which is the load-bearing part. Both callers repeat,
+ *  and re-showing a window the user has since dismissed to the menu bar would
+ *  be a bug. The flag lives here rather than at either call site because the
+ *  two cover different boot paths and must share one shot.
  *
- *  Best-effort telemetry carve-out (.claude/rules/frontend.md): a toast would be
- *  wrong because nothing here is user-initiated, and the failure self-heals
- *  without the user doing anything, since `setup()`'s fallback timer shows the
- *  window a few seconds in regardless. Only call when isTauri() is true. */
+ *  Best-effort telemetry carve-out (.claude/rules/frontend.md): a toast would
+ *  be wrong because nothing here is user-initiated, and `setup()`'s fallback
+ *  timer shows the window a few seconds in regardless. Only call when isTauri()
+ *  is true. */
 let readyToShowSignalled = false;
 export function windowReadyToShow(): void {
   if (readyToShowSignalled) return;
@@ -127,8 +122,8 @@ export function windowReadyToShow(): void {
 /**
  * Start a native drag of the calling window. Used by `useWindowDragRegion` once
  * the pointer crosses the drag threshold over a non-interactive area of the
- * title-bar band. App command (always allowed) — replaces the ACL-blocked
- * `data-tauri-drag-region`. Best-effort; only call when isTauri() is true. */
+ * title-bar band. An app command, which is always allowed, unlike the
+ * ACL-blocked `data-tauri-drag-region`. Only call when isTauri() is true. */
 export function startWindowDrag(): Promise<void> {
   return invoke('start_window_drag');
 }
@@ -143,13 +138,13 @@ export function toggleWindowMaximize(): Promise<void> {
 
 /**
  * Show a native macOS notification banner via the app's own
- * `show_native_notification` command (notifications.rs). We drive Apple's modern
- * `UserNotifications` framework (`UNUserNotificationCenter`) in Rust — not
- * `tauri-plugin-notification` / `mac-notification-sys`, which sit on the
- * deprecated `NSUserNotification` API that no longer delivers on recent macOS —
- * and capture the tap via a delegate. `deepLink` is the SW-message shape
- * (`notification_id` /
- * `thread_id` / `event_id` / `tap`); on tap the command emits
+ * `show_native_notification` command (notifications.rs). Rust drives Apple's
+ * `UNUserNotificationCenter` and captures the tap via a delegate.
+ * `tauri-plugin-notification` and `mac-notification-sys` are not options: both
+ * sit on the deprecated `NSUserNotification` API, which no longer delivers on
+ * recent macOS.
+ *
+ * `deepLink` is the SW-message shape. On tap the command emits
  * `native-notification-tapped` with it, which the page routes through the same
  * dispatchDeepLink the web-push tap uses. Only call when isTauri() is true.
  */
@@ -170,19 +165,17 @@ export async function showNativeNotification(opts: {
 
 /**
  * Remove an already-delivered native macOS banner via the app's
- * `dismiss_native_notification` command (notifications.rs →
- * `UNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers:)`,
- * for one identifier or for the set this workspace owns, which
- * `getDeliveredNotifications` enumerates). The cross-device dismiss counterpart of
- * `showNativeNotification`: when a notification is read elsewhere, the engine
- * broadcasts `NativePushDismissRequested` and the connected desktop app removes
- * its banner. `notificationId === null` removes every delivered banner THIS
- * workspace raised (the mark-all-read path), leaving other workspaces' banners
- * on screen. `workspace` is the caller's gateway slug, the same one
- * `showNativeNotification` stamped into the link: both arms of the Rust side
- * rebuild the composite request identifier from it, so a bare id would match
- * nothing. No-op in dev / off macOS (Rust side). Only call when isTauri() is
- * true.
+ * `dismiss_native_notification` command (notifications.rs). The cross-device
+ * dismiss counterpart of `showNativeNotification`: when a notification is read
+ * elsewhere, the engine broadcasts `NativePushDismissRequested` and the
+ * connected desktop app removes its banner.
+ *
+ * `notificationId === null` removes every delivered banner THIS workspace
+ * raised, leaving other workspaces' banners on screen. `workspace` is the
+ * caller's gateway slug, the same one `showNativeNotification` stamped into the
+ * link. Both arms of the Rust side rebuild the composite request identifier
+ * from it, so a bare id would match nothing. No-op in dev and off macOS. Only
+ * call when isTauri() is true.
  */
 export async function dismissNativeNotification(opts: {
   workspace: string | null;
@@ -205,41 +198,41 @@ export async function dismissNativeNotification(opts: {
  * user completes in a browser, after which they'd otherwise be left on the
  * callback tab with Lucidos behind it.
  *
- * The window it fronts is the calling page's, never `main`. The command used to
- * be `focus_main_window` and reshowed `main` specifically (creating one if it
- * was gone), which raised the wrong window whenever the flow was finished from a
- * New Window or a second workspace. Not a general "focus me" the page may call
- * freely: a window that fronts itself on a background event is a nuisance, so
- * keep callers to "this page started it, the user clicked seconds ago, fires
- * once". Best-effort: errors are swallowed (there is no window to front on a
- * failed IPC, and the connection itself already succeeded). Only call when
- * isTauri() is true. */
+ * The window it fronts is the calling page's, never `main`: fronting `main`
+ * raises the wrong window whenever the flow finishes from a New Window or a
+ * second workspace.
+ *
+ * Not a general "focus me" the page may call freely. A window that fronts
+ * itself on a background event is a nuisance. Keep callers to "this page
+ * started it, the user clicked seconds ago, fires once". Errors are swallowed:
+ * there is no window to front on a failed IPC, and the connection itself
+ * already succeeded. Only call when isTauri() is true. */
 export function focusCallingWindow(): void {
   invoke('focus_calling_window').catch(() => {});
 }
 
 /**
  * Wake the native unread-indicator loop for an immediate recompute (Rust
- * `nudge_dock_badge` command, whose name predates the tray surface). The page
- * calls this from its notification SSE handler so the macOS count updates the
- * instant a notification is read, in-app or from another device, instead of
- * waiting for the desktop poll. The recompute writes the menu-bar tray title
- * always, and the dock badge as well while a client window is open; it reads the
- * gateway's fresh `unread-total` aggregate, so this carries no count.
- * Best-effort: errors are swallowed (neither surface exists in dev / non-macOS).
- * Only call when isTauri() is true. */
+ * `nudge_dock_badge`). The page calls this from its notification SSE handler.
+ * The macOS count then updates the instant a notification is read, rather than
+ * waiting for the desktop poll.
+ *
+ * The recompute always writes the menu-bar tray title, and the dock badge too
+ * while a client window is open. It reads the gateway's fresh `unread-total`
+ * aggregate, so this carries no count. Errors are swallowed, since neither
+ * surface exists in dev or off macOS. Only call when isTauri() is true. */
 export function nudgeDockBadge(): void {
   invoke('nudge_dock_badge').catch(() => {});
 }
 
 /**
- * Report whether the native main window is currently *active* — focused AND
- * on-screen (visible, not minimized) — read live from AppKit by the Rust
- * `get_native_window_active` command. The page pulls this at startup to SEED its
- * `native-window-active` cache before registering the event listener, because
- * Tauri doesn't replay the transition events to a late-registering listener and
- * the cache defaults to `true` (see utils/nativeWindow.ts). Only call when
- * isTauri() is true. */
+ * Report whether the native main window is currently ACTIVE: focused and
+ * on-screen, read live from AppKit by the Rust `get_native_window_active`.
+ *
+ * The page pulls this at startup to SEED its `native-window-active` cache
+ * before registering the event listener. Tauri does not replay the transition
+ * events to a late-registering listener, and the cache defaults to `true` (see
+ * utils/nativeWindow.ts). Only call when isTauri() is true. */
 export function getNativeWindowActive(): Promise<boolean> {
   return invoke<boolean>('get_native_window_active');
 }
@@ -297,12 +290,12 @@ export function checkAppUpdate(): Promise<AppUpdateOffer | null> {
   return invoke<AppUpdateOffer | null>('check_app_update');
 }
 
-/** Install the available packaged update and restart the WHOLE stack — the
- *  launchd background service (gateway + engines + embedded Postgres) AND the GUI
- *  client — onto the new version. On success the client re-execs and this promise
- *  never resolves; it rejects with a string error otherwise (no update, download
- *  failure). Progress arrives out-of-band on {@link APP_UPDATE_PROGRESS_EVENT} —
- *  this promise says nothing until it is over. Only call when isTauri() is true. */
+/** Install the available packaged update and restart the WHOLE stack onto the
+ *  new version: the launchd background service and the GUI client. On success
+ *  the client re-execs and this promise never resolves. Otherwise it rejects
+ *  with a string error. Progress arrives out-of-band on
+ *  {@link APP_UPDATE_PROGRESS_EVENT}, so this promise says nothing until it is
+ *  over. Only call when isTauri() is true. */
 export function installAppUpdateAndRestart(): Promise<void> {
   return invoke('install_app_update_and_restart');
 }
@@ -314,11 +307,10 @@ export const APP_UPDATE_PROGRESS_EVENT = 'app-update-progress';
 /** Where a packaged update run currently is — the TypeScript mirror of Rust's
  *  `AppUpdatePhase` (`src/updater.rs`), serialized internally-tagged on `phase`.
  *
- *  A discriminated union rather than a bare string so the phase's data travels
- *  with it (only `downloading` has byte counts, only `failed` has a message) and
- *  `tsc` forces every consumer to handle every phase. `total` is null when the
- *  server declared no `Content-Length`: there is then no honest percentage, and
- *  the UI must show bytes alone rather than invent one. */
+ *  A discriminated union rather than a bare string, so the phase's data travels
+ *  with it and `tsc` forces every consumer to handle every phase. `total` is
+ *  null when the server declared no `Content-Length`. There is then no honest
+ *  percentage, and the UI must show bytes alone rather than invent one. */
 interface AppUpdateFrame {
   /** The version being installed; null until the check resolves one. */
   version: string | null;
@@ -335,10 +327,9 @@ export type AppUpdateProgress =
   | (AppUpdateFrame & { phase: 'failed'; message: string })
   /** The install left no runnable app behind: the swap destroyed the old bundle
    *  without landing the new one. Its own phase rather than a longer `failed`
-   *  message, because the two need different handling and not just different
-   *  wording: `failed` is retryable and this is not, the recovery is a reinstall
-   *  from the .dmg, and the page must not re-offer the update. Rust's
-   *  `AppUpdatePhase::BundleSwapFailed`, raised from both install outcomes. */
+   *  message, because the two need different handling. `failed` is retryable
+   *  and this is not: the recovery is a reinstall from the .dmg, and the page
+   *  must not re-offer the update. */
   | (AppUpdateFrame & { phase: 'bundle-swap-failed'; message: string });
 
 /** A frame describing a run still IN FLIGHT. `cancelled`, `failed` and
@@ -363,11 +354,9 @@ export function cancelAppUpdate(): Promise<void> {
 /** This Mac's Tailscale setup, as two INDEPENDENT facts (mirror of the Rust
  *  `TailscaleInfo`).
  *
- *  Tailnet state (`on_tailnet` / `tailnet_ip` / `magic_dns_name` / `serve_url`)
- *  is read from the machine itself with no CLI. `cli_available` gates the action
- *  buttons and nothing else: a Mac whose Tailscale works but has no CLI still
- *  gets described accurately, which before the split rendered as a Sign in
- *  button that could not work. */
+ *  Tailnet state is read from the machine itself with no CLI. `cli_available`
+ *  gates the action buttons and nothing else, so a Mac whose Tailscale works
+ *  but has no CLI is still described accurately. */
 export interface TailscaleInfo {
   /** Tailscale is present at all (app bundle or CLI). Drives "Get Tailscale",
    *  so it deliberately does NOT mean "usable". */
@@ -386,10 +375,9 @@ export interface TailscaleInfo {
   cli_available: boolean;
 }
 
-/** localhost / LAN / Tailscale connect URLs for the engine (mirror of the Rust
- *  `ConnectInfo`). The LAN URL is derived client-side from `lan_ip` + `port` +
- *  the gateway bind (`getNetworkConfig().gateway_bind`) — see
- *  `MobileAccessPage.tsx::lanRowState`. */
+/** localhost, LAN and Tailscale connect URLs for the engine (mirror of the Rust
+ *  `ConnectInfo`). The LAN URL is derived client-side from `lan_ip`, `port` and
+ *  the gateway bind: see `MobileAccessPage.tsx::lanRowState`. */
 export interface ConnectInfo {
   port: number;
   localhost_url: string;
@@ -399,11 +387,11 @@ export interface ConnectInfo {
 
 /** Open a URL in the system default browser (not the embedded webview).
  *
- *  Rejects when the OS launcher could not be STARTED (`open` / `xdg-open` /
- *  `rundll32` missing or unspawnable), so callers owe the user a toast. It does
- *  NOT reject for a launcher that starts and then fails, e.g. no application
- *  registered for the scheme: the child is fire-and-forget on the Rust side, for
- *  the reason spelled out on `open_in_default_browser` in `src/lib.rs`.
+ *  Rejects when the OS launcher could not be STARTED, so callers owe the user a
+ *  toast. It does NOT reject for a launcher that starts and then fails, such as
+ *  no application registered for the scheme: the child is fire-and-forget on
+ *  the Rust side, for the reason `open_in_default_browser` in `src/lib.rs`
+ *  spells out.
  *
  *  Only call when isTauri() is true. */
 export function openExternal(url: string): Promise<void> {
@@ -425,10 +413,10 @@ export function tailscaleUp(authKey?: string): Promise<void> {
 /** Expose the engine over the tailnet (`tailscale serve`), returning the
  *  `…ts.net` URL. Rejects with a string error. Only call when isTauri() is true.
  *
- *  Resolves only when the whole run is OVER, and a run legitimately waits minutes
- *  for a tailnet approval. Everything the user sees in between arrives on
- *  {@link TAILSCALE_SERVE_PROGRESS_EVENT}. Awaiting it silently is exactly what
- *  made the button look dead. */
+ *  Resolves only when the whole run is OVER, and a run legitimately waits
+ *  minutes for a tailnet approval. Everything the user sees in between arrives
+ *  on {@link TAILSCALE_SERVE_PROGRESS_EVENT}. Await it silently and the button
+ *  looks dead. */
 export function tailscaleServe(): Promise<string> {
   return invoke<string>('tailscale_serve');
 }
@@ -448,11 +436,10 @@ export const TAILSCALE_SERVE_PROGRESS_EVENT = 'tailscale-serve-progress';
 /** Where an Expose run currently is: the TypeScript mirror of Rust's `ServePhase`
  *  (`src/mobile.rs`), serialized internally-tagged on `phase`.
  *
- *  A discriminated union rather than a bare string, for the same two reasons the
- *  updater's is one: the phase's data travels with it (only the approval phase
- *  has a URL, only `done` has one, only `failed` has a message), and `tsc` forces
- *  every consumer to handle every phase, so a variant added in Rust cannot render
- *  as a blank line here.
+ *  A discriminated union rather than a bare string, for the same two reasons
+ *  the updater's is one. The phase's data travels with it. And `tsc` forces
+ *  every consumer to handle every phase, so a variant added in Rust cannot
+ *  render as a blank line here.
  *
  *  No phase carries a fraction, deliberately: not one step of this flow can
  *  honestly report one, so the surface spins rather than inventing a bar. */
@@ -463,10 +450,10 @@ export type TailscaleServeProgress =
   | { phase: 'checking-tailnet' }
   /** `tailscale serve` is running. */
   | { phase: 'configuring' }
-  /** Serve is not enabled on this tailnet, and the CLI is waiting for someone to
-   *  approve it in a browser. `url` is the link IT printed (the node id in it is
-   *  not reconstructable, and Rust has already checked it is an HTTPS Tailscale
-   *  URL before offering it). The run keeps waiting and finishes by itself. */
+  /** Serve is not enabled on this tailnet, and the CLI is waiting for someone
+   *  to approve it in a browser. `url` is the link IT printed: the node id in
+   *  it is not reconstructable, and Rust has already checked it is an HTTPS
+   *  Tailscale URL. The run keeps waiting and finishes by itself. */
   | { phase: 'awaiting-tailnet-approval'; url: string }
   /** Configured; waiting for something to answer on 443 (a first-run certificate
    *  takes a moment). */
@@ -490,19 +477,15 @@ export function currentWindowLabel(): string | null {
  * **The registered target is load-bearing, and `Any` is a trap.** Tauri's
  * dispatch does `*listener_target == EventTarget::Any || filter(target)`
  * (`match_any_or_filter` in tauri's `event/listener.rs`), so a listener
- * registered as `Any` matches **unconditionally** and receives every
- * `emit_to(other_label, ...)` in the process. Every listener here used to
- * register that way, which silently defeated all three of the app's targeted
- * emits: `native-window-active` (each window's focus state overwrote every other
- * window's cache, so a backgrounded window reported itself ACTIVE and the engine
- * suppressed its workspace's push into an invisible in-app toast),
- * `native-notification-tapped`, and the `panel-*` panel-preview events.
+ * registered as `Any` matches unconditionally and receives every
+ * `emit_to(other_label, ...)` in the process. That defeats all three of the
+ * app's targeted emits: `native-window-active`, `native-notification-tapped`,
+ * and the `panel-*` panel-preview events.
  *
- * Registering as `AnyLabel` instead costs nothing on the broadcast path: a
+ * Registering as `AnyLabel` instead costs nothing on the broadcast path. A
  * plain `app.emit(...)` dispatches with no filter, which that same expression
- * passes, so the app-update and tailscale-serve progress streams still arrive.
- * Falls back to `Any` when the label can't be read, i.e. the previous behaviour
- * rather than a listener that hears nothing.
+ * passes, so the progress streams still arrive. Falls back to `Any` when the
+ * label cannot be read, rather than to a listener that hears nothing.
  */
 export function listen<T>(event: string, handler: (e: { payload: T }) => void): Promise<() => void> {
   const internals = window.__TAURI_INTERNALS__!;

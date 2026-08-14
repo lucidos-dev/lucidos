@@ -7,6 +7,30 @@ const LUCIDOS_HOOKS_PATH: &str = ".lucidos/git-hooks";
 const LUCIDOS_POST_COMMIT_HOOK: &str = "post-commit";
 const LUCIDOS_CHAIN_MARKER: &str = "# lucidos-chain-hook: ";
 
+/// How many hex chars of a thread id go into an engine-generated name. Two
+/// names carry it and they must agree: the worktree directory
+/// `thread-<short>` and the `<short>` segment of the thread's branch
+/// (`branch_name::coding_agent_branch_base`). One constant so a branch and its
+/// worktree always show the same id, and reading one tells you the other.
+///
+/// 8 hex is for legibility, not for collision resistance: uniqueness comes
+/// from the thread id itself, and the full id is recorded in the
+/// `CodingAgentIdled` payload for unambiguous lookup.
+pub(crate) const SHORT_THREAD_ID_LEN: usize = 8;
+
+/// The [`SHORT_THREAD_ID_LEN`]-char prefix of a thread id, lowercase hex.
+///
+/// `chars().take` rather than a byte slice: the rule is that a uuid's
+/// ASCII-ness should not be what keeps an index from panicking.
+pub(crate) fn short_thread_id(thread_id: uuid::Uuid) -> String {
+    thread_id
+        .as_simple()
+        .to_string()
+        .chars()
+        .take(SHORT_THREAD_ID_LEN)
+        .collect()
+}
+
 /// Return the persistent directory for CC worktrees: `<workspace>/.lucidos/worktrees/`.
 /// Creates the directory if it doesn't exist.
 pub(crate) fn worktrees_dir(workspace_path: &Path) -> PathBuf {

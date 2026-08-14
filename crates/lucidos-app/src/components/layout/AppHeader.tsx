@@ -10,6 +10,7 @@ import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions
 import { focusPromptNow } from '../chat/promptFocus';
 import { MobileAppHeader } from './MobileAppHeader';
 import { BackupReminderBanner } from './BackupReminderBanner';
+import { ConnectionBanner } from './ConnectionBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -335,53 +336,58 @@ export function AppHeader() {
                 mobile headers: the chevrons bracket the title rather than
                 sitting in the leading cluster, so history reads as belonging to
                 what is on screen. The title is the group's one shrinking
-                member, and the group is a FIXED SPAN, so the chevrons hold
-                their places as the user navigates between destinations with
-                wildly different title lengths. */}
+                member, and the group is a FIXED SPAN centred on the row, so the
+                chevrons hold their places as the user navigates between
+                destinations with wildly different title lengths AND between
+                views whose trailing action clusters differ in width. */}
             <span class="pane-header-content-title">
-              <span class="header-title-span">
-                <ContentBackButton />
-                {showContentTitle && (
-                  showUrlPreview && editingUrl ? (
-                    <input
-                      ref={urlInputRef}
-                      class="panel-url-input"
-                      type="text"
-                      value={urlDraft}
-                      onInput={(e) => setUrlDraft((e.target as HTMLInputElement).value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') submitUrl();
-                        if (e.key === 'Escape') cancelEditingUrl();
-                      }}
-                      onBlur={cancelEditingUrl}
-                    />
-                  ) : showUrlPreview ? (
-                    <span
-                      class="panel-url-title"
-                      onClick={startEditingUrl}
-                      data-tooltip={url!}
-                    >
-                      {headerTitle}
-                    </span>
-                  ) : (
-                    <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
-                  )
-                )}
-                <ContentForwardButton />
-              </span>
+              <ContentBackButton />
+              {showContentTitle && (
+                showUrlPreview && editingUrl ? (
+                  <input
+                    ref={urlInputRef}
+                    class="panel-url-input"
+                    type="text"
+                    value={urlDraft}
+                    onInput={(e) => setUrlDraft((e.target as HTMLInputElement).value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') submitUrl();
+                      if (e.key === 'Escape') cancelEditingUrl();
+                    }}
+                    onBlur={cancelEditingUrl}
+                  />
+                ) : showUrlPreview ? (
+                  <span
+                    class="panel-url-title"
+                    onClick={startEditingUrl}
+                    data-tooltip={url!}
+                  >
+                    {headerTitle}
+                  </span>
+                ) : (
+                  <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
+                )
+              )}
+              <ContentForwardButton />
             </span>
             <ContentHeaderActions layout="desktop" />
           </div>
         </div>
 
-        {/* Mobile's backup reminder lives INSIDE the header, because the mobile
+        {/* Mobile's app-shell banners live INSIDE the header, because the mobile
             header is position:fixed and a sibling in the shell's flow would sit
-            behind it. As a header child it rides along for free: useHideOnScroll
-            observes this element's border box, so --mobile-header-height grows to
-            include the bar, and with it the mobile --app-header-bottom and every
-            pane's ::before spacer. It also hides and returns with the header on
-            scroll, which is right for chrome. The desktop copy is a flow sibling
-            in App.tsx; each renders only under its own viewport. */}
+            behind it. As header children they ride along for free:
+            useHideOnScroll observes this element's border box, so
+            --mobile-header-height grows to include them, and with it the mobile
+            --app-header-bottom and every pane's ::before spacer. They also hide
+            and return with the header on scroll, which is right for chrome. The
+            desktop copies are flow siblings in App.tsx; each renders only under
+            its own viewport.
+
+            This is also the phone's ONLY reading of the connection state in
+            words: the mark carries it as strength and motion, and `data-tooltip`
+            is a desktop-only surface. */}
+        <ConnectionBanner layout="mobile" />
         <BackupReminderBanner layout="mobile" />
       </header>
     </>

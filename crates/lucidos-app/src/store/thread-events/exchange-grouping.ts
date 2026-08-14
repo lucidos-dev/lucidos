@@ -50,17 +50,11 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
     });
   }
 
-  // Fast path: when every pending message sorts strictly after the last folded
-  // real event — ALWAYS true for chat (synthetic seqs are MAX_SAFE_INTEGER-based
-  // and chat synthetics carry no `created`, so the sort falls to seq) and the
-  // normal case for CC (pending.created is "now", after every persisted event) —
-  // the augmented fold is exactly the cached real-event fold with one fresh
-  // trailing exchange per pending message. Reuse the incremental cache and append
-  // instead of copying the whole events Map + re-sorting + re-folding the entire
-  // history on EVERY send and EVERY streamed token while the optimistic pending
-  // row is live (the "sending lags on a big thread" cost). Checking only the
-  // earliest pending (smallest seq, earliest send) suffices: later pending
-  // messages have strictly larger seqs and same-or-later timestamps.
+  // Fast path. When every pending message sorts after the last folded real
+  // event, the augmented fold is the cached fold plus one trailing exchange per
+  // pending message. So append, rather than re-fold the whole history on every
+  // send and every streamed token. Checking only the earliest pending suffices:
+  // later ones have strictly larger seqs and same-or-later timestamps.
   const base = groupIntoExchangesCached(thread.events);
   const cache = incrementalCache.get(thread.events);
   const first = synthetic[0];
@@ -105,15 +99,9 @@ function filterRemovedQueuedExchanges(
   });
 }
 
-/** Event types that begin a new exchange in the timeline. Includes user-initiated
- *  events (MessageReceived, UserPromptInjected), system-initiated events that
- *  spawn a fresh round of work (engine restart, auto-hardening, auto-merge),
- *  the abort/resume boundary pair, change lifecycle events
- *  (apply/discard/revert/fail), the ActionRequired family
- *  (UserQuestionAsked, CodingAgentPermissionRequest, CredentialRequested,
- *  McpConsentRequested) — each agent pause is its own auditable boundary with
- *  an actor, not a step inside the prior agent response — and ChildThreadCompleted
- *  where a sidequest result lands in the parent as a rich card.
+/** Event types that begin a new exchange in the timeline. Each agent pause is
+ *  its own auditable boundary with an actor, never a step inside the prior
+ *  agent response.
  *
  *  One boundary is decided by the EVENT rather than by its type and so is not
  *  in this set: see `isExchangeStartEvent`. */
@@ -142,37 +130,28 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
 /** Whether this event opens a new exchange. Takes the EVENT, not its type,
  *  because one boundary cannot be decided from the type alone.
  *
- *  `EventWaitCanceled` is a step for every cause but one. A **user stop** is a
- *  person doing something to the thread at a moment, and it is the one
- *  resolution with no wake, so nothing else in the transcript reports it: left
- *  as a step it either landed inside whatever turn happened to be current or,
- *  worse, rewrote the arming row hours above where the user was reading, which
- *  is what it did until 2026-08-07. As a boundary it reads like the Stop and
- *  Restart turns it belongs with, iconless with the device in its origin
- *  popover. Nothing resumes out of it, so no seamless-resume invariant is at
- *  stake (which is exactly why the park itself is still never a boundary). */
+ *  `EventWaitCanceled` is a step for every cause but one. A user stop is the one
+ *  resolution with no wake, so nothing else in the transcript reports it. Left
+ *  as a step it lands inside whatever turn is current, or rewrites the arming
+ *  row far above where the user is reading. As a boundary it reads like the Stop
+ *  and Restart turns it belongs with. Nothing resumes out of it, which is why
+ *  the park itself is still never a boundary. */
 export function isExchangeStartEvent(event: { type: string; cause?: string }): boolean {
   if (event.type === 'EventWaitCanceled') return isUserStoppedWait(event);
   return EXCHANGE_START_TYPES.has(event.type);
 }
 
-/** True when `exchange` is a divider still PARKED awaiting a user action — its
- *  resolution (answer / grant) hasn't landed as a step yet.
+/** True when `exchange` is a divider still PARKED awaiting a user action: its
+ *  resolution (answer / grant) has not landed as a step yet.
  *
- *  A parked divider owns its own post-resolution continuation (the resolution
- *  and the agent's reply route back to it by id), so a `ChildThreadCompleted`
- *  landing while it waits must NOT steal the request-id redirect away — the
- *  reply belongs with the card the user is answering, not below an unrelated
- *  child completion. Ordering is handled the other way round: when the
- *  resolution lands, `reanchorResolvedDivider` moves the DIVIDER below that
- *  boundary, so the reply stays with its card AND still reads last.
+ *  A parked divider owns its own post-resolution continuation, so a
+ *  `ChildThreadCompleted` landing while it waits must NOT steal the request-id
+ *  redirect away. Ordering is handled the other way round: when the resolution
+ *  lands, `reanchorResolvedDivider` moves the DIVIDER below that boundary.
  *
- *  The check is on the divider's STATE, not just its type: once resolved, the
- *  turn is an ordinary in-flight response again and a child completion must
- *  advance the redirect like any other (otherwise the post-completion work
- *  routes back up into the answered card while the stepless completion card
- *  sits last spinning 'Requesting' — the same stuck-looking thread, reached by
- *  the child finishing AFTER the answer instead of before it).
+ *  The check is on the divider's STATE, not just its type. Once resolved, the
+ *  turn is an ordinary in-flight response again, and a child completion must
+ *  advance the redirect like any other.
  *
  *  `CredentialRequested` / `McpConsentRequested` have no resolution event in the
  *  ThreadEvent union, so they can never be observed as resolved and stay parked.
@@ -203,47 +182,32 @@ function dividerStillAwaitsUser(exchange: Exchange): boolean {
 }
 
 /** Pure bookkeeping metadata events that belong to no exchange. Without this
- *  filter, such an event arriving after a boundary started a new (still-empty)
- *  exchange leaks into that exchange's steps via the `current.steps.push`
- *  fallthrough — breaking the absorbed-UPI single-step shape that
- *  exchangeStatus relies on to short-circuit to 'done', and on a CC thread
- *  flipping a trailing child-completion row to a phantom
- *  'coding-agent-working' (real thread 276f5580: a background `WorktreeCleaned`
- *  landed in the `ChildThreadCompleted` exchange an hour after the thread
- *  idled, so the UI showed "Working" forever — persisting across reloads since
- *  grouping is deterministic from the event history).
+ *  filter, such an event leaks into the new, still-empty exchange a boundary
+ *  just started, via the `current.steps.push` fallthrough. That breaks the
+ *  single-step shape `exchangeStatus` short-circuits on. It also flips a
+ *  trailing CC child-completion row to a phantom 'coding-agent-working' that
+ *  survives reloads, grouping being deterministic from the event history.
  *
- *  Two sources, unioned: every `Thread*` metadata event — derived from
- *  EVENT_CLASSIFICATION so a new one added in Rust is picked up without an edit
- *  (ThreadArchived is excluded automatically: the contract classifies it
- *  terminal, not metadata) — plus the non-`Thread`-prefixed pure-bookkeeping
- *  events that also render nothing and must never count as a step.
+ *  Two sources, unioned. Every `Thread*` metadata event, derived from
+ *  EVENT_CLASSIFICATION so a new one added in Rust needs no edit here.
+ *  ThreadArchived is excluded automatically, the contract classifying it
+ *  terminal. Plus the non-`Thread`-prefixed bookkeeping events that render
+ *  nothing and must never count as a step.
  *
  *  **The bar for the explicit list is that NOTHING which reads an exchange's
- *  steps may depend on the event.** Not rendering is necessary but not
- *  sufficient: membership drops the event out of `steps` entirely, so any
- *  consumer walking them loses it. `CodingAgentSettingsChanged` is the standing
- *  example of a metadata event that must stay OUT for the second reason rather
- *  than the first: it draws nothing itself, but `ccFieldFromExchange`
- *  (exchange.ts) reads it out of the steps for the model and reasoning effort
- *  the response header reports.
- *
- *  `BackgroundBashStarted` / `BackgroundBashCompleted` were named here as
- *  examples of metadata events that "DO render a panel". They do not: neither
- *  has a render case anywhere in the frontend (they appear only in the
- *  `ThreadEvent` union, the generated classification table, an artifact-refresh
- *  branch in actions/thread-sync.ts, and tests). Whether they belong in this set
- *  is therefore an open question with grouping consequences, not a settled no.
- *  `thread-flows-event-wait.test.ts` currently pins `BackgroundBashStarted` as a
- *  step of the turn that spawned it, so answering it means deciding that case
- *  too; the comment was corrected on 2026-08-10 without touching membership. */
+ *  steps may depend on the event.** Membership drops it out of `steps`
+ *  entirely. `CodingAgentSettingsChanged` stays OUT for exactly that reason: it
+ *  draws nothing, but `ccFieldFromExchange` (exchange.ts) reads it out of the
+ *  steps for the model and effort the response header reports. Whether
+ *  `BackgroundBash*` belong here is open; `thread-flows-event-wait.test.ts`
+ *  pins `BackgroundBashStarted` as a step of the turn that spawned it. */
 const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   ...Object.entries(EVENT_CLASSIFICATION)
     .filter(([evt, cls]) => cls === 'metadata' && evt.startsWith('Thread'))
     .map(([evt]) => evt),
   'QueuedMessageRemoved',
-  // Background worktree-cleanup bookkeeping — emitted as EventClass::Metadata
-  // by worktree_cleanup.rs, but not `Thread`-prefixed and with no render case.
+  // Background worktree-cleanup bookkeeping: EventClass::Metadata in
+  // worktree_cleanup.rs, but not `Thread`-prefixed and with no render case.
   'WorktreeCleaned',
 ]);
 
@@ -263,17 +227,17 @@ export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
 /** Find an existing exchange to absorb `event` into instead of starting a new one.
  *
  *  Two convergent paths:
- *  1. Engine resume note — UPI emitted by chat/rerun.rs right after ContinuationStarted
- *     belongs as a step under the resume initiator. A Human-mode UPI in the same
- *     position is a real correction and stays its own exchange.
- *  2. Mid-flight injection — chat fast-path emits MessageReceived first (with the
- *     client UUID) then sends the injection; the agentic loop later emits UPI
- *     carrying that UUID in `injected_message_id`. Without absorption the user
- *     sees a duplicate "Auto-prompt sent" panel below their own message.
+ *  1. Engine resume note. A UPI emitted by chat/rerun.rs right after
+ *     ContinuationStarted belongs as a step under the resume initiator. A
+ *     Human-mode UPI in the same position is a real correction and stays its
+ *     own exchange.
+ *  2. Mid-flight injection. The chat fast path emits MessageReceived first with
+ *     the client UUID, then sends the injection. The agentic loop later emits a
+ *     UPI carrying that UUID in `injected_message_id`.
  *
  *  Returns null when the event is not absorbable, or when an injection's partner
- *  is missing — the caller falls back to starting a new exchange so the UPI still
- *  renders rather than vanishing. */
+ *  is missing. The caller then starts a new exchange, so the UPI still renders
+ *  rather than vanishing. */
 function findAbsorbTarget(
   current: Exchange | null,
   exchanges: Exchange[],
@@ -294,28 +258,28 @@ function findAbsorbTarget(
 }
 
 /** Chat-loop events whose `request_event_id` should route them to their
- *  originating exchange. Excludes `CodingAgent*` because CC reuses one session
- *  across many follow-ups and never re-anchors the field — routing CC events
- *  by request id would push every follow-up's work back into the first MR.
+ *  originating exchange. `CodingAgent*` is excluded, since CC reuses one
+ *  session across many follow-ups and never re-anchors the field. Routing by
+ *  request id would push every follow-up's work back into the first MR.
  *
- *  Response* events are dual-purpose (chat AND CC emit them). For CC they
- *  carry the session's persistent req_id (same reason CodingAgent* events do),
- *  so they're filtered out by `shouldRouteByRequestId` when channel is CC.
+ *  Response* events are dual-purpose, chat and CC both emitting them. For CC
+ *  they carry the session's persistent req_id, so `shouldRouteByRequestId`
+ *  filters them out when the channel is CC.
  *
- *  Every event the chat agentic loop stamps with `meta.request_event_id` must
- *  appear here — anything missing falls through to the `current` pointer in
- *  `groupIntoExchanges` and silently leaks into a follow-up MR's empty
- *  exchange when the loop's events arrive after the follow-up was emitted.
- *  That leak flips `exchangeStatus` to 'aborted' for the follow-up via the
- *  `threadIdle && hasSteps && !isComplete` branch — observed on real thread
- *  9b5a05aa (a stray ContextAssembled) and again on ad178d6a where the current
- *  `ContextCaptured` landed in the empty follow-up exchange, flashing 'Aborted'
- *  before the follow-up's own events arrived and flipped it to 'Working'.
- *  `ContextCaptured` is the live event; `ContextAssembled` /
- *  `ContextTokensMeasured` are its retired predecessors, kept here so legacy
- *  DB rows route the same way (the render switch still handles all three). */
+ *  **Every event the chat agentic loop stamps with `meta.request_event_id` must
+ *  appear here.** Anything missing falls through to the `current` pointer. It
+ *  then leaks into a follow-up MR's empty exchange whenever the loop's events
+ *  arrive after the follow-up. That leak flips `exchangeStatus` to 'aborted'
+ *  for the follow-up.
+ *
+ *  `ContextCaptured` is the live event. `ContextAssembled` and
+ *  `ContextTokensMeasured` are its retired predecessors, kept so legacy DB rows
+ *  route the same way. `MemorySearched` is `MemoryRecalled`'s retired name and
+ *  is kept for the same reason: the snapshot endpoint serves the raw
+ *  `event_type` column, so the serde alias never reaches this list. */
 const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
   'ThoughtStreamed',
+  'MemoryRecalled',
   'MemorySearched',
   'ContextCaptured',
   'ContextAssembled',
@@ -328,12 +292,9 @@ const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
   'ResponseAborted',
   'ResponseFailed',
   // Command-guard checkpoint (ADR 0002, Phase 4). Both carry the turn's
-  // request_event_id — the checkpoint is emitted mid-turn; the revert is
-  // emitted later (at undo time) but is stamped with the ORIGINAL turn's
-  // request_event_id, so routing by it lands the revert back in the
-  // checkpoint's exchange (the card then renders reverted, live and on reload).
-  // Without this it would leak into the latest exchange via the `current`
-  // pointer and the card would never flip.
+  // request_event_id. The revert is emitted at undo time, long after, yet
+  // carries the ORIGINAL turn's id. Routing by it lands the revert back in
+  // the checkpoint's exchange, so the card renders reverted.
   'CommandCheckpointed',
   'CommandCheckpointReverted',
 ]);
@@ -341,14 +302,11 @@ const REQUEST_ID_ROUTED_TYPES: ReadonlySet<string> = new Set([
 /** Skip req_id routing for Response* terminals AND context snapshots when their
  *  channel is CC: the session's persistent meta carries the original MR's
  *  req_id for the entire session. Routing Response* back by id would push a
- *  mid-flight cancel/abort to the original exchange instead of terminating the
- *  active follow-up. Routing context snapshots (ContextCaptured and its retired
- *  predecessors) back by id pulls a post-apply continuation's snapshots out
- *  from between the change banners and up to the first message — the same
- *  reason CodingAgent* events are excluded from the routed set entirely (real
- *  thread 76b4ee76: a CC session applied a change, kept working under the same
- *  req_id, and its second turn vanished from the timeline). Keep them
- *  chronological (folded into `current`) on CC threads. */
+ *  mid-flight cancel or abort to the original exchange, instead of terminating
+ *  the active follow-up. Routing context snapshots back by id pulls a
+ *  post-apply continuation's snapshots up to the first message, out from
+ *  between the change banners. Keep them chronological on CC threads, folded
+ *  into `current`. */
 function shouldRouteByRequestId(event: StoredEvent): boolean {
   if (!REQUEST_ID_ROUTED_TYPES.has(event.type)) return false;
   switch (event.type) {
@@ -367,9 +325,9 @@ function shouldRouteByRequestId(event: StoredEvent): boolean {
   }
 }
 
-/** Read `request_event_id` from any event payload. The field is added to the
- *  wire payload by Rust's `EventMeta::apply()` regardless of the event type,
- *  so the cast is honest about what arrives at runtime. */
+/** Read `request_event_id` from any event payload. Rust's `EventMeta::apply()`
+ *  adds the field whatever the event type, so the cast is honest about what
+ *  arrives at runtime. */
 function requestEventIdOf(event: { type: string }): string | undefined {
   return (event as { request_event_id?: string }).request_event_id;
 }
@@ -405,28 +363,26 @@ export function sortEventsChronologically(
     .map(([seq, event]) => ({ seq, event }));
 }
 
-/** Event types whose appearance as a step of a `UserQuestionAsked` divider
- *  exchange (without a matching `UserQuestionAnswered`) means the agent has
- *  raced past the question and the QuestionCard's buttons should disable.
- *  Mirrors the Rust `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` constant
- *  (see `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`).
+/** Event types that, as a step of an unanswered `UserQuestionAsked` divider,
+ *  mean the agent has raced past the question. The QuestionCard's buttons then
+ *  disable. Mirrors the Rust `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`
+ *  constant (see
+ *  `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`).
  *
- *  Keep both lists in sync. One question, four gates now hang off them:
- *  server-side, the engine constant gates typed-text routing (a follow-up
- *  becomes a fresh message instead of a `FreeText` answer) and, unioned with
- *  three extras, the restart preserve guard (`unanswered_question_exists_sql`);
- *  client-side, this set gates the click-button affordance AND whether
- *  `exchangeStatus` may still read "Needs your answer" (via the
- *  `questionOvertaken` flag it sets below). They must agree: a card whose
- *  buttons are dead must not be labelled answerable, and a thread whose card is
- *  dead must not be preserved as a resumable checkpoint. */
+ *  **Keep both lists in sync.** Four gates hang off them. Server-side, the
+ *  engine constant gates typed-text routing, and, unioned with three extras,
+ *  the restart preserve guard (`unanswered_question_exists_sql`). Client-side,
+ *  this set gates the click-button affordance and whether `exchangeStatus` may
+ *  still read "Needs your answer". A card whose buttons are dead must not be
+ *  labelled answerable. A thread whose card is dead must not be preserved as a
+ *  resumable checkpoint. */
 const QUESTION_OVERTAKEN_STEP_TYPES: ReadonlySet<string> = new Set([
   // Terminal (both agents)
   'ResponseAborted',
   'ResponseCanceled',
   'ResponseFailed',
   'CodingAgentIdled',
-  // CC progression — the parallel-tool-call race the dev thread hit
+  // CC progression
   'CodingAgentTextStreamed',
   'CodingAgentToolCalled',
   'CodingAgentToolResult',
@@ -444,10 +400,9 @@ function markOvertakenQuestionDividers(exchanges: Exchange[]): void {
   }
 }
 
-/** Per-exchange half of `markOvertakenQuestionDividers`. The flag depends
- *  only on the exchange's OWN steps, so the incremental path re-runs this on
- *  exactly the exchanges an appended event touched — full-pass equivalent
- *  without walking every exchange per frame. */
+/** Per-exchange half of `markOvertakenQuestionDividers`. The flag depends only
+ *  on the exchange's OWN steps, so the incremental path re-runs this on exactly
+ *  the exchanges an appended event touched. */
 function markOvertakenForExchange(exchange: Exchange): void {
   if (exchange.userEvent.type !== 'UserQuestionAsked') return;
   const toolUseId = exchange.userEvent.tool_use_id;
@@ -460,49 +415,39 @@ function markOvertakenForExchange(exchange: Exchange): void {
   );
 }
 
-/** Resumable fold state behind `groupIntoExchanges` / the incremental cache.
- *  Everything the per-event walk reads or writes lives here so the fold can
- *  stop after any event and continue later with appended events — the basis
- *  of the per-thread memoization in `computeExchanges` that keeps a
- *  streaming token from re-sorting and re-walking the whole history every
- *  frame. */
+/** Resumable fold state behind `groupIntoExchanges` and the incremental cache.
+ *  Everything the per-event walk reads or writes lives here, so the fold can
+ *  stop after any event and continue later with appended events. That is the
+ *  basis of the per-thread memoization in `computeExchanges`. */
 interface GroupFoldState {
   exchanges: Exchange[];
   current: Exchange | null;
-  // tool_use_id → exchange that owns the matching CodingAgentToolCalled step.
-  // Populated as calls are appended (always via the default `current.steps.push`
-  // branch — CodingAgent* events aren't absorbed or request-id routed) and
-  // queried when a CodingAgentToolResult lands so we can re-route it to the
-  // call's exchange even if a permission request boundary intervened.
+  // tool_use_id to the exchange owning the matching CodingAgentToolCalled step.
+  // Queried when a CodingAgentToolResult lands, so it can be re-routed to the
+  // call's exchange even if a permission-request boundary intervened.
   toolCallOwners: Map<string, Exchange>;
-  // Chat ToolCalled.event_id → owner exchange. The chat agentic loop stamps
-  // `tool_called_event_id` on every live `ToolResult` (and the post-restart
-  // recovery sweep does the same on synthetic backfills), so this map is the
-  // primary routing path for chat ToolResults. Required because an
-  // `ask_user_question` call is followed by a `UserQuestionAsked` divider
-  // exchange: the request-id redirect moves to the divider, and the live
-  // post-answer `ToolResult` (sharing the originating MR's req_id) would
-  // otherwise follow the redirect into the divider — leaving the original
-  // call's "Executing …" spinner pending forever. Legacy DB rows without the
-  // field fall through to the request-id / `current` routing.
+  // Chat ToolCalled.event_id to owner exchange, the primary routing path for
+  // chat ToolResults. Required because an `ask_user_question` call is followed
+  // by a `UserQuestionAsked` divider exchange. The request-id redirect moves to
+  // that divider. The post-answer `ToolResult` shares the originating MR's
+  // req_id, so it would otherwise follow the redirect into the divider. The
+  // original call's "Executing" spinner would then stay pending forever.
+  // Legacy rows without the field fall through to request-id / `current`.
   chatToolCallOwners: Map<string, Exchange>;
-  // tool_use_id → the UserQuestionAsked divider exchange that owns it, and
-  // request_id → the CodingAgentPermissionRequest divider. A UserQuestionAnswered
-  // / CodingAgentPermissionResolved is neither request-id routed nor an exchange
-  // boundary, so by default it follows the `current` pointer. When a boundary
-  // (e.g. ChildThreadCompleted from a spawned CC sub-thread finishing while the
-  // question was on screen) lands between the divider and its answer, `current`
-  // is that boundary — the answer strands there and the divider stays stuck on
-  // 'awaiting-answer' forever (real thread 3e54cacb). Route the resolution back
-  // to its divider by id, mirroring the CodingAgentToolResult re-routing.
+  // tool_use_id to the UserQuestionAsked divider that owns it, and request_id
+  // to the CodingAgentPermissionRequest divider. A resolution is neither
+  // request-id routed nor a boundary, so by default it follows `current`. When
+  // a boundary lands between the divider and its answer, `current` is that
+  // boundary: the answer strands there and the divider stays stuck on
+  // 'awaiting-answer'. Route the resolution back to its divider by id.
   questionDividerOwners: Map<string, Exchange>;
   permissionDividerOwners: Map<string, Exchange>;
-  // request_event_id → redirect target exchange. Set when a UPI is absorbed
-  // mid-flight: the loop emits the UPI when it actually ingests the queued
-  // follow-up, so every event after that point is part of the answer to the
-  // absorbed prompt — not the original request. Without redirecting, the
-  // post-injection tools and the final ResponseGenerated all stay in the
-  // original exchange and the follow-up panel renders as an empty stub.
+  // request_event_id to redirect target exchange. Set when a UPI is absorbed
+  // mid-flight. The loop emits the UPI when it ingests the queued follow-up, so
+  // every event after that answers the absorbed prompt rather than the original
+  // request. Without the redirect, the post-injection tools and the final
+  // ResponseGenerated stay in the original exchange, and the follow-up panel
+  // renders as an empty stub.
   reqIdRedirect: Map<string, Exchange>;
   /** request_event_ids of every ResponseGenerated / ResponseFailed folded so
    *  far. The incremental path uses it to classify a late-arriving abort as
@@ -510,20 +455,17 @@ interface GroupFoldState {
   resolvedReqIds: Set<string>;
   /** request_event_ids of every ResponseAborted folded so far. A terminal
    *  arriving later with a matching id retro-classifies that abort
-   *  (abort-before-terminal direction) — the incremental path detects it and
-   *  falls back to a full rebuild. */
+   *  (abort-before-terminal direction), which the incremental path detects,
+   *  falling back to a full rebuild. */
   abortReqIds: Set<string>;
-  /** request_event_id of the most recent request-id-routed chat event — i.e.
-   *  the active chat turn's req_id. The divider redirect bootstrap reads it to
-   *  redirect the turn's post-answer continuation to the divider, instead of
-   *  trusting `previousCurrent` (which can be an UNINGESTED queued
-   *  MessageReceived that intervened between the turn and the question — real
-   *  thread 194474de). Invariant it relies on: a chat `ask_user_question` /
-   *  permission prompt is always preceded in the same turn by its
-   *  request-id-routed tool call, so at divider-creation time this holds the
-   *  turn's real req_id. Undefined until the first routed chat event (e.g. a
-   *  pure CC thread never sets it, so the chat-divider redirect is a no-op
-   *  there — CC events aren't request-id routed). */
+  /** request_event_id of the most recent request-id-routed chat event, i.e. the
+   *  active chat turn's req_id. The divider redirect bootstrap reads it to
+   *  target the divider directly. It cannot trust `previousCurrent`, which can
+   *  be an UNINGESTED queued MessageReceived that intervened. The invariant it
+   *  relies on: a chat `ask_user_question` or permission prompt is always
+   *  preceded in the same turn by its request-id-routed tool call. Undefined
+   *  until the first routed chat event, so the chat-divider redirect is a no-op
+   *  on a pure CC thread. */
   lastChatTurnReqId?: string;
 }
 
@@ -545,13 +487,12 @@ export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[]
   return foldSorted(sortEventsChronologically(events)).exchanges;
 }
 
-/** Incremental memo entry for one thread's events map. Valid only while the
- *  events arrive append-only in sort order — the validation pass in
+/** Incremental memo entry for one thread's events map. Valid only while events
+ *  arrive append-only in sort order. The validation pass in
  *  `groupIntoExchangesCached` falls back to a full rebuild the moment that
  *  contract breaks. Keyed by the Map OBJECT in a WeakMap: handleEvent never
- *  re-sets an existing seq, and the wholesale-rebuild paths
- *  (`rebuildCorruptedThreadEvents`) replace the Map, which naturally misses
- *  here and discards the stale entry. */
+ *  re-sets an existing seq, and `rebuildCorruptedThreadEvents` replaces the
+ *  Map, which misses here and discards the stale entry. */
 interface IncrementalCache {
   fold: GroupFoldState;
   /** Entries folded so far. New events are exactly the iteration-order
@@ -561,10 +502,9 @@ interface IncrementalCache {
    *  not sort before it. */
   lastCreated: string | null;
   lastSeq: number;
-  /** Flipped false when an event lacks `created` (legacy rows): the sort
-   *  comparator is no longer a total order we can do append-checks against,
-   *  so this map full-computes on every call — exactly the pre-cache
-   *  behavior. */
+  /** Flipped false when an event lacks `created` (legacy rows). The sort
+   *  comparator is then no longer a total order to append-check against, so
+   *  this map full-computes on every call. */
   cacheable: boolean;
 }
 
@@ -578,11 +518,10 @@ function compareSortKeys(
   bCreated: string | null,
   bSeq: number,
 ): number {
-  // ISO-8601 UTC timestamps (fixed-width, Zulu) sort identically under a plain
-  // lexical `<`/`>` compare, which is ~10–50× cheaper than the Intl collator
-  // that `String.localeCompare` spins up — and this comparator runs O(n log n)
-  // times per fold (every thread open + every full recompute). Equal timestamps
-  // (and the legacy missing-`created` case) fall through to the `seq` tiebreak.
+  // Fixed-width Zulu ISO-8601 timestamps sort identically under a plain lexical
+  // compare, which is far cheaper than the Intl collator `String.localeCompare`
+  // spins up. This comparator runs O(n log n) times per fold. Equal timestamps,
+  // and the legacy missing-`created` case, fall through to the `seq` tiebreak.
   if (aCreated && bCreated && aCreated !== bCreated) {
     return aCreated < bCreated ? -1 : 1;
   }
@@ -611,11 +550,11 @@ function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
   return [...fold.exchanges];
 }
 
-/** Memoized `groupIntoExchanges`. Result is always deep-equal to the
- *  from-scratch pass (pinned by incremental-grouping.test.ts); the returned
- *  array is a fresh copy each call (so signal subscribers fire on identity)
- *  while the Exchange objects inside stay identity-stable across appends
- *  (so per-exchange memoization holds). */
+/** Memoized `groupIntoExchanges`. The result is always deep-equal to the
+ *  from-scratch pass, pinned by incremental-grouping.test.ts. The array is a
+ *  fresh copy each call, so signal subscribers fire on identity. The Exchange
+ *  objects inside stay identity-stable across appends, so per-exchange
+ *  memoization holds. */
 function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] {
   const cache = incrementalCache.get(events);
   if (!cache) return rebuildIncrementalCache(events);
@@ -633,12 +572,11 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
   }
   appended.sort((a, b) => compareSortKeys(a.event.created, a.seq, b.event.created ?? null, b.seq));
 
-  // Validation pass — every appended event must keep the fold resumable.
-  // `batchAbortReqIds` covers the abort-then-terminal pair arriving INSIDE
-  // one batch: the abort isn't in `cache.fold.abortReqIds` yet (that set is
-  // only fed by foldEvent), so checking the cache set alone would miss the
-  // retro-classification and fold the abort as a real boundary where the
-  // from-scratch pass marks it superseded.
+  // Validation pass. Every appended event must keep the fold resumable.
+  // `batchAbortReqIds` covers the abort-then-terminal pair arriving INSIDE one
+  // batch. The abort is not in `cache.fold.abortReqIds` yet, that set being fed
+  // only by foldEvent, so checking the cache set alone would miss the
+  // retro-classification.
   let prevCreated = cache.lastCreated;
   let prevSeq = cache.lastSeq;
   const batchAbortReqIds = new Set<string>();
@@ -679,8 +617,8 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
   }
   for (const exchange of touched) {
     markOvertakenForExchange(exchange);
-    // In-place mutation is invisible to identity-based memo comparison —
-    // bump the captured-at-render revision so memoized components re-render.
+    // In-place mutation is invisible to identity-based memo comparison, so
+    // bump the captured-at-render revision to make memoized components render.
     exchange.revision = (exchange.revision ?? 0) + 1;
   }
   cache.processedCount = events.size;
@@ -691,17 +629,16 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
 
 /** One-shot fold over an already-sorted event list. Runs the legacy
  *  rerun-in-place pre-pass, folds every event, and applies the
- *  question-divider marking — the from-scratch path `groupIntoExchanges` and
- *  the cache rebuild both go through here. */
+ *  question-divider marking. Both `groupIntoExchanges` and the cache rebuild
+ *  go through here. */
 function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
-  // Legacy rerun-in-place: when a ResponseAborted shares request_event_id
-  // with a later ResponseGenerated/ResponseFailed in the same thread, the
-  // rerun re-used the original exchange (pre-Phase-5.3 behavior). Don't split
-  // at those aborts — supersededAbortIndices in exchangeStatus deflates the
-  // verdict to the later success.
+  // Legacy rerun-in-place. When a ResponseAborted shares request_event_id with
+  // a later ResponseGenerated or ResponseFailed, the rerun re-used the original
+  // exchange. Do not split at those aborts: supersededAbortIndices in
+  // exchangeStatus deflates the verdict to the later success.
   //
   // Single forward pass: record request_event_ids of every later resolving
-  // terminal first, then mark aborts that match. O(N) instead of O(N²).
+  // terminal first, then mark aborts that match.
   const resolvedReqIds = new Set<string>();
   for (const { event } of sorted) {
     if (event.type !== 'ResponseGenerated' && event.type !== 'ResponseFailed') continue;
@@ -723,17 +660,16 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
   return state;
 }
 
-/** Re-anchor `exchange` to the end of the timeline — the position it should
- *  occupy now that the agent has actually engaged with it. Used by the two
- *  "the exchange was created earlier than it was engaged with" paths: the
- *  mid-flight `UserPromptInjected` absorb and `reanchorResolvedDivider`. No-op
- *  when it is already last, which is the common case for both.
+/** Re-anchor `exchange` to the end of the timeline, the position it should
+ *  occupy now that the agent has engaged with it. Used by the two paths where
+ *  an exchange was created earlier than it was engaged with: the mid-flight
+ *  `UserPromptInjected` absorb and `reanchorResolvedDivider`. No-op when it is
+ *  already last, the common case for both.
  *
  *  Position is not part of an Exchange's own state, so callers relying on
- *  position-derived props must not need a `touched` bump: the render pass
- *  recomputes `isLast` / `hasPriorActive` / `priorModel` / `priorEffort` for
- *  every exchange and `chatExchangePropsEqual` compares each of them, so a
- *  reorder re-renders the affected panels on its own. */
+ *  position-derived props need no `touched` bump. The render pass recomputes
+ *  `isLast` / `hasPriorActive` / `priorModel` / `priorEffort` per exchange and
+ *  `chatExchangePropsEqual` compares each, so a reorder re-renders on its own. */
 function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
   const idx = exchanges.indexOf(exchange);
   if (idx === -1 || idx === exchanges.length - 1) return;
@@ -741,33 +677,24 @@ function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
   exchanges.push(exchange);
 }
 
-/** A divider just received its resolution (answer / permission grant). If a
- *  boundary exchange was appended while the card sat on screen — the shape is
- *  a spawned sub-thread finishing and emitting `ChildThreadCompleted` between
- *  the question and the answer (real thread 8144b43e) — the divider is no
- *  longer last, yet it still OWNS the turn's continuation via `reqIdRedirect`.
- *  Left in place, every post-answer step renders ABOVE that intervening card:
- *  the user sees the agent's live work in the middle of the timeline while the
- *  bottom of the thread is a stepless completion card frozen on 'Requesting',
- *  which reads as a stuck agent. (Both halves are one bug — `exchangeStatus`
- *  keeps a stepless `ChildThreadCompleted` spinning precisely while it is
- *  `isLast` on a running thread, because it normally expects the continuation
- *  to land in it.)
+/** A divider just received its resolution (answer / permission grant). A
+ *  boundary exchange appended while the card sat on screen leaves the divider
+ *  no longer last, yet still OWNING the turn's continuation via
+ *  `reqIdRedirect`. The usual shape is a spawned sub-thread emitting
+ *  `ChildThreadCompleted`. Left in place, every post-answer step renders ABOVE
+ *  that intervening card. Live work then reads mid-timeline while the bottom of
+ *  the thread is a stepless card frozen on 'Requesting', as if stuck.
  *
  *  So re-anchor the divider to its RESOLUTION point: move it to the end and
- *  make it `current`. Same move, same reason as the mid-flight `UserPromptInjected`
- *  absorb above — the exchange is repositioned to where the agent actually
- *  engages with it, so its forthcoming reply renders below the boundaries that
- *  landed while it waited (and the superseded card falls to `!isLast` → 'done').
+ *  make it `current`. Same move and reason as the mid-flight
+ *  `UserPromptInjected` absorb above.
  *
  *  Gated on the divider being a `reqIdRedirect` target, which is exactly the
- *  in-process chat dividers (`UserQuestionAsked`, `CommandPermissionRequested`,
- *  `McpPermissionRequested`) whose continuation routes back here by request id.
- *  A CC `CodingAgentPermissionRequest` is never a redirect target — CC events
- *  aren't request-id routed, so its continuation flows through `current` to the
- *  intervening boundary and moving the card would strand it. No-op in the
- *  common case: with no boundary between, the divider is already last and
- *  already `current`. */
+ *  in-process chat dividers whose continuation routes back here by request id.
+ *  A CC `CodingAgentPermissionRequest` is never a redirect target, CC events
+ *  not being request-id routed. Its continuation flows through `current` to the
+ *  intervening boundary, so moving the card would strand it. No-op with no
+ *  boundary between, the divider being already last and already `current`. */
 function reanchorResolvedDivider(
   state: GroupFoldState,
   divider: Exchange,
@@ -787,13 +714,10 @@ function reanchorResolvedDivider(
   return divider;
 }
 
-/** Fold one event into the state. `isLegacySupersededAbort` is decided by
- *  the caller (the one-shot path precomputes it positionally-blind over the
- *  whole array; the incremental path derives the terminal-before-abort
- *  direction from `resolvedReqIds`-so-far and full-rebuilds on the other
- *  direction). `touched` collects every exchange this event mutated or
- *  created so the incremental path can re-run the question-divider marking
- *  on exactly those. */
+/** Fold one event into the state. `isLegacySupersededAbort` is decided by the
+ *  caller. `touched` collects every exchange this event mutated or created, so
+ *  the incremental path can re-run the question-divider marking on exactly
+ *  those. */
 function foldEvent(
   state: GroupFoldState,
   seq: number,
@@ -819,19 +743,18 @@ function foldEvent(
 
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
     // Remember the active chat turn's req_id (see `lastChatTurnReqId`) so the
-    // divider redirect bootstrap below can target it directly, rather than
-    // inferring it from `previousCurrent` (wrong when a queued follow-up
-    // intervened).
+    // divider redirect bootstrap below targets it directly, rather than
+    // inferring it from `previousCurrent`.
     if (reqId) state.lastChatTurnReqId = reqId;
     const owner = reqId
       ? (reqIdRedirect.get(reqId) ?? findExchangeByAnchorId(exchanges, reqId))
       : null;
 
-    // ResponseAborted is dual-purpose: it terminates the originating exchange
-    // (so the partial-response panel reads 'Aborted ⚠') AND opens a new
-    // boundary exchange whose userEvent is the abort itself, rendered as the
-    // AbortPanel. The boundary always sits chronologically last so the panel
-    // appears below any newer MessageReceived in the timeline.
+    // ResponseAborted is dual-purpose. It terminates the originating exchange,
+    // so the partial-response panel reads 'Aborted'. It also opens a boundary
+    // exchange whose userEvent is the abort itself, rendered as the AbortPanel.
+    // The boundary always sits chronologically last, so the panel appears below
+    // any newer MessageReceived in the timeline.
     if (event.type === 'ResponseAborted' && !isLegacySupersededAbort) {
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseAborted') {
@@ -843,20 +766,19 @@ function foldEvent(
         return;
       }
     }
-    // ResponseCanceled mirrors the abort dual-purpose pattern: keep the
-    // cancel as a step on the originating exchange (so its response panel
-    // reads 'Canceled ✕') AND open a new boundary exchange so a separate
-    // 'Response canceled' panel renders below the truncated reply.
-    // Skip the boundary only when the question card already carries the
-    // cancel attribution via its Cancel-as-picked button — i.e. the question
-    // resolved as Canceled. Any non-Canceled resolution leaves the picked
-    // option as the visible state, so the boundary panel must render.
+    // ResponseCanceled mirrors the abort dual-purpose pattern. Keep the cancel
+    // as a step on the originating exchange, so its response panel reads
+    // 'Canceled'. Also open a boundary exchange, so a separate 'Response
+    // canceled' panel renders below the truncated reply. Skip the boundary only
+    // when the question resolved as Canceled, the card already carrying the
+    // attribution via its Cancel-as-picked button. Any other resolution leaves
+    // the picked option visible, so the boundary panel must render.
     //
-    // A `superseded_by_followup` cancel (Codex mid-turn follow-up redirect) is
-    // the exception: the user steered, not Stopped, so it renders neutrally like
-    // the chat/CC follow-up. Keep it as a step on the originating exchange (so
-    // step resolution / model extraction still see a terminator) but do NOT open
-    // a boundary — there must be no standalone 'Response canceled' panel.
+    // A `superseded_by_followup` cancel (a Codex mid-turn follow-up redirect)
+    // is the exception. The user steered rather than Stopped, so it renders
+    // neutrally like the chat or CC follow-up. Keep it as a step, so step
+    // resolution and model extraction still see a terminator, but open NO
+    // boundary: there must be no standalone 'Response canceled' panel.
     if (event.type === 'ResponseCanceled') {
       const target = owner ?? current;
       if (target && target.userEvent.type !== 'ResponseCanceled') {
@@ -890,20 +812,17 @@ function foldEvent(
         return;
       }
     }
-    // Chat ToolResult routing. The chat agentic loop stamps
-    // `tool_called_event_id` on every live emit (and the post-restart
-    // recovery sweep does the same on synthetic backfills), so this branch
-    // is the primary routing path — see the `chatToolCallOwners`
-    // declaration above for the full rationale (in short: an
-    // `ask_user_question` call's post-answer ToolResult would otherwise
-    // follow the req_id redirect into the question divider and the original
-    // call's "Executing …" spinner would stay pending forever). The
-    // tracking map only knows about ToolCalled events seen so far in the
-    // walk; a synthetic ToolResult arriving before its ToolCalled would
-    // miss this branch, which is fine — neither the live loop (call before
-    // result by construction) nor recovery (emits AFTER reading the orphan
-    // ToolCalled out of the DB) produces that ordering. Legacy DB rows
-    // without the field fall through to the request_id / `current` routing.
+    // Chat ToolResult routing, the primary path: the chat agentic loop stamps
+    // `tool_called_event_id` on every live emit, and the post-restart recovery
+    // sweep does the same on synthetic backfills. See the `chatToolCallOwners`
+    // declaration above for the rationale.
+    //
+    // The tracking map only knows the ToolCalled events seen so far in the
+    // walk, so a synthetic ToolResult arriving before its ToolCalled misses
+    // this branch. Neither producer emits that ordering: the live loop calls
+    // before it results, and recovery emits after reading the orphan ToolCalled
+    // out of the DB. Legacy rows without the field fall through to the
+    // request_id / `current` routing.
     if (event.type === 'ToolResult') {
       const tcId = (event as { tool_called_event_id?: string }).tool_called_event_id;
       const callOwner = tcId ? chatToolCallOwners.get(tcId) : undefined;
@@ -942,20 +861,16 @@ function foldEvent(
     }
     const absorbTarget = findAbsorbTarget(current, exchanges, event);
     if (absorbTarget) {
-      // A queued mid-flight message is ingested here (the UPI is the moment the
-      // loop actually picked it up). If boundary exchanges — a question card,
-      // another message — were created while it sat in the queue, the optimistic
-      // MR panel is now positioned ABOVE them, but the agent only engages with
-      // this message now, so its panel + forthcoming reply belong BELOW those
-      // boundaries. Re-anchor it to the ingestion point by moving it to the end,
-      // otherwise the reply renders above the intervening question card (real
-      // thread ab70366f). No-op when it's already last (the common case: no
-      // boundary intervened), which keeps the simple absorb paths unchanged.
+      // A queued mid-flight message is ingested here, the UPI being the moment
+      // the loop picked it up. Boundaries created while it sat in the queue
+      // leave the optimistic MR panel positioned ABOVE them. The agent only
+      // engages with the message now, so its panel and reply belong BELOW those
+      // boundaries. Re-anchor to the ingestion point by moving it to the end.
+      // No-op when it is already last, the common case.
       moveExchangeToEnd(exchanges, absorbTarget);
       absorbTarget.steps.push({ seq, event });
       touched?.add(absorbTarget);
-      // It owns the turn again — a handoff recorded while it sat in the queue
-      // (a divider raised with this uningested message as `previousCurrent`)
+      // It owns the turn again, so a handoff recorded while it sat in the queue
       // no longer holds. See `Exchange.continuationMoved`.
       absorbTarget.continuationMoved = false;
       current = absorbTarget;
@@ -970,24 +885,20 @@ function foldEvent(
       touched?.add(current);
       // **The user's Stop-waiting boundary takes no ownership of the turn.**
       //
-      // Every other boundary here either ends the turn or takes it over, so
-      // becoming `current` is right for them. A stop is neither: a subscription
-      // does not hold its thread's turn (ADR 0049) and the Stop waiting button
-      // has no idle guard, so the user can press it while an unrelated turn is
-      // mid-flight, and that turn keeps running afterwards.
+      // Every other boundary here ends the turn or takes it over, so becoming
+      // `current` is right for them. A stop is neither. A subscription does not
+      // hold its thread's turn (ADR 0049), and the Stop waiting button has no
+      // idle guard. So the user can press it mid-flight on an unrelated turn,
+      // and that turn keeps running afterwards.
       //
       // Whatever routes CHRONOLOGICALLY must therefore keep landing in the turn
-      // that produced it: every coding-agent event (they are deliberately out of
-      // `REQUEST_ID_ROUTED_TYPES`), and on a chat thread a `TodoListWritten` or a
-      // background-bash pair. Folded into this boundary instead they would draw
-      // nothing at all, because the stop panel renders no response body, and the
-      // running turn's pending `Thinking` marker would shimmer forever with
-      // nothing left to resolve it. That is the shape the abort-boundary and
-      // change-banner exceptions elsewhere in this file exist for, reached from
-      // the other side.
+      // that produced it: every coding-agent event, and on a chat thread a
+      // `TodoListWritten` or a background-bash pair. Folded into this boundary
+      // they would draw nothing, the stop panel rendering no response body, and
+      // the running turn's pending `Thinking` marker would shimmer forever.
       //
       // Restoring `current` is the whole handling it needs, and is why it is
-      // also absent from `advancesRedirect` below: it continues nothing, so
+      // also absent from `advancesRedirect` below. It continues nothing, so
       // there is no continuation to redirect and no handoff to record.
       if (isUserStoppedWait(event)) {
         current = previousCurrent;
@@ -1005,62 +916,26 @@ function foldEvent(
       ) {
         permissionDividerOwners.set(event.request_id, current);
       }
-      // Chat agent's `ask_user_question` AND the chat command guard's
-      // `IrreversibleDanger` permission prompt both run in-process inside the
-      // agentic loop: every event in the turn carries the originating MR's
-      // req_id, and the turn RESUMES (more thinking + the reply) after the
-      // user answers / grants. Without a redirect here, those post-resolution
-      // TextStreamed / ResponseGenerated / ToolResult / ThoughtStreamed route
-      // back to the MR exchange via shouldRouteByRequestId and the agent's
-      // reply renders ABOVE the question / permission card instead of below it
-      // (the gated tool call + its result still re-route to the MR exchange by
-      // tool_called_event_id, so the "Running …" step stays merged above the
-      // card — only the genuine continuation moves below). Move any existing
-      // redirect that targets the previous current to the new exchange;
-      // bootstrap from the previous current's anchor _eventId (the turn's
-      // req_id for an MR) when no redirect existed yet — the first interruption
-      // of this turn. CC's `CodingAgentPermissionRequest` is deliberately
-      // excluded: CC events are never request-id routed, so it needs no redirect
-      // (its resolution + resumption route by `current` / tool_use_id instead).
+      // Three shapes reach this advance, all one thing: a turn INTERRUPTED by a
+      // boundary that then resumes under its own, unchanged req_id. Without the
+      // redirect, everything after the boundary routes back to the pre-boundary
+      // exchange, which sits ABOVE the card, so the continuation renders first.
       //
-      // `ChildThreadCompleted` is the same shape from the other direction: when
-      // a spawned sub-thread finishes WHILE the parent is mid-response, the
-      // engine injects the child's summary into the running loop as a
-      // WakeFromChild (no new req_id — the turn keeps streaming under the
-      // originating MR's id) and emits the completion card as a boundary. The
-      // post-completion continuation must group UNDER the card; without
-      // advancing the redirect it routes back to the pre-completion exchange,
-      // which sits ABOVE the card, so the continued "Thinking / Running …"
-      // renders before the card it follows (real thread 4d193da8). EXCEPTION:
-      // when the turn is parked at a question / permission divider that is
-      // STILL awaiting the user (real thread 3e54cacb), that divider owns its
-      // own post-answer continuation — leave the redirect on it so the reply
-      // stays with the card the user is answering, not below an unrelated child
-      // completion. The divider is then moved BELOW the card when the answer
-      // lands (`reanchorResolvedDivider`), which is what keeps the continuation
-      // rendering last. An ALREADY-resolved divider gets no exception — see
-      // `dividerStillAwaitsUser`.
+      // 1. A chat `ask_user_question` or command-guard permission prompt, both
+      //    in-process in the agentic loop. The gated tool call and its result
+      //    still re-route to the MR exchange by tool_called_event_id, so only
+      //    the genuine continuation moves below the card. CC's
+      //    `CodingAgentPermissionRequest` is excluded, never being routed.
+      // 2. `ChildThreadCompleted`, a sub-thread finishing mid response. The
+      //    engine injects the summary as a ReentryFromEngine, minting no id.
+      // 3. An unabsorbed `UserPromptInjected`, injected as a ReentryFromWait
+      //    from a detached wait, which holds no turn of its own (ADR 0049).
       //
-      // An unabsorbed `UserPromptInjected` is the SAME wake, reached from the
-      // third direction, and it belongs here for the same reason: an event
-      // wait does not hold its thread's turn (ADR 0049), so a detached wait
-      // can resolve while an unrelated turn is running, and the engine then
-      // injects the wake into that live loop (`WakeFromEvent`, the sibling of
-      // `WakeFromChild` under `InjectedPromptKind::is_engine_wake`) rather than
-      // opening a second turn. Every event after it therefore keeps the
-      // ORIGINAL turn's req_id, so without the advance the whole wake (its tool
-      // calls, its reply, its terminator) routes back into the exchange sitting
-      // ABOVE the card, leaving the card itself stranded last with nothing
-      // under it. Real thread bec39316: the release turn's "Stopped. Here is
-      // exactly where the release stands" rendered above the wake that caused
-      // it. The same advance is right for the other unabsorbed shapes, which
-      // are all mid-flight injections into a turn that keeps its id: a queued
-      // message whose `MessageReceived` partner never arrived, and a human
-      // correction landing on a `ContinuationStarted` resume.
-      //
-      // An IDLE wake is unaffected: there the engine starts a fresh turn
-      // anchored on the injection itself, so its events find this exchange by
-      // its own id and the moved redirect is never consulted.
+      // EXCEPTION for shapes 2 and 3: a turn parked at a divider STILL awaiting
+      // the user keeps its redirect, so the reply stays with the card being
+      // answered. A resolved divider gets no exception, see
+      // `dividerStillAwaitsUser`. An IDLE wake is unaffected: the engine starts
+      // a fresh turn anchored on the injection, which finds this exchange.
       const advancesRedirect =
         event.type === 'UserQuestionAsked'
         || event.type === 'CommandPermissionRequested'
@@ -1069,26 +944,20 @@ function foldEvent(
           && !!previousCurrent
           && !dividerStillAwaitsUser(previousCurrent));
       if (advancesRedirect && previousCurrent) {
-        // The turn now belongs to `current`, so nothing else will land in
-        // `previousCurrent` — a `Thinking` marker left pending there can never
+        // The turn now belongs to `current`, so nothing else lands in
+        // `previousCurrent`. A `Thinking` marker left pending there can never
         // resolve on its own events. Record the handoff so rendering finalizes
-        // it instead of shimmering an old step half a screen above the work
-        // (real thread 8144b43e). See `Exchange.continuationMoved`.
+        // it. See `Exchange.continuationMoved`.
         previousCurrent.continuationMoved = true;
         touched?.add(previousCurrent);
-        // Move any redirect that pointed at the previous current (the turn kept
-        // an ANCESTOR's req_id — e.g. a mid-response child completion keeps the
-        // originating MR's id) AND, unconditionally, map the previous current's
-        // OWN anchor id → current. Both are needed: when `previousCurrent`
-        // itself opened a fresh turn (a ChildThreadCompleted whose parent turn
-        // had already finished — its continuation streams under the card's OWN
-        // id), the moved entries are SPURIOUS leftovers and the real reply
-        // routes by `previousCurrent`'s id. Gating the bootstrap on "no entry
-        // moved" dropped that mapping, so the post-answer reply misrouted back
-        // into the card (rendered above the question) and the divider flashed
-        // 'aborted' (real thread 2e98b44a). Setting both keeps the
-        // keep-ancestor-id and fresh-turn cases correct; a redundant entry is
-        // harmless (nothing routes by an unused id).
+        // Two writes, both needed. Move any redirect that pointed at the
+        // previous current, covering a turn that kept an ANCESTOR's req_id.
+        // Then map the previous current's OWN anchor id to `current`,
+        // unconditionally. When `previousCurrent` itself opened a fresh turn,
+        // its continuation streams under that card's own id. The moved entries
+        // are then spurious leftovers, and only the second write routes the
+        // real reply. A redundant entry is harmless: nothing routes by an
+        // unused id.
         for (const [reqId, exchange] of reqIdRedirect.entries()) {
           if (exchange === previousCurrent) {
             reqIdRedirect.set(reqId, current);
@@ -1098,29 +967,27 @@ function foldEvent(
         if (anchorId) reqIdRedirect.set(anchorId, current);
       }
       // For a chat in-process divider, the post-answer continuation carries the
-      // ACTIVE turn's req_id — which is `previousCurrent`'s anchor only when
-      // `previousCurrent` IS that turn's exchange. When an UNINGESTED queued
-      // follow-up MessageReceived intervened, `previousCurrent` is the queued MR
-      // and the bootstrap above anchors on the WRONG id, so the reply +
-      // ResponseGenerated route back to the original message exchange and the
-      // divider strands terminal-less → a persistent 'aborted' (real thread
-      // 194474de). Redirect the turn's real req_id (tracked as
-      // `lastChatTurnReqId`, set by the divider-raising tool call) to the divider
-      // directly. Additive and idempotent in the common no-queue case: there
-      // `lastChatTurnReqId` already equals `previousCurrent`'s anchor. CC
-      // dividers never set `lastChatTurnReqId` (CC events aren't request-id
-      // routed), so this is a no-op for them. ChildThreadCompleted is excluded —
-      // its continuation routing is governed by the `previousCurrent` logic above.
+      // ACTIVE turn's req_id. That is `previousCurrent`'s anchor only when
+      // `previousCurrent` IS that turn's exchange. An UNINGESTED queued
+      // follow-up MessageReceived that intervened makes it the queued MR
+      // instead. The bootstrap above then anchors on the WRONG id, and the
+      // divider strands terminal-less on a persistent 'aborted'.
+      //
+      // Redirect the turn's real req_id, tracked as `lastChatTurnReqId`, to the
+      // divider directly. Additive and idempotent in the common no-queue case,
+      // where it already equals `previousCurrent`'s anchor. CC dividers never
+      // set it, so this is a no-op for them. ChildThreadCompleted is excluded:
+      // the `previousCurrent` logic above governs its continuation routing.
       if (
         (event.type === 'UserQuestionAsked'
           || event.type === 'CommandPermissionRequested'
           || event.type === 'McpPermissionRequested')
         && state.lastChatTurnReqId
       ) {
-        // Whoever held that req_id just lost the turn — normally
-        // `previousCurrent` (marked above), but the queued-follow-up shape has
-        // them be different exchanges, and the handoff mark belongs on the one
-        // the redirect is actually moved OFF. See `Exchange.continuationMoved`.
+        // Whoever held that req_id just lost the turn. Normally that is
+        // `previousCurrent`, marked above, but the queued-follow-up shape makes
+        // them different exchanges. The handoff mark belongs on the one the
+        // redirect is moved OFF. See `Exchange.continuationMoved`.
         const priorOwner = reqIdRedirect.get(state.lastChatTurnReqId)
           ?? findExchangeByAnchorId(exchanges, state.lastChatTurnReqId);
         if (priorOwner && priorOwner !== current) {
@@ -1131,8 +998,8 @@ function foldEvent(
       }
     } else if (event.type === 'CodingAgentUserMessageSent') {
       // Legacy: old data has this instead of MessageReceived for CC follow-ups.
-      // New data emits both MessageReceived and CodingAgentUserMessageSent for the same
-      // user message — skip creating a duplicate exchange if one already exists.
+      // New data emits both for the same user message, so skip creating a
+      // duplicate exchange if one already exists.
       if (current && current.userEvent.type === 'MessageReceived' && current.steps.length === 0) {
         // MessageReceived already started this exchange — skip the duplicate
         return;
@@ -1142,14 +1009,12 @@ function foldEvent(
       exchanges.push(current);
       touched?.add(current);
     } else if (event.type === 'CodingAgentPromptSent' && !current) {
-      // Legacy engine-spawned CC threads (merge-conflict, hardening) created
-      // before MergeConflictDetected/MissingHardeningDetected boundary events
-      // existed emit a bare CodingAgentPromptSent as the first content event.
-      // Promote it to a synthetic boundary so the panel renders — without this
-      // every following step is dropped and the thread shows the "Messages
-      // could not be displayed" empty state. Modern threads always have a
-      // proper boundary first, so `current` is non-null and we fall through
-      // to the step branch below.
+      // Legacy engine-spawned CC threads emit a bare CodingAgentPromptSent as
+      // the first content event. Promote it to a synthetic boundary so the
+      // panel renders. Without this, every following step is dropped and the
+      // thread shows the "Messages could not be displayed" empty state. Modern
+      // threads always have a proper boundary first, so `current` is non-null
+      // and the step branch below takes them.
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
       touched?.add(current);
@@ -1232,24 +1097,21 @@ export function handleEvent(
       console.warn(`[handleEvent] persisted event ${event.type} (seq=${seq}) missing created timestamp — this indicates a backend bug`);
     }
     const stored: StoredEvent = { ...(event as ThreadEvent), created, ...(eventId ? { _eventId: eventId } : {}) };
-    // CONTRACT: `thread.events` is append-only with deduped seqs — the
-    // `has(seq)` guard above is load-bearing. The incremental grouping
-    // cache (`groupIntoExchangesCached`) keys its memo on this Map object
-    // and detects new work by size + insertion-order suffix; an in-place
-    // re-set of an existing seq, a delete(), or a clear() would serve
-    // STALE exchanges with no failure signal. To rewrite a thread's
-    // events wholesale, replace the Map object instead (see
-    // `rebuildCorruptedThreadEvents`) — a new Map misses the WeakMap and
-    // triggers a clean rebuild.
+    // CONTRACT: `thread.events` is append-only with deduped seqs, so the
+    // `has(seq)` guard above is load-bearing. `groupIntoExchangesCached` keys
+    // its memo on this Map object and detects new work by size plus
+    // insertion-order suffix. An in-place re-set of an existing seq, a
+    // delete(), or a clear() would serve STALE exchanges with no failure
+    // signal. To rewrite a thread's events wholesale, replace the Map object
+    // instead: a new Map misses the WeakMap and triggers a clean rebuild.
     thread.events.set(seq, stored);
     thread.streamingBuffer = '';
     // Update updatedAt only for events that the backend updates last_activity for.
     // Must stay in sync with update_thread_projection() in event_bus.rs.
     // Tick-only write — does not mark metaChanged (see `applyAggregateToMeta`).
     if (created && updatesLastActivity(event.type)) thread.meta.updatedAt = created;
-    // When a real MessageReceived event arrives from the backend,
-    // remove the matching optimistic pending message by event_id (UUID).
-
+    // A real MessageReceived from the backend removes the matching optimistic
+    // pending message by event_id.
     if ((event.type === 'MessageReceived' || event.type === 'UserPromptInjected') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
         const idx = thread.pendingUserMessages.findIndex(p => p.eventId === eventId);
@@ -1264,11 +1126,11 @@ export function handleEvent(
         clearedPendingUserMessage = true;
       }
     }
-    // FreeText answers don't emit a MessageReceived (the backend routes typed
-    // text straight to UserQuestionAnswered), so the optimistic pending message
-    // added by sendMessage() must be cleared here too. Match by text — the
-    // backend forwards user input verbatim. A non-match indicates drift; let
-    // the safety timer clean it up rather than silently shifting the wrong one.
+    // FreeText answers emit no MessageReceived, the backend routing typed text
+    // straight to UserQuestionAnswered, so the optimistic pending message must
+    // be cleared here too. Match by text, which the backend forwards verbatim.
+    // A non-match indicates drift: let the safety timer clean it up rather
+    // than shifting the wrong one.
     if (event.type === 'UserQuestionAnswered' && event.answer.kind === 'FreeText' && thread.pendingUserMessages.length > 0) {
       const text = event.answer.text;
       const idx = thread.pendingUserMessages.findIndex(p => p.text === text);
@@ -1305,23 +1167,19 @@ export function handleEvent(
     if ('text' in event && typeof event.text === 'string') {
       // `CumulativeTextUpdated` carries the FULL accumulated text for the turn,
       // not a delta: the engine re-sends its whole `raw_buffer` on every flush
-      // (agentic_loop/run.rs). So this REPLACES. Appending double-renders
+      // (agentic_loop/run.rs). So this REPLACES. Appending would double-render
       // whenever two flushes land before the paired persisted TextStreamed
-      // resets the buffer, which `should_flush` makes routine (a completed
-      // heading line and a following blank line are two flushes in a row).
-      // The `typeof` guard also keeps a payload with no text from appending the
-      // literal "undefined", which the previous `+=` did.
+      // resets the buffer, which `should_flush` makes routine. The `typeof`
+      // guard keeps a payload with no text from appending "undefined".
       thread.streamingBuffer = event.text;
     }
-    // Transient events (streaming text, tool calls) represent the thread's
-    // own active work — update updatedAt so the drawer timestamp stays
-    // current during long-running Claude Code sessions. ChildrenCountChanged
-    // and CodingAgentDiffChanged are excluded because they are out-of-band
-    // aggregate refreshes, not fresh activity by the receiving thread. Bumping
-    // updatedAt to broadcast NOW() would churn the drawer's "X ago" timestamp
-    // even though the aggregate already carries the thread's own unchanged
-    // last_activity for applyAggregateToMeta to overlay.
-    // Tick-only write — does not mark metaChanged.
+    // Transient events are the thread's own active work, so updatedAt keeps the
+    // drawer timestamp current during a long coding-agent session.
+    // ChildrenCountChanged and CodingAgentDiffChanged are excluded as
+    // out-of-band aggregate refreshes rather than fresh activity. Bumping
+    // updatedAt for them would churn the drawer's "X ago", the aggregate
+    // already carrying the thread's own unchanged last_activity.
+    // Tick-only write, so it does not mark metaChanged.
     if (created && event.type !== 'ChildrenCountChanged' && event.type !== 'CodingAgentDiffChanged') {
       thread.meta.updatedAt = created;
     }

@@ -9,38 +9,10 @@
  * walked (the repo idiom, no DOM render library), which is why the markup lives
  * in the hook-free `backupReminderBody` and the gate in `shouldRenderBanner`.
  */
-import type { ComponentChildren, VNode } from 'preact';
 import { describe, expect, it } from 'vitest';
-import {
-  backupReminderBody,
-  bannerHeightValue,
-  shouldRenderBanner,
-} from '../BackupReminderBanner';
-
-type AnyVNode = VNode<Record<string, unknown>>;
-
-/** Plain-text content of a vnode subtree (host nodes only). */
-function textOf(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join('');
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return '';
-  return textOf(v.props.children as ComponentChildren);
-}
-
-/** Host vnodes whose class list includes `cls`. Does not descend into function
- *  components (their hooks would throw outside a real render). */
-function findByClass(node: ComponentChildren, cls: string): AnyVNode[] {
-  if (node === null || node === undefined || typeof node !== 'object') return [];
-  if (Array.isArray(node)) return node.flatMap((n) => findByClass(n, cls));
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return [];
-  const out: AnyVNode[] = [];
-  const klass = (v.props.class as string | undefined) ?? '';
-  if (klass.split(' ').includes(cls)) out.push(v);
-  return out.concat(findByClass(v.props.children as ComponentChildren, cls));
-}
+import { backupReminderBody, shouldRenderBanner } from '../BackupReminderBanner';
+import { bannerHeightValue } from '../appBanner';
+import { findByClass, textOf } from './vnodeWalk';
 
 const NOOP = () => {};
 

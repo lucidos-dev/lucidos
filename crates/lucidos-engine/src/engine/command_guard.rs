@@ -1,32 +1,23 @@
-//! Command guard — a pre-dispatch safety gate over the Lucidos Agent's
-//! bash/python tools (`run_bash`, `run_bash_background`, `run_python`,
-//! `run_python_background`).
+//! Command guard: a pre-dispatch safety gate over the Lucidos Agent's bash and
+//! python tools. See ADR 0002 for the decision it implements.
 //!
-//! See ADR 0002 (`docs/adr/0002-lucidos-agent-command-safety.md`) and the
-//! design / phased-implementation docs (`docs/plans/2026-06-08-agent-command-
-//! safety-*.md`).
-//!
-//! Classification is two-tier (the hybrid of ADR 0002):
+//! Classification is two-tier, the hybrid of ADR 0002:
 //!
 //!  * [`static_classify`] is the deterministic, zero-cost pass. It settles the
-//!    two ends — the catastrophic deny-list (`Settled(Catastrophic)`,
-//!    hard-blocked) and an obviously-safe positive allowlist (`Settled(Safe)`,
-//!    run now) — and hands the *ambiguous middle* to the judge as `NeedsJudge`.
-//!  * The LLM *judge* (Phase 3, `engine::command_judge`) classifies that middle
-//!    into `Safe` / `ReversibleDanger` / `IrreversibleDanger`, erring toward
-//!    ask. When the judge is off or unavailable, [`fallback_classify`] degrades
-//!    to the static lists: the "dangerous" side-effect shapes
-//!    ([`static_side_effect_category`]) plus a destruction scan
-//!    (out-of-workspace target → ask, in-workspace → checkpoint).
+//!    two ends, a catastrophic deny-list that hard-blocks and an
+//!    obviously-safe allowlist that runs now, and hands the *ambiguous middle*
+//!    to the judge.
+//!  * The LLM *judge* classifies that middle, erring toward ask. When the judge
+//!    is off or unavailable, [`fallback_classify`] degrades to the static
+//!    lists: the dangerous side-effect shapes plus a destruction scan, where an
+//!    out-of-workspace target asks and an in-workspace one checkpoints.
 //!
-//! `IrreversibleDanger` on a chat channel pauses to ask the user (mirroring the
-//! coding-agent permission model — see `engine::command_permission`).
-//! `ReversibleDanger` snapshots the workspace on a safety ref and runs, leaving
-//! a one-click Undo (Phase 4).
+//! `IrreversibleDanger` on a chat channel pauses to ask the user, mirroring the
+//! coding-agent permission model. `ReversibleDanger` snapshots the workspace on
+//! a safety ref and runs, leaving a one-click Undo.
 //!
 //! The whole gate is off unless the workspace turns on the `command_guard`
-//! preference, so it ships dark; the judge has its own `command_guard_judge`
-//! sub-toggle and a configurable `model_command_judge`.
+//! preference, so it ships dark. The judge has its own sub-toggle.
 
 use crate::llm::tool_names as tn;
 use serde::{Deserialize, Serialize};
@@ -42,34 +33,31 @@ use std::sync::LazyLock;
 pub enum RiskLane {
     /// Run immediately, no gate. The default for everything not flagged below.
     Safe,
-    /// A pattern no legitimate workflow needs — recursive deletion of the
+    /// A pattern no legitimate workflow needs: recursive deletion of the
     /// filesystem root or home directory, a fork bomb, formatting a filesystem,
-    /// or overwriting a raw block device. Hard-blocked; the reason is fed back
-    /// to the LLM as a failed tool result.
+    /// or overwriting a raw block device. Hard-blocked, and the reason is fed
+    /// back to the LLM as a failed tool result.
     Catastrophic,
-    /// Destruction confined to the workspace (an in-workspace `rm`/overwrite) —
-    /// recoverable from version control. Produced by the judge or by the static
-    /// fallback's destruction scan; handled by snapshotting the workspace on a
-    /// safety ref before running, leaving a one-click Undo (Phase 4).
+    /// Destruction confined to the workspace, and so recoverable from version
+    /// control. Produced by the judge or by the static fallback's destruction
+    /// scan. Handled by snapshotting the workspace on a safety ref before
+    /// running, which leaves a one-click Undo.
     ReversibleDanger,
-    /// A command that may cause an irreversible real-world side-effect (sending
-    /// mail, a mutating HTTP request, a cloud-CLI mutation) or out-of-workspace
-    /// destruction. On a chat channel the guard pauses and asks the user
-    /// (mirroring the coding agent); the user can Allow once / for the thread /
-    /// always.
+    /// A command that may cause an irreversible real-world side-effect, or
+    /// destruction outside the workspace. On a chat channel the guard pauses
+    /// and asks the user, mirroring the coding agent.
     IrreversibleDanger,
 }
 
 /// The kind of irreversible real-world side-effect a command may perform. Only
-/// meaningful for [`RiskLane::IrreversibleDanger`]: the LLM *judge* tags each
-/// irreversible command with a category (the static fallback derives one for
-/// the shapes it recognises), and an unattended *trigger* runs the command only
-/// if its declared **side-effect grant** contains that category (ADR 0002,
-/// Phase 5). A chat turn always asks the user, regardless of category.
+/// meaningful for [`RiskLane::IrreversibleDanger`]. The judge tags each
+/// irreversible command with a category, and the static fallback derives one
+/// for the shapes it recognises. An unattended *trigger* runs the command only
+/// when its declared **side-effect grant** contains that category (ADR 0002).
+/// A chat turn always asks the user, whatever the category.
 ///
-/// Wire form is snake_case (`email`, `external_api`, …) — it rides on the
-/// `TriggerCreated` / `TriggerUpdated` payload's `side_effect_grant` array and
-/// in the judge's JSON `category` field.
+/// Wire form is snake_case. It rides on the trigger payload's
+/// `side_effect_grant` array and in the judge's JSON `category` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffectCategory {
@@ -142,9 +130,9 @@ pub enum StaticVerdict {
 pub struct JudgeInput {
     pub tool_name: String,
     pub command: String,
-    /// True when the static pass saw a filesystem target / redirect escaping the
-    /// workspace — a *risk signal* the judge weighs (out-of-workspace
-    /// destruction is irreversible), not a verdict on its own.
+    /// True when the static pass saw a filesystem target escaping the
+    /// workspace. A *risk signal* the judge weighs, not a verdict on its own,
+    /// because out-of-workspace destruction is irreversible.
     pub out_of_workspace: bool,
 }
 
@@ -182,22 +170,20 @@ pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", 
 /// Unwrap a single shell `-c`-style wrapper so the inner script is what gets
 /// classified.
 ///
-/// Both classifiers inspect each segment's HEAD token and do NOT descend into a
-/// shell `-c`/`-lc` payload, so a wrapped command would read as head `zsh`/`bash`
-/// and bypass every check. Codex sends commands pre-wrapped as
-/// `/bin/zsh -lc '<script>'`; a chat `run_bash` can be handed the same shape.
-/// Returns the original command when it isn't a recognized shell wrapper (Claude
-/// Code's `Bash` passes the raw command, which falls through unchanged).
+/// Both classifiers inspect each segment's HEAD token and do NOT descend into
+/// a shell payload. A wrapped command would read as head `bash` and bypass
+/// every check. Codex sends commands pre-wrapped, and a chat `run_bash` can be
+/// handed the same shape. Returns the original command when it is not a
+/// recognized shell wrapper.
 pub(crate) fn unwrap_shell_command(command: &str) -> &str {
     const SHELLS: &[&str] = &GUARD_SHELLS;
     let trimmed = command.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
         return command;
     };
-    // Normalized, not a raw basename: `\bash -c '…'` and `"bash" -c '…'` run the
-    // same shell, and leaving them unwrapped hid the payload from every scan
-    // that follows (the head read `\bash`, matched no rule, and the script never
-    // got classified on its own merits). Unwrapping can only ever expose more.
+    // Normalized, not a raw basename. An escaped or quoted head runs the same
+    // shell, and leaving it unwrapped hides the payload from every scan that
+    // follows. Unwrapping can only ever expose more.
     let base = normalized_head(first);
     if !SHELLS.contains(&base) {
         return command;
@@ -220,14 +206,13 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
         }
         if is_shell_c_flag(&trimmed[start..i]) {
             let (script, tail) = split_shell_script_operand(trimmed[i..].trim());
-            // `sh -c <script> [$0 args]` makes the tail positional parameters,
-            // which is why cutting at the close quote is right. But the tail is
-            // only OURS to discard when it really is plain words: a control
-            // operator there belongs to the OUTER shell and runs, so returning
-            // the script alone hid it from every scan
-            // (`bash -c 'echo hi'; rm -rf /` classified as just `echo hi`).
-            // Fall back to the whole command, which the segment split then
-            // covers end to end. Strictly more scanning, never less.
+            // `sh -c <script> [$0 args]` makes the tail positional
+            // parameters, which is why cutting at the close quote is right. The
+            // tail is only OURS to discard when it really is plain words. A
+            // control operator there belongs to the OUTER shell and runs, so
+            // returning the script alone would hide it from every scan. Fall
+            // back to the whole command, which the segment split covers end to
+            // end. Strictly more scanning, never less.
             if tail_runs_more_commands(tail) {
                 return command;
             }
@@ -242,14 +227,12 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
 /// `-l`).
 fn is_shell_c_flag(tok: &str) -> bool {
     match tok.strip_prefix('-') {
-        // Any single-dash cluster of ASCII letters containing `c`. An enumerated
-        // letter set was tried and is the wrong shape: it has to list every
-        // option a shell accepts, and the ones it missed (`-uc`, `-vc`, `-Tc`,
-        // `-pc`, `-Bc`, `-Cc`, `-hc`, `-bc`) are all real invocations that run
-        // the script, so the wrapper went unrecognised and its payload
-        // unclassified. Rejecting long options and non-letter clusters is all
-        // that is actually needed, and reading MORE things as a wrapper only
-        // ever exposes the script to the scans.
+        // Any single-dash cluster of ASCII letters containing `c`. An
+        // enumerated letter set is the wrong shape: it has to list every option
+        // a shell accepts, and each one it misses is a real invocation whose
+        // payload then goes unclassified. Rejecting long options and
+        // non-letter clusters is all that is needed. Reading MORE things as a
+        // wrapper only ever exposes the script to the scans.
         Some(letters) if tok.len() >= 2 && !tok.starts_with("--") => {
             letters.contains('c') && letters.chars().all(|ch| ch.is_ascii_alphabetic())
         }
@@ -259,16 +242,15 @@ fn is_shell_c_flag(tok: &str) -> bool {
 
 /// Take the script operand that follows a shell `-c` flag.
 ///
-/// In `sh -c <script> [$0 [arg ...]]` the script is ONE word, and anything after
-/// it sets `$0` and the positional parameters. So the close quote is not
-/// necessarily the last character: `bash -c 'rm -rf /' ignored` really does run
-/// `rm -rf /`. Cutting at the matching close quote (rather than only unwrapping
-/// when the quotes surround the whole remainder) is what keeps that form from
-/// presenting a head token of `'rm` and slipping past every head-token scan.
+/// In `sh -c <script> [$0 [arg ...]]` the script is ONE word, and anything
+/// after it sets `$0` and the positional parameters. So the close quote is not
+/// necessarily the last character. Cut at the matching close quote, rather
+/// than only unwrapping quotes that surround the whole remainder. That keeps
+/// the form from presenting a quoted head token and slipping past every
+/// head-token scan.
 ///
-/// An unquoted or unterminated operand is returned as-is: there is no full shell
-/// parser here, and the classifiers downstream are the ones that must stay
-/// conservative.
+/// An unquoted or unterminated operand is returned as-is. There is no full
+/// shell parser here, and the classifiers downstream must stay conservative.
 ///
 /// Returns the script and the TAIL after it, because the caller has to decide
 /// whether that tail is discardable (see [`tail_runs_more_commands`]).
@@ -293,11 +275,10 @@ fn split_shell_script_operand(s: &str) -> (&str, &str) {
 /// constructs that would have become their own segment had the command not been
 /// truncated.
 ///
-/// **Redirection counts too**, even though it starts no new segment. It is the
-/// OUTER shell's, so `bash -c 'echo x' > /etc/crontab` truncates that file while
-/// the unwrapped script says only `echo x`, and because the unwrap result
-/// replaces the raw command for every later check, the redirect was invisible
-/// even to `command_escapes_workspace`.
+/// **Redirection counts too**, even though it starts no new segment. It
+/// belongs to the OUTER shell, so it writes a file the unwrapped script never
+/// mentions. The unwrap result replaces the raw command for every later check,
+/// so an unnoticed redirect is invisible even to `command_escapes_workspace`.
 fn tail_runs_more_commands(tail: &str) -> bool {
     tail.contains(';')
         || tail.contains('|')
@@ -324,12 +305,10 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
     let Some(raw) = command_text(tool_name, input) else {
         return StaticVerdict::Settled(RiskLane::Safe);
     };
-    // Classify the INNER script of a `sh -c '<script>'` wrapper. Every check
-    // below reads each segment's head token and does not descend into the
-    // payload, so without this a wrapped `bash -c 'rm -rf /'` reads as head
-    // `bash`, skips the catastrophic hard-block entirely, and (with the judge
-    // off) falls all the way through to Safe. The coding-agent lane has always
-    // unwrapped; this is the same call for the chat lane.
+    // Classify the INNER script of a shell wrapper. Every check below reads
+    // each segment's head token and does not descend into the payload. Without
+    // this, a wrapped command reads as head `bash`, skips the catastrophic
+    // hard-block, and with the judge off falls through to Safe.
     let cmd = unwrap_shell_command(raw);
     if catastrophic_reason(cmd).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
@@ -365,11 +344,10 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
 ///      (checkpoint + run — no prompt),
 ///   4. everything else → `Safe` (the Phase-2 default: run it).
 ///
-/// Coarser than the judge by construction — `sed -i`, `find -delete`,
-/// `rsync --delete`, and destruction behind a variable path are residuals only
-/// the judge catches — but the headline screwups (`rm` / `mv` / `cp` / `dd` /
-/// a truncating redirect onto a path outside the workspace) no longer run
-/// silently when the judge is off.
+/// Coarser than the judge by construction. Destruction behind a variable path,
+/// and the in-place editing flags, are residuals only the judge catches. What
+/// this does cover is the headline shapes: a delete, move, copy or truncating
+/// redirect onto a path outside the workspace.
 pub fn fallback_classify(ji: &JudgeInput) -> JudgedClassification {
     if let Some(cat) = static_side_effect_category(&ji.command) {
         return JudgedClassification {
@@ -530,11 +508,11 @@ static PY_DESTRUCTION_CALLS: &[&str] = &[
 ];
 
 /// Destruction scope of Python `code`, or `None`. A destruction call paired
-/// with any string literal that looks like an escaping path (absolute, `~`, or
-/// `..` traversal) is out-of-workspace; with only relative literals it's
-/// in-workspace (checkpointable). Coarse on purpose: the literal needn't be
-/// the destruction call's own argument — a stray absolute path alongside an
-/// unrelated delete errs toward ask, the fallback's documented direction. A
+/// with any string literal that looks like an escaping path is
+/// out-of-workspace. With only relative literals it is in-workspace, and so
+/// checkpointable. Coarse on purpose: the literal need not be the destruction
+/// call's own argument. A stray absolute path alongside an unrelated delete
+/// errs toward ask, the fallback's documented direction. A
 /// destruction call on a pure variable path stays in-workspace (the checkpoint
 /// covers the common case; the judge covers the rest when it's on).
 fn python_destruction_scope(code: &str) -> Option<DestructionScope> {
@@ -603,8 +581,8 @@ pub enum GuardDecision {
     /// loop hands back to `finalize_command_checkpoint` afterwards.
     ProceedCheckpointed(PendingCheckpoint),
     /// Block this command and hand `message` back to the LLM as a failed tool
-    /// result (catastrophic hard-block or a chat Deny) — the turn continues so
-    /// the model can route around it.
+    /// result, on a catastrophic hard-block or a chat Deny. The turn continues,
+    /// so the model can route around it.
     Refuse(String),
     /// Block this command AND fail the whole trigger run (ADR 0002, Phase 5): an
     /// unattended trigger hit an `IrreversibleDanger` command whose side-effect
@@ -631,24 +609,22 @@ pub fn command_text<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 // Static "obviously safe" fast-path.
 //
 // A POSITIVE allowlist of shapes that are safe regardless of the judge: reads,
-// in-workspace writes/creates, downloads (GET), and read-only git. The
-// allowlist is fail-SAFE — anything not on it falls through to the judge (which
-// classifies it correctly, at the cost of one cheap LLM call), so a missing
-// entry costs latency, never safety. The breadth here is a pure tuning knob:
-// widening it moves more common commands off the judge without changing what's
-// gated. Deliberately ABSENT: anything that can spawn/eval arbitrary code (sh,
-// bash, eval, xargs, awk, sed -i, find -exec, perl/ruby/node -e, python) — it
+// in-workspace writes, downloads and read-only git. The allowlist is fail-SAFE.
+// Anything not on it falls through to the judge, so a missing entry costs
+// latency, never safety. The breadth is a pure tuning knob: widening it moves
+// more common commands off the judge without changing what is gated.
+// Deliberately ABSENT is anything that can spawn or eval arbitrary code, which
 // would let a dangerous payload ride in unclassified.
 // ===========================================================================
 
 /// Command heads that read or transform-to-stdout. Output redirects are
 /// validated separately by [`segment_is_safe`].
 ///
-/// Most are safe regardless of their arguments, but a handful can be POINTED at
-/// an output path instead of stdout; those are listed again in
-/// [`WRITE_CAPABLE_READ_ONLY_HEADS`] and carry an extra check. Before adding a
-/// head here, check its man page for an output-file flag or a trailing output
-/// positional, and list it there too if it has one.
+/// Most are safe regardless of their arguments. A handful can be POINTED at an
+/// output path instead of stdout, and those are listed again in
+/// [`WRITE_CAPABLE_READ_ONLY_HEADS`] with an extra check. Before adding a head
+/// here, read its man page for an output-file flag or a trailing positional.
+/// List it there too if it has one.
 static READ_ONLY_HEADS: &[&str] = &[
     // Listing / inspection (`find` is NOT here — `find -delete`/`-exec` mutate)
     "ls",
@@ -751,7 +727,7 @@ static READ_ONLY_HEADS: &[&str] = &[
 ];
 
 /// The subset of [`READ_ONLY_HEADS`] that can be pointed at an output FILE
-/// rather than stdout, so "read-only" holds for the ordinary invocation but not
+/// rather than stdout. "Read-only" holds for the ordinary invocation, but not
 /// for every argument list:
 ///
 /// * `sort -o FILE`, `tree -o FILE`, macOS `base64 -o FILE`
@@ -821,13 +797,12 @@ fn segment_is_safe(segment: &str) -> bool {
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
     let i = command_head_index(&toks);
-    // A `VAR=value` preamble is skipped when resolving the head (so `sudo rm` and
-    // `FOO=1 rm` are both seen as `rm`), but a handful of variable NAMES make the
-    // process load and run attacker-chosen code before the head's own `main`.
-    // `LD_PRELOAD=/tmp/evil.so ls` would otherwise settle as the read-only `ls`
-    // and execute arbitrary code with no card and no checkpoint. Route them to
-    // the judge instead; the head walk is deliberately left alone so the
-    // catastrophic scan still sees `LD_PRELOAD=x rm -rf /` as an `rm`.
+    // A `VAR=value` preamble is skipped when resolving the head. But a handful
+    // of variable NAMES make the process load and run attacker-chosen code
+    // before the head's own `main`. That would settle as a read-only head and
+    // execute arbitrary code with no card and no checkpoint. Route those to the
+    // judge. The head walk is deliberately left alone, so the catastrophic scan
+    // still resolves the real command.
     //
     // Scanned over the PREAMBLE only, not the whole segment: past the head the
     // same text is an argument, not an assignment the shell acts on, so
@@ -839,16 +814,14 @@ fn segment_is_safe(segment: &str) -> bool {
         // Only benign prefixes / redirects — no command runs.
         return true;
     };
-    // Resolve the head by NAME, never by basename. `head.rsplit('/')` read
-    // `data/bin/ls`, `./ls` and `/tmp/ls` as the read-only `ls` and settled them
-    // Safe, so the agent could write its own `ls` with an ordinary in-workspace
-    // write (itself Safe) and then run it with no card, no checkpoint and no
-    // judge call. That is the same write-then-run escalation `PATH=` is on
-    // `CODE_INJECTING_ENV_NAMES` to close, reachable here without the `PATH=`
-    // preamble. A path-qualified head now falls through to the judge, which is
-    // the fail-safe direction and costs one LLM call on the rare `/usr/bin/ls`.
-    // The DANGER scans deliberately keep resolving by basename
-    // ([`normalized_head`]), because there it can only add a verdict.
+    // Resolve the head by NAME, never by basename. Resolving a path-qualified
+    // head to its basename would settle the agent's OWN binary as the read-only
+    // one it is named after. The agent could then write it with an ordinary
+    // in-workspace write and run it with no card, no checkpoint and no judge
+    // call. That is the write-then-run escalation `PATH=` is on
+    // `CODE_INJECTING_ENV_NAMES` to close, reachable without the preamble. A
+    // path-qualified head falls through to the judge instead. The DANGER scans
+    // keep resolving by basename, because there it can only add a verdict.
     if head.contains('/') {
         return false;
     }
@@ -872,18 +845,15 @@ fn segment_is_safe(segment: &str) -> bool {
     }
 }
 
-/// True when `args` (the tokens after `git`) name a read-only subcommand,
-/// skipping leading global flags (`-C <dir>`, `--no-pager`, …), AND that
-/// subcommand is not being pointed at an output file.
+/// True when `args`, the tokens after `git`, name a read-only subcommand and
+/// are not pointing it at an output file. Leading global flags are skipped.
 ///
-/// The second half is not redundant: "read-only" here means "does not mutate
-/// the repository", and the whole diff family (`diff`, `log`, `show`,
-/// `whatchanged`) accepts `--output=<file>` / `-o <file>`, which truncates and
-/// rewrites an arbitrary path with no `>` for `redirect_targets` to see. So
-/// `git diff --output=/etc/crontab` used to settle `Safe`: no card on the chat
-/// lane, `RequestVerdict::Benign` (unattended auto-allow) on the coding-agent
-/// one. An output flag anywhere after the subcommand routes the whole call to
-/// the judge, which is the allowlist's fail-safe direction.
+/// The second half is not redundant. "Read-only" here means "does not mutate
+/// the repository". The whole diff family accepts an output flag, which
+/// truncates and rewrites an arbitrary path with no `>` for `redirect_targets`
+/// to see. Such a call would settle `Safe`, with no card on the chat lane and
+/// an unattended auto-allow on the coding-agent one. An output flag anywhere
+/// after the subcommand routes the whole call to the judge.
 fn git_subcommand_read_only(args: &[&str]) -> bool {
     let mut i = 0;
     while let Some(&arg) = args.get(i) {
@@ -919,14 +889,12 @@ fn git_subcommand_read_only(args: &[&str]) -> bool {
 /// True when a post-subcommand `git` token names a file the subcommand will
 /// write.
 ///
-/// Long spellings ONLY, deliberately. A bare `-o` is NOT an output flag for any
-/// subcommand on [`GIT_READ_ONLY_SUBCOMMANDS`]: the diff family accepts only
-/// `--output` / `--output=<file>`, while `-o` means `--others` on `git ls-files`
-/// and `--only-matching` on `git grep`. Matching it cost a judge call on every
-/// `git ls-files -o --exclude-standard`, a routine coding-agent read, and bought
-/// no safety, because git rejects `-o` on the subcommands that can write.
-/// `--output-directory` is kept for the day `format-patch` joins the list; it is
-/// inert until then.
+/// Long spellings ONLY, deliberately. A bare `-o` is NOT an output flag for
+/// any subcommand on [`GIT_READ_ONLY_SUBCOMMANDS`]: the diff family accepts
+/// only the long form, while `-o` means something else on `ls-files` and
+/// `grep`. Matching it would cost a judge call on a routine read and buy no
+/// safety, because git rejects `-o` on the subcommands that can write.
+/// `--output-directory` is kept for the day `format-patch` joins the list.
 fn is_git_output_flag(arg: &str) -> bool {
     matches!(arg, "--output" | "--output-directory")
         || arg.starts_with("--output=")
@@ -934,16 +902,16 @@ fn is_git_output_flag(arg: &str) -> bool {
 }
 
 /// True when `code` is statically safe Python: no signal of a real-world
-/// side-effect or arbitrary shell-out. Pure compute, data crunching, and file
-/// reads/in-workspace writes have no signal and run without the judge; anything
-/// with a network-write / mail / subprocess / eval shape falls through to it.
+/// side-effect or arbitrary shell-out. Pure compute, data crunching and
+/// in-workspace file work have no signal and run without the judge. A network
+/// write, a subprocess or an eval shape falls through to it.
 fn python_is_statically_safe(code: &str) -> bool {
     !python_side_effect_signal(code)
 }
 
-/// Heuristic signal that Python `code` may have a real-world side-effect or run
-/// arbitrary shell — broader than [`python_side_effect_category`] (which is the
-/// definite-write set used for the static fallback summary). A match routes the
+/// Heuristic signal that Python `code` may have a real-world side-effect or
+/// run arbitrary shell. Broader than [`python_side_effect_category`], which is
+/// the definite-write set the static fallback summarises. A match routes the
 /// code to the judge, which reads the actual call to decide the lane.
 fn python_side_effect_signal(code: &str) -> bool {
     const SIGNALS: &[&str] = &[
@@ -976,13 +944,11 @@ fn python_side_effect_signal(code: &str) -> bool {
         "exec(",
         "__import__(",
     ];
-    // Filesystem destruction / move (PY_DESTRUCTION_CALLS) also routes to the
-    // judge — it reads the path to decide the lane (in-workspace → reversible,
-    // out-of-workspace → irreversible); the static fallback derives the same
-    // split from string literals via `python_destruction_scope`. (Plain
-    // `open(path, "w")` writes are left as a known residual — flagging every
-    // file write would tax routine data output, and an out-of-workspace
-    // open-write is an implausible screwup.)
+    // Filesystem destruction also routes to the judge, which reads the path to
+    // decide the lane. The static fallback derives the same split from string
+    // literals. A plain write is a known residual: flagging every file write
+    // would tax routine data output, and an out-of-workspace one is an
+    // implausible screwup.
     SIGNALS.iter().any(|s| code.contains(s))
         || PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s))
 }
@@ -990,8 +956,8 @@ fn python_side_effect_signal(code: &str) -> bool {
 // --- Out-of-workspace marker + path helpers --------------------------------
 
 /// True when any segment of `command` touches a filesystem path or redirect
-/// outside the workspace. A *risk signal* passed to the judge — NOT a verdict
-/// (an out-of-workspace read is wanted; only destruction is a threat).
+/// outside the workspace. A *risk signal* passed to the judge, NOT a verdict:
+/// an out-of-workspace read is wanted, and only destruction is a threat.
 pub fn command_escapes_workspace(command: &str) -> bool {
     command_segments(command).any(|s| segment_escapes_workspace(&s))
 }
@@ -1006,21 +972,15 @@ fn segment_escapes_workspace(segment: &str) -> bool {
 }
 
 /// True when a single token names a path outside the workspace, in any of the
-/// three shapes an argument can carry one: a bare path (`/etc/x`, `../y`, `~/z`),
-/// the value of an `=`-glued option (`--output=/etc/x`), or the value of a
-/// SHORT-glued option (`-o/etc/x`).
+/// three shapes an argument can carry one: a bare path, the value of an
+/// `=`-glued option, or the value of a SHORT-glued option.
 ///
-/// The third shape used to be a documented residual, on the reasoning that
-/// telling `-o/etc/x` from a flag that merely contains a slash needs per-flag
-/// knowledge. It does not, because the answer only has to be safe rather than
-/// exact: `is_pathish` rejects anything starting with `-`, and there is no `=`
-/// to split on, so an absolute path glued to its flag rode straight past both
-/// branches. That is not theoretical. `sort -o/etc/crontab data/f` reached the
-/// same Safe verdict (no card on chat, unattended auto-allow on the
-/// coding-agent lane) that the spaced `sort -o /etc/crontab` was fixed to
-/// refuse, and so did `curl -o/etc/cron.d/evil`. Over-flagging a flag that
-/// happens to hold a slash (`-I/usr/include`) costs exactly one judge call,
-/// which is the direction this allowlist is built to fail in.
+/// The third shape needs no per-flag knowledge, because the answer only has to
+/// be safe rather than exact. `is_pathish` rejects anything starting with `-`,
+/// and there is no `=` to split on. An absolute path glued to its flag would
+/// therefore ride past both other branches, and reach the Safe verdict its
+/// spaced form is refused for. Over-flagging a flag that merely holds a slash
+/// costs one judge call, the direction this allowlist fails in.
 fn token_escapes_workspace(tok: &str) -> bool {
     if is_pathish(tok) && !path_in_workspace(tok) && !is_harmless_redirect(tok) {
         return true;
@@ -1030,12 +990,12 @@ fn token_escapes_workspace(tok: &str) -> bool {
             return true;
         }
     }
-    // Short-glued option value: drop the leading dash(es) and the single option
+    // Short-glued option value: drop the leading dashes and the single option
     // character, and judge what is left. Scanning for the first `/` instead
-    // would be wrong in the safe direction that matters least and the unsafe
-    // direction that matters most: it turns the in-workspace `-odata/o.json`
-    // into the absolute `/o.json`. A multi-letter bundle (`-lah`) simply leaves
-    // a non-pathish remainder. `char_indices` keeps the slice on a boundary.
+    // would turn an in-workspace relative path into an absolute one, which is
+    // wrong in the direction that matters most. A multi-letter bundle simply
+    // leaves a non-pathish remainder. `char_indices` keeps the slice on a
+    // boundary.
     if let Some(rest) = tok.strip_prefix('-') {
         let rest = rest.strip_prefix('-').unwrap_or(rest);
         let mut chars = rest.char_indices();
@@ -1050,8 +1010,8 @@ fn token_escapes_workspace(tok: &str) -> bool {
     false
 }
 
-/// True when a token looks like a filesystem path (so its location is worth
-/// checking) — contains a `/` (but is not a URL), or is `..`, or starts with
+/// True when a token looks like a filesystem path, so its location is worth
+/// checking: it contains a `/` without being a URL, or is `..`, or starts with
 /// `~`. Flags are excluded.
 fn is_pathish(token: &str) -> bool {
     let t = token.trim_matches(|c| c == '"' || c == '\'');
@@ -1117,16 +1077,12 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
         );
     }
     for segment in command_segments(command) {
-        // Unwrap a shell wrapper PER SEGMENT, not just at the head of the whole
-        // line. `static_classify` unwraps the outermost wrapper, which covers
-        // `bash -c 'rm -rf /'`; it does nothing for a wrapper that appears in a
-        // LATER segment, where the segment's head token reads as `bash` and the
-        // payload is never inspected. Prefixing any read-only command was
-        // therefore enough to walk the hard-block: `true && bash -c 'rm -rf /'`
-        // scanned as head `true` then head `bash`, matched nothing, and fell
-        // through to Safe (auto-allowed outright on the unattended
-        // coding-agent lane). Unwrapping here can only ever ADD a catastrophic
-        // verdict, never remove one.
+        // Unwrap a shell wrapper PER SEGMENT, not just at the head of the
+        // whole line. `static_classify` unwraps the outermost wrapper only. It
+        // does nothing for a wrapper in a LATER segment, where the head token
+        // reads as `bash` and the payload is never inspected. Prefixing any
+        // read-only command would then be enough to walk the hard-block.
+        // Unwrapping here can only ADD a catastrophic verdict.
         if let Some(reason) = catastrophic_rm_or_chmod(unwrap_shell_command(&segment)) {
             return Some(reason);
         }
@@ -1135,11 +1091,10 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
 }
 
 /// Split a command line into individual command segments at shell control
-/// operators (`;`, `&&`, `||`, `|`, `&`, newline) so a chained command like
-/// `cd /tmp && rm -rf /` is analysed segment-by-segment. fd-duplications
-/// (`2>&1`, `>&2`) are stripped first — they're pure plumbing, and splitting
-/// on their `&` would shear `ls 2>&1` into a junk `1` segment that defeats
-/// the safe fast-path for one of the most common shell shapes.
+/// operators, so a chained command is analysed segment by segment.
+/// fd-duplications are stripped first. They are pure plumbing, and splitting
+/// on their `&` would shear a redirect into a junk segment. That defeats the
+/// safe fast path for one of the most common shell shapes.
 fn command_segments(command: &str) -> impl Iterator<Item = String> {
     static FD_DUP: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
@@ -1239,14 +1194,13 @@ fn catastrophic_rm_or_chmod(segment: &str) -> Option<&'static str> {
 }
 
 /// The command word a head token really names, after stripping the shell
-/// decorations that do NOT change which binary runs: a leading `\` (the
-/// alias-bypass form `\rm`, which runs `/bin/rm` exactly like a bare `rm`),
-/// surrounding quotes (`"rm"`, `'rm'`), a glued grouping token (`(rm`), and any
-/// directory prefix (`/bin/rm`).
+/// decorations that do NOT change which binary runs: a leading backslash (the
+/// alias-bypass form), surrounding quotes, a glued grouping token, and any
+/// directory prefix.
 ///
-/// A raw `head.rsplit('/')` comparison saw `\rm` and `"rm"` as unknown commands,
-/// so `\rm -rf /` matched neither the catastrophic deny-list nor the
-/// destruction-scope scan and classified all the way through to Safe.
+/// A raw basename comparison reads a decorated head as an unknown command. It
+/// then matches neither the catastrophic deny-list nor the destruction-scope
+/// scan, and classifies all the way through to Safe.
 fn normalized_head(head: &str) -> &str {
     let stripped = head.trim_start_matches(['(', '{', '\\']);
     let unquoted = stripped.trim_matches(|c| c == '"' || c == '\'');
@@ -1260,34 +1214,24 @@ fn is_flag_token(tok: &str) -> bool {
 }
 
 /// Every (command word, argument tokens) pair a segment could be running, for
-/// the three scans that CLASSIFY DANGER ([`catastrophic_rm_or_chmod`],
-/// [`segment_destruction_scope`] and [`segment_side_effect_category`]). Extends
-/// [`command_head_index`] by also walking past a bare shell grouping token
-/// (`{ rm -rf /; }`, `( rm -rf / )`), and normalizes each head via
+/// the three scans that CLASSIFY DANGER. Extends [`command_head_index`] by also
+/// walking past a bare shell grouping token, and normalizes each head via
 /// [`normalized_head`].
 ///
-/// It returns a LIST rather than one head because a wrapper's own options have
+/// It returns a LIST rather than one head, because a wrapper's own options have
 /// an arity we cannot know. [`is_benign_prefix`] never matches a `-`-prefixed
-/// token, so the walk used to stop dead on one and resolve the head to the
-/// FLAG: `sudo -E rm -rf /` resolved to `-E`, matched none of the danger
-/// tables, and [`fallback_classify`] settled the whole line `Safe`, which on
-/// the unattended coding-agent lane is an auto-allow with no card and no
-/// checkpoint. The catastrophic hard-block was defeated by the same token, as
-/// were `env -i rm -rf /` and `nice -n 10 rm -rf /`.
+/// token, so a naive walk stops dead on one and resolves the head to the FLAG.
+/// The whole line then matches no danger table and settles `Safe`.
 ///
-/// Enumerating each wrapper's flag arity is the other repair and it fails OPEN
-/// on every flag not listed (`sudo -u root rm -rf /` would resolve to `root`),
-/// so instead a flag-shaped head branches into BOTH readings, flag-takes-no-arg
-/// and flag-takes-one-argument, and every reading is scanned. That is safe by
-/// construction, because these three scans can only ever ADD a danger verdict,
-/// never remove one, and it costs nothing on ordinary input: a head that is not
-/// flag-shaped never branches, so `git commit -m "rm -rf / is bad"` still
-/// resolves to exactly one candidate. The visited set bounds the walk to at
-/// most one candidate per token.
+/// Enumerating each wrapper's flag arity is the other repair, and it fails OPEN
+/// on every flag not listed. So a flag-shaped head branches into BOTH readings,
+/// and every reading is scanned. That is safe by construction: these scans can
+/// only ADD a danger verdict. A head that is not flag-shaped never branches, so
+/// it costs nothing on ordinary input.
 ///
-/// Deliberately NOT used by [`segment_is_safe`]: there an unrecognised head
-/// already falls through to the judge, which is the conservative direction, so
-/// resolving these forms would newly SETTLE decorated commands as Safe.
+/// Deliberately NOT used by [`segment_is_safe`]. There an unrecognised head
+/// already falls through to the judge, so resolving these forms would newly
+/// SETTLE decorated commands as Safe.
 fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
     // The grouping-token walk, from an arbitrary starting offset.
     fn resolve_head_at(toks: &[&str], from: usize) -> usize {
@@ -1323,16 +1267,15 @@ fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str]
     candidates
 }
 
-/// Environment-variable names whose value is loaded and EXECUTED by the process
-/// the command starts, so a `VAR=value` preamble carrying one runs code the
-/// command head says nothing about. Matched case-sensitively (the dynamic loader
-/// and these interpreters all read exact upper-case names).
+/// Environment-variable names whose value is loaded and EXECUTED by the
+/// process the command starts. A `VAR=value` preamble carrying one runs code
+/// the command head says nothing about. Matched case-sensitively, because the
+/// loader and these interpreters read exact upper-case names.
 ///
 /// **An entry ending in `=` is an EXACT name; every other entry is a prefix.**
-/// `ENV`, `PATH` and `IFS` are short enough to begin a great many ordinary
-/// application variables (`ENVIRONMENT`, `PATHEXT`, `IFS_MODE`), and matching
-/// those as prefixes drops routine commands out of the Safe fast path for
-/// nothing.
+/// The three-letter names begin many ordinary application variables, and
+/// matching those as prefixes drops routine commands out of the Safe fast path
+/// for nothing.
 ///
 /// Not a completeness claim: it covers the loader hooks (`LD_*`, `DYLD_*`) and
 /// the startup-file hooks of the interpreters we ship or that any dev box has.
@@ -1342,10 +1285,10 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
     "DYLD_",
     "BASH_ENV",
     "ENV=",
-    // The most direct one: the agent can write `data/bin/ls` with an ordinary
-    // in-workspace write (itself Safe) and then `PATH=data/bin ls` runs it with
-    // no card, no checkpoint and no judge call. Exact, so `PATHEXT=` and the
-    // various `*_PATH=` build variables keep the fast path.
+    // The most direct one. The agent can write its own binary with an ordinary
+    // in-workspace write, itself Safe. A `PATH=` preamble then runs it with no
+    // card, no checkpoint and no judge call. Exact, so `PATHEXT=` and the
+    // various build variables keep the fast path.
     "PATH=",
     "SHELLOPTS",
     "BASHOPTS",
@@ -1374,18 +1317,17 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
 /// [`CODE_INJECTING_ENV_NAMES`].
 ///
 /// A trailing `=` in the list marks an **exact** variable name; every other
-/// entry is a name prefix. The distinction is load-bearing: `ENV` and `IFS` are
-/// three-letter names that begin an enormous number of ordinary application
-/// variables (`ENVIRONMENT`, `ENV_FILE`, `IFS_MODE`), so matching them as
+/// entry is a name prefix. The distinction is load-bearing. `ENV` and `IFS`
+/// begin an enormous number of ordinary application variables. Matching them as
 /// prefixes would drop routine commands out of the Safe fast path and send them
 /// to the judge for nothing.
 fn is_code_injecting_assignment(tok: &str) -> bool {
     let Some((name, _)) = tok.split_once('=') else {
         return false;
     };
-    // bash's append form `VAR+=value` assigns the same variable, so the `+` has
-    // to come off before an exact-name comparison. Without this `PATH+=:data/bin`
-    // sailed past the fast path while `PATH=` was refused.
+    // bash's append form assigns the same variable, so the `+` has to come off
+    // before an exact-name comparison. Without it, an appended `PATH` sails
+    // past the fast path while the plain one is refused.
     let name = name.strip_suffix('+').unwrap_or(name);
     if name.is_empty() || name.starts_with('-') {
         return false;
@@ -1411,8 +1353,8 @@ fn preamble_has_code_injecting_env(toks: &[&str], head_at: usize) -> bool {
 ///
 /// Shared by the two PERMISSIVE paths so they cannot disagree: the Safe fast
 /// path in [`segment_is_safe`], and the stored-grant path in
-/// `command_permission::command_is_allowed`, where a `Bash(ls:*)` grant would
-/// otherwise auto-allow `LD_PRELOAD=/tmp/evil.so ls` with no card, which is the
+/// `command_permission::command_is_allowed`. A stored grant for a read-only
+/// head would otherwise auto-allow a preamble-injected run with no card, the
 /// same bypass the fast path already refuses.
 ///
 /// The danger scans' head walk is deliberately NOT gated on this: there the
@@ -1437,13 +1379,13 @@ fn is_benign_prefix(tok: &str) -> bool {
 }
 
 /// Walk past the tokens that precede the real command word and return the index
-/// of the command head in `toks` (or `toks.len()` when the segment is only
-/// prefixes/redirects, so no command runs). Skips two kinds of preamble:
-///   * benign privilege/wrapper prefixes + `VAR=value` ([`is_benign_prefix`]),
-///   * **leading I/O redirections** — bash allows `2>log cmd args`, so a redirect
-///     before the command must not be mistaken for the command itself (otherwise
-///     `2>log rm -rf /` would slip past both the safe-list and the catastrophic
-///     deny-list).
+/// of the command head in `toks`. Returns `toks.len()` when the segment is only
+/// prefixes and redirects, so no command runs. Two kinds of preamble are
+/// skipped:
+///   * benign privilege and wrapper prefixes, plus `VAR=value`,
+///   * **leading I/O redirections**. Bash allows a redirect before the command,
+///     which must not be mistaken for the command itself. Otherwise it slips
+///     past both the safe-list and the catastrophic deny-list.
 fn command_head_index(toks: &[&str]) -> usize {
     let mut i = 0;
     while let Some(tok) = toks.get(i) {
@@ -1458,10 +1400,9 @@ fn command_head_index(toks: &[&str]) -> usize {
     i
 }
 
-/// If `tok` is an I/O-redirection operator (`>`, `>>`, `<`, `2>`, `&>`, …),
-/// return whether its target is the *following* token (`2> file` → `true`)
-/// rather than glued onto this one (`2>file`, `2>&1` → `false`). `None` when
-/// `tok` is not a redirect.
+/// If `tok` is an I/O-redirection operator, return whether its target is the
+/// *following* token rather than glued onto this one. `None` when `tok` is not
+/// a redirect.
 fn redirect_token_needs_target(tok: &str) -> Option<bool> {
     let rest = tok.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
     let after = rest
@@ -1497,14 +1438,14 @@ fn is_recursive_flag(arg: &str) -> bool {
     }
 }
 
-/// True for a token that names the filesystem root or home directory (the only
-/// targets the catastrophic lane recognises), tolerating surrounding quotes and
-/// the common `$HOME` / `~` spellings.
+/// True for a token that names the filesystem root or home directory, the only
+/// targets the catastrophic lane recognises. Tolerates surrounding quotes and
+/// the common `$HOME` and `~` spellings.
 fn is_catastrophic_target(tok: &str) -> bool {
     // Trailing shell punctuation comes off with the quotes. `normalized_head`
-    // already strips the OPENING grouping token off the head, so `(rm -rf /)`
-    // resolves its head to `rm`; without the matching close the target read as
-    // `/)` and the pair escaped the hard block into the merely-dangerous lane.
+    // already strips the OPENING grouping token off the head. Without the
+    // matching close, the target keeps its bracket and the pair escapes the
+    // hard block into the merely-dangerous lane.
     //
     // A trailing `}` is only a group closer when the token opened no brace of
     // its own: `${HOME}` carries its own, and trimming it unconditionally
@@ -1538,32 +1479,28 @@ fn is_catastrophic_target(tok: &str) -> bool {
 // ===========================================================================
 // IrreversibleDanger — the static "dangerous" list, now category-tagged.
 //
-// Phase 3 demoted this from the primary detector to TWO supporting roles, and
-// Phase 5 makes both category-aware (so an unattended trigger can match a
-// command against its side-effect grant):
-//   1. [`fallback_classify`] — the classification used for the ambiguous middle
-//      when the judge is off (`command_guard_judge=false`) or unavailable (no
-//      provider / a failed call). It flags the obvious side-effects (this
-//      list), routes destruction shapes via the static destruction scan, and
-//      runs the rest. The matching [`SideEffectCategory`] is what the trigger
-//      grant check (Phase 5) keys on when the judge is unavailable.
-//   2. [`permission_summary`] — the card text when the judge produced no
-//      tailored summary (judge off / failed); derived from the category.
-// The judge (`engine::command_judge`) is the primary classifier and both widens
-// coverage (novel side-effects, out-of-workspace destruction) and cuts false
+// This is not the primary detector. It has two supporting roles, both
+// category-aware so an unattended trigger can match a command against its
+// side-effect grant:
+//   1. [`fallback_classify`] classifies the ambiguous middle when the judge is
+//      off or unavailable. It flags the obvious side-effects from this list,
+//      routes destruction shapes through the static destruction scan, and runs
+//      the rest. The matching category is what the trigger grant check keys on.
+//   2. [`permission_summary`] derives the card text from the category when the
+//      judge produced no tailored summary.
+// The judge is the primary classifier. It widens coverage and cuts false
 // positives. Keep this list conservative: every match costs a permission prompt
-// (chat) or a trigger block (trigger) on the fallback path.
+// or a trigger block on the fallback path.
 // ===========================================================================
 
-/// The [`SideEffectCategory`] a command statically looks like — the static
-/// counterpart of the judge's category tag, used by [`fallback_classify`] /
-/// [`permission_summary`] and as the trigger grant key when the judge is
-/// unavailable. `None` when no obvious side-effect shape matches. Scans both
-/// shapes: per-segment shell command heads (bash) and inline Python
-/// side-effect calls (the python `code` field). Each scan is harmless on the
-/// other tool's text — Python code has no matching shell head, and a shell
-/// command has no `requests.post(`. Out-of-workspace destruction is not this
-/// list's job — [`fallback_classify`]'s destruction scan tags it.
+/// The [`SideEffectCategory`] a command statically looks like: the static
+/// counterpart of the judge's category tag, and the trigger grant key when the
+/// judge is unavailable. `None` when no obvious side-effect shape matches.
+///
+/// Scans both shapes, per-segment shell command heads and inline Python calls.
+/// Each scan is harmless on the other tool's text. Out-of-workspace destruction
+/// is not this list's job, and [`fallback_classify`]'s destruction scan tags
+/// it.
 pub fn static_side_effect_category(command: &str) -> Option<SideEffectCategory> {
     if let Some(cat) = python_side_effect_category(command) {
         return Some(cat);
@@ -1576,11 +1513,11 @@ pub fn static_side_effect_category(command: &str) -> Option<SideEffectCategory> 
 fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
     let toks: Vec<&str> = segment.split_whitespace().collect();
     // Resolved exactly like the danger scans, decorations and bare grouping
-    // tokens included: this category is what an unattended trigger's grant is
-    // checked against, so a head that resolved to nothing here skipped the grant
-    // check entirely and auto-allowed. Using the shared resolver can only ever
-    // derive a category where there was none, and keeps the three head-resolving
-    // scans from drifting apart again.
+    // tokens included. This category is what an unattended trigger's grant is
+    // checked against. A head that resolves to nothing here would skip the
+    // grant check entirely and auto-allow. The shared resolver can only derive
+    // a category where there was none, and it keeps the three head-resolving
+    // scans from drifting apart.
     danger_head_candidates(&toks)
         .into_iter()
         .find_map(|(base, args)| match base.as_str() {
@@ -1591,9 +1528,9 @@ fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
         })
 }
 
-/// True when curl/wget args carry a write HTTP method or a request body/upload
-/// — the signal that the call mutates server state rather than just reading.
-/// A bare `curl https://…` (a GET) is NOT flagged.
+/// True when curl or wget args carry a write HTTP method, or a request body:
+/// the signal that the call mutates server state rather than just reading. A
+/// bare GET is NOT flagged.
 fn is_mutating_http(args: &[&str]) -> bool {
     const MUTATING_METHODS: &[&str] = &["POST", "PUT", "DELETE", "PATCH"];
     // Data / upload flags imply a body (curl defaults to POST when given data;
@@ -1681,12 +1618,12 @@ fn python_side_effect_category(code: &str) -> Option<SideEffectCategory> {
     None
 }
 
-/// The command head (basename, with benign privilege/wrapper prefixes and
-/// leading redirects skipped) of every segment of `command` that actually runs
-/// a command: `sudo /usr/bin/aws s3 rm x && curl -X POST u` → `["aws", "curl"]`.
-/// Redirect-only / empty segments contribute nothing. Used by the permission
-/// lane's auto-allow matching, which requires EVERY head to be covered by a
-/// granted `Bash(<head>:*)` pattern — matching only the first head would let a
+/// The command head of every segment of `command` that actually runs a
+/// command, as a basename with benign prefixes and leading redirects skipped.
+/// Redirect-only and empty segments contribute nothing.
+///
+/// Used by the permission lane's auto-allow matching, which requires EVERY head
+/// to be covered by a granted pattern. Matching only the first head would let a
 /// dangerous trailing segment ride into a grant for a harmless leading one.
 pub fn segment_heads(command: &str) -> Vec<String> {
     command_segments(command)
@@ -1700,10 +1637,9 @@ pub fn segment_heads(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// The first entry of [`segment_heads`] — used to derive the `Bash(<head>:*)`
-/// allow-pattern STORED by an "Always allow" click (the card's narrow button is
-/// labeled with it). `/usr/bin/git push` → `git`, `sudo aws s3 …` → `aws`.
-/// `None` for a command that runs nothing. Deterministic so the stored pattern
+/// The first entry of [`segment_heads`], used to derive the allow-pattern an
+/// "Always allow" click STORES. The card's narrow button is labeled with it.
+/// `None` for a command that runs nothing. Deterministic, so the stored pattern
 /// matches the pattern checked on the next prompt.
 pub fn first_command_token(command: &str) -> Option<String> {
     segment_heads(command).into_iter().next()
@@ -1860,12 +1796,11 @@ mod tests {
         }
     }
 
-    /// The Safe fast path resolved its head by BASENAME, so a binary the agent
-    /// had just written into the workspace ran with no card, no checkpoint and
-    /// no judge call: `data/bin/ls` read as the read-only `ls`. That is the
-    /// write-then-run escalation `PATH=` is on `CODE_INJECTING_ENV_NAMES` to
-    /// close, reachable without the `PATH=` preamble. A path-qualified head
-    /// falls through to the judge now.
+    /// Resolving the Safe fast path's head by BASENAME lets a binary the agent
+    /// just wrote run with no card, no checkpoint and no judge call. That is
+    /// the write-then-run escalation `PATH=` is on
+    /// `CODE_INJECTING_ENV_NAMES` to close, reachable without the preamble. A
+    /// path-qualified head falls through to the judge.
     #[test]
     fn a_path_qualified_head_never_settles_safe() {
         for cmd in [
@@ -1882,11 +1817,10 @@ mod tests {
         assert_settled(bash("ls -la"), RiskLane::Safe, "ls -la");
     }
 
-    /// The wrapper only had to move out of the FIRST segment to hide again:
-    /// `static_classify` unwraps the outermost wrapper, so prefixing any
-    /// read-only command left the payload behind a head token of `bash`, and
-    /// the whole line fell through to Safe (auto-allowed outright on the
-    /// unattended coding-agent lane). The unwrap is per segment now.
+    /// A wrapper only has to move out of the FIRST segment to hide.
+    /// `static_classify` unwraps the outermost one. Prefixing any read-only
+    /// command leaves the payload behind a head token of `bash`, and the whole
+    /// line falls through to Safe. The unwrap is per segment.
     #[test]
     fn catastrophic_survives_a_shell_c_wrapper_in_a_later_segment() {
         for cmd in [
@@ -1918,10 +1852,10 @@ mod tests {
         }
     }
 
-    /// A `VAR=value` preamble is skipped when resolving the head, which is right
-    /// for `FOO=1 ls` but wrong for the variables the dynamic loader and the
-    /// interpreters EXECUTE: `LD_PRELOAD=/tmp/evil.so ls` used to settle Safe on
-    /// the read-only `ls` and run arbitrary code with no card and no checkpoint.
+    /// A `VAR=value` preamble is skipped when resolving the head. That is right
+    /// for an ordinary variable and wrong for the ones the dynamic loader and
+    /// the interpreters EXECUTE. Those settle Safe on the read-only head and
+    /// run arbitrary code with no card and no checkpoint.
     #[test]
     fn a_code_injecting_env_assignment_is_never_settled_safe() {
         for cmd in [
@@ -2425,11 +2359,11 @@ mod tests {
         );
     }
 
-    /// Regression: the SHORT-GLUED output flag (`-o/etc/x`, no space and no `=`).
-    /// `is_pathish` rejects anything starting with `-` and there is no `=` to
-    /// split on, so the path rode past both branches of
-    /// `token_escapes_workspace` and the command settled `Safe` even though the
-    /// spaced and `=`-glued spellings of the very same write were refused.
+    /// Regression: the SHORT-GLUED output flag, with no space and no `=`.
+    /// `is_pathish` rejects anything starting with `-`, and there is no `=` to
+    /// split on. The path rides past both branches of
+    /// `token_escapes_workspace`, and the command settles `Safe` even though
+    /// the spaced spelling of the same write is refused.
     #[test]
     fn short_glued_output_flag_outside_the_workspace_goes_to_judge() {
         for cmd in [
@@ -2452,9 +2386,9 @@ mod tests {
     }
 
     /// Regression: a `READ_ONLY_HEADS` entry that can be POINTED at an output
-    /// file wrote outside the workspace with no `>` for the redirect scan to
-    /// catch, so it settled `Safe` (no card on chat, `Benign` auto-allow on the
-    /// unattended coding-agent lane). See `WRITE_CAPABLE_READ_ONLY_HEADS`.
+    /// file writes outside the workspace with no `>` for the redirect scan to
+    /// catch. It then settles `Safe`, with no card on chat and an auto-allow on
+    /// the unattended lane. See `WRITE_CAPABLE_READ_ONLY_HEADS`.
     #[test]
     fn read_only_head_writing_outside_the_workspace_goes_to_judge() {
         for cmd in [
@@ -2493,10 +2427,10 @@ mod tests {
         }
         // A read-only subcommand with no output flag is unaffected.
         assert_settled(bash("git diff HEAD~1"), RiskLane::Safe, "plain git diff");
-        // A bare `-o` is NOT an output flag on any read-only subcommand: it is
-        // `--others` on ls-files and `--only-matching` on grep. Matching it sent
-        // this routine read to the judge on every call and bought no safety,
-        // since git rejects `-o` on the subcommands that can actually write.
+        // A bare `-o` is NOT an output flag on any read-only subcommand: it
+        // means something else on ls-files and grep. Matching it would send a
+        // routine read to the judge and buy no safety, since git rejects `-o`
+        // on the subcommands that can actually write.
         for cmd in [
             "git ls-files -o --exclude-standard",
             "git grep -o pattern",

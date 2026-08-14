@@ -57,6 +57,19 @@ export interface ExplainerProps {
  * runs long. A centered dialog is correct at every viewport and every length of
  * copy, and is one thing for the user to learn rather than two.
  *
+ * **The icon is glued to the label it explains and can never wrap away from
+ * it.** A button is an atomic inline, and line breaking allows a break in front
+ * of one. A label squeezed by the control beside it therefore drops the glyph
+ * onto a line of its own, under the text, belonging to nothing.
+ * `.explainer-slot` is what prevents that: a plain inline box whose `::before`
+ * is a U+2060 WORD JOINER, which forbids the break. The joiner is generated
+ * content rather than a text node, so it never reaches `textContent`, an
+ * accessible name, or a copied selection.
+ *
+ * The slot must stay `display: inline`. An inline-flex or inline-block one is
+ * an atomic inline itself, which hides the joiner from the line breaker and
+ * puts the orphan straight back.
+ *
  * Built on `<Overlay>`, so click-outside dismiss-and-swallow, the Escape
  * registry and inert-behind all come from the central contract. The icon button
  * is passed as `anchor`: that is what makes a second tap on it close via this
@@ -147,23 +160,29 @@ export function Explainer({ title, children }: ExplainerProps) {
 
   return (
     <>
-      <button
-        ref={setAnchor}
-        // Never a submit: explainers sit inside real forms (the trigger editor,
-        // the credential modal), where the default type would save on click.
-        type="button"
-        class="icon-btn explainer-btn"
-        aria-label={`About ${title}`}
-        // `aria-haspopup`, not `aria-expanded`: this opens a modal dialog, not a
-        // disclosure. The backdrop covers the icon while the dialog is up, so
-        // there is no expanded state the reader can act on from here (the exits
-        // are Close, Escape, and the scrim). The handler still toggles, since
-        // the anchor owning its own re-activation is the <Overlay> contract.
-        aria-haspopup="dialog"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <InfoIcon />
-      </button>
+      {/* The slot keeps the icon on its label's line, per the note above. It
+          carries no markup of its own: the word joiner is its `::before`, and
+          the gap before the icon is its margin. */}
+      <span class="explainer-slot">
+        <button
+          ref={setAnchor}
+          // Never a submit: explainers sit inside real forms (the trigger editor,
+          // the credential modal), where the default type would save on click.
+          type="button"
+          class="icon-btn explainer-btn"
+          aria-label={`About ${title}`}
+          // `aria-haspopup`, not `aria-expanded`: this opens a modal dialog, not
+          // a disclosure. The backdrop covers the icon while the dialog is up.
+          // So there is no expanded state the reader can act on from here (the
+          // exits are Close, Escape, and the scrim). The handler still toggles,
+          // since the anchor owning its own re-activation is the <Overlay>
+          // contract.
+          aria-haspopup="dialog"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <InfoIcon />
+        </button>
+      </span>
       {typeof document === 'undefined' ? dialog : createPortal(dialog, document.body)}
     </>
   );

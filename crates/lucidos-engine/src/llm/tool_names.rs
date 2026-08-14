@@ -163,7 +163,7 @@ pub const NOTIFICATIONS: &str = "notifications";
 pub const READ_NOTIFICATIONS: &str = "read_notifications";
 pub const NAVIGATE_UI: &str = "navigate_ui";
 pub const ASK_USER_QUESTION: &str = "ask_user_question";
-/// Subscribe to an event and be woken as a new turn when it arrives. Returns
+/// Subscribe to an event and be re-opened as a new turn when it arrives. Returns
 /// immediately and does not end the turn. See `engine::event_wait` and ADR 0047.
 ///
 /// One thing outside the tool layer keys on this name and cannot import it from
@@ -176,7 +176,7 @@ pub const AWAIT_EVENT: &str = "await_event";
 pub const LIST_EVENT_WAITS: &str = "list_event_waits";
 /// Stand one of the calling thread's own subscriptions down, or all of them.
 /// The revoke half of `await_event`: without it an agent told to stop watching
-/// had to admit the subscription would wake it later regardless.
+/// had to admit the subscription would re-open it later regardless.
 pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
 
 // Image generation

@@ -57,12 +57,73 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
 }
 
 #[test]
-fn payload_app_badge_reflects_unread_count() {
+fn gateway_scope_is_a_path_deeper_than_root() {
+    // The discriminator behind the whole aggregate-badge rule: a subscription
+    // whose recorded SW scope has a path is one the GATEWAY served, and the
+    // gateway re-stamps every manifest it serves with `scope: "/"`, so that
+    // install's single icon covers every workspace on the origin.
+    assert!(is_gateway_scoped(Some("https://lucidos.test/dev/")));
+    assert!(is_gateway_scoped(Some("http://192.0.2.10:5251/myws/")));
+    // The picker itself is under the sigil, so it is gateway-scoped too.
+    assert!(is_gateway_scoped(Some("https://lucidos.test/~/")));
+
+    // A direct engine port serves exactly one workspace: own count.
+    assert!(!is_gateway_scoped(Some("https://lucidos.test:5250/")));
+    assert!(!is_gateway_scoped(Some("http://localhost:5250/")));
+    // A legacy row from before the column existed, and any unparseable value,
+    // keep the own-count behaviour rather than guessing.
+    assert!(!is_gateway_scoped(None));
+    assert!(!is_gateway_scoped(Some("not a url")));
+    assert!(!is_gateway_scoped(Some("")));
+}
+
+#[test]
+fn app_badge_is_the_aggregate_only_for_a_gateway_install() {
+    // A gateway install badges every workspace on the origin...
+    assert_eq!(
+        app_badge_for(Some("https://lucidos.test/dev/"), Some(2), Some(9)),
+        Some(9)
+    );
+    // ...and falls back to its own count when the gateway could not be reached,
+    // so the icon reads low rather than staying frozen at what the last push
+    // wrote.
+    assert_eq!(
+        app_badge_for(Some("https://lucidos.test/dev/"), Some(2), None),
+        Some(2)
+    );
+    // A direct-engine subscription never takes the aggregate, even when one was
+    // resolved for a sibling subscription in the same fan-out.
+    assert_eq!(
+        app_badge_for(Some("https://lucidos.test:5250/"), Some(2), Some(9)),
+        Some(2)
+    );
+    // A legacy subscription with no recorded scope behaves as it always has.
+    assert_eq!(app_badge_for(None, Some(2), Some(9)), Some(2));
+    // Nothing readable at all leaves the badge untouched.
+    assert_eq!(
+        app_badge_for(Some("https://lucidos.test/dev/"), None, None),
+        None
+    );
+}
+
+#[test]
+fn gateway_total_is_read_from_the_control_answer() {
+    assert_eq!(parse_unread_total(r#"{"total":7}"#), Some(7));
+    assert_eq!(parse_unread_total(r#"{"total":0}"#), Some(0));
+    // Anything else is "unknown", never a silent 0 that would clear the badge.
+    assert_eq!(parse_unread_total(r#"{"total":"7"}"#), None);
+    assert_eq!(parse_unread_total(r#"{"workspaces":[]}"#), None);
+    assert_eq!(parse_unread_total("not json"), None);
+}
+
+#[test]
+fn payload_app_badge_reflects_the_resolved_badge_count() {
     // Declarative Web Push top-level `app_badge` (sibling of `web_push` /
     // `notification`) drives the installed PWA's home-screen badge — iOS reads
     // it in its parent process without running the SW, the only badge path for
-    // a closed iOS PWA. It carries the workspace's OWN unread count, so a
-    // per-workspace PWA badges its own workspace.
+    // a closed iOS PWA. The envelope carries whatever `app_badge_for` resolved
+    // for this subscription: the workspace's own count, or the cross-workspace
+    // total for a gateway-served install.
     let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(3));
     assert_eq!(payload["app_badge"], 3);
 

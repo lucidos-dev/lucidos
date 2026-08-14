@@ -762,7 +762,7 @@ async fn first_turn_creates_deterministic_worktree_path() {
     let path = resolve_worktree_path(&pool, thread_id, workspace.path(), &repo_root, None).await;
     let expected_suffix = format!(
         "thread-{}",
-        &thread_id.simple().to_string()[..THREAD_WORKTREE_ID_LEN]
+        crate::engine::git_ops::short_thread_id(thread_id)
     );
     assert!(
         path.ends_with(&expected_suffix),

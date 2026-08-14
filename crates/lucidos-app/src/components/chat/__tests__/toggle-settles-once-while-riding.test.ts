@@ -259,7 +259,20 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
    *  lives in `withScrollAnchor`; skip one without the other and the reader is
    *  left frozen at their old offset with the content above them grown, which
    *  is a drift rather than a hold. `followIsCarrying` is the one question both
-   *  ask, which is what makes that state unreachable. */
+   *  ask, which is what makes that state unreachable.
+   *
+   *  A reveal is also GROWTH, so in the app the resize handler runs for one too,
+   *  and since 2026-08-13 its growth branch keeps an armed reader who is still ON
+   *  the live edge there (`keepTheLiveEdge`). The two do not fight, because
+   *  the correction below WRITES the container and its scroll event re-measures
+   *  the reader as off the edge before the resize is delivered, which is what
+   *  `defers to an anchor correction that moved them off the edge first` in
+   *  `scroll-follow-the-live-edge.test.ts` pins. What that leaves is the reveal
+   *  whose correction is a no-op because it grew content only BELOW the reader:
+   *  they were on the edge and still are, and growth carries them to the new
+   *  bottom exactly as it would for an arriving card. This file drives the two
+   *  anchor halves directly and wires no observers, so the cases below are the
+   *  correction's own answer rather than the whole app's. */
   describe('and holds an armed reader still on an IDLE thread instead', () => {
     /** Arm the follow, then let the thread go quiet. */
     function armedOnAFinishedThread() {

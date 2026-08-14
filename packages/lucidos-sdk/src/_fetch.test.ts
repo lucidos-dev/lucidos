@@ -58,6 +58,52 @@ describe('restampDeadline', () => {
   });
 });
 
+/** The workspace address is the whole reason `apiUrl` is public: an app that
+ *  builds an engine URL by hand gets a 404 that a `catch` turns into silence.
+ *  Both derivations are locked here because they are what the SDK reads INSTEAD
+ *  of the two shapes an author reaches for (a relative path against
+ *  `document.baseURI`, or a root-absolute `/api/v1/…`). See
+ *  `system-knowhow/js-sdk.md` § lucidos.apiUrl. */
+describe('apiUrl workspace-address derivation', () => {
+  const originalQuerySelector = globalThis.document.querySelector;
+  const originalLocation = (globalThis as unknown as { location?: unknown }).location;
+
+  /** Re-import `_fetch` so its load-time `computeBaseUrl()` reads the DOM we
+   *  just installed. The base is resolved once per module instance, so a fresh
+   *  instance per case is the only way to exercise both branches. */
+  async function apiUrlUnder(
+    base: string | null,
+    pathname: string,
+  ): Promise<(suffix: string) => string> {
+    globalThis.document.querySelector = ((): Element | null =>
+      (base === null ? null : { getAttribute: () => base } as unknown as Element)) as
+      typeof document.querySelector;
+    (globalThis as unknown as { location: { pathname: string } }).location = { pathname };
+    vi.resetModules();
+    return (await import('./_fetch')).apiUrl;
+  }
+
+  afterEach(() => {
+    globalThis.document.querySelector = originalQuerySelector;
+    (globalThis as unknown as { location?: unknown }).location = originalLocation;
+  });
+
+  it('reads the SPA shell\'s <base href>, whatever the slug is called', async () => {
+    const apiUrl = await apiUrlUnder('/dev/', '/dev/');
+    expect(apiUrl('/events/query?limit=1')).toBe('/dev/api/v1/events/query?limit=1');
+  });
+
+  it('takes everything before /app/ when there is no <base>, as in an app iframe', async () => {
+    const apiUrl = await apiUrlUnder(null, '/dev/app/habit-tracker/');
+    expect(apiUrl('/events/query?limit=1')).toBe('/dev/api/v1/events/query?limit=1');
+  });
+
+  it('falls back to an unprefixed URL with no <base> and no /app/ segment', async () => {
+    const apiUrl = await apiUrlUnder(null, '/');
+    expect(apiUrl('/events/query')).toBe('/api/v1/events/query');
+  });
+});
+
 describe('rawFetch deadline + caller signal', () => {
   it('reports a fired deadline as TimeoutError, never a bare cancel', async () => {
     globalThis.fetch = abortingFetch() as unknown as typeof fetch;

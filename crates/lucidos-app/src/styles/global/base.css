@@ -145,7 +145,7 @@ html {
        var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
        Mobile redefines this in mobile.css: its header is fixed at the viewport
        top instead, so the anchor there is the measured header height alone. */
-    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px));
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px));
     /* The breathing room a surface HUNG FROM the header leaves below that edge,
        so it reads as coming out of the row it was opened from rather than as
        welded to it. The other half of the anchor above, and it lives beside it
@@ -163,6 +163,26 @@ html {
        the banner renders inside the fixed header, whose measured height
        (--mobile-header-height) already includes it. */
     --app-banner-height: 0px;
+    /* The connection banner's own height, on the same terms. A SECOND property
+       rather than a share of the one above, because both bars can be up at once
+       and each publishes from its own ResizeObserver: one property would mean
+       whichever measured last wins, and retracting either would clear the
+       reservation for both. */
+    --app-conn-banner-height: 0px;
+    /* How much of a state colour an app-shell banner washes over its surface.
+       Shared by both bars so they read as one family, and named so the live
+       style remote can retune the wash without reaching into two rules. */
+    --banner-tint-strength: 10%;
+    /* The connection banner's line-height, stated rather than inherited and
+       named rather than written into the rule, because the dot's offset is
+       derived from it: the offset lands the dot on the sentence's FIRST line,
+       so a second copy of the number would drift the dot off that line the
+       moment either is retuned. */
+    --banner-line-height: 1.4;
+    /* The dot leading the connection banner's sentence. Named because the
+       shared `.status-dot` scale carries colour only: every host sizes its own
+       (see `--brand-menu-notice-dot`, the same dot inside the Lucidos menu). */
+    --connection-banner-dot: 0.5rem;
     /* Height of the desktop transcript's top fade (the mask that dissolves
        messages as they scroll up under the thread title header — see
        .thread-content in chat/input-messages.css). Shared so the deep-link /
@@ -585,6 +605,38 @@ button {
     font-feature-settings: var(--font-features-text, normal);
 }
 
+/* The other half of trap 2 above, and the reason the app "sets font-family on
+   inputs by hand" in roughly twenty places. The UA shorthand resets the whole
+   font, not just its features, so a control inherits neither the family from
+   `body` nor a size from its container: it renders in the system UI face at a
+   FIXED pixel size that does not move with the user's ui-scale at all. Every
+   one of those hand-written declarations was somebody noticing one control look
+   wrong; this is the default they were each standing in for. (Caught live by
+   e2e/type-scale.spec.ts: `.welcome-dismiss` sized itself from a token and
+   still painted in Arial.)
+
+   LONGHANDS, never the `font` shorthand. The shorthand resets `font-weight` and
+   `font-feature-settings` to their initial values, so a global one would undo
+   the rule directly above at every control at once, and clobber deliberate
+   weights. Both traps are already recorded at the sites that hit them:
+   skills.css (a shorthand ate a `font-weight: 600`, and picked up the raw root
+   size in a row that set none) and steps.css (a shorthand handed Fira Code's
+   ligatures back, needing an explicit `font-feature-settings: inherit` after
+   it). `html` is deliberately NOT in this list: `font-size: inherit` on the
+   root would override the ui-scale declaration at the top of this file, since
+   both are element selectors and this one comes later.
+
+   `inherit` rather than a token, so a control inside a smaller container (a
+   button in a `--font-size-xs` row) matches its surroundings instead of jumping
+   back to body size. */
+input,
+textarea,
+select,
+button {
+    font-family: inherit;
+    font-size: inherit;
+}
+
 /* Element selectors on purpose, so a new code surface is covered with nothing
    to maintain: fenced blocks and inline code in markdown, the shell commands in
    step rows (<code class="step-note-detail">), LineNumberedCode (which backs the
@@ -709,6 +761,24 @@ samp,
 
 body {
     font-family: var(--font-ui);
+    /* The body step, so text that names no size of its own lands on prose
+       rather than on a heading. This is a DEFAULT, not a value anything is
+       expected to rely on: nearly every surface still names its own token.
+
+       Without it an unsized element resolves to the root, and the root is
+       `var(--user-ui-scale)`, which is exactly `--font-size-xl` (1rem) and is
+       labelled "section headings". So an omission did not render "unstyled",
+       it rendered a step and a half ABOVE body text, and it did so most
+       visibly at a scaled root. That shipped in Settings > System > What's New,
+       where the release notes came out larger than the version heading they sat
+       under, because `.whats-new-notes` styled its padding and stopped.
+
+       Matches `body` in the engine's api/sdk_iframe.css, which has carried the
+       same declaration since 2026-08-05 for the same reason on the app side.
+       docs/code-review-priors.md carries the history of both, including the one
+       time this was deleted on the theory that a `rem` here ignores the UI
+       scale. It does not: the token is a `rem`, so it tracks the root. */
+    font-size: var(--font-size-md);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;

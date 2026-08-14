@@ -9,10 +9,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const swSource = readFileSync(resolve(__dirname, '../public/sw.js'), 'utf-8');
 
-// In source (and in the live dev server) sw.js carries the literal
-// `__LUCIDOS_BUILD_ID__` placeholder; the `lucidos-sw-stamp` Vite plugin
-// replaces it with a per-build id at `vite build` time (vite.config.ts). These
-// tests run the unstamped source, so the shell cache name keeps the placeholder.
+// In source, sw.js carries the literal `__LUCIDOS_BUILD_ID__` placeholder. The
+// `lucidos-sw-stamp` Vite plugin replaces it at `vite build` time
+// (vite.config.ts), and these tests run it unstamped, so the shell cache name
+// keeps the placeholder.
 const SHELL_CACHE = 'lucidos-shell-__LUCIDOS_BUILD_ID__';
 
 type FakeClient = {
@@ -26,9 +26,8 @@ type FakeClient = {
 
 // Runs sw.js inside a sandbox where `self`, `fetch`, `clients`, and `caches`
 // are mocks. Returns the registered fetch handler so tests can drive it.
-// Top-level handlers (push, notificationclick) only register their listeners —
-// they don't fire at load time, so the mocks just need to satisfy the
-// addEventListener calls.
+// Top-level handlers (push, notificationclick) only register their listeners.
+// They do not fire at load time, so the mocks only satisfy addEventListener.
 //
 // `opts.buildId` simulates the `lucidos-sw-stamp` plugin: it replaces the
 // `__LUCIDOS_BUILD_ID__` placeholder, flipping the SW's `IS_BUILT` gate true so
@@ -162,12 +161,11 @@ describe('Service Worker fetch handler', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
-  // The connection watchdog's probe. Its 4.5s deadline covers whatever happens
-  // inside the SW, so `fetchWithRetry`'s second attempt would run on what is
-  // left of the budget belonging to the attempt that matters, turning a fast
-  // honest failure into a timeout and the dot red. The retry buys nothing here
-  // either: three consecutive failed probes are suppressed and the next is 5s
-  // away.
+  // The connection watchdog's probe. Its 4.5s deadline covers everything inside
+  // the SW, so `fetchWithRetry`'s second attempt would eat the budget of the
+  // attempt that matters. That turns a fast honest failure into a timeout. The
+  // retry buys nothing here either: three consecutive failed probes are
+  // suppressed and the next is 5s away.
   it('GET to /api/v1/health: does NOT call respondWith', () => {
     const event = makeEvent('https://example.com/api/v1/health');
     handlers.fetch(event);
@@ -224,11 +222,9 @@ describe('Service Worker fetch handler', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
-  // Content-addressed blob endpoints (immutable for the lifetime of the
-  // hash) get persisted in the Cache API so iOS PWA — which evicts the HTTP
-  // cache aggressively — doesn't re-fetch on every thread visit. The visible
-  // symptom of the eviction is a brief black flash where the empty <img>
-  // shows the dark page background through it before the bytes arrive.
+  // A content-addressed blob endpoint is immutable, so the Cache API persists
+  // it. iOS PWA evicts the HTTP cache aggressively, and the symptom is a black
+  // flash where the empty image shows the page background through it.
   it('GET /api/v1/blobs/<hash>/preview: serves from Cache API on hit (no network)', async () => {
     const cached = new Response('cached-bytes');
     cacheStore.set('https://example.com/api/v1/blobs/abc/preview', cached);
@@ -279,13 +275,11 @@ describe('Service Worker fetch handler', () => {
   });
 });
 
-// Content-hashed app bundles (Vite's build output, /assets/<name>-<hash>.<ext>)
-// are immutable for a given URL, so the SW serves them Cache-first — a reload
-// pulls the JS/CSS graph from disk instead of the network (the bulk of an iOS
-// PWA reload after a notification-tap navigation; see notifications.md §4.5).
-// The branch self-gates across run modes: the Vite dev server serves modules
-// from /src, /@vite, /@id, /node_modules/.vite — never /assets/* — so it never
-// fires in dev, where caching unhashed modules would pin stale code / break HMR.
+// A content-hashed app bundle (/assets/<name>-<hash>.<ext>) is immutable for a
+// given URL, so the SW serves it cache-first. A reload then pulls the JS and
+// CSS graph from disk (see notifications.md §4.5). The branch self-gates across
+// run modes: the Vite dev server serves modules from /src, /@vite, /@id and
+// /node_modules/.vite, never /assets/*, so caching cannot pin stale code in dev.
 describe('Service Worker fetch handler — immutable /assets bundle caching', () => {
   it('GET /assets/<hash>.js: serves from Cache API on hit (no network), via SHELL_CACHE', async () => {
     const sw = loadSw();
@@ -369,19 +363,16 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
   });
 });
 
-// Navigation-shell serving (twelfth iteration, notifications.md §4.5). The shell
-// is served NETWORK-FIRST: every top-level navigation — the PWA start URL and
-// every notification-tap reload (`/?notification=…`, the cross-document load
-// WebKit forces on iOS) — fetches a fresh index.html so the shell always matches
-// the content-hashed /assets/* bundles the server currently has. A shell pinned
-// cache-first from an earlier build referenced bundles a later `vite build
-// --watch` had already deleted; the server's SPA fallback answered those with
-// index.html (200 text/html), the page loaded HTML as its entry module script,
-// and the PWA went black. The cache is the OFFLINE fallback only. Built mode only
-// (the SW's IS_BUILT gate, flipped here by stamping a fake build id); the live
-// dev server must serve a network-fresh shell so HMR / index.html edits aren't
-// pinned. The cache entry is keyed by the normalized `/` URL so every query
-// variant collapses onto one shell; `path === '/'` excludes app-UI iframe
+// Navigation-shell serving (notifications.md §4.5). The shell is NETWORK-FIRST:
+// every top-level navigation fetches a fresh index.html, so the shell always
+// matches the content-hashed /assets/* bundles the server has. A cache-first
+// shell can reference bundles a later build deleted. The SPA fallback then
+// answers those with index.html, which the page loads as its entry module
+// script. The cache is the OFFLINE fallback only.
+//
+// Built mode only, through the SW's IS_BUILT gate, flipped here by stamping a
+// fake build id. The cache entry is keyed by the normalized `/` URL, so every
+// query variant collapses onto one shell. `path === '/'` excludes app-UI iframe
 // (`/app/<id>/`) navigations, which are their own server-rendered HTML.
 const STAMPED_BUILD = 'testbuild0001';
 const STAMPED_SHELL_CACHE = `lucidos-shell-${STAMPED_BUILD}`;
@@ -396,9 +387,8 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
 
   it('built: navigate to /?notification=… fetches a FRESH shell (network-first), even when one is cached', async () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
-    // A stale shell is already cached under the normalized `/` key. Network-first
-    // must NOT serve it while online — that is exactly the stale-bundle black
-    // screen this iteration fixes.
+    // A stale shell is already cached under the normalized `/` key.
+    // Network-first must NOT serve it while online.
     const stale = new Response('<!doctype html>STALE shell');
     sw.cacheStore.set('https://example.com/', stale);
     const fresh = new Response('<!doctype html>FRESH shell', { status: 200 });
@@ -494,9 +484,9 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
     const cached = new Response('<!doctype html>good shell');
     sw.cacheStore.set('https://example.com/', cached);
     // A gateway predating the X-Lucidos-Boot-Splash marker still answers a
-    // stopped/booting workspace with a 503 splash; the engine is down either way,
-    // so the cached shell would just 503-storm. Key on the 503 status, not the
-    // header, so the splash shows against an older gateway too.
+    // stopped workspace with a 503 splash. The engine is down either way, so
+    // the cached shell would only 503-storm. Key on the status, not the header,
+    // so the splash shows against an older gateway too.
     const splash = new Response('<!doctype html>workspace starting…', { status: 503 });
     sw.mockFetch.mockResolvedValue(splash);
     const event = makeEvent('https://example.com/', 'GET', 'navigate');
@@ -551,8 +541,8 @@ describe('Service Worker install handler — shell precache', () => {
 });
 
 // activate() takes control of open pages, then prunes any cache it no longer
-// recognizes so a new build's shell cache name (lucidos-shell-<BUILD_ID>)
-// purges the prior generation instead of leaking it forever.
+// recognizes. A new build's shell cache name (lucidos-shell-<BUILD_ID>)
+// therefore purges the prior generation instead of leaking it.
 describe('Service Worker activate handler — cache lifecycle', () => {
   function makeActivateEvent() {
     const waiting: Array<Promise<unknown>> = [];
@@ -576,9 +566,9 @@ describe('Service Worker activate handler — cache lifecycle', () => {
   });
 });
 
-// Build a push event with a JSON payload. The SW handler calls `event.data.json()`
-// and `event.waitUntil(promise)` — collect waitUntil promises so tests can await
-// them before asserting.
+// Build a push event with a JSON payload. The SW handler calls
+// `event.data.json()` and `event.waitUntil(promise)`, so collect the waitUntil
+// promises for tests to await before asserting.
 function makePushEvent(payload: unknown) {
   const waiting: Promise<unknown>[] = [];
   return {
@@ -594,9 +584,7 @@ function makePushEvent(payload: unknown) {
 }
 
 describe('Service Worker push handler — normal show-notification path', () => {
-  // The cross-device read-marker pushes (type=mark_read / mark_all_read)
-  // were removed — see work-tracker `pwa-read-on-another-device-noise`.
-  // The push handler now only deals with create-time notifications.
+  // The push handler only deals with create-time notifications.
   let handlers: Record<string, (event: any) => void>;
   let mockRegistration: ReturnType<typeof loadSw>['mockRegistration'];
 
@@ -678,8 +666,8 @@ describe('Service Worker message handler — liveness ping', () => {
   });
 });
 
-// Locks the always-showNotification contract — see sw.js push handler for the
-// Chrome silent-push-budget rationale.
+// Locks the always-showNotification contract. The Chrome silent-push-budget
+// rationale is in the sw.js push handler.
 describe('Service Worker push handler — userVisibleOnly contract', () => {
   function pushEvent(payload: Record<string, unknown>) {
     const waited: Array<Promise<unknown>> = [];
@@ -706,9 +694,9 @@ describe('Service Worker push handler — userVisibleOnly contract', () => {
 
   it('still calls showNotification when a visible client exists (no silent-push shortcut)', async () => {
     const { handlers, mockRegistration, matchAll } = loadSw();
-    // Even with a visible top-level Lucidos tab the SW must NOT route via
-    // postMessage and skip showNotification — that's exactly what burned
-    // Chrome's silent-push budget last time.
+    // Even with a visible top-level Lucidos tab, the SW must NOT route via
+    // postMessage and skip showNotification. That burns Chrome's silent-push
+    // budget.
     matchAll.mockResolvedValue([
       { frameType: 'top-level', visibilityState: 'visible', postMessage: vi.fn() },
     ]);
@@ -729,16 +717,16 @@ describe('Service Worker push handler — userVisibleOnly contract', () => {
   });
 });
 
-// Declarative Web Push envelope — the wire format the engine emits
-// (`{web_push: 8030, notification: {...}}`). Safari 18.5+ handles this
-// declaratively (the SW push handler never runs); Chrome/Firefox don't
-// recognize the magic so this SW handler parses the envelope manually,
-// reads `notification.navigate` straight off the wire (URL built by the
-// engine — see crates/lucidos-engine/src/scheduler/push.rs::build_push_payload),
-// and stamps it on showNotification. The engine emits TWO navigate forms:
-// `notification.navigate` is the QUERY URL (`/?…`, for iOS/declarative), while
-// `notification.data.navigate` is the HASH URL (`/#…`, what notificationclick
-// reads for `client.navigate()`). See system-knowhow notifications.md §4.5.
+// The Declarative Web Push envelope, the wire format the engine emits
+// (`{web_push: 8030, notification: {...}}`). Safari 18.5+ handles it
+// declaratively and never runs the SW push handler. Chrome and Firefox do not
+// recognize the magic, so this handler parses the envelope, reads
+// `notification.navigate` off the wire and stamps it on showNotification.
+//
+// The engine emits TWO navigate forms (scheduler/push.rs::build_push_payload):
+// `notification.navigate` is the QUERY URL for iOS, and
+// `notification.data.navigate` is the HASH URL notificationclick reads for
+// `client.navigate()`. See system-knowhow notifications.md §4.5.
 describe('Service Worker push handler — declarative envelope', () => {
   function pushEvent(payload: Record<string, unknown>) {
     const waited: Array<Promise<unknown>> = [];
@@ -762,9 +750,9 @@ describe('Service Worker push handler — declarative envelope', () => {
     const ev = pushEvent(declarativeEnvelope({
       title: 'Claude is asking',
       body: 'Reply needed',
-      // QUERY form — the iOS/declarative navigate URL the engine stamps on
+      // QUERY form: the iOS/declarative navigate URL the engine stamps on
       // `notification.navigate`. The SW copies it to showNotification's
-      // `navigate` option (honored by Safari / future declarative Chrome).
+      // `navigate` option, which Safari honors.
       navigate: '/?notification=nid-thread&thread=tid-1&event=evt-7&tap=%7B%22kind%22%3A%22navigate%22%7D',
       tag: 'nid-thread',
       data: {
@@ -819,8 +807,8 @@ describe('Service Worker push handler — declarative envelope', () => {
 
   it('declarative push: app_badge sets the app-icon badge', async () => {
     // The engine carries the workspace's unread count in the top-level
-    // `app_badge` field; the SW mirrors it onto the installed PWA icon so a
-    // CLOSED workspace PWA stays accurate on Chrome/Android.
+    // `app_badge` field. The SW mirrors it onto the installed PWA icon, so a
+    // CLOSED workspace PWA stays accurate on Chrome and Android.
     const { handlers, setAppBadge, clearAppBadge } = loadSw();
     const ev = pushEvent(
       declarativeEnvelope({ title: 'T', body: 'B', tag: 'nid-1', data: {} }, { app_badge: 3 }),
@@ -868,8 +856,8 @@ describe('Service Worker push handler — declarative envelope', () => {
   });
 
   it('legacy flat-shape push (deploy-window compat): still calls showNotification with title/body', async () => {
-    // Defensive legacy branch — kept for one deploy cycle so in-flight pushes
-    // emitted by an old engine reaching a freshly-updated SW don't break.
+    // Defensive legacy branch, kept for one deploy cycle so an in-flight push
+    // from an old engine does not break a freshly-updated SW.
     const { handlers, mockRegistration } = loadSw();
     const ev = pushEvent({
       title: 'Legacy',
@@ -884,8 +872,8 @@ describe('Service Worker push handler — declarative envelope', () => {
     expect(title).toBe('Legacy');
     expect(opts.body).toBe('Old shape');
     expect(opts.tag).toBe('nid-legacy');
-    // Legacy shape has no engine-built navigate URL — SW falls back to origin
-    // root rather than rebuilding URL params (URL building moved to engine).
+    // The legacy shape has no engine-built navigate URL, so the SW falls back
+    // to the origin root rather than rebuilding the params.
     expect(opts.navigate).toBe('https://example.com/');
     expect(opts.data).toEqual({
       notification_id: 'nid-legacy',
@@ -915,11 +903,11 @@ describe('Service Worker push handler — declarative envelope', () => {
   });
 });
 
-// Layer 3 — wake-push contract. The engine schedules a duplicate push 3 s
-// after every real push to a macOS-Chrome subscription, carrying `wake:
-// true`. SW must call showNotification (Chrome's userVisibleOnly budget)
-// but with renotify:false + silent:true so the OS doesn't re-pop sound /
-// banner — the original notification is already on screen. See
+// Layer 3, the wake-push contract. The engine schedules a duplicate push 3s
+// after every real push to a macOS-Chrome subscription, carrying `wake: true`.
+// The SW must call showNotification for Chrome's userVisibleOnly budget, but
+// with renotify:false and silent:true. The original notification is already on
+// screen, so the OS must not re-pop sound or banner. See
 // system-knowhow/notifications.md §4.5.
 describe('Service Worker push handler — wake variant (layer 3)', () => {
   function pushEvent(payload: Record<string, unknown>) {
@@ -971,17 +959,16 @@ describe('Service Worker push handler — wake variant (layer 3)', () => {
   });
 });
 
-// notificationclick — the macOS-Chrome tap path (Safari handles the tap
-// declaratively and never runs this handler). routeToDeepLink delivers the
-// deep link to an already-open Lucidos tab via postMessage, NOT via a
-// fragment-only client.navigate(). The fragment-navigate path is unreliable:
-// Chrome doesn't fire `hashchange` for a fragment-only WindowClient.navigate(),
-// and the page-side focus/visibilitychange resume safety net doesn't fire when
-// the tab the user clicked back into was already the focused/visible tab (the
-// "came back to the computer in the morning" report — SW focused the right tab
-// and marked the notification read, but the page never dispatched the deep
-// link, so no modal opened / no thread navigation). See
-// system-knowhow/notifications.md §4.5.
+// notificationclick is the macOS-Chrome tap path. Safari handles the tap
+// declaratively and never runs this handler. routeToDeepLink delivers the deep
+// link to an already-open Lucidos tab via postMessage, NOT via a fragment-only
+// client.navigate().
+//
+// The fragment-navigate path is unreliable. Chrome fires no `hashchange` for a
+// fragment-only WindowClient.navigate(). The page-side resume safety net does
+// not fire either, when the tab clicked back into was already visible. The SW
+// then focuses the right tab and marks the notification read while the page
+// dispatches nothing. See system-knowhow/notifications.md §4.5.
 describe('Service Worker notificationclick handler — deep-link routing', () => {
   function makeClickEvent(data: Record<string, unknown>) {
     const waited: Array<Promise<unknown>> = [];
@@ -1027,9 +1014,9 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
     expect(client.postMessage).toHaveBeenCalledWith({ type: 'lucidos:deep-link', target: threadData });
     // The tab is brought forward.
     expect(client.focus).toHaveBeenCalledTimes(1);
-    // Regression lock: the warm path must NOT fragment-navigate the tab — that
-    // "succeeds" yet routes nothing (no hashchange, resume listener idle when
-    // the tab was already focused). This is the morning-tap bug.
+    // Regression lock: the warm path must NOT fragment-navigate the tab. That
+    // "succeeds" yet routes nothing, with no hashchange and the resume listener
+    // idle when the tab was already focused.
     expect(client.navigate).not.toHaveBeenCalled();
     // No duplicate window is opened when a tab already exists.
     expect(openWindow).not.toHaveBeenCalled();
@@ -1091,13 +1078,12 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
     expect(ev.notification.close).toHaveBeenCalledTimes(1);
   });
 
-  // Behind the workspace gateway several workspaces share one origin
-  // (/personal/, /dev/, …). A push for /personal is delivered to the /personal
-  // SW, but clients.matchAll({includeUncontrolled:true}) returns EVERY same-origin
-  // tab — including an open /dev tab. routeToDeepLink must only ever focus +
-  // postMessage a tab in ITS OWN scope, else the tap lands in the wrong
-  // workspace whose store has no such thread and "goes nowhere" (the reported
-  // bug). These lock the per-scope client selection.
+  // Behind the workspace gateway several workspaces share one origin. A push
+  // for /personal is delivered to the /personal SW, but
+  // clients.matchAll({includeUncontrolled:true}) returns EVERY same-origin tab,
+  // an open /dev tab included. routeToDeepLink must only ever focus and
+  // postMessage a tab in ITS OWN scope. Otherwise the tap lands in a workspace
+  // whose store has no such thread, and goes nowhere.
   const SCOPE_PERSONAL = 'https://example.com/personal/';
 
   it('cross-workspace: a tab in a DIFFERENT scope is not focused/messaged — opens a new window in THIS scope', async () => {
@@ -1157,8 +1143,8 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
 
 
 // ADR 0013: behind the workspace gateway the SW is registered at /ws/<id>/sw.js
-// with scope /ws/<id>/, so every same-origin path it matches or builds must be
-// resolved against that scope. These lock in the scope-relative behavior.
+// with scope /ws/<id>/. Every same-origin path it matches or builds must
+// resolve against that scope.
 describe('Service Worker base-path awareness (gateway scope)', () => {
   const SCOPE = 'https://example.com/ws/work/';
 

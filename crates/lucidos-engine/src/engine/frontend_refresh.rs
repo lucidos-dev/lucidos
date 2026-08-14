@@ -641,7 +641,7 @@ mod tests {
             "engine1"
         ));
         assert!(!frontend_advance_is_safe(
-            &BuildState::Ready,
+            &BuildState::ready_from(Some("head1".into())),
             Some("engine1"),
             "engine1"
         ));

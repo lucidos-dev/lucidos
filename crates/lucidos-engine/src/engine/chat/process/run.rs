@@ -33,6 +33,7 @@ use super::PreEmittedOrigin;
 
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
+    registry: &crate::llm::ModelRegistry,
     use_coding_agent: Option<bool>,
     thread_id: Option<Uuid>,
     exclude_event_id: Option<Uuid>,
@@ -40,6 +41,10 @@ pub(super) async fn resolve_route_overrides(
     reasoning_effort: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     if use_coding_agent == Some(true) {
+        // A coding-agent effort belongs to Claude Code / Codex, whose models are
+        // not in the chat registry and whose own drivers validate it
+        // (`validate_codex_effort`). Clamping it against a chat model would be
+        // answering a question about the wrong agent.
         return (None, reasoning_effort.map(str::to_string));
     }
 
@@ -47,14 +52,41 @@ pub(super) async fn resolve_route_overrides(
     // reuses the model/effort this thread last ran with. `exclude_event_id`
     // drops the current turn's own MessageReceived when it was pre-emitted
     // upstream, so the thread never reads itself as its "previous" value.
-    PreferenceStore::resolve_chat_overrides_for_thread(
+    let (model, effort) = PreferenceStore::resolve_chat_overrides_for_thread(
         pool,
         thread_id,
         exclude_event_id,
         model_override.map(str::to_string),
         reasoning_effort.map(str::to_string),
     )
-    .await
+    .await;
+
+    // Clamp the pair HERE, not only at the wire, so the effort this turn
+    // STAMPS on its events is the effort it actually SENDS.
+    //
+    // The two can disagree because the pair is resolved per field: a request
+    // can take its model from one source and its effort from another (a thread
+    // that remembers a model, with the effort still coming from the account
+    // preference), so nothing upstream guarantees the effort is one the model
+    // offers. `RoutingProvider` clamps at the wire regardless, but the events
+    // are the durable record of what the thread "last ran with"
+    // (`docs/glossary.md` § per-thread model memory) and the in-thread picker
+    // displays them: stamping a tier the model cannot run leaves the dropdown
+    // showing a value absent from its own options, and feeds that value back as
+    // the next turn's remembered effort.
+    //
+    // With no resolved model there is nothing to clamp against (the provider
+    // default applies, and only `RoutingProvider` knows it), so leave it.
+    let effort = match (&model, effort) {
+        (Some(m), Some(e)) => crate::llm::reasoning::clamp_effort(
+            &e,
+            crate::llm::model_registry::provider_kind_for(registry, m),
+            m,
+        )
+        .map(str::to_string),
+        (_, e) => e,
+    };
+    (model, effort)
 }
 
 /// Whether a typed-instead-of-clicked message is eligible to answer a pending
@@ -68,7 +100,7 @@ pub(super) async fn resolve_route_overrides(
 /// child's `[CHILD THREAD COMPLETED] …` block gets persisted as a bogus
 /// `UserQuestionAnswered { FreeText }` (actor = `thread_link`/`child`),
 /// silently consuming the user's open question. Excluded here, the wake falls
-/// through to the injection fast-path below, which queues it as `WakeFromChild`
+/// through to the injection fast-path below, which queues it as `ReentryFromEngine`
 /// so the question stays live for the user and the completion is processed
 /// right after they answer it.
 ///
@@ -161,6 +193,7 @@ impl LucidosEngine {
         // normal path it's `None` and the current turn isn't emitted until later.
         let (resolved_model, resolved_effort) = resolve_route_overrides(
             &self.pool,
+            &self.model_registry,
             use_coding_agent,
             thread_id,
             pre_emitted_origin.map(PreEmittedOrigin::event_id),
@@ -485,11 +518,11 @@ impl LucidosEngine {
                 //
                 // Skip the emit whenever the caller already persisted the
                 // event. Only a CHILD WAKE also changes how the input routes
-                // (see `AgentInputKind::WakeFromChild` docs); a pre-emitted
+                // (see `AgentInputKind::ReentryFromEngine` docs); a pre-emitted
                 // user message is an ordinary follow-up.
                 let (origin_event_id, input_kind) = if let Some(pre) = pre_emitted_origin {
                     let kind = if pre.is_engine_reentry() {
-                        AgentInputKind::WakeFromChild
+                        AgentInputKind::ReentryFromEngine
                     } else {
                         AgentInputKind::User
                     };
@@ -1045,19 +1078,19 @@ impl LucidosEngine {
                 .await);
         };
 
-        // Emit MemorySearched step so the frontend can show it
+        // Emit MemoryRecalled step so the frontend can show it
         if classification.needs_memory {
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::MemorySearched {
+                        event: crate::engine::thread_events::ThreadEvent::MemoryRecalled {
                             results: memory_results,
                             queries: classification.sub_queries.clone(),
                         },
                         meta: response_meta,
                     },
-                    "[Chat] MemorySearched",
+                    "[Chat] MemoryRecalled",
                 )
                 .await;
         }

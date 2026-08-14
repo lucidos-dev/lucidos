@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { ToastList } from '../Toast';
-import { toasts, showToast, focusedPane, splitRatio, engineRestarting } from '../../../store/store';
+import { toasts, showToast, focusedPane, splitRatio, engineRestarting, toastPlacement } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
 
 /**
@@ -50,6 +50,11 @@ beforeEach(() => {
   engineRestarting.value = false;
   viewportIsMobile.value = false;
   splitRatio.value = 0.4;
+  // This whole file is about the per-pane shape, which is one of four while the
+  // placement comparison runs (docs/temporary-measures.md). State it rather than
+  // inherit whatever the default happens to be: once a shape wins, either the
+  // default IS per-pane and this line goes, or the file goes with the shape.
+  toastPlacement.value = 'pane';
 });
 
 afterEach(() => {

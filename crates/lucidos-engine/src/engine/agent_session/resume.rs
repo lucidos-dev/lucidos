@@ -1,4 +1,4 @@
-use crate::engine::git_ops::{find_worktree_for_branch, worktrees_dir};
+use crate::engine::git_ops::{find_worktree_for_branch, short_thread_id, worktrees_dir};
 use std::path::{Path, PathBuf};
 
 /// Lifecycle events that close out a CC turn.
@@ -32,26 +32,18 @@ pub(crate) const CC_ORIGINATING_EVENT_TYPES: &[&str] = &[
     "ChildThreadCompleted",
 ];
 
-/// Length of the `thread_id` prefix used to build deterministic worktree
-/// directory names (e.g. `thread-1a2b3c4d`). 8 hex chars ~= 4 billion
-/// combinations, far in excess of plausible per-workspace thread counts;
-/// the full `thread_id` lives in the `CodingAgentIdled` payload for
-/// unambiguous lookup.
-pub(crate) const THREAD_WORKTREE_ID_LEN: usize = 8;
-
 /// Generate the deterministic per-thread worktree directory:
 /// `<workspace>/.lucidos/worktrees/thread-<short_thread_id>`.
 ///
 /// Phase 6.1 of the CC resume architecture: every thread owns one persistent
 /// worktree, so the path is derived from the thread id rather than a random
-/// per-spawn UUID. The 8-char prefix is for readability — collision avoidance
-/// is the responsibility of the per-workspace scope (the namespace is
-/// effectively `(workspace, thread)`), and the full `thread_id` is recorded
-/// in `CodingAgentIdled.worktree_path` so lookups are unambiguous.
+/// per-spawn UUID. The short prefix is for readability, and the thread's
+/// branch carries the same one. Collisions are avoided by the per-workspace
+/// scope (the namespace is effectively `(workspace, thread)`), and the full
+/// `thread_id` is recorded in `CodingAgentIdled.worktree_path` so lookups are
+/// unambiguous.
 pub(crate) fn deterministic_worktree_path(workspace_path: &Path, thread_id: uuid::Uuid) -> PathBuf {
-    let id_str = thread_id.simple().to_string();
-    let short = &id_str[..THREAD_WORKTREE_ID_LEN.min(id_str.len())];
-    worktrees_dir(workspace_path).join(format!("thread-{}", short))
+    worktrees_dir(workspace_path).join(format!("thread-{}", short_thread_id(thread_id)))
 }
 
 /// Look up the most-recent `CodingAgentIdled` event for a thread and return

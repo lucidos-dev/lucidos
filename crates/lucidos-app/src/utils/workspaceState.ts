@@ -37,3 +37,19 @@ export const WORKSPACE_STATE_LABEL: Record<WorkspaceState, string> = {
 export function workspaceStateLabel(w: WorkspaceStatus): string {
   return w.last_error || WORKSPACE_STATE_LABEL[workspaceState(w)];
 }
+
+/** The same words again, but only when the row owes the user an EXPLANATION
+ *  rather than a label: the state that is a fault, and nothing else.
+ *
+ *  `unhealthy` is the one, and it is the one the picker draws in red. The other
+ *  three are already told by the row itself: a healthy workspace is the ordinary
+ *  case, `booting` pulses and offers Stop, and `stopped` is a calm idle the play
+ *  button explains (it is also the state a never-started workspace lands in, see
+ *  `workspaceState`, which is exactly why "unhealthy with an error" and "not
+ *  started" must not share a sentence).
+ *
+ *  Pure and separate from the rendering so the four states are unit-testable,
+ *  and so no surface has to re-derive which one is the fault. */
+export function workspaceFaultNote(w: WorkspaceStatus): string | null {
+  return workspaceState(w) === 'unhealthy' ? workspaceStateLabel(w) : null;
+}

@@ -72,10 +72,16 @@ test.describe('File preview inline editing', () => {
     await expect(textarea).toBeVisible({ timeout: 5_000 });
     await expect(textarea).toHaveValue(/original body/);
 
+    // Save is the neutral (blue) `.action-btn`, and it is inert until the draft
+    // actually differs from the content loaded at mount.
+    const saveBtn = page.locator('.file-editor-toolbar button:visible').filter({ hasText: 'Save' }).first();
+    await expect(saveBtn).toBeDisabled();
+
     // Replace the content and save.
     const marker = `edited-${Date.now()}`;
     await textarea.fill(`# E2E heading\n\n${marker}\n`);
-    expect(await clickVisibleElement(page, '.action-btn-confirm', 'Save')).toBe(true);
+    await expect(saveBtn).toBeEnabled();
+    await saveBtn.click();
 
     // Editor closes and the rendered preview reflects the new content.
     await expect(page.locator('.file-editor-textarea')).toHaveCount(0, { timeout: 10_000 });

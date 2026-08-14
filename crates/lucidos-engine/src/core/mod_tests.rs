@@ -1696,9 +1696,64 @@ fn index_locked_error() -> git2::Error {
 }
 
 #[test]
-fn retry_while_index_locked_waits_out_a_transient_lock() {
+fn transient_contention_covers_the_index_lock() {
+    assert!(is_transient_repo_contention(&index_locked_error()));
+}
+
+/// The HEAD compare-and-swap loss. Classified from the same helper as the index
+/// lock so both contended shapes stay documented in one place.
+#[test]
+fn transient_contention_covers_the_lost_head_compare_and_swap() {
+    let e = git2::Error::new(
+        git2::ErrorCode::Modified,
+        git2::ErrorClass::Reference,
+        "old reference value does not match",
+    );
+    assert!(is_transient_repo_contention(&e));
+}
+
+/// Anything else (a missing path, a corrupt repo, a conflict) is the caller's
+/// answer, not contention. Retrying it would delay a real failure by the whole
+/// backoff budget on every write. The `Reference` / `NotFound` case matters
+/// most: widening on CLASS alone would have swallowed it.
+#[test]
+fn transient_contention_rejects_unrelated_errors() {
+    for (code, class, msg) in [
+        (
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Index,
+            "no such path",
+        ),
+        (
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Reference,
+            "no such reference",
+        ),
+        (
+            git2::ErrorCode::Modified,
+            git2::ErrorClass::Index,
+            "the file was modified",
+        ),
+        (
+            git2::ErrorCode::Conflict,
+            git2::ErrorClass::Merge,
+            "merge conflict",
+        ),
+    ] {
+        let e = git2::Error::new(code, class, msg);
+        assert!(
+            !is_transient_repo_contention(&e),
+            "{:?}/{:?} must not be treated as contention",
+            class,
+            code
+        );
+    }
+}
+
+#[test]
+fn retry_while_repo_contended_waits_out_a_transient_lock() {
     let mut attempts = 0;
-    let out = retry_while_index_locked(|| {
+    let out = retry_while_repo_contended(|| {
         attempts += 1;
         if attempts < 3 {
             Err(index_locked_error())
@@ -1710,13 +1765,12 @@ fn retry_while_index_locked_waits_out_a_transient_lock() {
     assert_eq!(attempts, 3, "it must retry until the lock clears");
 }
 
-/// Retrying is only ever right for the lock. Anything else (a missing path, a
-/// corrupt repo) is the caller's answer and must come straight back, or a real
-/// failure is delayed by the whole backoff budget on every write.
+/// Retrying is only ever right for contention. Anything else is the caller's
+/// answer and must come straight back.
 #[test]
-fn retry_while_index_locked_returns_any_other_error_at_once() {
+fn retry_while_repo_contended_returns_any_other_error_at_once() {
     let mut attempts = 0;
-    let out: Result<(), git2::Error> = retry_while_index_locked(|| {
+    let out: Result<(), git2::Error> = retry_while_repo_contended(|| {
         attempts += 1;
         Err(git2::Error::new(
             git2::ErrorCode::NotFound,
@@ -1725,18 +1779,238 @@ fn retry_while_index_locked_returns_any_other_error_at_once() {
         ))
     });
     assert_eq!(out.unwrap_err().code(), git2::ErrorCode::NotFound);
-    assert_eq!(attempts, 1, "a non-lock error must not be retried");
+    assert_eq!(attempts, 1, "a non-contended error must not be retried");
 }
 
 /// A lock nobody ever releases (a crashed writer's stale `index.lock`) must
 /// surface as the error it is rather than hang the caller forever.
 #[test]
-fn retry_while_index_locked_gives_up_and_reports_the_lock() {
+fn retry_while_repo_contended_gives_up_and_reports_the_lock() {
     let mut attempts = 0;
-    let out: Result<(), git2::Error> = retry_while_index_locked(|| {
+    let out: Result<(), git2::Error> = retry_while_repo_contended(|| {
         attempts += 1;
         Err(index_locked_error())
     });
     assert_eq!(out.unwrap_err().code(), git2::ErrorCode::Locked);
     assert!(attempts > 1, "it must have retried before giving up");
+}
+
+/// Init a repo with one commit and return the handle. Shared by the HEAD-race
+/// tests below.
+fn repo_with_seed_commit(ws: &std::path::Path) -> git2::Repository {
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    let repo = git2::Repository::init_opts(ws, &opts).unwrap();
+    std::fs::write(ws.join("seed.txt"), "seed").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("seed.txt")).unwrap();
+    index.write().unwrap();
+    commit_index(&repo, "seed").unwrap();
+    repo
+}
+
+/// Stage one file through `repo` and commit it, the way a competing writer
+/// (another `Repository` handle, a `git` CLI process) lands on HEAD.
+fn write_and_commit(repo: &git2::Repository, name: &str, message: &str) -> String {
+    let ws = repo.workdir().unwrap().to_path_buf();
+    std::fs::write(ws.join(name), name).unwrap();
+    let mut index = repo.index().unwrap();
+    reset_index_to_head(repo, &mut index).unwrap();
+    index.add_path(std::path::Path::new(name)).unwrap();
+    index.write().unwrap();
+    commit_index(repo, message).unwrap()
+}
+
+/// A competing FULL-TREE commit, the shape `ArtifactManager::commit_all_dirty`
+/// has: staging everything picks up a deletion another writer was in the middle
+/// of committing, which is what makes that writer's retry find nothing to stage.
+fn commit_whole_tree(repo: &git2::Repository, message: &str) -> String {
+    let mut index = repo.index().unwrap();
+    reset_index_to_head(repo, &mut index).unwrap();
+    index
+        .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    commit_index(repo, message).unwrap()
+}
+
+/// Lose the HEAD compare-and-swap for real. Hold the reference HEAD resolved to
+/// BEFORE `mover` runs, then try to write through it: that is exactly the swap
+/// `repo.commit(Some("HEAD"), ...)` performs at the end of `commit_index`, with
+/// the window widened enough for a test to drive it. Returns the genuine
+/// libgit2 error, never a synthesized one.
+fn lose_head_swap(repo: &git2::Repository, mover: impl FnOnce()) -> git2::Error {
+    let mut stale_head = repo.head().expect("head");
+    let stale_target = stale_head.target().expect("a direct ref");
+    mover();
+    stale_head
+        .set_target(stale_target, "lose the race")
+        .map(|_| ())
+        .expect_err("the swap must fail once HEAD has moved")
+}
+
+/// Pins the classifier against what libgit2 ACTUALLY produces when a HEAD
+/// compare-and-swap is lost, rather than against a hand-built error. If a git2
+/// upgrade ever reclassified this, the fix would silently stop working and only
+/// this test would notice.
+#[test]
+fn a_lost_head_compare_and_swap_is_classified_as_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_with_seed_commit(dir.path());
+    // A competing writer moves HEAD out from under the ref we are holding.
+    let other = git2::Repository::open(dir.path()).unwrap();
+    let err = lose_head_swap(&repo, || {
+        write_and_commit(&other, "theirs.txt", "theirs");
+    });
+
+    assert_eq!(err.class(), git2::ErrorClass::Reference);
+    assert_eq!(err.code(), git2::ErrorCode::Modified);
+    assert!(
+        err.message().contains("old reference value does not match"),
+        "the production symptom string changed: {}",
+        err.message()
+    );
+    assert!(
+        is_transient_repo_contention(&err),
+        "the real libgit2 error must be retried"
+    );
+}
+
+/// The race itself, end to end: a competing commit lands on HEAD mid-attempt,
+/// the attempt loses the compare-and-swap, and the retry must commit ONTO the
+/// winner rather than beside it or over it. Both commits survive and the
+/// winner's file is still in the final tree.
+///
+/// The interleave is driven from the test body because the real window is
+/// inside one libgit2 call, between `repo.head()` and `repo.commit()` in
+/// `commit_index`. The error the first attempt returns is a genuine libgit2
+/// `Reference` / `Modified` from a lost swap, not a synthesized one.
+#[test]
+fn a_lost_head_race_retries_onto_the_new_head_and_keeps_both_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let repo = repo_with_seed_commit(ws);
+    let other = git2::Repository::open(ws).unwrap();
+    std::fs::write(ws.join("ours.txt"), "ours").unwrap();
+
+    let mut attempts = 0;
+    let ours = retry_while_repo_contended(|| {
+        attempts += 1;
+        let mut index = repo.index()?;
+        reset_index_to_head(&repo, &mut index)?;
+        index.add_path(std::path::Path::new("ours.txt"))?;
+        index.write()?;
+
+        if attempts == 1 {
+            // A competing commit lands on HEAD after this attempt read its
+            // parent, so this attempt's swap is against a head that moved.
+            return Err(lose_head_swap(&repo, || {
+                write_and_commit(&other, "theirs.txt", "theirs");
+            }));
+        }
+        commit_index(&repo, "ours")
+    })
+    .expect("the retry must commit onto the new head");
+
+    assert_eq!(attempts, 2, "exactly one retry should have been needed");
+
+    // History: ours on top of theirs on top of seed, linear, nothing lost.
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.id().to_string(), ours, "our commit must be HEAD");
+    let messages: Vec<String> = repo
+        .revwalk()
+        .map(|mut walk| {
+            walk.push_head().unwrap();
+            walk.filter_map(|id| repo.find_commit(id.unwrap()).ok())
+                .map(|c| c.message().unwrap().to_string())
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(messages, vec!["ours", "theirs", "seed"]);
+    assert_eq!(head.parent_count(), 1, "history must stay linear");
+
+    // The competing writer's file survived, which is the part a naive retry
+    // (committing the pre-race tree onto the new head) would have clobbered.
+    let tree = head.tree().unwrap();
+    assert!(tree.get_name("theirs.txt").is_some(), "theirs.txt was lost");
+    assert!(tree.get_name("ours.txt").is_some(), "ours.txt was lost");
+    assert!(tree.get_name("seed.txt").is_some(), "seed.txt was lost");
+}
+
+/// The delete helpers are the one shape the retry alone cannot rescue. They
+/// remove from the working tree BEFORE the closure, so the writer that wins the
+/// race can commit the very same deletion (`commit_all_dirty` stages all of
+/// `data/`, picking our removal up as its own). The retry then resets onto a
+/// head that no longer tracks the path and has nothing left to stage. That must
+/// settle as done, not fail a request whose deletion demonstrably happened.
+#[test]
+fn a_deletion_the_race_winner_already_committed_settles_as_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let repo = repo_with_seed_commit(ws);
+    let other = git2::Repository::open(ws).unwrap();
+    write_and_commit(&repo, "doomed.txt", "add doomed.txt");
+
+    // The caller removes the file from the working tree, outside the retry.
+    std::fs::remove_file(ws.join("doomed.txt")).unwrap();
+
+    let mut attempts = 0;
+    let reported = retry_while_repo_contended(|| {
+        attempts += 1;
+        let mut index = repo.index()?;
+        reset_index_to_head(&repo, &mut index)?;
+        let _ = index.remove_path(std::path::Path::new("doomed.txt"));
+        index.write()?;
+
+        if attempts == 1 {
+            // The competitor sweeps the whole tree, committing OUR deletion,
+            // and we lose the swap to it.
+            return Err(lose_head_swap(&repo, || {
+                commit_whole_tree(&other, "theirs: sweep the working tree");
+            }));
+        }
+        commit_index_unless_unchanged(&repo, "delete doomed.txt")
+    })
+    .expect("an already-committed deletion must not fail the request");
+
+    assert_eq!(attempts, 2, "exactly one retry should have been needed");
+
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(
+        reported,
+        head.id().to_string(),
+        "it must report the head that records the deletion"
+    );
+    assert_eq!(
+        head.message().unwrap(),
+        "theirs: sweep the working tree",
+        "no empty commit should have been stacked on the winner"
+    );
+    assert!(
+        head.tree().unwrap().get_name("doomed.txt").is_none(),
+        "the deletion must actually be recorded at the reported commit"
+    );
+}
+
+/// The ordinary delete still commits. Guards against the tolerance above
+/// swallowing a real deletion into a no-op that reports the unchanged head.
+#[test]
+fn an_uncontended_deletion_still_makes_its_own_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let repo = repo_with_seed_commit(ws);
+    let before = write_and_commit(&repo, "doomed.txt", "add doomed.txt");
+    std::fs::remove_file(ws.join("doomed.txt")).unwrap();
+
+    let mut index = repo.index().unwrap();
+    reset_index_to_head(&repo, &mut index).unwrap();
+    let _ = index.remove_path(std::path::Path::new("doomed.txt"));
+    index.write().unwrap();
+    let sha = commit_index_unless_unchanged(&repo, "delete doomed.txt").unwrap();
+
+    assert_ne!(sha, before, "a real deletion must produce a new commit");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.message().unwrap(), "delete doomed.txt");
+    assert!(head.tree().unwrap().get_name("doomed.txt").is_none());
+    assert!(head.tree().unwrap().get_name("seed.txt").is_some());
 }

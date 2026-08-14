@@ -18,10 +18,8 @@ use super::lucidos_cli::{
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
 /// Single source of truth for CC's `/model` and `/effort` picker entries.
-/// The data lives in `cc_menu_options.json` next to this file — see that
-/// file's `_note` for why it's hand-maintained and how to update it. The
-/// JSON is `include_str!()`-baked at compile time and parsed once via
-/// `LazyLock` so there's no runtime IO cost.
+/// The data lives in `cc_menu_options.json` next to this file: see that file's
+/// `_note` for why it is hand-maintained and how to update it.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CcMenuOption {
     pub value: String,
@@ -74,10 +72,10 @@ pub fn normalize_cc_model_id(full_id: &str) -> &str {
 }
 
 /// Reconcile CC's stream-json model name with the engine-supplied alias.
-/// CC strips the `[1m]` suffix when echoing the model in Init / per-message
-/// Usage frames, so a naive `normalize_cc_model_id` loses the 1M-context
-/// signal that `context_window_for` keys on. If the engine pinned `[1m]` and
-/// CC reports the same base model, re-attach the suffix.
+/// CC strips the `[1m]` suffix when echoing the model in Init and Usage frames.
+/// A naive `normalize_cc_model_id` therefore loses the 1M-context signal that
+/// `context_window_for` keys on. Re-attach the suffix when the engine pinned
+/// `[1m]` and CC reports the same base model.
 pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
     let normalized = normalize_cc_model_id(cc_reported);
     if let Some(orig_base) = original.and_then(|o| o.strip_suffix("[1m]")) {
@@ -220,18 +218,13 @@ impl AgentRuntime for ClaudeCodeRuntime {
         cancel: CancellationToken,
     ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
         let cli_dir = lucidos_cli_dir();
-        // The CC permission-prompt MCP server runs `lucidos mcp-permission-server`.
-        // Resolve that binary up front and FAIL FAST with a descriptive error if
-        // it's missing — otherwise CC starts, the MCP server silently fails to
-        // load ("Available MCP tools: none"), and the first tool call dies
-        // mid-stream with a cryptic "permission-prompt-tool not found" abort. A
-        // packaged build that ships `lucidos-engine` but forgets the sibling
-        // `lucidos` CLI hits exactly that — see
-        // docs/plans/2026-06-30-packaged-app-bundle-lucidos-cli-and-failfast.md.
+        // Resolve the permission-prompt MCP server's binary up front so a
+        // missing `lucidos` CLI fails the spawn rather than surfacing as
+        // "Available MCP tools: none" mid-stream. See `resolve_lucidos_binary_in`.
         resolve_lucidos_binary(cli_dir)?;
-        // A user-configured `claude` path must point at a real executable —
-        // fail the spawn naming the setting rather than silently probing past
-        // a typo (see `spawn_env::resolve_binary_override`).
+        // A user-configured `claude` path must point at a real executable, so
+        // fail the spawn naming the setting rather than probing past a typo.
+        // See `spawn_env::resolve_binary_override`.
         if let Some(path) = args.binary_override {
             super::spawn_env::resolve_binary_override(
                 path,
@@ -246,12 +239,10 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 e
             );
         }
-        // If the injected skill is *tracked* in this repo (an earlier session
-        // auto-committed it before the deep-path exclude existed), overwriting
-        // it on disk just now produces a phantom `M` that `.git/info/exclude`
-        // can't hide. Skip-worktree it so this session never sees a change it
-        // didn't author. No-op for the Lucidos repo, where the tracked copy is
-        // identical and must stay editable.
+        // A *tracked* copy of the injected skill turns the overwrite above into
+        // a phantom `M` that `.git/info/exclude` cannot hide. Skip-worktree it
+        // so this session never sees a change it did not author. No-op for the
+        // Lucidos repo, where the tracked copy is identical and stays editable.
         crate::engine::git_ops::hide_phantom_tracked_skill(
             args.worktree_path,
             LUCIDOS_CLI_SKILL_REL_PATH,
@@ -307,22 +298,19 @@ impl AgentRuntime for ClaudeCodeRuntime {
     }
 }
 
-/// Resolve the `claude` executable for spawn: the user-configured override
-/// (already validated by the spawn path — see
-/// `spawn_env::resolve_binary_override`) wins outright; otherwise probe the
-/// common install locations; otherwise fall back to a bare PATH lookup.
+/// Resolve the `claude` executable for spawn. The user-configured override wins
+/// outright (the spawn path already validated it, see
+/// `spawn_env::resolve_binary_override`), then the common install locations,
+/// then a bare PATH lookup.
 ///
-/// Why probing: the CC native installer (the canonical install since 2026-01)
-/// symlinks `$HOME/.local/bin/claude` at the active version, but a launchd-,
-/// IDE-, or any non-interactive-shell-launched engine inherits a PATH that
-/// omits `~/.local/bin` — a bare `Command::new("claude")` then ENOENTs even
-/// though the binary is installed, surfacing as "Failed to start Claude Code:
-/// No such file or directory". The probe list mirrors `resolve_codex_binary`:
-/// native installer first, the older `~/.claude/local` install, then the
-/// Homebrew prefixes. Bare `"claude"` last so `Command::spawn` does its own
-/// PATH lookup for everything else (npm globals, custom symlinks). `home` is
-/// injected to keep the function pure and testable; production callers pass
-/// `std::env::var_os("HOME")`.
+/// Probing is needed because the CC native installer symlinks
+/// `$HOME/.local/bin/claude`, and an engine launched by launchd or an IDE
+/// inherits a PATH without `~/.local/bin`. A bare `Command::new("claude")` then
+/// ENOENTs even though the binary is installed. The probe list mirrors
+/// `resolve_codex_binary`: native installer, the older `~/.claude/local`
+/// install, then the Homebrew prefixes. Bare `"claude"` is last, so
+/// `Command::spawn` does its own PATH lookup for npm globals and custom
+/// symlinks. `home` is injected to keep the function pure and testable.
 pub(crate) fn resolve_claude_binary(
     home: Option<&Path>,
     override_path: Option<&Path>,
@@ -349,15 +337,13 @@ pub(crate) fn resolve_claude_binary(
 /// permission-prompt MCP server (`lucidos mcp-permission-server`).
 ///
 /// Prefer the bundled binary next to the engine (`cli_dir`, found by
-/// `find_lucidos_cli_dir`); fall back to a `PATH` lookup for installs where
-/// `lucidos` lives elsewhere on `PATH`. Returns a descriptive `Err` when the
-/// binary is reachable from neither — converting what used to be a silent
-/// "Available MCP tools: none" mid-stream abort into an immediate, actionable
-/// spawn failure. The most common cause is a packaged build that bundles
-/// `lucidos-engine` but forgets the sibling `lucidos` CLI.
+/// `find_lucidos_cli_dir`), else a `PATH` lookup. Returns a descriptive `Err`
+/// when neither has it, so the spawn fails at once instead of surfacing as a
+/// silent "Available MCP tools: none" mid-stream abort. The most common cause
+/// is a packaged build that bundles `lucidos-engine` but forgets the sibling
+/// `lucidos` CLI.
 ///
-/// `path_env` is injected to keep the lookup pure and testable; the public
-/// wrapper passes `std::env::var_os("PATH")`.
+/// `path_env` is injected to keep the lookup pure and testable.
 fn resolve_lucidos_binary_in(
     cli_dir: Option<&Path>,
     path_env: Option<&std::ffi::OsStr>,
@@ -388,32 +374,21 @@ fn resolve_lucidos_binary(
     resolve_lucidos_binary_in(cli_dir, std::env::var_os("PATH").as_deref())
 }
 
-/// Byte-idle deadline we hand Claude Code for its own streaming watchdog,
-/// in milliseconds. 30 minutes, which is also the maximum CC accepts (it
-/// clamps `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` to `[10_000, 1_800_000]`).
+/// Byte-idle deadline we hand Claude Code for its own streaming watchdog, in
+/// milliseconds. 30 minutes, the maximum CC accepts (it clamps
+/// `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` to `[10_000, 1_800_000]`).
 ///
-/// CC wraps every SSE response body in a watchdog that aborts the turn when no
-/// BYTES arrive for a deadline, defaulting to 300_000 ms. It then reports
-/// `API Error: Stream idle timeout - no chunks received`, does NOT fall back to
-/// a non-streaming request, and retries at most once and only while nothing but
-/// thinking has been produced, so in practice the turn just dies. A large
-/// cache-cold prompt is silent on the wire from `message_start` until the first
-/// content delta, and at the 200k+ token contexts a coding-agent session
-/// routinely reaches, that silence can exceed 5 minutes (measured: two deaths at
-/// 303 s and one survivor at 290 s on the same thread, 2026-08-02).
+/// CC aborts a turn when no bytes arrive on the SSE body for its deadline,
+/// which defaults to 300_000 ms. It does not recover: no non-streaming
+/// fallback, and at most one retry. A large cache-cold prompt can be silent
+/// on the wire for longer than that.
 ///
-/// Raising it past the engine's own silence detectors
-/// (`agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS`, 10 min in-loop,
-/// and `agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS`, 12 min
-/// out-of-loop) is the point: they cover the same "subprocess went silent
-/// mid-turn" case and their response is `ContinuationRequested`, a
-/// non-destructive kill plus auto-resume via `--resume`. Whichever deadline is shorter decides
-/// the outcome, so making CC's the outer one converts a dead thread into a
-/// resumed turn while keeping a backstop for the cases the engine watchdog
-/// legitimately stands down on (a tool in flight below
-/// `WATCHDOG_HUNG_TOOL_CEILING_MS`). Disabling CC's watchdog outright
-/// (`CLAUDE_ENABLE_BYTE_WATCHDOG=0`) would remove that backstop and reintroduce
-/// the unbounded hang it was shipped to fix.
+/// The point is to push CC's deadline PAST the engine's own silence detectors
+/// (`agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS` and
+/// `agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS`), whose
+/// response is a non-destructive kill plus auto-resume. The shorter deadline
+/// decides the outcome, so CC's must be the outer one. Disabling CC's
+/// watchdog outright would remove the backstop it was shipped to be.
 ///
 /// Temporary measure, see `docs/temporary-measures.md`
 /// ("CC byte-idle deadline raised past the engine watchdog") and
@@ -454,15 +429,12 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env_remove("CLAUDECODE");
-    // Always request partial-message streaming — fresh AND resumed sessions.
-    // The `stream_event` deltas it produces are turned into
-    // `AgentEvent::StreamActivity` liveness pings that keep the watchdog's
-    // inactivity clock fresh through a long single step (extended thinking on a
-    // hard problem). Omitting it on `--resume` (the old fresh-only gate, a fossil
-    // from when resume was a separate spawn path) left the heartbeat ticking only
-    // at step boundaries, so the watchdog killed long unattended steps mid-work —
-    // follow-ups, engine-restart recovery, merge-conflict resolution, hardening.
-    // The flag is a streaming-output option, orthogonal to `--resume`.
+    // Always request partial-message streaming, on fresh AND resumed sessions.
+    // The `stream_event` deltas become `AgentEvent::StreamActivity` liveness
+    // pings that keep the watchdog's inactivity clock fresh through one long
+    // step. Omit it on `--resume` and the heartbeat ticks only at step
+    // boundaries, so the watchdog kills long unattended steps mid-work. The
+    // flag is a streaming-output option, orthogonal to `--resume`.
     cmd.arg("--include-partial-messages");
 
     if let Some(tools) = args.allowed_tools {
@@ -495,13 +467,13 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
     apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
     // Pin the session's CLAUDE_CONFIG_DIR on a RESUME. CC stores each session's
-    // transcript at `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/<sid>.jsonl`, so a
-    // `--resume <sid>` MUST run under the exact config dir the session was created
-    // in — otherwise CC can't find it and returns "No conversation found with
-    // session ID". Set AFTER `apply_lucidos_env` (which applied any user-managed
-    // `CLAUDE_CONFIG_DIR` first) so this engine-owned pin wins: a live user toggle
-    // of the env var then can't strand an in-flight thread's resume (dev/bf997e21).
-    // `None` for a fresh session — leaves the user's value / CC's default in place.
+    // transcript at `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/<sid>.jsonl`, so
+    // a `--resume <sid>` MUST run under the config dir the session was created
+    // in. Otherwise CC returns "No conversation found with session ID".
+    // Set AFTER `apply_lucidos_env`, which applied any user-managed
+    // `CLAUDE_CONFIG_DIR` first, so this engine-owned pin wins: a live toggle of
+    // the env var cannot strand an in-flight thread's resume. `None` for a fresh
+    // session leaves the user's value or CC's default in place.
     if let Some(dir) = args.claude_config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
@@ -510,43 +482,30 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
     // See `spawn_env::isolate_in_process_group`.
     crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
-    // The engine permission handler now waits indefinitely for the user
-    // (matching `AskUserQuestion`'s "stay idle" behavior). CC has TWO
-    // separate MCP timeouts that both have to be lifted, otherwise whichever
-    // is shorter forces a retry that surfaces a duplicate prompt:
-    //   * MCP_TOOL_TIMEOUT — per-tool-call cap (default 1e8 ms ≈ 28h)
-    //   * MCP_TIMEOUT      — per-RPC cap (default 30_000 ms = 30s)
-    // The 30-second `MCP_TIMEOUT` default is the one that historically caused
-    // the "infinite loop of identical permission cards every ~30s" bug —
-    // CC's MCP client would cancel the permission RPC, the engine would gc
-    // the orphaned waiter, and CC's model would retry the original tool.
-    // Set both to 24 hours — effectively "never time out" for any practical
-    // session.
+    // The engine permission handler waits indefinitely for the user, matching
+    // `AskUserQuestion`. CC has TWO separate MCP timeouts that both have to be
+    // lifted, otherwise whichever is shorter forces a retry that surfaces a
+    // duplicate prompt:
+    //   * `MCP_TOOL_TIMEOUT`, the per-tool-call cap, defaulting to about 28h.
+    //   * `MCP_TIMEOUT`, the per-RPC cap, defaulting to 30s.
+    // The 30-second `MCP_TIMEOUT` default is what produced an infinite loop of
+    // identical permission cards: CC's MCP client cancelled the permission RPC,
+    // the engine gc'd the orphaned waiter, and CC's model retried the original
+    // tool. Both are set to 24 hours.
     cmd.env("MCP_TOOL_TIMEOUT", (86_400u64 * 1000).to_string());
     cmd.env("MCP_TIMEOUT", (86_400u64 * 1000).to_string());
-    // NOTE: we deliberately do NOT attempt a post-fork macOS TCC "responsibility
-    // disclaim" here (a prior version called
-    // `responsibility_set_caller_responsible_for_self()` from a `pre_exec` hook).
-    // It was a verified no-op: macOS captures TCC responsibility from the
-    // `posix_spawnattr_t` at the `posix_spawn`/exec syscall, but Rust's
-    // `pre_exec` forces the `fork()`+`execvp()` path (no `posix_spawn`), so the
-    // only effective knob — `responsibility_spawnattrs_setdisclaim` — never gets
-    // set. Empirically, `responsibility_set_caller_responsible_for_self()` and
-    // `responsibility_set_pid_responsible_for_pid(self, self)` both leave the
-    // child attributed to the engine in every context tested (forked child,
-    // running process, parent-side reassignment). TCC grant stability for the
-    // dev engine is handled instead by signing the engine binary with a stable
-    // self-signed identity at build time (`scripts/lib/codesign.sh`), giving it
-    // a rebuild-stable Designated Requirement so a single Allow click sticks.
+    // No macOS TCC responsibility disclaim is attempted here, and adding one
+    // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
+    // only effective knob is never consulted. See ADR 0075.
     cmd
 }
 
 /// MCP server name Claude Code mounts `lucidos mcp-permission-server` under
 /// (the `mcpServers` key in [`permission_mcp_config_json`]). CC prefixes every
 /// MCP tool with `mcp__<server>__`, so this is also the first half of both wire
-/// names below. Codex mounts the SAME binary under the name `lucidos`, which is
-/// why its question tool has a different wire name
-/// ([`super::CODEX_ASK_USER_QUESTION_TOOL`]) for the same server-side tool.
+/// names below. Codex mounts the SAME binary under the name `lucidos`, so its
+/// question tool ([`super::CODEX_ASK_USER_QUESTION_TOOL`]) has a different wire
+/// name for the same server-side tool.
 const CC_PERMISSION_MCP_SERVER: &str = "lucidos_perm";
 
 /// The tool CC is pointed at with `--permission-prompt-tool`: every gated tool
@@ -557,10 +516,10 @@ pub const CC_PERMISSION_PROMPT_TOOL: &str = "mcp__lucidos_perm__approve";
 /// calls, under CC's mount name, so it is a THIRD wire name for one flow.
 ///
 /// It is reachable because CC's `--mcp-config` advertises every tool the server
-/// lists, and the server lists `approve` and `ask_user_question` both. So a CC
-/// session can raise a QuestionCard through here instead of through its own
-/// native `AskUserQuestion`, and everything keyed on the name has to know it:
-/// see [`super::is_user_question_tool`], which is the one place that decides.
+/// lists, and the server lists both `approve` and `ask_user_question`. So a CC
+/// session can raise a QuestionCard through here rather than through its native
+/// `AskUserQuestion`. Everything keyed on the name has to know that:
+/// [`super::is_user_question_tool`] is the one place that decides.
 pub const CC_MCP_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos_perm__ask_user_question";
 
 /// Claude Code's OWN built-in question tool, intercepted by the PreToolUse hook
@@ -569,25 +528,24 @@ pub const CC_MCP_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos_perm__ask_user_que
 pub const CC_NATIVE_ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 
 /// Build the `--mcp-config` JSON for the lucidos permission server. CC spawns
-/// `lucidos mcp-permission-server` over stdio; the server reads `LUCIDOS_THREAD_ID`
-/// + `LUCIDOS_WORKSPACE` from the inherited env to resolve the engine endpoint.
+/// `lucidos mcp-permission-server` over stdio; the server reads
+/// `LUCIDOS_THREAD_ID` and `LUCIDOS_WORKSPACE` from the inherited env.
 ///
 /// `--permission-only` narrows the server to its `approve` tool. The same
-/// binary also serves Codex's `ask_user_question` (Codex has no question tool
-/// of its own), and CC has no per-server tool filter to hide it with, so
-/// without the flag that tool lands in CC's tool list as a duplicate of its
-/// native `AskUserQuestion`. Calling it then raises a permission card for
-/// `mcp__lucidos_perm__ask_user_question`, because CC routes every MCP tool
-/// through `--permission-prompt-tool`. Asking the user a question is not a
-/// permission-worthy act: the tool simply does not belong to this backend.
-/// See `mcp_permission_server::ToolSet` for the other half of the split.
+/// binary also serves Codex's `ask_user_question`, and CC has no per-server
+/// tool filter. Without the flag, that tool lands in CC's list as a duplicate
+/// of its native `AskUserQuestion`. Calling it then raises a permission card,
+/// because CC routes every MCP tool through `--permission-prompt-tool`.
 ///
-/// `command` is the ABSOLUTE path to the resolved `lucidos` binary
-/// (`resolve_lucidos_binary`), not the bare name — so the MCP server doesn't
-/// depend on the engine's modified `PATH` surviving the engine → `claude` (Node)
-/// → MCP-server spawn chain. `spawn()` has already `?`-checked the same
-/// resolution and failed fast, so the bare-name fallback here is unreachable in
-/// practice; it only keeps this builder infallible.
+/// Asking the user a question is not a permission-worthy act: the tool does not
+/// belong to this backend. See `mcp_permission_server::ToolSet` for the other
+/// half of the split.
+///
+/// `command` is the ABSOLUTE path to the resolved `lucidos` binary, not the
+/// bare name. The MCP server must not depend on the engine's modified `PATH`
+/// surviving the spawn chain through `claude` into the server. `spawn()` has
+/// already `?`-checked the same resolution, so the bare-name fallback here only
+/// keeps this builder infallible.
 fn permission_mcp_config_json(cli_dir: Option<&Path>) -> String {
     let command = resolve_lucidos_binary(cli_dir)
         .map(|p| p.to_string_lossy().into_owned())
@@ -642,12 +600,12 @@ fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
     line
 }
 
-/// True when an exit status indicates the process was killed by a signal —
-/// either delivered directly by the kernel (`status.signal()` is set) or via
-/// the Node.js `128 + signum` convention (a handler caught the signal, ran
-/// cleanup, and re-exited `exit=143`/`exit=137`). Used to distinguish a stray
-/// external kill (auto-resumable) from a clean exit. Mirrors the case analysis
-/// in `format_exit_status`; lives next to it so the two stay in lockstep.
+/// True when an exit status indicates the process was killed by a signal.
+/// Either the kernel delivered it (`status.signal()` is set), or the child
+/// followed the Node.js `128 + signum` convention after handling it.
+/// Distinguishes a stray external kill (auto-resumable) from a clean exit.
+/// Mirrors the case analysis in `format_exit_status`, and lives next to it so
+/// the two stay in lockstep.
 #[cfg(unix)]
 pub(crate) fn exit_indicates_signal_kill(status: &std::process::ExitStatus) -> bool {
     use std::os::unix::process::ExitStatusExt;
@@ -663,29 +621,18 @@ pub(crate) fn exit_indicates_signal_kill(_status: &std::process::ExitStatus) -> 
 }
 
 /// Decode a `child.wait()` result into a debuggable string. `{:?}` on
-/// `ExitStatus` prints `unix_wait_status(36608)` — useless without
-/// manual decoding when a session-ending CC death lands in production
-/// logs. Three cases worth distinguishing:
+/// `ExitStatus` prints `unix_wait_status(36608)`, useless when a
+/// session-ending CC death lands in production logs. Three cases:
 ///
-/// * `exit=N` — clean exit with code `N` below the signal-convention
-///   range. Most CC sessions end here (exit 0 / 1 / SDK-specific codes).
-/// * `exit=N (probable SIGNAME)` — Node.js convention. A child that
-///   installs a signal handler typically re-exits with `128 + signum`
-///   after running cleanup. The hint converts the cryptic 143/137 codes
-///   the Lucidos engine sees from Claude Code into "SIGTERM" / "SIGKILL"
-///   at log-read time so future "who killed CC?" investigations don't
-///   require manual arithmetic.
-/// * `signal=NAME (N)` / `signal=N` — kernel delivered the signal as
-///   cause-of-death directly (no handler ran). Distinct from the
-///   exit=128+N path because the child never got to clean up.
+/// * `exit=N`: a clean exit with code `N` below the signal-convention range.
+/// * `exit=N (probable SIGNAME)`: the Node.js convention, where a child with a
+///   signal handler re-exits `128 + signum` after cleanup. The hint reads the
+///   cryptic 143 and 137 codes back as SIGTERM and SIGKILL at log-read time.
+/// * `signal=NAME (N)` / `signal=N`: the kernel delivered the signal as
+///   cause-of-death, so the child never got to clean up.
 ///
-/// `signal_name` is the bridge: it keeps the named-signal table tiny
-/// (Node.js and the macOS Jetsam stack between them cover the common
-/// values we care about) and falls through to bare numbers for anything
-/// we haven't mapped, so the log never silently drops information. It
-/// lives in `core::shell` next to `TaskOutcome`, which renders the same
-/// names (and decodes the same `128 + signum` range) for the bash tools
-/// — one table, so the two can't drift.
+/// `signal_name` falls through to bare numbers for anything unmapped, so the
+/// log never silently drops information.
 pub(crate) fn format_exit_status(
     wait_result: &std::io::Result<std::process::ExitStatus>,
 ) -> String {
@@ -723,12 +670,11 @@ pub(crate) fn format_exit_status(
 }
 
 /// Grace a cancelled CC process group gets to tear itself down (SIGTERM) before
-/// the engine force-kills it (SIGKILL). Sized for a Playwright runner in the tree
-/// to close the browsers it tracks — those `setsid`-escape the group, so only the
-/// runner's own teardown reaps them; a bare SIGKILL orphaned them (the 2026-06-24
-/// WebKit pile-up). Runs in the detached `driver_task`, off the cancel UX path,
-/// so the wait costs no interactive latency. See
-/// `spawn_env::graceful_kill_child_process_group`.
+/// the engine force-kills it (SIGKILL). Sized for a Playwright runner to close
+/// the browsers it tracks: those `setsid`-escape the group, so only the runner's
+/// own teardown reaps them and a bare SIGKILL leaves them orphaned. Runs in the
+/// detached `driver_task`, off the cancel UX path, so the wait costs no
+/// interactive latency. See `spawn_env::graceful_kill_child_process_group`.
 const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
@@ -746,19 +692,15 @@ async fn driver_task(
     cancel: CancellationToken,
     mut session_id: Option<String>,
 ) {
-    // Capture the child pid before the wait arm consumes the Child —
-    // `tokio::process::Child::id()` returns `None` after `wait()` resolves,
-    // and the post-loop diagnostic log line is the one place we genuinely
-    // need it (for correlating the engine's "CC process exited" line with
-    // macOS unified-log entries / ps output during incident analysis).
+    // Capture the child pid before the wait arm consumes the Child:
+    // `tokio::process::Child::id()` returns `None` once `wait()` resolves, and
+    // the diagnostic log line below is the one place that needs it.
     let child_pid = child.id();
-    // The process's NATURAL exit status — captured only when the OS reports
-    // the child gone on its own (the `child.wait()` arm, or a post-loop
-    // `try_wait`), BEFORE any engine-side teardown kill. Drives
-    // `killed_by_signal` so a stray external SIGTERM (exit=143) is told apart
-    // from a clean exit or an engine-initiated cancel (whose SIGKILL would
-    // otherwise masquerade as a stray signal). `None` = the engine tore the
-    // child down (cancel/EOF) — not auto-resumable.
+    // The process's NATURAL exit status, captured only when the OS reports the
+    // child gone on its own, BEFORE any engine-side teardown kill. It drives
+    // `killed_by_signal`, so a stray external SIGTERM (exit=143) is told apart
+    // from a clean exit and from an engine-initiated cancel. `None` means the
+    // engine tore the child down, which is not auto-resumable.
     let mut natural_exit_status: Option<std::process::ExitStatus> = None;
     // True once the child has been reaped (`wait()` resolved). Gates the
     // group-kill below: after reaping, the pid (hence the group id) may be
@@ -834,21 +776,16 @@ async fn driver_task(
                 // Always-on subprocess exit handler. Fires the instant the
                 // OS reports the child is gone, regardless of stdout state.
                 //
-                // Catches the case where a grandchild (rustc forked by
-                // cargo, a backgrounded Bash tool, anything that inherited
-                // stdout) keeps the pipe open after CC's main process dies.
-                // Without this arm, the previous 500ms `try_wait` poll was
-                // starved by continuous grandchild noise: tokio::select!
-                // re-creates futures each iteration, so a noise line every
-                // ~100ms resets the 500ms timer before it can resolve. The
-                // engine then wedged at status='running' forever — no
-                // CodingAgentIdled, no ResponseAborted — until the
-                // grandchild eventually died on its own.
+                // A grandchild that inherited stdout (rustc under cargo, a
+                // backgrounded Bash tool) keeps the pipe open after CC's main
+                // process dies. Polling `try_wait` on a timer instead is
+                // starved by continuous grandchild noise, because
+                // `tokio::select!` re-creates its futures each iteration. The
+                // engine then wedges at status='running' forever.
                 //
                 // After the exit, drain remaining stdout with a bounded
-                // timeout so a final `Result` line CC flushed before exiting
-                // is still forwarded (clean-exit path) without blocking on
-                // a noisy grandchild (silent-death path).
+                // timeout. A final `Result` line CC flushed before exiting is
+                // still forwarded, without blocking on a noisy grandchild.
                 log!(
                     "[ClaudeCode] CC process exited (pid={} status={}) — draining remaining stdout",
                     child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
@@ -898,9 +835,9 @@ async fn driver_task(
     }
 
     // If the child already died on its own but a different select! arm won the
-    // race (stdout EOF / error / a pre-captured line), reap it here BEFORE any
-    // teardown kill so its true exit status still classifies the death. A
-    // still-running child (genuine cancel) yields `None` and stays unreaped.
+    // race, reap it here BEFORE any teardown kill. Its true exit status then
+    // still classifies the death. A still-running child yields `None` and stays
+    // unreaped.
     if !child_reaped {
         if let Ok(Some(status)) = child.try_wait() {
             natural_exit_status = Some(status);
@@ -908,13 +845,9 @@ async fn driver_task(
         }
     }
 
-    // Deliberate teardown: tear down the whole process group (CC + every
-    // descendant it spawned — Bash tools, cargo/rustc, an e2e Playwright runner)
-    // so nothing is left orphaned holding the stdout pipe. Graceful-first: SIGTERM
-    // the group + a short grace so a Playwright runner can close the browsers it
-    // tracks (they `setsid`-escape the group and can't be reached directly — only
-    // its own teardown reaps them), THEN SIGKILL. A bare SIGKILL orphaned those
-    // browsers (the 2026-06-24 WebKit pile-up). Only while the child is unreaped —
+    // Tear down the whole process group, so no descendant is left orphaned
+    // holding the stdout pipe. Graceful-first: SIGTERM the group, wait out
+    // `GROUP_TEARDOWN_GRACE`, then SIGKILL. Only while the child is unreaped,
     // see `signal_child_process_group`'s pid-recycle caveat.
     #[cfg(unix)]
     if !child_reaped {

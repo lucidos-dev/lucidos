@@ -138,31 +138,37 @@ pub enum InjectedPromptKind {
     /// Synthesised user message — emits `UserPromptInjected` and pushes the
     /// framed text into the next agentic-loop turn.
     UserText,
-    /// Child-completion wake. The parent's `ChildThreadCompleted` event is
+    /// Engine re-entry on an existing thread, the child-completion case being
+    /// the headline one. The parent's `ChildThreadCompleted` event is
     /// already the exchange-starter on the wire (caller passed its id as
     /// `prompt.spawning_event_id`); the loop projects `prompt.text` inline
     /// as the next user-channel block WITHOUT emitting `UserPromptInjected`
     /// — otherwise the response would split into a duplicate exchange and
     /// strand the rich child-completion card.
-    WakeFromChild,
-    /// Event-wait wake on a thread whose subscription had already **detached**
-    /// (see `engine::event_wait`). Same projection rule as `WakeFromChild` and
-    /// for the same reason: `emit_delivery` has already put the wake's
-    /// exchange-starter on the wire (a `UserPromptInjected` carrying the
-    /// matched event), so the loop must project the text inline rather than
-    /// emit a second one.
+    ReentryFromEngine,
+    /// Event-wait delivery or expiry (see `engine::event_wait`). Same
+    /// projection rule as `ReentryFromEngine` and for the same reason:
+    /// `emit_delivery` has already put the re-entry's exchange-starter on the
+    /// wire (a `UserPromptInjected` carrying the matched event), so the loop
+    /// must project the text inline rather than emit a second one.
     ///
-    /// Distinct from `WakeFromChild` rather than folded into it because the two
-    /// wakes come from different places and say so in the log; the *layout*
-    /// they share is expressed once, by [`InjectedPromptGroup::Standalone`].
-    WakeFromEvent,
+    /// **Named for the resolved WAIT, not for a sleeping thread.** Reaching
+    /// this arm at all means the thread was running, since an idle one has no
+    /// loop to inject into, and the model is then told the event arrived "while
+    /// you were working" (see `framed_injected_prompt`). It was `WakeFromEvent`
+    /// until 2026-08-13, which named the one case it cannot be.
+    ///
+    /// Distinct from `ReentryFromEngine` rather than folded into it because the
+    /// two come from different places and say so in the log; the *layout* they
+    /// share is expressed once, by [`InjectedPromptGroup::Standalone`].
+    ReentryFromWait,
 }
 
 impl InjectedPromptKind {
-    /// True for the engine's own wakes, which carry their exchange-starter on
-    /// the wire already and must never emit a second one.
-    pub(crate) fn is_engine_wake(&self) -> bool {
-        matches!(self, Self::WakeFromChild | Self::WakeFromEvent)
+    /// True for the engine's own re-entries, which carry their exchange-starter
+    /// on the wire already and must never emit a second one.
+    pub(crate) fn is_engine_reentry(&self) -> bool {
+        matches!(self, Self::ReentryFromEngine | Self::ReentryFromWait)
     }
 }
 
@@ -400,6 +406,12 @@ pub struct LucidosEngine {
     /// behind HEAD, so an idle workspace never populates it. Dev-only. See
     /// `engine_version::pending_commits`.
     pending_commits_cache: std::sync::Mutex<engine_version::PendingCommitsCache>,
+    /// Throttled cache of the checkout's HEAD sha. Three callers now need it on
+    /// the hot path (the version-status response's pending-version identity, the
+    /// wedged-rebuild verdict, and the self-heal driver's per-HEAD budget), and
+    /// each used to fork its own `git rev-parse`. Same TTL rationale as
+    /// `source_behind_cache`. Dev-only. See `engine_version::head_sha`.
+    head_sha_cache: std::sync::Mutex<engine_version::HeadShaCache>,
     /// Self-heal bookkeeping: how many background rebuilds this engine has
     /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
     /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
@@ -476,7 +488,7 @@ pub struct LucidosEngine {
     /// such field: `main.rs` handed the only copy to the pre-emit, so the two
     /// emits that run after it (`shutdown_active_threads` and the
     /// `emit_stop_terminal` abort arm) hardcoded a system actor. A chat thread
-    /// woken by an event 1.5s into a *Switch to new version* therefore settled
+    /// re-entered by an event 1.5s into a *Switch to new version* therefore settled
     /// `failed` with a manual Continue while its two siblings settled `paused`
     /// and auto-resumed, because the device actor is half the switch fingerprint
     /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`).
@@ -729,12 +741,12 @@ pub struct LucidosEngine {
     /// `rebuild_event_waits` reconstructs this whole map from the event store
     /// at boot. There is no `thread_event_waits` table and must not be one.
     pub(crate) live_waits: Arc<event_wait::LiveWaits>,
-    /// Sender for the event-wait wake task. A resolved wait pushes a
-    /// [`event_wait::EventWakeRequest`] here and the consumer (started at boot
-    /// via `start_event_wake_consumer`) runs the actual turn.
+    /// Sender for the event-wait re-entry task. A resolved wait pushes a
+    /// [`event_wait::WaitReentryRequest`] here and the consumer (started at boot
+    /// via `start_wait_reentry_consumer`) runs the actual turn.
     ///
-    /// The indirection is required, not stylistic: see `EVENT_WAKE_RX`.
-    pub(crate) event_wake_tx: tokio::sync::mpsc::UnboundedSender<event_wait::EventWakeRequest>,
+    /// The indirection is required, not stylistic: see `WAIT_REENTRY_RX`.
+    pub(crate) wait_reentry_tx: tokio::sync::mpsc::UnboundedSender<event_wait::WaitReentryRequest>,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.
@@ -798,13 +810,13 @@ thread_local! {
     /// `start_apply_all_driver` (called after `Arc::new(engine)`) can pick
     /// it up.
     static APPLY_ALL_DRIVE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<apply_all_driver::ApplyAllDriveMsg>>> = const { std::cell::RefCell::new(None) };
-    /// Event-wait wake receiver, same pattern again. Here the channel is
+    /// Event-wait re-entry receiver, same pattern again. Here the channel is
     /// load-bearing rather than a convenience: registration runs its catch-up
     /// scan inline, so without it `run_agentic_loop` awaits a delivery which
-    /// awaits a wake which re-enters `run_agentic_loop`, a cyclic future whose
+    /// awaits a re-entry into `run_agentic_loop`, a cyclic future whose
     /// `Send`-ness rustc cannot infer (exactly as noted on
     /// `apply_all_drive_tx`). A plain-data message over a channel has no cycle.
-    static EVENT_WAKE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_wait::EventWakeRequest>>> = const { std::cell::RefCell::new(None) };
+    static WAIT_REENTRY_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_wait::WaitReentryRequest>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn spawn_vertex_region_subscriber(
@@ -1187,7 +1199,7 @@ pub(crate) async fn emit_stuck_thread_eviction_abort(
     // below are only the fallback for a turn that never got that far. CC
     // threads fall back on `MessageReceived` / `CodingAgentUserMessageSent` /
     // `TriggerStarted` / `ChildThreadCompleted` (any can start a CC turn:
-    // CCUMS for live follow-ups, CTC for parents waking from a finished
+    // CCUMS for live follow-ups, CTC for parents re-entered from a finished
     // child via `notify_parent_of_child_completion`). Chat threads use the
     // same list minus CCUMS. The shared constants live in
     // `agent_session::resume`.

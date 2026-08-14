@@ -186,6 +186,13 @@ impl ArtifactManager {
         // them (e.g. data/blobs/) without rewriting historical lines. When
         // the file is newly created or modified, also commit it to the
         // artifacts repo so the workspace's git history records the change.
+        //
+        // Deliberately NOT routed through `retry_while_repo_contended`: this is
+        // the constructor, so it runs at startup before this manager is shared
+        // and before any timer or agent session exists to move HEAD under it.
+        // It also stages outside any closure, and it logs-and-continues rather
+        // than failing a request, so losing a race here costs a .gitignore
+        // update that the next boot redoes rather than a 500.
         match super::ensure_workspace_gitignore_entries(&workspace_path) {
             Ok(true) => {
                 let mut index = repo.index()?;
@@ -310,7 +317,7 @@ impl ArtifactManager {
         let paths: Vec<String> = artifact_paths.to_vec();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            super::retry_while_index_locked(|| {
+            super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
                 super::reset_index_to_head(&repo, &mut index)?;
@@ -354,7 +361,7 @@ impl ArtifactManager {
         let paths: Vec<String> = data_relative_paths.to_vec();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            super::retry_while_index_locked(|| {
+            super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
                 super::reset_index_to_head(&repo, &mut index)?;
@@ -390,15 +397,22 @@ impl ArtifactManager {
         let repo = self.repo.clone();
         let repo_path = format!("data/{}", data_relative_path);
         let message = message.to_string();
-        let commit_id = tokio::task::spawn_blocking(move || -> Result<String, git2::Error> {
-            let repo = repo.lock().unwrap();
-            let mut index = repo.index()?;
-            super::reset_index_to_head(&repo, &mut index)?;
+        // The file removal above stays outside the retry closure, so a retried
+        // attempt only re-stages an already-absent path onto the winner's head.
+        // Staging is tolerant and the commit goes through
+        // `commit_index_unless_unchanged`, because the writer that won the race
+        // may have committed this deletion already.
+        let commit_id = tokio::task::spawn_blocking(move || {
+            super::retry_while_repo_contended(|| {
+                let repo = repo.lock().unwrap();
+                let mut index = repo.index()?;
+                super::reset_index_to_head(&repo, &mut index)?;
 
-            index.remove_path(std::path::Path::new(&repo_path))?;
-            index.write()?;
+                let _ = index.remove_path(std::path::Path::new(&repo_path));
+                index.write()?;
 
-            super::commit_index(&repo, &message)
+                super::commit_index_unless_unchanged(&repo, &message)
+            })
         })
         .await
         .unwrap()?;
@@ -426,7 +440,7 @@ impl ArtifactManager {
         let repo_path = repo_path.to_string();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            super::retry_while_index_locked(|| {
+            super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
                 super::reset_index_to_head(&repo, &mut index)?;
@@ -470,8 +484,9 @@ impl ArtifactManager {
             let _worktree_guard = worktree_guard;
             // The worktree guard excludes the engine's OWN git-CLI paths, not a
             // git process outside this engine, so the index can still be locked
-            // under us here; see `retry_while_index_locked`.
-            super::retry_while_index_locked(|| {
+            // under us here, and HEAD can still move under us between the parent
+            // read and the commit; see `retry_while_repo_contended`.
+            super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
                 super::reset_index_to_head(&repo, &mut index)?;

@@ -45,14 +45,14 @@ pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, REPEATED_ACTION_RULE};
 /// about whether the input is a message the person sent, yet a live thread
 /// routes the two differently: a message is injected as `UserText` and
 /// acknowledged with a `UserPromptInjected`, and it arms the Codex redirect
-/// interrupt; an engine re-entry is injected as `WakeFromChild`, silently.
+/// interrupt; an engine re-entry is injected as `ReentryFromEngine`, silently.
 ///
 /// Modelling both as one nullable id made every reader infer the second from
 /// the first (`pre_emitted_origin.is_none()` == "genuine user follow-up").
 /// That held only because no pre-emitting caller could reach the follow-up
 /// fast-paths: each one either starts a NEW thread or genuinely is an engine
 /// re-entry. The moment a caller pre-emits a real message on a LIVE thread,
-/// the inference misclassifies it as a wake, so the user's queued message is
+/// the inference misclassifies it as a re-entry, so the user's queued message is
 /// ingested with no visible acknowledgment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreEmittedOrigin {
@@ -62,22 +62,22 @@ pub(crate) enum PreEmittedOrigin {
     /// exactly like a message this function emitted itself.
     Message(Uuid),
     /// An engine-internal re-entry on an existing thread, anchored to an event
-    /// the UI already renders: a child thread's completion waking its parent
+    /// the UI already renders: a child thread's completion re-opening its parent
     /// (`notify_parent_of_child_completion`), a continuation rerun's note
     /// (`chat::rerun`), or the re-processing of an orphaned injection. Not
     /// something the person just typed, so it must not surface as one.
     EngineReentry(Uuid),
-    /// An **event-wait wake** (`engine::event_wait`). A re-entry like the one
+    /// An **event-wait re-entry** (`engine::event_wait`). A re-entry like the one
     /// above, split out because a live thread has to inject it under its own
-    /// name: the two wakes are projected identically but come from different
-    /// places, and folding an event wake into `WakeFromChild` would put a
+    /// name: the two are projected identically but come from different
+    /// places, and folding a wait re-entry into `ReentryFromEngine` would put a
     /// child that does not exist into the log.
     ///
     /// Anchored to the `UserPromptInjected` `emit_resolution` wrote beside the
     /// resolution, which carries the payload as prose. One shape, always: a
     /// subscription does not hold its thread's turn, so there is never a
     /// dangling tool call for the delivery to land in instead.
-    EventWake(Uuid),
+    WaitReentry(Uuid),
 }
 
 impl PreEmittedOrigin {
@@ -86,7 +86,7 @@ impl PreEmittedOrigin {
         match self {
             PreEmittedOrigin::Message(id)
             | PreEmittedOrigin::EngineReentry(id)
-            | PreEmittedOrigin::EventWake(id) => id,
+            | PreEmittedOrigin::WaitReentry(id) => id,
         }
     }
 
@@ -94,7 +94,7 @@ impl PreEmittedOrigin {
     pub(crate) fn is_engine_reentry(self) -> bool {
         matches!(
             self,
-            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::EventWake(_)
+            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::WaitReentry(_)
         )
     }
 
@@ -103,8 +103,10 @@ impl PreEmittedOrigin {
     pub(crate) fn inject_kind(self) -> crate::engine::InjectedPromptKind {
         match self {
             PreEmittedOrigin::Message(_) => crate::engine::InjectedPromptKind::UserText,
-            PreEmittedOrigin::EngineReentry(_) => crate::engine::InjectedPromptKind::WakeFromChild,
-            PreEmittedOrigin::EventWake(_) => crate::engine::InjectedPromptKind::WakeFromEvent,
+            PreEmittedOrigin::EngineReentry(_) => {
+                crate::engine::InjectedPromptKind::ReentryFromEngine
+            }
+            PreEmittedOrigin::WaitReentry(_) => crate::engine::InjectedPromptKind::ReentryFromWait,
         }
     }
 }

@@ -230,6 +230,27 @@ Runs for **every** diff, with no fast path: the docs-only skip below does NOT ap
 
 This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
 
+### Also always: the prose gate
+
+```bash
+./scripts/check-prose.sh
+```
+
+Runs for **every** diff, with no fast path, for the same reason as the em-dash gate above: prose is what it measures, so a docs-only skip would exempt the diff it exists for.
+
+Four limits, all diff-scoped and added-lines-only (see `.claude/rules/prose.md`):
+
+- a comment block of at most 20 lines
+- a sentence of at most 25 words
+- a paragraph of at most 6 sentences
+- no ISO date inside a comment (a dated *path* is fine, and linking a plan is what the rule asks for)
+
+The tree's 143,575 existing comment lines never fire it. A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
+
+Three further rules in that file are **not** machine-checked, because each needs part-of-speech tagging: a 20-word limit for an imperative step, active voice, and 3-word noun clusters. Those are a `code-review` angle, so Phase 1 covers them and this gate does not pretend to.
+
+This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
+
 ### Also always: the ADR gate
 
 ```bash
@@ -393,11 +414,19 @@ canonical invocation; never restate its flags here.
 When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. (Codex / any agent without a background-Bash + `TaskOutput` tool: run the two suites **sequentially** instead — `cargo …` then `npm …`. Parallelism is only a wall-clock optimization; sequential gives identical correctness.) Pattern:
 
 ```
-# Launch both in parallel
-Bash(cmd="make lint && make test", run_in_background=true)  → task_id A
-Bash(cmd="cd crates/lucidos-app && npx tsc --noEmit && npm test", run_in_background=true)  → task_id B
-# Then TaskOutput on A and B until both finish
+# Logs go in the worktree's own .lucidos/ (gitignored, and per-worktree, so a
+# concurrent /harden in another session cannot truncate this run's log).
+Bash(cmd="mkdir -p .lucidos && (make lint && make test) > .lucidos/harden-rust.log 2>&1", run_in_background=true)  → task_id A
+Bash(cmd="mkdir -p .lucidos && (cd crates/lucidos-app && npx tsc --noEmit && npm test) > .lucidos/harden-ts.log 2>&1", run_in_background=true)  → task_id B
+# Then TaskOutput (block: true) on A and B until both finish, and read the
+# detail out of the logs: tail -40 on each, grep -nE "^error|test result:"
 ```
+
+Redirecting is not piping, so each task still reports cargo's / npm's real exit
+code, and it is what keeps the join cheap: every `TaskOutput` call replays the
+task's ENTIRE accumulated output rather than only what is new, so joining an
+un-redirected `make test` pours the whole engine suite into context again on
+every wait.
 
 **Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `make test > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 

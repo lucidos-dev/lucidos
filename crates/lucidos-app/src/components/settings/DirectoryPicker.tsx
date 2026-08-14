@@ -3,6 +3,7 @@ import type { ComponentChildren } from 'preact';
 import { browseDirectories, type BrowseResult } from '../../api/client';
 import { toFailed, type Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { FolderIcon, FolderUpIcon } from '../shared/icons';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 interface DirectoryPickerProps {
@@ -61,7 +62,7 @@ export function directoryPickerBody({
           onClick={onGoUp}
           onMouseEnter={() => onHoverIndex(0)}
         >
-          <span class="dir-picker-icon">{'\u{1F4C2}'}</span>
+          <span class="dir-picker-icon"><FolderUpIcon /></span>
           <span class="dir-picker-name">..</span>
         </button>
       )}
@@ -77,7 +78,7 @@ export function directoryPickerBody({
             onClick={() => onSelectDir(dir)}
             onMouseEnter={() => onHoverIndex(idx)}
           >
-            <span class="dir-picker-icon">{'\u{1F4C1}'}</span>
+            <span class="dir-picker-icon"><FolderIcon /></span>
             <span class="dir-picker-name">{dir}</span>
           </button>
         );

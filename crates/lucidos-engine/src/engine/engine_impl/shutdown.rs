@@ -30,7 +30,7 @@ impl LucidosEngine {
     /// rebuild. Walks the in-flight chat AND CC threads and emits the boundary
     /// events with the `actor` the switch handler stashed (via
     /// `take_restart_actor`): a device actor → "Paused by restart"; `None`
-    /// (bare stop.sh / external SIGUSR1) → "⚙ System / Response interrupted".
+    /// (bare stop.sh / external SIGUSR1) → "System / Response interrupted".
     ///
     /// For chat threads: emits `ResponseAborted { actor: <actor> }` with
     /// `request_event_id` pointing to the originating MessageReceived/
@@ -213,7 +213,7 @@ impl LucidosEngine {
     /// via `teardown_actor()`. A user-driven restart therefore settles a thread
     /// reached only by this fallback at `'paused'` with an auto-resume, exactly
     /// like one the pre-emit knew about; a teardown nobody requested has no actor
-    /// to read, falls back to `MessageOrigin::system()` (⚙ System on the
+    /// to read, falls back to `MessageOrigin::system()` (System on the
     /// AbortPanel: the host system killed these responses) and settles
     /// `'failed'`, which is what puts it in the needs-attention count.
     ///
@@ -224,7 +224,7 @@ impl LucidosEngine {
     /// (`AbortCause::promises_auto_resume`), so hardcoding it made ONE user
     /// switch produce two different verdicts depending only on whether a thread
     /// became in-flight before or after the pre-emit's `processing_thread_ids()`
-    /// snapshot. A chat thread woken by an `await_event` delivery 1.5s into a
+    /// snapshot. A chat thread re-entered by an `await_event` delivery 1.5s into a
     /// switch got "Response interrupted" and a manual Continue while its two
     /// siblings got "Paused by restart" and resumed by themselves. See
     /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.

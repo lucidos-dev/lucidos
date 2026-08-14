@@ -61,7 +61,7 @@ fn matched_index_names_the_entry_that_fired() {
         ],
         0,
     );
-    // Second entry, so the model can tell which of its subscriptions woke it.
+    // Second entry, so the model can tell which of its subscriptions delivered.
     assert_eq!(
         w.matched_index("ChangeProposed", &json!({"file_count": 3})),
         Some(1),
@@ -195,11 +195,11 @@ fn expired_waits_uses_an_inclusive_deadline() {
     assert_eq!(expired, vec![past.wait_id, exactly.wait_id]);
 }
 
-// ── the wake payloads ───────────────────────────────────────────────
+// ── the re-entry payloads ───────────────────────────────────────────────
 
 #[test]
-fn the_delivery_wake_carries_the_event_and_the_reason() {
-    let text = delivery_wake_text(
+fn the_delivery_text_carries_the_event_and_the_reason() {
+    let text = delivery_reentry_text(
         "ChangeProposed",
         &json!({"file_count": 2}),
         "waiting to apply",
@@ -209,14 +209,14 @@ fn the_delivery_wake_carries_the_event_and_the_reason() {
     assert!(text.contains("waiting to apply"), "{text}");
 }
 
-/// An expiry wakes the thread rather than dropping it, and the text has to
+/// An expiry re-enters the thread rather than dropping it, and the text has to
 /// steer the model away from subscribing again to the same thing: a silent
 /// re-subscribe loop would be the polling this feature replaces, with extra
 /// steps.
 #[test]
-fn the_expiry_wake_says_it_timed_out_and_discourages_re_subscribing() {
+fn the_expiry_text_says_it_timed_out_and_discourages_re_subscribing() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
-    let text = expiry_wake_text(&w, &[]);
+    let text = expiry_reentry_text(&w, &[]);
     assert!(text.contains("Timed out"), "{text}");
     assert!(text.contains("ChangeProposed"), "{text}");
     assert!(
@@ -242,7 +242,7 @@ fn the_registration_result_says_nothing_is_blocking() {
     );
     assert!(
         engine_side.contains("NEW turn"),
-        "says where the wake lands: {engine_side}"
+        "says where the re-entry lands: {engine_side}"
     );
     assert!(
         engine_side.contains("Do not call await_event again"),
@@ -253,12 +253,12 @@ fn the_registration_result_says_nothing_is_blocking() {
 /// Delivery is the only resolution that CONSUMES the subscription, and it used
 /// to be the only one whose text said nothing about that. Silence read as
 /// agreement with its neighbours, which say "do not register again": on
-/// 2026-08-06 a live thread woke, reported the event, closed with "Re-arming
+/// 2026-08-06 a live thread was re-entered, reported the event, closed with "Re-arming
 /// the watch now" and ended the turn with no second call, leaving the user
 /// looking at an idle thread that had just promised to keep watching.
 #[test]
-fn the_delivery_wake_says_the_subscription_is_spent_and_re_arming_is_a_call() {
-    let text = delivery_wake_text(
+fn the_delivery_text_says_the_subscription_is_spent_and_re_arming_is_a_call() {
+    let text = delivery_reentry_text(
         "ChangeProposed",
         &json!({"file_count": 3}),
         "waiting to apply",
@@ -283,7 +283,7 @@ fn the_delivery_wake_says_the_subscription_is_spent_and_re_arming_is_a_call() {
 ///
 /// **Add a row when you add a shape.** One that ships silent reproduces exactly
 /// that bug. A cancel is deliberately absent: the user ended it, and it writes
-/// no wake at all.
+/// no re-entry at all.
 #[test]
 fn every_subscription_text_says_where_the_subscription_stands() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
@@ -301,16 +301,16 @@ fn every_subscription_text_says_where_the_subscription_stands() {
                 &w,
                 Some(&lookback_of(&[("ChangeProposed", payload.clone(), 26)])),
             ),
-            "will NOT wake you",
+            "will NOT deliver anything below",
         ),
         (
             "delivery",
-            delivery_wake_text("ChangeProposed", &payload, "waiting to apply"),
+            delivery_reentry_text("ChangeProposed", &payload, "waiting to apply"),
             "now spent",
         ),
         (
             "expiry",
-            expiry_wake_text(&w, &[]),
+            expiry_reentry_text(&w, &[]),
             "rather than subscribing again",
         ),
     ];
@@ -365,9 +365,9 @@ async fn seed_completion_card(
 /// here: the bare subscription, and one carrying a `condition` on a real field.
 ///
 /// This is the half the gate's first version got wrong. It probed only for a
-/// persisted `EventWaitDelivered`, but the fan-in and the dispatcher are woken
+/// persisted `EventWaitDelivered`, but the fan-in and the dispatcher are driven
 /// by the same broadcast on separate tasks, so that row is almost never written
-/// yet when the fan-in looks: the gate essentially never fired and both wakes
+/// yet when the fan-in looks: the gate essentially never fired and both re-entries
 /// ran. Matching the live cache against this payload is what closes it.
 #[tokio::test]
 async fn a_child_completion_card_matches_a_wait_watching_for_one() {
@@ -409,7 +409,7 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
     // And the gate has to ask through `waits_matching_row`, not against the
     // stored column: a `thread_id` condition matches the *matchable payload*
     // only, so asking the raw way reports this parent as un-subscribed and the
-    // callback runs beside the wake its own wait is about to deliver.
+    // callback runs beside the delivery its own wait is about to make.
     let scoped = wait_with(
         parent_id,
         vec![sub(
@@ -579,7 +579,7 @@ async fn a_wait_scopes_to_one_coding_agent_session_on_every_path() {
     let before = max_sequence(&pool).await;
 
     // The other agent finishes FIRST, so a scoped wait has to step over it. An
-    // unscoped one would have woken here and reported the wrong session.
+    // unscoped one would have fired here and reported the wrong session.
     let other_row = seed_coding_agent_idle(&bus, &pool, other).await;
     let watched_row = seed_coding_agent_idle(&bus, &pool, watched).await;
 
@@ -624,7 +624,7 @@ async fn a_wait_scopes_to_one_coding_agent_session_on_every_path() {
     assert_eq!(
         hit.2["thread_id"],
         json!(watched.to_string()),
-        "and the payload it hands the wake carries the thread it matched on"
+        "and the payload it hands the re-entry carries the thread it matched on"
     );
 
     // 3. ARMING LOOKBACK. The report a model gets for a match that landed just
@@ -796,7 +796,7 @@ async fn rebuild_keeps_armed_at_and_falls_back_to_the_row_for_a_legacy_payload()
 }
 
 /// A wait whose deadline passed while the engine was down is re-armed rather
-/// than dropped, so the deadline sweep can wake its thread with an expiry.
+/// than dropped, so the deadline sweep can re-enter its thread with an expiry.
 /// Dropping it here is the silent-stall the whole design refuses (I3).
 #[tokio::test]
 async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
@@ -926,7 +926,7 @@ async fn catch_up_on_an_empty_subscription_list_queries_nothing() {
 /// The report is the only part of a registration result the model has to act on
 /// within the turn, so it leads, and it says the trap out loud. The 2026-08-06
 /// failure was a thread that had every fact it needed except this one: the
-/// subscription it had just armed was never going to wake it for the change
+/// subscription it had just armed was never going to deliver the change
 /// that had landed 26 seconds earlier.
 #[test]
 fn the_arming_lookback_leads_the_result_and_names_the_trap() {
@@ -949,7 +949,7 @@ fn the_arming_lookback_leads_the_result_and_names_the_trap() {
         "the actionable half leads:\n{text}"
     );
     assert!(
-        text.contains("will NOT wake you"),
+        text.contains("will NOT deliver anything below"),
         "a forward-only watch is the trap, and it has to be stated: {text}"
     );
     assert!(
@@ -1313,7 +1313,7 @@ async fn the_lookback_reports_the_newest_matches_up_to_the_limit() {
 }
 
 /// The condition is applied here exactly as the forward scan applies it, so a
-/// filter that narrows a wake also narrows the report.
+/// filter that narrows a delivery also narrows the report.
 #[tokio::test]
 async fn the_lookback_applies_the_condition_not_just_the_event_name() {
     let (pool, db_name) = setup_test_db().await;
@@ -1353,7 +1353,7 @@ async fn the_lookback_applies_the_condition_not_just_the_event_name() {
 
 /// Nothing above the watermark leaks into the report. That half of the timeline
 /// belongs to the forward scan, and reporting it here would double up with the
-/// wake it is about to produce.
+/// delivery it is about to produce.
 #[tokio::test]
 async fn the_lookback_stops_at_the_watermark() {
     let (pool, db_name) = setup_test_db().await;
@@ -1373,7 +1373,10 @@ async fn the_lookback_stops_at_the_watermark() {
     )
     .await
     .unwrap();
-    assert!(found.is_empty(), "after the watermark is the wake's job");
+    assert!(
+        found.is_empty(),
+        "after the watermark is the delivery's job"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1483,7 +1486,7 @@ async fn the_lookback_on_an_empty_subscription_list_queries_nothing() {
 
 // ── emission order ──────────────────────────────────────────────────
 
-/// `EventWaitDelivered` must persist BEFORE its wake anchor, so a crash
+/// `EventWaitDelivered` must persist BEFORE its re-entry anchor, so a crash
 /// between the two leaves a resolved wait rather than an anchor for a wait the
 /// boot rebuild would re-arm.
 #[tokio::test]
@@ -1596,16 +1599,16 @@ async fn a_delivered_wait_does_not_come_back_on_the_next_boot() {
     teardown_test_db(&db_name).await;
 }
 
-/// A wake the teardown declined costs nothing, because the next engine
+/// A re-entry the teardown declined costs nothing, because the next engine
 /// delivers it. This is the property that makes
-/// `LucidosEngine::shutdown_declines_wake` safe, and the reason it must be
+/// `LucidosEngine::shutdown_declines_reentry` safe, and the reason it must be
 /// consulted BEFORE `LiveWaits::take` rather than after.
 ///
 /// Declining is, by construction, doing nothing: the wait is never taken and no
 /// resolution is emitted, so what the next engine sees is exactly the state this
 /// test sets up. The 2026-08-07 report is the case it covers. A
 /// `BackgroundBashCompleted` matched a live wait 1.5 seconds into a *Switch to
-/// new version*, and the wake ran a chat turn against an engine with fourteen
+/// new version*, and the re-entry ran a chat turn against an engine with fourteen
 /// seconds to live. With the gate, that same match is simply picked up by the
 /// engine that replaces it.
 #[tokio::test]
@@ -1773,11 +1776,11 @@ async fn a_thread_holding_a_subscription_is_idle() {
     teardown_test_db(&db_name).await;
 }
 
-// ── the wake anchor and the lost-wake sweep (I3b) ────────────────────
+// ── the re-entry anchor and the lost-re-entry sweep (I3b) ────────────────────
 
 /// A detached resolution has no tool-result slot, so `emit_resolution` writes a
 /// `UserPromptInjected` instead: the frontend's exchange-starter, which is what
-/// makes the wake read as the new turn it genuinely is. The anchor id must be
+/// makes the delivery read as the new turn it genuinely is. The anchor id must be
 /// that event, since the re-entry hangs its whole exchange off it.
 #[tokio::test]
 async fn a_delivery_anchors_on_a_user_prompt_injected() {
@@ -1790,7 +1793,7 @@ async fn a_delivery_anchors_on_a_user_prompt_injected() {
     rebuild_live_waits(&pool, &waits).await.unwrap();
     let wait = waits.take(wait_id).await.unwrap();
 
-    let wake = emit_delivery(
+    let reentry = emit_delivery(
         &bus,
         &wait,
         Uuid::new_v4(),
@@ -1803,17 +1806,17 @@ async fn a_delivery_anchors_on_a_user_prompt_injected() {
 
     let (anchor_type, anchor_text): (String, Option<String>) =
         sqlx::query_as("SELECT event_type, payload->>'text' FROM events WHERE id = $1")
-            .bind(wake.anchor_event_id)
+            .bind(reentry.anchor_event_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(anchor_type, "UserPromptInjected");
     assert_eq!(
         anchor_text.as_deref(),
-        Some(wake.text.as_str()),
+        Some(reentry.text.as_str()),
         "the anchor carries the same words the re-entry prompts with"
     );
-    assert!(wake.text.contains("ChangeProposed"), "{}", wake.text);
+    assert!(reentry.text.contains("ChangeProposed"), "{}", reentry.text);
 
     // No ToolResult: there was no open slot to fill.
     let tool_results: i64 = sqlx::query_scalar(
@@ -1845,7 +1848,7 @@ async fn a_delivery_anchor_points_back_at_its_resolution() {
     rebuild_live_waits(&pool, &waits).await.unwrap();
     let wait = waits.take(wait_id).await.unwrap();
 
-    let wake = emit_delivery(
+    let reentry = emit_delivery(
         &bus,
         &wait,
         Uuid::new_v4(),
@@ -1859,7 +1862,7 @@ async fn a_delivery_anchor_points_back_at_its_resolution() {
     let linked: Option<Uuid> = sqlx::query_scalar(
         "SELECT (payload->>'delivered_event_id')::uuid FROM events WHERE id = $1",
     )
-    .bind(wake.anchor_event_id)
+    .bind(reentry.anchor_event_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1897,12 +1900,12 @@ async fn an_expiry_anchor_carries_no_delivery_link() {
     rebuild_live_waits(&pool, &waits).await.unwrap();
     let wait = waits.take(wait_id).await.unwrap();
 
-    let wake = emit_expiry(&bus, &wait, &[]).await.unwrap();
+    let reentry = emit_expiry(&bus, &wait, &[]).await.unwrap();
 
     let linked: Option<Uuid> = sqlx::query_scalar(
         "SELECT (payload->>'delivered_event_id')::uuid FROM events WHERE id = $1",
     )
-    .bind(wake.anchor_event_id)
+    .bind(reentry.anchor_event_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -1914,7 +1917,7 @@ async fn an_expiry_anchor_carries_no_delivery_link() {
 
 /// Seed a `thread_summaries` row, then subscribe + resolve, leaving the anchor
 /// as the thread's last word. That is the crash shape
-/// `refire_unresolved_event_wakes` exists for: the resolution is persisted (so
+/// `refire_unresolved_wait_reentries` exists for: the resolution is persisted (so
 /// the rebuild will not re-arm the wait) and the turn never ran.
 async fn subscribe_and_resolve_without_waking(
     bus: &EventBus,
@@ -1939,38 +1942,38 @@ async fn subscribe_and_resolve_without_waking(
 }
 
 #[tokio::test]
-async fn the_lost_wake_sweep_finds_a_resolution_whose_turn_never_ran() {
+async fn the_lost_reentry_sweep_finds_a_resolution_whose_turn_never_ran() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     subscribe_and_resolve_without_waking(&bus, &pool, thread_id).await;
 
-    let lost = lost_event_wakes(&pool).await.unwrap();
+    let lost = lost_wait_reentries(&pool).await.unwrap();
     assert_eq!(lost.len(), 1, "{lost:?}");
     assert_eq!(lost[0].thread_id, thread_id);
     assert!(
-        lost[0].wake.text.contains("ChangeProposed"),
+        lost[0].reentry.text.contains("ChangeProposed"),
         "the re-entry re-uses the persisted prompt: {}",
-        lost[0].wake.text
+        lost[0].reentry.text
     );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// The other half of the rule, and the one that matters: a wake that DID run
+/// The other half of the rule, and the one that matters: a re-entry that DID run
 /// must never be re-driven, or a restart would double-run the turn.
 #[tokio::test]
-async fn the_lost_wake_sweep_skips_a_wake_that_already_ran() {
+async fn the_lost_reentry_sweep_skips_a_reentry_that_already_ran() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     subscribe_and_resolve_without_waking(&bus, &pool, thread_id).await;
-    assert_eq!(lost_event_wakes(&pool).await.unwrap().len(), 1);
+    assert_eq!(lost_wait_reentries(&pool).await.unwrap().len(), 1);
 
-    // One event from the woken turn is enough to prove it ran.
+    // One event from the re-entered turn is enough to prove it ran.
     seed_thread_event(
         &bus,
         thread_id,
@@ -1984,8 +1987,8 @@ async fn the_lost_wake_sweep_skips_a_wake_that_already_ran() {
     .await;
 
     assert!(
-        lost_event_wakes(&pool).await.unwrap().is_empty(),
-        "a consumed wake is not lost"
+        lost_wait_reentries(&pool).await.unwrap().is_empty(),
+        "a consumed re-entry is not lost"
     );
 
     pool.close().await;
@@ -1993,7 +1996,7 @@ async fn the_lost_wake_sweep_skips_a_wake_that_already_ran() {
 }
 
 #[tokio::test]
-async fn the_lost_wake_sweep_skips_a_discarded_thread() {
+async fn the_lost_reentry_sweep_skips_a_discarded_thread() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
@@ -2006,7 +2009,7 @@ async fn the_lost_wake_sweep_skips_a_discarded_thread() {
         .unwrap();
 
     assert!(
-        lost_event_wakes(&pool).await.unwrap().is_empty(),
+        lost_wait_reentries(&pool).await.unwrap().is_empty(),
         "reviving a thread the user threw away is the archive-curtain problem again"
     );
 
@@ -2088,7 +2091,7 @@ async fn a_never_emitted_event_type_is_flagged_on_expiry_only() {
     // learn it: registration accepts an unknown name on purpose, so a typo is
     // invisible until the deadline.
     let w = wait_with(thread_id, vec![sub("ReleaseFinnished", None)], 0);
-    let text = expiry_wake_text(&w, &["ReleaseFinnished".to_string()]);
+    let text = expiry_reentry_text(&w, &["ReleaseFinnished".to_string()]);
     assert!(text.contains("never emitted"), "{text}");
     assert!(text.contains("ReleaseFinnished"), "{text}");
 
@@ -2199,10 +2202,10 @@ async fn a_cancel_that_never_persisted_is_reported_as_still_live() {
 
 /// The boot-ordering trap, pinned. `rebuild_event_waits` delivers inline, so
 /// the pair it writes is momentarily indistinguishable from a stranded one: the
-/// wake turn runs in a separate task and writes nothing for hundreds of
-/// milliseconds. Running the lost-wake sweep AFTER the rebuild therefore
-/// re-drives every wake the rebuild just queued, and each recovered thread
-/// wakes twice. `main.rs` runs the sweep FIRST for exactly this reason; this
+/// re-entry turn runs in a separate task and writes nothing for hundreds of
+/// milliseconds. Running the lost-re-entry sweep AFTER the rebuild therefore
+/// re-drives every re-entry the rebuild just queued, and each recovered thread
+/// runs two turns. `main.rs` runs the sweep FIRST for exactly this reason; this
 /// test is what makes that ordering a decision rather than an accident.
 #[tokio::test]
 async fn a_freshly_delivered_wait_looks_exactly_like_a_lost_one() {
@@ -2214,7 +2217,7 @@ async fn a_freshly_delivered_wait_looks_exactly_like_a_lost_one() {
     let wait_id = emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
 
     // Exactly what the boot rebuild's catch-up scan does: resolve the wait and
-    // hand the turn to the wake channel, which has not run yet.
+    // hand the turn to the re-entry channel, which has not run yet.
     let waits = LiveWaits::new();
     rebuild_live_waits(&pool, &waits).await.unwrap();
     let wait = waits.take(wait_id).await.unwrap();
@@ -2223,9 +2226,9 @@ async fn a_freshly_delivered_wait_looks_exactly_like_a_lost_one() {
         .unwrap();
 
     assert_eq!(
-        lost_event_wakes(&pool).await.unwrap().len(),
+        lost_wait_reentries(&pool).await.unwrap().len(),
         1,
-        "a just-delivered pair IS a lost-wake candidate until its turn writes \
+        "a just-delivered pair IS a lost-re-entry candidate until its turn writes \
          something, which is why the sweep must run before the rebuild",
     );
 

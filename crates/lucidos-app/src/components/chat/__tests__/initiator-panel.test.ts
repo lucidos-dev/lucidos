@@ -242,19 +242,19 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  /** A detached event wake is the ONE injection whose text is not its content:
+  /** An event delivery is the ONE injection whose text is not its content:
    *  the prose is the model's prompt and carries the matched payload as
    *  pretty-printed JSON, which is a screen of raw JSON in a transcript. When
    *  the resolved delivery is in hand, the event row in the body names the event
    *  instead.
    *
-   *  **No panel summary line**, because that row already reads "Woke on
+   *  **No panel summary line**, because that row already reads "Event arrived:
    *  <event>". Carrying one printed the same words twice, once as plain prose in
    *  the header and once in the card underneath (reported 2026-08-10). Same as
    *  `TriggerStarted` and `ChildThreadCompleted` above, whose rows own their
-   *  prefixes too. A wake with no resolved delivery is NOT this case and keeps
-   *  its prose summary, covered by the test below. */
-  it('UserPromptInjected (detached event wake): the row names the event, the header stays quiet', () => {
+   *  prefixes too. An injection with no resolved delivery is NOT this case and
+   *  keeps its prose summary, covered by the test below. */
+  it('UserPromptInjected (event delivery): the row names the event, the header stays quiet', () => {
     const ex = exchangeWith({
       type: 'UserPromptInjected',
       text: 'An event you subscribed to has arrived …\n\nCodingAgentIdled:\n{ … }',
@@ -279,9 +279,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   /** The link can dangle: the delivery sits in an earlier exchange, so a long
-   *  thread can load the wake without it. Falling back to the prose is the
+   *  thread can load the anchor without it. Falling back to the prose is the
    *  honest thing to show when the structured half is not in hand. */
-  it('UserPromptInjected (wake whose delivery is not loaded): falls back to the prose body', () => {
+  it('UserPromptInjected (delivery not loaded): falls back to the prose body', () => {
     const ex = exchangeWith({
       type: 'UserPromptInjected',
       text: 'An event you subscribed to has arrived …',

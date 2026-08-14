@@ -127,10 +127,10 @@ describe('a turn parked on an event wait', () => {
     expect(getLabel(exchange)).toBe('Done');
   });
 
-  /** An attached delivery resumes THIS exchange: the wake's steps land under
-   *  the same row, which flips to `woke`, and the turn is live again until its
-   *  own terminator. */
-  it('goes back to working when an attached delivery wakes it', () => {
+  /** An attached delivery resumes THIS exchange: its steps land under the same
+   *  row, which flips to `matched`, and the turn is live again until its own
+   *  terminator. */
+  it('goes back to working when an attached delivery lands', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
@@ -145,8 +145,8 @@ describe('a turn parked on an event wait', () => {
     // No `matched_event_id` assertion: `insertEvents` reads a top-level
     // `event_id` as the row's OWN id and strips it, so the delivery's
     // same-named payload field cannot survive this helper.
-    expect(waits(events)[0]).toMatchObject({ state: 'woke', matched_event_type: 'ChangeProposed' });
-    // The wake's own tool call is the only step, and it is the one still running.
+    expect(waits(events)[0]).toMatchObject({ state: 'matched', matched_event_type: 'ChangeProposed' });
+    // The delivery's own tool call is the only step, and it is the one still running.
     expect(steps(events)).toHaveLength(1);
     expect(exchangeStatus(exchange, '', true)).toBe('streaming');
   });
@@ -186,8 +186,9 @@ describe('a turn parked on an event wait', () => {
     expect(steps(events)[0]).toMatchObject({ outcome: 'success', result: 'Error: unknown event type' });
   });
 
-  /** A deadline wakes the model exactly like a delivery does (it gets a
-   *  "never seen" tool result and carries on), so the turn is live again. */
+  /** A deadline re-enters the thread exactly like a delivery does (the model
+   *  gets a "never seen" tool result and carries on), so the turn is live
+   *  again. */
   it('goes back to working when the deadline passes', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
@@ -201,7 +202,7 @@ describe('a turn parked on an event wait', () => {
   });
 
   /** The park's own turn stays done when the user stops the wait, and never
-   *  reads as aborted. A cancel is the one resolution with no wake behind it:
+   *  reads as aborted. A cancel is the one resolution that re-enters nothing:
    *  the engine closes the dangling call so the next turn is sendable, and the
    *  thread settles to idle. Settled plus no terminator is exactly the shape
    *  the stale detector calls a crash. */
@@ -367,9 +368,9 @@ describe('a turn parked on an event wait', () => {
     ]);
   });
 
-  /** Neither a delivery nor an expiry gets one: both WAKE the thread, so each
-   *  already reads as its own turn further down. A second row would report the
-   *  same thing twice. */
+  /** Neither a delivery nor an expiry gets one: both RE-ENTER the thread, so
+   *  each already reads as its own turn further down. A second row would report
+   *  the same thing twice. */
   it.each(['EventWaitDelivered', 'EventWaitExpired'] as const)(
     'adds no row for a %s that lands in a later exchange',
     (type) => {
@@ -388,24 +389,28 @@ describe('a turn parked on an event wait', () => {
     },
   );
 
-  /** **A wake that lands mid-turn keeps the work that follows it.**
+  /** **A delivery that lands mid-turn keeps the work that follows it.**
    *
    *  A subscription does not hold its thread's turn (ADR 0049), so a detached
    *  wait can fire while an UNRELATED turn is running. The engine then injects
-   *  the wake into that live loop as `InjectedPromptKind::WakeFromEvent` rather
-   *  than starting a second turn, which means every event after it still
+   *  the delivery into that live loop as `InjectedPromptKind::ReentryFromWait`
+   *  rather than starting a second turn, which means every event after it still
    *  carries the ORIGINAL turn's `request_event_id`.
    *
-   *  Without the wake card taking that redirect, all of it routes back up into
-   *  the message exchange the card was pushed below, so the reader gets the
+   *  **This lane is also why the card cannot say "woke".** The thread was
+   *  working, and the engine tells the model so, framing the injection as
+   *  arriving "while you were working".
+   *
+   *  Without the delivery card taking that redirect, all of it routes back up
+   *  into the message exchange the card was pushed below, so the reader gets the
    *  reply, the tool calls and the terminator ABOVE the card that explains why
    *  the agent went and did them, and the card itself is left stranded last
    *  holding nothing (real thread bec39316, reported 2026-08-11).
    *
    *  Same shape and same fix as a `ChildThreadCompleted` landing mid-response:
-   *  both are engine wakes into a running loop
-   *  (`InjectedPromptKind::is_engine_wake`), so both advance the redirect. */
-  it('files the work after a mid-turn wake under the wake, not above it', () => {
+   *  both are engine re-entries into a running loop
+   *  (`InjectedPromptKind::is_engine_reentry`), so both advance the redirect. */
+  it('files the work after a mid-turn delivery under the delivery, not above it', () => {
     const { map, id } = makeThread('thread-1', 'running');
     insertEvents(map, id, [
       ...park,
@@ -414,8 +419,8 @@ describe('a turn parked on an event wait', () => {
       { type: 'MessageReceived', text: 'meanwhile, stop the build', event_id: 'req-1' },
       { type: 'ToolCalled', name: 'bash_kill', args: { task_id: 'b1' }, request_event_id: 'req-1' },
       { type: 'ToolResult', name: 'bash_kill', result: 'killed b1', request_event_id: 'req-1' },
-      // The watch fires mid-turn. Its anchor is the wake card; the loop it was
-      // injected into keeps streaming under `req-1`.
+      // The watch fires mid-turn. Its anchor is the delivery card; the loop it
+      // was injected into keeps streaming under `req-1`.
       { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false },
       { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1' },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'req-1' },
@@ -429,13 +434,13 @@ describe('a turn parked on an event wait', () => {
       'MessageReceived',
       'UserPromptInjected',
     ]);
-    // The message turn keeps only what it did BEFORE the wake.
+    // The message turn keeps only what it did BEFORE the delivery.
     expect(exchanges[1].steps.map((s) => s.event.type)).toEqual([
       'ToolCalled',
       'ToolResult',
       'EventWaitDelivered',
     ]);
-    // Everything the wake produced, terminator included, is under the card.
+    // Everything the delivery produced, terminator included, is under the card.
     expect(exchanges[2].steps.map((s) => s.event.type)).toEqual([
       'ToolCalled',
       'ToolResult',
@@ -443,25 +448,25 @@ describe('a turn parked on an event wait', () => {
     ]);
   });
 
-  /** The far commoner wake, pinned because the fix above reaches every
+  /** The far commoner lane, pinned because the fix above reaches every
    *  unabsorbed injection and this is the one it must leave alone.
    *
    *  A wait resolving on an IDLE thread has no running loop to be injected
    *  into, so the engine opens a fresh turn anchored on the injection itself
-   *  (`PreEmittedOrigin::EventWake`) and every event carries the WAKE's id as
-   *  its `request_event_id`. Those find the wake exchange by its own anchor,
-   *  so the moved redirect is never consulted. The arming turn keeps its row
-   *  and still reads done: nothing about it was retroactively abandoned. */
-  it('leaves an idle wake owning its own turn, arming row intact', () => {
+   *  (`PreEmittedOrigin::WaitReentry`) and every event carries the ANCHOR's id
+   *  as its `request_event_id`. Those find the delivery exchange by its own
+   *  anchor, so the moved redirect is never consulted. The arming turn keeps its
+   *  row and still reads done: nothing about it was retroactively abandoned. */
+  it('leaves an idle delivery owning its own turn, arming row intact', () => {
     const { map, id } = makeThread('thread-1', 'running');
     insertEvents(map, id, [
       ...park,
       { type: 'ResponseGenerated', text: "I'll watch for that." },
       { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false },
-      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1', event_id: 'wake-1' },
-      { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'wake-1' },
-      { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'wake-1' },
-      { type: 'ResponseGenerated', text: 'The change landed.', request_event_id: 'wake-1' },
+      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1', event_id: 'reentry-1' },
+      { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'reentry-1' },
+      { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'reentry-1' },
+      { type: 'ResponseGenerated', text: 'The change landed.', request_event_id: 'reentry-1' },
     ] as ThreadEvent[]);
 
     const exchanges = getExchanges(map, id);
@@ -476,10 +481,10 @@ describe('a turn parked on an event wait', () => {
     ]);
     // The park still says what it did. The delivery landed back in the arming
     // exchange (it is chronologically routed, and that exchange was current),
-    // so the row resolves in place to `woke` rather than being rewritten or
-    // dropped, and the turn is not repainted as abandoned by the wake below it.
+    // so the row resolves in place to `matched` rather than being rewritten or
+    // dropped, and the turn is not repainted as abandoned by the card below it.
     expect(waits(exchangeResponseEvents(exchanges[0]))).toMatchObject([
-      { wait_id: 'w1', state: 'woke', reason: REASON },
+      { wait_id: 'w1', state: 'matched', reason: REASON },
     ]);
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
   });

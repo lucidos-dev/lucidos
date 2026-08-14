@@ -30,12 +30,11 @@ So treat every file outside `docs/plans/**` and `WORKSPACES.md` as **public**. T
 | a live workspace | `~/workspaces/dev` or `~/workspaces/myws` |
 
 **Placeholders excuse themselves, not their line.** The home-path allow-list is
-applied per **occurrence**: a line is clean only when EVERY home path on it is an
-approved placeholder, and one real home path anywhere on the line is a hit. So
-the natural "here's the generic form, here's the real one" comment
-(`/Users/me/ws vs the real /Users/<realname>/ws`) is a leak, not an
-illustration. Put the real path nowhere, and let the placeholder alone carry the
-example.
+applied per **occurrence**: a line is clean only when EVERY home path on it is
+approved, and one real home path anywhere on the line is a hit. So the natural
+"here's the generic form, here's the real one" comment is a leak, not an
+illustration. Put the real path nowhere, and let the placeholder carry the
+example alone.
 
 ## Carve-out: legitimate project-identity attribution is allowed
 

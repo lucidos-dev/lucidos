@@ -263,9 +263,13 @@
     }
 
     .prompt-box .prompt-textarea {
-        /* Sized for the composer's clear button; the Intent field shares the
-           floor so both .prompt-box surfaces keep one mobile box height. Only
-           the type scale above is composer-specific. */
+        /* One empty-box floor for both .prompt-box surfaces, the composer and
+           the Intent field, so they keep one mobile height. It was originally
+           the height of the composer's clear button, which shared this row
+           until that button moved to the prompt row (PromptInput.tsx); the
+           value stays because it is what the mobile composer rests at, and it
+           now answers to nothing but itself. Only the type scale above is
+           composer-specific. */
         min-height: 2.25rem;
         -webkit-user-select: text;
         user-select: text;
@@ -1093,6 +1097,14 @@
            and once the chrome is scrolled away there is nothing left to overlap
            anyway.
 
+           At the top of a thread the thumb PARKS at the track's top, so this
+           inset is the one the reader sees. It has to clear the title bar's
+           hairline, without dropping so far below that it reads as a gap. Half
+           a rem is that middle. Just above it sits --mobile-title-fade, the
+           band where content dissolves under the bar
+           (.mobile-thread-title-row::after). The bottom has no chrome over it
+           and keeps its hairline inset.
+
            Outside this gate it stays `display: none` (the base rule in
            chat/input-messages.css), which also idles the hook for free: a
            display:none track measures 0, so computeScrollIndicator reports
@@ -1101,7 +1113,7 @@
             display: block;
             position: absolute;
             right: 0.125rem;
-            top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.25rem);
+            top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.5rem);
             bottom: 0.25rem;
             width: 0.25rem;
             pointer-events: none;

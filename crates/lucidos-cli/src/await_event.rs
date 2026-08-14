@@ -6,8 +6,8 @@
 //! and the refusal wording cannot drift between the two agents.
 //!
 //! It returns immediately. Nothing blocks, nothing is polled here: the engine
-//! wakes the thread with a follow-up message when the subscription matches, or
-//! tells it the deadline passed. Finishing the session is the correct thing to
+//! re-opens the thread with a follow-up message when the subscription matches,
+//! or tells it the deadline passed. Finishing the session is the correct thing to
 //! do right after calling this.
 //!
 //! `$LUCIDOS_THREAD_ID` names the thread, the same way `spawn-thread` reads it.
@@ -18,7 +18,7 @@ use crate::http::{client as http_client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
 pub(crate) struct AwaitEventArgs<'a> {
-    /// Event names to wake on. Any match wakes the thread (OR).
+    /// Event names to watch for. Any match re-opens the thread (OR).
     pub on: &'a [String],
     /// Optional payload filter, applied to EVERY name in `on`. The tool form
     /// takes a condition per entry; a CLI caller almost always watches one

@@ -1,6 +1,6 @@
 ---
 name: e2e-lock-wait
-description: Use when an e2e script refuses to start because another run holds the e2e lock ("ERROR: another e2e run is in progress", "orphaned processes"). Subscribe to E2ELockReleased with `lucidos await-event` and END THE TURN instead of sleeping, polling, re-running the script on a timer, or writing a retry loop into /tmp. Covers picking a timeout, what to do on the wake, and the two cases where nothing will wake you.
+description: Use when an e2e script refuses to start because another run holds the e2e lock ("ERROR: another e2e run is in progress", "orphaned processes"). Subscribe to E2ELockReleased with `lucidos await-event` and END THE TURN instead of sleeping, polling, re-running the script on a timer, or writing a retry loop into /tmp. Covers picking a timeout, what to do on the delivery, and the two cases where nothing will reach you.
 ---
 
 # You lost the e2e lock. Subscribe, do not poll.
@@ -42,12 +42,12 @@ point, not a side effect: the command returns immediately and blocks nothing, so
 a turn that keeps working after it is a turn nobody needed to hold open. The
 thread sits plain idle while it watches.
 
-**4. On the wake, retry the script exactly once.** The wake arrives as a new turn
+**4. On the delivery, retry the script exactly once.** It arrives as a new turn
 with the whole conversation behind it, so re-read what you were doing first. If
 the retry is refused again, another waiter won the race: go back to step 1.
 
 **5. Nothing to clean up once you win.** Taking the lock stands your own watch
-for its release down, whether the wake or something else got you there. What
+for its release down, whether the delivery or something else got you there. What
 still needs you is the case where you never take it at all: see "A watch you no
 longer need is yours to end".
 
@@ -57,11 +57,11 @@ Get these wrong and you are worse off than with the sleep loop.
 
 ### It is one-shot, and re-subscribing is normal
 
-The first match consumes the subscription. Every waiter wakes on one release and
-they race; exactly one wins the lock. Being refused on the retry is the expected
+The first match consumes the subscription. One release is delivered to every
+waiter and they race; exactly one wins the lock. Being refused on the retry is the expected
 case, not a failure, and it is not a reason to fall back to polling.
 
-Nothing is watching after a wake. If you say you are still waiting, call
+Nothing is watching after a delivery. If you say you are still waiting, call
 `await_event` again in that same turn: narrating it does not do it.
 
 ### A watch you no longer need is yours to end
@@ -95,7 +95,7 @@ What this cost before the acquire did it for you: you subscribe, the user comes
 back and resumes you, you retry and win the lock, and the suite runs green.
 Nothing resolved the subscription, so the thread reads **Waiting** for the rest
 of your timeout after its work is finished and applied. Six hours in the
-incident that produced this section, and two hours plus a spurious wake in the
+incident that produced this section, and two hours plus a spurious re-open in the
 one that produced the automatic stand-down. Cancel it in the turn you stop
 caring, and say you did.
 
@@ -125,29 +125,29 @@ re-subscription as free:
 
 ### The timeout is a backstop you must handle
 
-On expiry the engine wakes you with a timeout notice. Do not silently subscribe
+On expiry the engine re-opens the thread with a timeout notice. Do not silently subscribe
 again. Read the lock file, then report: released and you missed it, still held by
 the same owner, or held by someone new. Re-subscribe only if the answer gives you
 a reason to expect a release soon, and only within the attempt cap.
 
-## Two cases where nothing will wake you
+## Two cases where nothing will reach you
 
 Both are real, both are known, and in both the `--timeout-secs` deadline is the
 recovery. That is why the timeout is required and why it must be a number you are
-willing to be woken by.
+willing to be re-opened on.
 
 **The holder is in another workspace.** The lock is shared by every workspace on
 the machine, but `lucidos events emit` writes to the emitting subprocess's own
-`$LUCIDOS_WORKSPACE`. A holder in workspace A releasing does not wake a waiter in
+`$LUCIDOS_WORKSPACE`. A holder in workspace A releasing does not reach a waiter in
 workspace B, and there is deliberately no cross-workspace emit: do not invent one
 and do not POST to another engine's port to fake it. Compare the lock file's
 `WORKTREE` with your own `$LUCIDOS_WORKSPACE`; when it is elsewhere, the refusal
 message says so too. Use a shorter timeout there (say `1800`) and plan on
-reporting at expiry rather than being woken.
+reporting at expiry rather than on a delivery.
 
 **The engine was down at the moment of release.** The emit is best effort by
 design, so nothing is written and there is nothing for your subscription to catch
-up on when the engine returns. Narrow in practice, because a wake only works
+up on when the engine returns. Narrow in practice, because a delivery only works
 same-workspace, which means your own workspace was down with it.
 
 The neighbouring case is covered and needs no special handling: a holder killed
@@ -160,8 +160,8 @@ reclaim it emits the release on the dead owner's behalf with
 The **subscription** does. It is persisted as an event, rebuilt from the event
 store when the engine boots, and it carries the sequence it was armed at, so a
 release emitted while the engine was down is still delivered on the way back up.
-A deadline that passed during downtime wakes you with its timeout rather than
-vanishing. So a restart is not a reason to re-subscribe or to go back to polling.
+A deadline that passed during downtime re-opens the thread with its timeout
+rather than vanishing. So a restart is not a reason to re-subscribe or to go back to polling.
 
 The **emit** does not, per the case above.
 

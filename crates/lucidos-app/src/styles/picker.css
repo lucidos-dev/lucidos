@@ -470,13 +470,42 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+/* The two quantities the row's own geometry is made of, named because a third
+   thing now derives from them: the fault note indents itself to the name
+   column, which is exactly the dot plus one gap. A copy of either number there
+   would put the note off that column the moment the row is retuned. On :root
+   rather than on the row, so the live style remote can reach them (see the
+   header of styles/header-mark.css for why that matters). */
+:root {
+  --ws-picker-dot-size: 0.625rem;
+  --ws-picker-row-gap: 0.75rem;
+  /* The gap between the row and the fault note under it. Its own quantity
+     rather than the row gap above, which is a column gap between three cells on
+     one line and reads as a chasm when spent vertically. */
+  --ws-picker-note-gap: 0.25rem;
+  /* The one coral the fault wears, on the dot, on its glow, and on the sentence
+     that explains it. Stated once so the three cannot drift; a literal, like
+     every other colour on this surface, because the picker is the gateway's own
+     white-on-blue screen and never wears an app theme (see the file header). */
+  --ws-picker-fault-color: #ff7b72;
+}
+
 /* The whole row opens the workspace. Fixed three-cell layout (dot · name ·
    actions): the name grows and ellipsizes, so its length can never reshape the
-   row — every workspace renders identically regardless of name. */
+   row, and every workspace renders identically regardless of name.
+
+   It WRAPS, for one child only: an unhealthy row's fault note, which is the
+   last child and claims a full line, so it falls under the three cells instead
+   of squeezing them. Nothing else in the row can reach a second line (the name
+   ellipsizes, the actions are fixed-width), so every other row is laid out
+   exactly as before. */
 .ws-picker-open {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.75rem;
+  /* Column gap only: the one thing that wraps here brings its own top margin,
+     and a row gap this wide under a single line reads as a hole. */
+  gap: 0 var(--ws-picker-row-gap);
   padding: 0.625rem 0.625rem 0.625rem 0.75rem;
   border-radius: 0.625rem;
   cursor: pointer;
@@ -490,15 +519,36 @@
 
 .ws-picker-dot {
   flex: 0 0 auto;
-  width: 0.625rem;
-  height: 0.625rem;
+  width: var(--ws-picker-dot-size);
+  height: var(--ws-picker-dot-size);
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.45);
 }
 .ws-picker-dot-healthy { background: #56d364; box-shadow: 0 0 0.5rem rgba(86, 211, 100, 0.7); }
 .ws-picker-dot-booting { background: #e3b341; animation: ws-dot-pulse 1.2s ease-in-out infinite; }
 .ws-picker-dot-stopped { background: rgba(255, 255, 255, 0.4); }
-.ws-picker-dot-unhealthy { background: #ff7b72; box-shadow: 0 0 0.5rem rgba(255, 123, 114, 0.7); }
+.ws-picker-dot-unhealthy {
+  background: var(--ws-picker-fault-color);
+  box-shadow: 0 0 0.5rem color-mix(in srgb, var(--ws-picker-fault-color) 70%, transparent);
+}
+
+/* Why the dot is red, in words, on the row it belongs to. A full-width flex item
+   so it takes its own line under the row (see .ws-picker-open), indented to the
+   name column: the dot's width plus the gap after it, derived rather than
+   guessed, so it starts where the workspace name starts.
+
+   It wraps rather than truncating. This is the gateway's own error text and its
+   length is not ours to predict, and a reason the user can only half-read is not
+   a reason. Quieter than the name above it and in the fault's own coral, so the
+   pairing with the dot is obvious without the row shouting. */
+.ws-picker-row-note {
+  flex: 1 0 100%;
+  margin: var(--ws-picker-note-gap) 0 0;
+  padding-left: calc(var(--ws-picker-dot-size) + var(--ws-picker-row-gap));
+  font-size: var(--font-size-sm);
+  color: var(--ws-picker-fault-color);
+  overflow-wrap: anywhere;
+}
 
 @keyframes ws-dot-pulse {
   0%, 100% { opacity: 1; }

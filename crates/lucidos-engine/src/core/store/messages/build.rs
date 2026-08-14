@@ -321,12 +321,17 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     trimmed,
                 });
             }
-            "MemorySearched" => {
-                let has_results = event
+            // "MemorySearched" is the legacy DB string; the variant was renamed
+            // to MemoryRecalled so it stops mirroring the `memory` tool's own
+            // "Searching memory" step. New rows store "MemoryRecalled"; old
+            // rows are unchanged. Both must hit this arm so legacy threads
+            // still render.
+            "MemorySearched" | "MemoryRecalled" => {
+                let results = event
                     .payload
                     .get("results")
                     .and_then(|v| v.as_u64())
-                    .is_some_and(|n| n > 0);
+                    .unwrap_or(0);
                 let queries: Vec<String> = event
                     .payload
                     .get("queries")
@@ -337,18 +342,14 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                             .collect()
                     })
                     .unwrap_or_default();
-                let desc = if has_results {
-                    "Memory searched"
-                } else {
-                    "Memory: no results"
-                };
+                let desc = crate::core::store::memory_recalled_label(results);
                 let detail = if queries.is_empty() {
                     None
                 } else {
                     Some(queries.join(", "))
                 };
                 pending_steps.push(Step {
-                    description: desc.to_string(),
+                    description: desc.clone(),
                     tool_name: None,
                     success: true,
                     context_tokens: None,
@@ -357,7 +358,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     tool_called_event_id: None,
                 });
                 pending_events.push(ResponseEvent::Step {
-                    description: desc.to_string(),
+                    description: desc,
                     tool_name: None,
                     success: true,
                     detail,

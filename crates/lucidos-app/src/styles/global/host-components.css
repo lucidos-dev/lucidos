@@ -216,10 +216,10 @@
     }
 }
 
-/* Icon-only buttons: one 2.25rem tap target, large glyph, background filling the
-   full area. `header-icon` is the one in a header band; `row-icon` is the same
-   control sitting inline in a list row or a status line. Two names for one box
-   because only the header one is narrowed by the mobile thread title bar, which
+/* Icon-only buttons: one 2.25rem tap target, background filling the full area.
+   `header-icon` is the one in a header band; `row-icon` is the same control
+   sitting inline in a list row or a status line. Two names for one box because
+   only the header one is narrowed by the mobile thread title bar, which
    squeezes it onto the title's own line, and a row control must not follow it
    there. Left to `.icon-btn`'s bare padding either would be its glyph plus
    0.25rem, a ~24px target a thumb misses that reads squat beside the row's text.
@@ -227,11 +227,12 @@
    heading's pair (1.375rem) each were before they came here.
 
    `--icon-glyph` is the NOMINAL size of whatever glyph the box holds, and it is
-   the only part a context may retune: the 2.25rem box is the tap target, grown
+   the only part that varies: the 2.25rem box is the tap target, grown
    deliberately after the trash was reported unhittable on mobile (and after the
    `.edge-swipe-right` overlay fix), so a context that wants a smaller icon turns
-   the glyph down and leaves the box alone. The default keeps every existing
-   caller, the trigger group heading included, at exactly the size it had. */
+   the glyph down and leaves the box alone. It is declared per class below, on
+   selectors this rule's own list carries, so a nominal can never be set on
+   something that is not one of these tap targets. */
 .icon-btn.header-icon,
 .icon-btn.row-icon {
     position: relative;
@@ -240,7 +241,25 @@
     padding: 0;
     justify-content: center;
     -webkit-tap-highlight-color: transparent;
+}
+
+/* A header icon IS the content of its band, so it takes the large step. */
+.icon-btn.header-icon {
     --icon-glyph: var(--icon-size-lg);
+}
+
+/* A row icon is a secondary control beside text that outranks it, and the eye
+   reads it against the header icons a few rows up rather than against its own
+   neighbour, so it sits one step down. At the large step the trigger group
+   heading's pencil painted 20.12 of its 24 viewBox units where the header's
+   compose icon paints 12.5 of 18, a fifth more ink in a nominally equal box,
+   and was reported oversized: the same 21% mismatch the trash correction below
+   exists to remove, in the other direction. At the medium step it lands within
+   a few percent of that icon's ink. Both callers of this class want the step
+   (the heading's pair, and the queued message's trash, which used to override
+   it locally), so it is the default here rather than a per-context retune. */
+.icon-btn.row-icon {
+    --icon-glyph: var(--icon-size-md);
 }
 
 .icon-btn.header-icon svg,
@@ -1079,15 +1098,44 @@ html[data-theme="dark"] .split-button.open::before {
    copy scroll inside rather than spill past the viewport on iOS). One dialog
    look for the app; only the body typography differs, because an explainer's
    copy is JSX with code spans and lists while a confirm's is one string. */
+/* THE ICON NEVER WRAPS AWAY FROM ITS LABEL. A button is an atomic inline and
+   line breaking allows a break in front of one, so a label squeezed by the
+   control beside it drops the glyph onto a line of its own, under the text. The
+   slot's leading U+2060 WORD JOINER forbids that break. It also raises the
+   label's min-content width to include the icon, so a flex row cannot shrink it
+   off the line either.
+
+   `display: inline` is load-bearing. An inline-flex or inline-block slot is an
+   atomic inline itself, which hides the joiner from the line breaker and puts
+   the orphan straight back. `line-height: 0` keeps the joiner's own strut out
+   of the layout, so the wrapper measures exactly what the bare button did in
+   every row that holds an explainer, flex rows included.
+
+   The slot owns the space before the icon, so a row separating its items with
+   its own `gap` zeroes the margin HERE rather than on the button. */
+.explainer-slot {
+    display: inline;
+    line-height: 0;
+    margin-left: 0.375rem;
+}
+
+/* The joiner itself. Generated content rather than a text node in the markup,
+   which is what keeps it out of `textContent`, out of the accessible name of a
+   label wrapping an explainer, and out of a copied selection: it is a layout
+   instruction, and only the line breaker should ever see it. */
+.explainer-slot::before {
+    content: '\2060';
+}
+
 .explainer-btn {
     /* Rides .icon-btn for colour, hover, focus ring and svg sizing. Overrides
        are only about sitting INSIDE a line of label text: no padding to push
-       the label away, and a small gap before it. `position: relative` is the
-       anchor for the hit expander below, and for the optical nudge. */
+       the label away. The gap before it belongs to the slot above.
+       `position: relative` is the anchor for the hit expander below, and for
+       the optical nudge. */
     display: inline-flex;
     position: relative;
     padding: 0;
-    margin-left: 0.375rem;
     vertical-align: middle;
     /* `vertical-align: middle` is defined against the X-HEIGHT: it puts the
        glyph's centre at the baseline plus half an x, which sits visibly below

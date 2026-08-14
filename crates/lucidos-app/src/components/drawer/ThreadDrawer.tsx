@@ -49,13 +49,12 @@ function formatCreatedTimestamp(createdAt: string | undefined): string {
 }
 
 // Per-section header display: label + icon. The `'saved'` section reads "Pinned"
-// in the UI — a label-only override. Every USER-FACING surface now says
-// "Pinned" / "Pin" / "Unpin" (this header, the chat pin toggle, the unpin
-// confirm dialog, tooltips, aria-labels, the disk-usage badge); only the
-// INTERNAL identifiers still say "saved" (the section key, `is_saved`, the
-// `ThreadSaved`/`ThreadUnsaved` events, the `/threads/save`+`/unsave` routes) —
-// a full-stack rename of those is a later decision. The other two sections
-// derive their label from the section key.
+// in the UI, a label-only override. Every USER-FACING surface says "Pinned" /
+// "Pin" / "Unpin". The INTERNAL identifiers still say "saved": the section key,
+// `is_saved`, the `ThreadSaved` / `ThreadUnsaved` events, and the
+// `/threads/save` + `/unsave` routes. RENAME NOTED, not made: a full-stack
+// rename is its own change. The other two sections derive their label from the
+// section key.
 const SECTION_META: Record<DisplaySection, { title: string; Icon: ComponentType<{ size?: string }> }> = {
     saved: { title: 'Pinned', Icon: PinIcon },
     current: { title: 'Current', Icon: InboxIcon },
@@ -92,8 +91,8 @@ export type DrawerNavNode =
           /** Nesting depth — 0 for top-level rows, ≥1 for sub-threads. */
           depth: number;
           /** The visible parent thread id, set only when this row is nested
-           *  under a parent that's also rendered (depth > 0); null for top-level
-           *  rows and orphans whose parent is paginated/filtered out. */
+           *  under a parent that is also rendered. Null for top-level rows and
+           *  for orphans whose parent is paginated or filtered out. */
           parentId: string | null;
           /** Whether the row renders a family disclosure (has sub-threads). */
           hasChildren: boolean;
@@ -157,13 +156,13 @@ export function selectHighlighted() {
     focusThread(id);
 }
 
-/** Open the highlighted thread row's overflow (⋯) menu — the keyboard route to
- *  every per-row action (pin/unpin, archive, copy, download, info), since the
- *  inline row buttons are `tabindex=-1` (mouse-only) so the drawer stays a single
- *  tab stop. Driven by the customizable `openThreadActions` shortcut. No-op unless
- *  the drawer is focused and a THREAD (not a section header) is highlighted. Opens
- *  the menu by clicking its trigger, located the same way the highlight scroller
- *  finds rows (`[data-thread-nav]`); the menu's Overlay then owns focus/Escape. */
+/** Open the highlighted thread row's overflow (⋯) menu: the keyboard route to
+ *  every per-row action. The inline row buttons are `tabindex=-1`, so the drawer
+ *  stays a single tab stop. Driven by the customizable `openThreadActions`
+ *  shortcut, and a no-op unless the drawer is focused and a THREAD is
+ *  highlighted. Opens by clicking the trigger, located the way the highlight
+ *  scroller finds rows (`[data-thread-nav]`); the menu's Overlay then owns
+ *  focus and Escape. */
 export function openHighlightedThreadActions(): void {
     if (focusedPane.value !== 'drawer') return;
     const key = highlightedKey.value;
@@ -174,15 +173,15 @@ export function openHighlightedThreadActions(): void {
     trigger?.click();
 }
 
-/** Collapse/expand the FOCUSED thread's own sub-thread family — the keyboard
- *  counterpart to clicking that row's disclosure chevron, but keyed off the open
- *  (focused) thread rather than the drawer-highlighted row, so it works from any
- *  pane without first moving focus into the drawer. Unlike the drawer's ←/→ tree
- *  nav it NEVER climbs to a parent: it always toggles the focused thread's own
- *  family, so collapsing it hides that thread's entire descendant subtree (direct
- *  sub-threads and theirs). No-op when no thread is focused or the focused thread
- *  has no sub-threads (nothing to toggle). Driven by the `toggleSubthreads`
- *  shortcut. */
+/** Collapse or expand the FOCUSED thread's own sub-thread family, the keyboard
+ *  counterpart to clicking that row's disclosure chevron. It is keyed off the
+ *  open thread rather than the drawer-highlighted row, so it works from any pane
+ *  without first moving focus into the drawer.
+ *
+ *  Unlike the drawer's ←/→ tree nav it NEVER climbs to a parent. Collapsing
+ *  therefore hides the focused thread's entire descendant subtree. A no-op when
+ *  no thread is focused, or the focused thread has no sub-threads. Driven by the
+ *  `toggleSubthreads` shortcut. */
 export function toggleFocusedThreadFamily(): void {
     const id = focusedThreadId.value;
     if (!id) return;
@@ -347,10 +346,8 @@ export function moveHighlight(delta: number) {
     setHighlight(nodeKey(nodes[next]));
 }
 
-/** Pure seed: where the keyboard highlight starts when the drawer gains focus —
- *  the open thread if it's navigable, else the first node (the top section header
- *  when there's no focused thread), else null (empty list). Exported for unit
- *  testing. */
+/** Pure seed: where the keyboard highlight starts when the drawer gains focus.
+ *  The open thread if it is navigable, else the first node, else null. */
 export function pickInitialHighlight(openThreadId: string | null, navKeys: string[]): string | null {
     if (openThreadId && navKeys.includes(openThreadId)) return openThreadId;
     return navKeys[0] ?? null;
@@ -358,10 +355,9 @@ export function pickInitialHighlight(openThreadId: string | null, navKeys: strin
 
 /** Seed the keyboard highlight when the drawer is focused via ⌘⇧1, so Enter has
  *  an immediate target. `navNodes` is set in a post-render effect, so on a fresh
- *  open it can still be empty for the first frame(s); retry a few frames while
- *  it's empty so the seed lands on a real node. With a focused thread the seed is
- *  that thread; without one it falls to the top section header. A genuinely empty
- *  list just seeds null after the retries, which is harmless. */
+ *  open it can be empty for the first frames. Retrying a few frames is what
+ *  lands the seed on a real node. A genuinely empty list seeds null after the
+ *  retries, which is harmless. */
 export function seedDrawerHighlight(): void {
     let tries = 0;
     const seed = () => {
@@ -376,15 +372,13 @@ export function seedDrawerHighlight(): void {
  *  signals and module functions) so the filter-panel suppression below is
  *  unit-testable without mounting the pane. */
 export function handleDrawerKeyDown(e: KeyboardEvent): void {
-    // The filter panel covers the list and owns its own controls: an Enter on one
-    // of its rows must not ALSO fire "open the highlighted thread" as the key
-    // bubbles out to this container, and its arrows must not walk a list nobody
-    // can see.
+    // The filter panel covers the list and owns its own controls. An Enter on
+    // one of its rows must not ALSO open the highlighted thread as the key
+    // bubbles out here. Its arrows must not walk a list nobody can see.
     if (threadFilterPanelOpen.value) return;
-    // List-nav owns only un-modified arrows/Enter. Any chord with a primary
-    // modifier or Alt is a global shortcut (⌘⇧↵ maximize pane group, ⌘⌥↑↓
-    // history, …), so let it bubble to the document handler instead of stealing
-    // Enter as "select highlighted" / arrows as "move highlight".
+    // List-nav owns only un-modified arrows and Enter. Any chord with a primary
+    // modifier or Alt is a global shortcut, so it bubbles to the document
+    // handler instead.
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -407,16 +401,16 @@ export function handleDrawerKeyDown(e: KeyboardEvent): void {
 }
 
 export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) {
-    // On mobile, the drawer overlay is disabled — mobile has a dedicated threads
-    // pane (pane 0) that keeps dots, header, and content in sync via mobileView.
-    // The drawer overlay (threadDrawerOpen) is desktop-only.
+    // The drawer overlay (`threadDrawerOpen`) is desktop-only. Mobile has a
+    // dedicated threads pane keeping dots, header and content in sync via
+    // `mobileView`.
     const visible = forceVisible || (threadDrawerOpen.value && splitRatio.value > 0);
-    // Keep the list mounted through the width-collapse transition —
-    // unmounting at close start blanks the drawer body while it's still
-    // sliding shut. Scaled by the Animation speed slider, exactly as the
-    // transition it outlives is (the 50ms is slack, so it stays outside the
-    // scaled term); reading the scale here subscribes this component to the
-    // slider, which is what makes a mid-session change take effect.
+    // Keep the list mounted through the width-collapse transition. Unmounting
+    // at close start blanks the drawer body while it is still sliding shut.
+    // Scaled by the Animation speed slider, as the transition it outlives is;
+    // the 50ms is slack, so it stays outside the scaled term. Reading the scale
+    // here subscribes this component to the slider, which is what makes a
+    // mid-session change take effect.
     const renderContent = useLingeringFlag(visible, scaledDurationMs(PANE_TRANSITION_MS) + 50);
     const isSearching = threadSearchQuery.value.trim().length > 0;
     const view = drawerView.value;
@@ -430,13 +424,13 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     useScrollMemory(listRef, 'lucidos-scroll-thread-drawer', { paused: activeView !== 'all' });
 
     // Keep the container's `aria-activedescendant` in lockstep with the keyboard
-    // highlight WITHOUT re-rendering the list. The drawer is a single focusable
-    // (role="tree", tabindex=0); the active row is pointed to by id rather than
-    // moving DOM focus per row (the aria-activedescendant model — see the plan).
-    // Setting the attribute imperatively in a signal effect preserves the drawer's
-    // per-row render budget: reading `highlightedKey` in the component body would
-    // re-run ThreadList on every ↑/↓, the storm DrawerSectionTitle/ThreadRow were
-    // split out to avoid. Rows + section headers carry matching `navKeyDomId` ids.
+    // highlight WITHOUT re-rendering the list. The drawer is a single focusable,
+    // and the active row is pointed to by id rather than by moving DOM focus.
+    // Setting the attribute imperatively in a signal effect preserves the
+    // per-row render budget: reading `highlightedKey` in the component body
+    // would re-run ThreadList on every ↑/↓, the storm DrawerSectionTitle and
+    // ThreadRow were split out to avoid. Rows and section headers carry
+    // matching `navKeyDomId` ids.
     useSignalEffect(() => {
         const id = navKeyDomId(highlightedKey.value);
         const el = drawerRef.current;
@@ -451,12 +445,11 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 
     // The filter panel is a view OF this pane, so it cannot outlive the pane
     // being visible. Its open state is a signal and it holds an Escape-registry
-    // entry, so a drawer closed (or a thread side collapsed) with the panel up
-    // would otherwise leave an invisible surface eating the user's next Escape,
-    // and reopening the drawer would land on the filter instead of the list.
-    // Mobile passes `forceVisible`, so this never fires there: the threads pane
-    // keeps whichever view it was showing when the user swiped away, which is
-    // what every other pane does.
+    // entry. A drawer closed with the panel up would leave an invisible surface
+    // eating the next Escape. Reopening would then land on the filter rather
+    // than the list. Mobile passes `forceVisible`, so this never fires there:
+    // the threads pane keeps whichever view it was showing, as every other pane
+    // does.
     //
     // It runs at mount too, which is what keeps the panel's persisted open state
     // honest across a reload: booting with the drawer closed clears it, so the
@@ -514,30 +507,27 @@ function ThreadList() {
     const hydrated = threadsLoaded.value;
 
     // The *applied* selection, not the live signals the filter panel's
-    // checkboxes write: while that panel is up it covers this list completely,
-    // so reading it live meant every tick recategorized, rebuilt every row and
-    // refetched behind an opaque panel, delaying the paint of the very checkbox
-    // the user just ticked. See `store/appliedThreadFilter.ts`.
+    // checkboxes write. That panel covers this list completely, so reading it
+    // live means every tick recategorizes, rebuilds every row and refetches
+    // behind an opaque panel. That delays the paint of the checkbox the user
+    // just ticked. See `store/appliedThreadFilter.ts`.
     const applied = appliedThreadFilter.value;
     // Empty channel filter means "show nothing" — including composing threads.
     // Otherwise the composing drafts would be the only thing visible.
     const composingList = applied.channels.size === 0 ? [] : composingThreads(threadMap.value);
 
     // The categorization pipeline (family graph → top-thread filter → section
-    // routing → sort) is O(loaded threads) across several passes. It used to run
-    // on EVERY ThreadList render — including renders triggered by signals it does
-    // NOT depend on (a section collapse, the archive-count refresh, a pagination
-    // loading-flip). In a workspace with many coding-agent families the loaded set
-    // (inbox + saved + archive page + family extensions) is large enough that
-    // re-running it per render blocks the main thread and delays click handling
-    // (dev-ws input lag, 2026-06-24). Read its real inputs into locals — so the
-    // component still SUBSCRIBES to them — and memoize on exactly those, so a
-    // re-render that didn't change them reuses the result. The four filter sets
-    // arrive as ONE object whose identity changes only when the selection really
-    // moved (`appliedThreadFilter`), which is what lets the whole facet
-    // selection be a single memo key. Collapse-filtering and nesting stay below:
-    // they key on `collapsedFamilies` and are cheap over the already-categorized
-    // rendered set.
+    // routing → sort) is O(loaded threads) across several passes. Renders from
+    // signals it does NOT depend on would re-run it for nothing. In a workspace
+    // with many coding-agent families that blocks the main thread and delays
+    // click handling.
+    //
+    // So read its real inputs into locals, which keeps the component SUBSCRIBED
+    // to them, and memoize the categorization on exactly those. The four filter
+    // sets arrive as ONE object (`appliedThreadFilter`) whose identity moves
+    // only when the selection does. The whole selection is then one memo key.
+    // Collapse-filtering and nesting stay below: they key on `collapsedFamilies`
+    // and are cheap over the categorized set.
     const threadMapValue = threadMap.value;
     const { categorized, familyGraph, decorations } = useMemo<DrawerCategorization>(
         () => hydrated
@@ -562,13 +552,11 @@ function ThreadList() {
     const collapsedFamiliesSet = collapsedFamilies.value;
     const filterCollapsed = (nested: NestedThread[]) =>
         nested.filter(n => !hasCollapsedAncestor(n.thread.meta.id, collapsedFamiliesSet, familyGraph));
-    // `count` is the section's full thread total (parents + sub-threads, before
-    // family-collapse filtering) — the number shown in the collapsed-section
-    // badge. `threads` is the post-collapse render list. Archive is special:
-    // its badge reads the server-sourced `archiveThreadCount` (the true count of
-    // archived threads matching the active filter — see `refreshArchivedCount`)
-    // so it stays stable as rows page in and never drifts when the user
-    // collapses/expands the section.
+    // `count` is the section's full thread total, before family-collapse
+    // filtering, and is the number the collapsed-section badge shows.
+    // `threads` is the post-collapse render list. Archive is special: its badge
+    // reads the server-sourced `archiveThreadCount` (see `refreshArchivedCount`)
+    // so it stays stable as rows page in and never drifts on a collapse.
     const archiveCount = archiveThreadCount.value;
     // Composing drafts ride at the top of Current (most-recent-first, already
     // sorted by `composingThreads`), ahead of the family-sorted current rows.
@@ -638,15 +626,13 @@ function ThreadList() {
     // repo / app / trigger sub-selection change animated the swap.
     useFlipTransitions(containerRef, portalRef, sectionDefs, applied);
 
-    // Infinite scroll, part 1 — the fill loop. Keep loading until the sentinel
-    // is pushed back out of view (or there's nothing more). This loop is
-    // load-bearing: an IntersectionObserver fires only on enter/exit
-    // *transitions*, so when a page doesn't refill the viewport (a sparse
-    // filtered result, or a page that adds few visible rows) the sentinel stays
-    // intersecting with no new event and pagination stalls — which is why it
-    // previously only advanced when a collapse/expand re-layout forced a fresh
-    // intersection. `fillingRef` makes the loop re-entrancy-safe so a scroll
-    // event firing the observer mid-fill can't double-load.
+    // Infinite scroll, part 1: the fill loop. Keep loading until the sentinel is
+    // pushed back out of view, or there is nothing more. The loop is
+    // load-bearing. An IntersectionObserver fires only on enter/exit
+    // *transitions*. So a page that does not refill the viewport leaves the
+    // sentinel intersecting with no new event, and pagination stalls.
+    // `fillingRef` makes the loop re-entrancy-safe, so a scroll event firing the
+    // observer mid-fill cannot double-load.
     const fillingRef = useRef(false);
     const loadWhileSentinelVisible = useCallback(async () => {
         if (fillingRef.current) return;
@@ -655,14 +641,13 @@ function ThreadList() {
         if (!sentinel || !root) return;
         fillingRef.current = true;
         try {
-            // Runaway backstop. Filling a viewport needs ~2-3 pages; this cap is
-            // far above that. It guards the pathological case where loaded rows
-            // render NOWHERE visible (e.g. filter matches that are all
-            // collapsed-family descendants, dropped by `filterCollapsed`): then
-            // the map grows every page (so the size guard never trips) and the
-            // sentinel never moves, so without a cap one intersection would page
-            // through the whole matching set synchronously. Subsequent scrolls
-            // resume pagination normally.
+            // Runaway backstop. Filling a viewport needs 2 to 3 pages, so this
+            // cap is far above that. It guards the case where loaded rows render
+            // NOWHERE visible, such as filter matches that are all
+            // collapsed-family descendants. The map then grows every page, so
+            // the size guard never trips, and the sentinel never moves. Without
+            // a cap one intersection would page through the whole matching set.
+            // Subsequent scrolls resume pagination normally.
             const MAX_PAGES_PER_FILL = 40;
             let pages = 0;
             while (
@@ -677,9 +662,9 @@ function ThreadList() {
                 // Let the re-render commit so the next iteration measures the new
                 // layout (whether the freshly-loaded rows pushed the sentinel out).
                 await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
-                // Defensive stop: loadOlderThreads already flips threadHasMore off
-                // when a page adds nothing, but bail if the map didn't grow so a
-                // stuck cursor can never spin this loop.
+                // Defensive stop. `loadOlderThreads` flips `threadHasMore` off
+                // when a page adds nothing. Bailing on a map that did not grow
+                // is what stops a stuck cursor spinning this loop.
                 if (threadMap.value.size === before) break;
             }
         } finally {
@@ -687,28 +672,24 @@ function ThreadList() {
         }
     }, []);
 
-    // When the channel / trigger / repo / app filter changes, re-arm pagination
-    // AND eagerly fetch the first page of matching threads, then fill the
-    // viewport. A different filter is a different cursor space, and the matches
-    // may be entirely outside the loaded window (e.g. a repo whose threads are
-    // all archived) — relying on the IntersectionObserver alone strands the user
-    // because it only re-fires on a scroll transition. `reloadAfterFilterChange`
-    // makes population deterministic; `loadWhileSentinelVisible` then tops the
-    // viewport off.
+    // When the filter changes, re-arm pagination AND eagerly fetch the first
+    // page of matching threads, then fill the viewport. A different filter is a
+    // different cursor space, and the matches may sit entirely outside the
+    // loaded window. The IntersectionObserver alone
+    // strands the user there, since it only re-fires on a scroll transition.
+    // `reloadAfterFilterChange` makes population deterministic, and
+    // `loadWhileSentinelVisible` tops the viewport off.
     //
     // The guard is `filterChangedSinceLoad()`, a STORE fact, not a `useRef`
     // seeded at mount. This list renders under the default `all` status only,
-    // and the Filter panel can change the selection under the other four, so a
-    // per-instance ref answers the wrong question twice: it misses the change
-    // (nobody is watching) and then seeds with the new value, suppressing the
-    // catch-up on the way back. Comparing against what was actually fetched
-    // makes the mount run correct rather than merely skipped: silent on a
-    // window that already matches, and a full reload on one that does not.
+    // and the Filter panel can change the selection under the other four. A
+    // per-instance ref therefore answers the wrong question twice: it misses the
+    // change, then seeds with the new value and suppresses the catch-up.
+    // Comparing against what was actually fetched makes the mount run correct
+    // rather than merely skipped.
     //
-    // Keyed on the APPLIED selection, so a run of ticks made while the filter
-    // panel covers this list settles into ONE reload when the panel closes,
-    // rather than a page fetch plus an archived-count fetch plus a fill loop
-    // per tick, all for rows nobody can see.
+    // Keyed on the APPLIED selection. A run of ticks made while the filter
+    // panel covers this list settles into ONE reload when the panel closes.
     useEffect(() => {
         // Before the first window lands there is nothing to bring up to date,
         // and the initial load stamps the selection it fetched against.
@@ -848,19 +829,17 @@ export function toggleFamilyCollapse(threadId: string) {
     setFamilyCollapsed(threadId, !collapsedFamilies.value.has(threadId));
 }
 
-// Skip pagination when Archive is collapsed: collapsing shrinks the list, pops
-// the sentinel into view, and would otherwise let the fill loop pull the ENTIRE
-// archive into memory while every row is hidden — pointless fetch + render churn
-// the user can't see. Archive is the bottom section and the one that absorbs
-// paginated older threads.
+// Skip pagination when Archive is collapsed. Collapsing shrinks the list and
+// pops the sentinel into view. The fill loop would then pull the ENTIRE archive
+// into memory while every row is hidden. Archive is the bottom section and the
+// one absorbing paginated older threads.
 //
-// Unlike the prior version, there is NO filter-active bypass: the collapsed
-// badge now reads the server-sourced `archiveThreadCount` (see
-// `refreshArchivedCount`), so a filter whose matches are all archived shows its
-// true count even while collapsed — no need to eager-load hidden rows to count
-// them. When the user expands the section the fill loop loads the matches, and
-// `reloadAfterFilterChange` already fetches the first page on every filter
-// change, so selecting a facet is never stranded on "No threads".
+// There is NO filter-active bypass. The collapsed badge reads the
+// server-sourced `archiveThreadCount` (see `refreshArchivedCount`), so a filter
+// whose matches are all archived shows its true count while collapsed.
+// Expanding the section makes the fill loop load the matches, and
+// `reloadAfterFilterChange` fetches the first page on every filter change. So
+// selecting a facet is never stranded on "No threads".
 export function archivePaginationAllowed(collapsed: ReadonlySet<string>): boolean {
     return !collapsed.has('archive');
 }
@@ -929,70 +908,40 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
     );
 }
 
-/** The repo / app / trigger name chip. A long name WRAPS inside the chip's
- *  CSS `max-width` (see `.thread-row-context` in drawer.css), but a constrained
- *  box sits at its constraint, not at the widest resulting line — so a name that
- *  wraps to e.g. "Habit" / "Tracker" leaves dead space to the right of the
- *  shorter line. Pure CSS can't shrink a box to the longest line of *wrapped*
- *  text (the line breaks depend on the width we'd be deriving from them), so we
- *  measure the rendered line boxes and pin the chip to its widest line. A
- *  single-line name needs no measurement — flex `align-items: flex-end` +
- *  fit-content already hugs it (max-content < max-width), so we leave it alone.
+/** The repo / app / trigger name chip. A long name WRAPS inside the chip's CSS
+ *  `max-width` (`.thread-row-context` in drawer.css). A constrained box sits at
+ *  its constraint, not at its widest line, so a wrapped name leaves dead space.
+ *  CSS cannot shrink a box to the longest line of *wrapped* text. So measure
+ *  the rendered line boxes and pin the chip to its widest line. A single-line
+ *  name needs none of it: fit-content already hugs it.
  *
- *  Four things make the pin robust to WHEN it runs, to transforms, and to UI
- *  scale — the chip may only ever SHRINK below max-width, never below a word:
+ *  Four things keep the pin robust. It may only SHRINK below max-width.
  *
- *  1. Measure at the chip's own `max-width`, NOT its live rendered width.
- *     `.thread-row` is `.list-row` (flex-wrap) and the drawer animates its own
- *     width (`transition: width` on open, plus resize-divider drags), so
- *     measuring the LIVE box while the chip laid out mid-transition (drawer still
- *     animating open from width 0, or the right column momentarily wrapped narrow)
- *     would read a transient TINY box and pin the name into single-word /
- *     broken-word lines. The chip's `flex-shrink: 0` column never squeezes it
- *     below `max-width` at rest, so the max-width wrap IS the rest-state wrap:
- *     forcing the measurement to that width makes the pin independent of the
- *     animation frame (every word fits within max-width, so the widest wrapped
- *     line is always ≥ the widest word).
- *
- *  2. Divide the measured line widths by the element's own scale factor
- *     (visual `getBoundingClientRect` width ÷ layout `offsetWidth`).
- *     `getClientRects` returns TRANSFORM-scaled geometry, so a FLIP row animation
- *     (the wrapper animates `scale(0.95 → 1.03)` on mount / reorder) mid-measure
- *     would shrink every line and pin a hair too narrow (the intermittent
- *     "Track / er" break). Un-scaling recovers the true line widths at any frame.
- *
- *  3. Pin the width in `rem` (px ÷ root font-size), NOT `px`. The chip's
- *     font-size and padding are rem-based, so a rem width tracks the text when the
- *     user changes UI scale (root font-size) WITHOUT a reload or a re-measure. A
- *     px pin goes stale on a scale change (too narrow scaling up → words break;
- *     too wide scaling down → dead space) until a reload re-measures.
- *
- *  4. Safety net: if the pin somehow raised the wrapped line count (a corrupted
- *     measurement we didn't anticipate), drop the pin and fall back to the
- *     max-width box — dead space, never a broken word. Line COUNT is
- *     transform-invariant, so this check holds even mid-animation.
- *
- *  Verified in Chromium across the full UI-scale matrix and every FLIP scale
- *  (0.7 → 1.03): no word break and no dead space in any cell. */
+ *  1. Measure at the chip's own `max-width`, not its live width. The live one
+ *     is transient while the drawer animates open or a divider is dragged.
+ *  2. Divide the measured widths by the element's own scale factor.
+ *     `getClientRects` returns transform-scaled geometry, so a FLIP row
+ *     animation would otherwise pin a hair too narrow.
+ *  3. Pin in `rem`, so the width tracks the text across a UI-scale change. A px
+ *     pin goes stale until a reload re-measures.
+ *  4. If the pin raised the wrapped line count, drop it: dead space beats a
+ *     broken word. Line COUNT is transform-invariant. */
 function ContextChip({ name }: { name: string }) {
     const ref = useRef<HTMLSpanElement>(null);
     useLayoutEffect(() => {
         const el = ref.current;
         if (!el) return;
         const cs = getComputedStyle(el);
-        // (1) Force the wrap to the chip's max-width, not the transient live width,
-        // so the measurement reproduces the rest state regardless of the drawer's
-        // current open/resize animation frame. Fall back to natural width only if
-        // max-width is somehow not a length (e.g. overridden to `none`).
+        // (1) Fall back to the natural width only when max-width is not a
+        // length, such as an override to `none`.
         const maxW = parseFloat(cs.maxWidth);
         el.style.width = Number.isFinite(maxW) && maxW > 0 ? `${maxW}px` : '';
         const range = document.createRange();
         range.selectNodeContents(el);
         const rects = range.getClientRects();
         const naturalLines = rects.length;
-        if (naturalLines <= 1) { el.style.width = ''; return; } // single line — hug via fit-content
-        // (2) Un-scale: getClientRects is transform-scaled, so divide by this
-        // element's own scale (visual ÷ layout width) to recover true line widths
+        if (naturalLines <= 1) { el.style.width = ''; return; } // hug via fit-content
+        // (2) Un-scale by visual ÷ layout width, recovering the true line widths
         // even while a FLIP `scale(...)` animation runs on an ancestor.
         const scaleX = el.offsetWidth > 0 ? el.getBoundingClientRect().width / el.offsetWidth : 1;
         let maxLine = 0;
@@ -1018,12 +967,11 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
     const classes = ['list-row', 'thread-row', 'compose-draft-row'];
     if (isFocused) classes.push('thread-row-focused');
     if (isHighlighted) classes.push('thread-row-highlighted');
-    // A coding draft hasn't bound a backend yet — it spawns with THIS draft's
-    // resolved backend at send time (see sendCompose), so the tag reflects that
-    // draft's pick (Codex vs Claude Code) rather than always "Claude Code" or a
-    // global another draft changed. A plain chat draft is a Lucidos thread —
-    // `formatThreadChannelLabel('chat')` reads "Lucidos Agent", the same tag
-    // started chat threads wear.
+    // A coding draft has not bound a backend. It spawns with THIS draft's
+    // resolved backend at send time (see `sendCompose`). So the tag must read
+    // that draft's own pick, never a global another draft changed. A plain chat
+    // draft is a Lucidos thread, so `formatThreadChannelLabel('chat')` gives it
+    // the same tag started chat threads wear.
     const draftMode = getDraft(thread.meta.id).mode;
     const modeLabel = draftMode === 'claude_code'
         ? formatThreadChannelLabel('claude_code', resolveCodingAgent(thread.meta.id))
@@ -1103,13 +1051,13 @@ interface ThreadRowContentProps {
      *  "Codex" vs "Claude Code" channel tag. Absent for non-coding-agent/legacy rows. */
     codingAgent?: 'claude-code' | 'codex';
     /** Precomputed status dot, derived by the caller via `resolveVisualStatus`
-     *  from the snapshot `status` (the same `effectiveThreadStatus` the panel
-     *  header uses) — so every drawer row's dot is built in one pass and stays
-     *  in lockstep with the list, instead of being re-read live per row. */
+     *  from the snapshot `status`. Every drawer row's dot is built in one pass
+     *  and stays in lockstep with the list, rather than being re-read per
+     *  row. */
     visualStatus: VisualStatus;
     /** Repo / app / trigger name chip shown next to the channel tag. Undefined
-     *  for plain chat — a Lucidos thread carries no channel tag and no context
-     *  name; the bare row (no chips) is itself the signal it's a regular chat. */
+     *  for plain chat: a Lucidos thread carries no channel tag and no context
+     *  name, so the bare row is itself the signal. */
     contextName?: string;
     totalChildren: number;
     needsReview: boolean;
@@ -1156,49 +1104,46 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     if (props.needsReview) classes.push('thread-row-review');
     if (props.isLiftedParent) classes.push('thread-row-lifted-parent');
     if (props.isResponsibleChild) classes.push('thread-row-lifted-child');
-    // Lets the CSS reserve bottom room in the title column for the absolutely-
-    // positioned disclosure badge, so a long (multi-line) title can't grow down
-    // into it (see `.thread-row-has-family .thread-row-left` in drawer.css).
+    // Lets the CSS reserve bottom room in the title column for the disclosure
+    // badge, so a multi-line title cannot grow into it. See
+    // `.thread-row-has-family .thread-row-left` in drawer.css.
     if (hasFamily) classes.push('thread-row-has-family');
 
     const wrapClasses = ['thread-row-wrap'];
     if (depth > 0) wrapClasses.push('is-nested');
-    // On the WRAPPER, not the row: the status dot is the wrapper's child (it
-    // holds a fixed left column at every depth), and it has to dim with the
-    // rest of the row.
+    // On the WRAPPER, not the row. The status dot is the wrapper's child,
+    // holding a fixed left column at every depth. It has to dim with the rest
+    // of the row.
     if (props.isArchivedSubThread) wrapClasses.push('is-archived');
 
-    // aria stays a smart-plural bare count; the visible sub-thread count rides
-    // in a badge shown only while the family is collapsed (expanded families
-    // show their children inline, so the number would be redundant).
+    // aria stays a smart-plural bare count. The visible sub-thread count rides
+    // in a badge shown only while the family is collapsed: an expanded family
+    // shows its children inline, so the number would be redundant.
     const a11yCount = `${props.totalChildren} sub-thread${props.totalChildren === 1 ? '' : 's'}`;
-    // The disclosure control carries its OWN tooltip + aria-label so hovering the
-    // badge/chevron shows what the control does — not the row's general thread
+    // The disclosure control carries its OWN tooltip and aria-label, so
+    // hovering it shows what the control does rather than the row's thread
     // tooltip. The global tooltip system walks up to the nearest `data-tooltip`
-    // ancestor (useTooltip `findTarget`), so without this the badge/chevron
-    // inherited the row's `data-tooltip` and showed the thread blurb. Collapsed
-    // names the hidden count ("Show N sub-threads"); expanded is just "Hide
-    // sub-threads" — the children are listed inline, so repeating the count
-    // would be redundant (same reason the count badge is collapsed-only).
+    // ancestor (useTooltip `findTarget`), so without this the control inherits
+    // the row's. Collapsed names the hidden count; expanded is just "Hide
+    // sub-threads", since the children are listed inline.
     const disclosureLabel = props.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads';
 
-    // Shared by the disclosure button's click + keydown so the collapse logic
-    // lives in one place. stopPropagation keeps the row's onClick from also
-    // firing on click, and — for keydown — keeps the drawer container's
-    // Enter→selectHighlighted handler from stealing the keystroke (see below).
+    // Shared by the disclosure button's click and keydown, so the collapse
+    // logic lives in one place. `stopPropagation` keeps the row's `onClick`
+    // from also firing, and on keydown keeps the drawer container's
+    // Enter→selectHighlighted handler from stealing the keystroke.
     const toggleFamily = (e: Event) => {
         e.stopPropagation();
         props.onToggleFamily?.();
     };
 
-    // Every thread carries a channel tag now (chat reads "Lucidos Agent"); the
-    // guard stays so a future empty label (or an unknown channel) doesn't paint
-    // an empty bordered chip.
+    // Every thread carries a channel tag. The guard stays so an empty label, or
+    // an unknown channel, never paints an empty bordered chip.
     const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
 
     // The status dot is the wrapper's child, not the row's, so it stays in a
-    // fixed left column at every depth — anchored to the un-indented wrapper
-    // instead of tracking the title's per-depth indent (see drawer.css).
+    // fixed left column at every depth. It is anchored to the un-indented
+    // wrapper rather than tracking the title's per-depth indent (drawer.css).
     return (
         <div class={wrapClasses.join(' ')}
              style={depthStyle(depth)}
@@ -1213,15 +1158,14 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                  // itself never takes DOM focus. Omitted on skeleton rows (no id).
                  role={props.id ? 'treeitem' : undefined}
                  aria-selected={props.id ? (props.isHighlighted ?? false) : undefined}
-                 // The thread's structured details (Status / You / Agent / Type /
-                 // Exchanges / Started) live behind the ⋯ menu's Info item now,
-                 // not a row tooltip — see ThreadOverflowMenu.
-                 // Prefetch on press-in: pointerdown fires before the tap's click
-                 // (touch-start / mouse-down), so the event load starts earlier and
-                 // content is often ready by the time focusThread switches the view.
-                 // loadThreadEvents is idempotent (no-op if already loading/loaded,
-                 // or if this row isn't in threadMap yet — e.g. a search hit), so a
-                 // canceled press just warms the cache and the tap never double-fetches.
+                 // The thread's structured details live behind the ⋯ menu's Info
+                 // item, not a row tooltip. See ThreadOverflowMenu.
+                 //
+                 // Prefetch on press-in. pointerdown fires before the tap's
+                 // click, so the event load starts earlier and content is often
+                 // ready by the time focusThread switches the view.
+                 // `loadThreadEvents` is idempotent, so a canceled press just
+                 // warms the cache and the tap never double-fetches.
                  onPointerDown={sk ? undefined : () => { if (props.id) void loadThreadEvents(props.id); }}
                  onClick={sk ? undefined : props.onClick}>
                 {hasFamily && (
@@ -1235,14 +1179,13 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                         onClick={toggleFamily}
                         onKeyDown={(e) => {
                             // The drawer container's keydown handler intercepts
-                            // Enter (selectHighlighted) at the bubble phase and
-                            // preventDefaults it, which cancels this native
-                            // button's Enter→click activation — so Enter would
-                            // otherwise never toggle the family. Handle Enter/Space
-                            // here: preventDefault blocks Space page-scroll and the
-                            // native synthetic click (so the toggle fires exactly
-                            // once), and toggleFamily's stopPropagation keeps the
-                            // drawer handler from also acting on the keystroke.
+                            // Enter at the bubble phase and preventDefaults it,
+                            // cancelling this button's Enter→click activation.
+                            // So Enter and Space are handled here instead.
+                            // `preventDefault` blocks Space page-scroll and the
+                            // native synthetic click, firing the toggle exactly
+                            // once, and `toggleFamily`'s `stopPropagation` keeps
+                            // the drawer handler off the keystroke.
                             if (e.key === 'Enter' || e.key === ' ') {
                                 e.preventDefault();
                                 toggleFamily(e);
@@ -1296,7 +1239,7 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
 }
 
 /** Skip the render when nothing the row paints has changed. Drawer flushes
- *  fire on every SSE event in the workspace — without memo, all 100+ visible
+ *  fire on every SSE event in the workspace. Without memo, all 100+ visible
  *  rows re-execute their render function and reconcile their VDOM even when
  *  only one thread's state moved. `onClick` is intentionally excluded from
  *  the equality check: the closure changes per parent render, but it always
@@ -1340,22 +1283,19 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
      *  flat lists where collapsing nothing visible would be a no-op. */
     enableFamilyToggle?: boolean;
 }) {
-    // Signal reads stay here so each row's subscription set is narrow: the
-    // row re-renders on threadMap / focusedThreadId / highlightedKey /
-    // draftPresentThreadIds, but the memo on ThreadRowContent below short-
-    // circuits when none of the primitives it derives actually changed —
-    // turning a per-flush N-row VDOM storm into one render per moved row.
+    // Signal reads stay here so each row's subscription set is narrow. The row
+    // re-renders on several signals, but the memo on ThreadRowContent below
+    // short-circuits when none of the primitives it derives changed. That turns
+    // a per-flush N-row VDOM storm into one render per moved row.
     const thread = threadMap.value.get(threadId);
     if (!thread) return null;
     const { meta } = thread;
-    // Status dot from the snapshot `status` prop (the list builder derived it
-    // from the same `effectiveThreadStatus` the panel uses), NOT a live re-read
-    // of `meta.status`. ThreadRow re-renders on `focusedThreadId` changes, which
-    // do NOT flush `threadMap`; a live `meta.status` read here made the focused
-    // row repaint its dot to a value that diverged from the rest of the list
-    // (which still shows the snapshot) until the next flush — the "focused
-    // thread's running dot disappears" bug. Feeding the snapshot `status` through
-    // the shared `resolveVisualStatus` formula keeps every row's dot in lockstep.
+    // Status dot from the snapshot `status` prop, NOT a live re-read of
+    // `meta.status`. ThreadRow re-renders on `focusedThreadId` changes, which do
+    // NOT flush `threadMap`. A live `meta.status` read here repaints the focused
+    // row's dot to a value diverging from the rest of the list until the next
+    // flush. Feeding the snapshot through the shared `resolveVisualStatus`
+    // formula keeps every row's dot in lockstep.
     const visualStatus = resolveVisualStatus(
         status,
         meta.activeChildrenCount > 0,
@@ -1399,12 +1339,11 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
 /** One-tap shortcut back to the unfiltered "All statuses" view, offered by every
  *  status-filter view (Drafts / Needs attention / Review / Running) in both
  *  states: under the "nothing here" message when the filter is empty, and under
- *  the last row when it isn't. Either way the user has reached the end of what
- *  this status holds, and what they're after lives under another one, so the way
- *  out sits where they're already looking rather than back up in the filter
- *  control. The all-statuses and search views don't use it: "All statuses" IS
- *  the destination, and an exhausted search wants a different query, not a
- *  filter reset. */
+ *  the last row when it is not. Either way the user has reached the end of this
+ *  status. So the way out sits where they are already looking, rather than back
+ *  up in the filter control. The all-statuses and search views do not use it:
+ *  "All statuses" IS the destination, and an exhausted search wants a different
+ *  query, not a filter reset. */
 function SeeAllStatusesLink() {
     return (
         <button type="button" class="accent-link" onClick={() => setDrawerView('all')}>
@@ -1436,13 +1375,12 @@ function FilteredViewFooter() {
     );
 }
 
-/** Single-section view of every thread carrying an unsent draft. Bypasses the
- *  channel/trigger/repo filters and the four lifecycle sections — when the user
- *  toggles the drafts icon they want every draft, not just the ones the active
- *  filter would surface. Drafts come from threads already in `threadMap`; older
- *  draft-bearing threads outside the pagination window are not loaded on
- *  demand, which is acceptable because drafts are by definition recently
- *  touched and ride at the top of the window. */
+/** Single-section view of every thread carrying an unsent draft. It bypasses
+ *  the channel / trigger / repo filters and the four lifecycle sections: a user
+ *  toggling the drafts icon wants every draft. Drafts come from threads already
+ *  in `threadMap`, and older draft-bearing threads outside the pagination
+ *  window are not loaded on demand. That is acceptable, since drafts are by
+ *  definition recently touched and ride at the top of the window. */
 function DraftsList() {
     const hydrated = threadsLoaded.value;
     const drafts = hydrated ? draftThreads(threadMap.value) : [];
@@ -1607,11 +1545,11 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     const section = liveThread?.meta.section ?? result.section;
     const isFocused = focusedThreadId.value === result.thread_id;
     const isHighlighted = highlightedKey.value === result.thread_id;
-    // Context name works whether or not the hit is hydrated into threadMap —
-    // ThreadMeta is structurally a ThreadContextFields; the result's snake-case
-    // fields map onto the same shape. (The richer details — Status / You / Agent
-    // / Exchanges / Started — live behind the ⋯ menu's Info item, which reads the
-    // live meta itself, so an unhydrated hit simply omits the Info item.)
+    // The context name works whether or not the hit is hydrated into
+    // `threadMap`. ThreadMeta is structurally a ThreadContextFields, and the
+    // result's snake-case fields map onto the same shape. The richer details
+    // live behind the ⋯ menu's Info item, which reads the live meta itself, so
+    // an unhydrated hit omits that item.
     const ctxFields: ThreadContextFields = liveThread?.meta ?? {
         channel: result.channel,
         triggerName: result.trigger_name,

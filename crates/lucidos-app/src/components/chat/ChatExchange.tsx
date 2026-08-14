@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -23,12 +23,12 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
-import { TrashIcon } from '../shared/icons';
+import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setThreadLive } from './scrollState';
 
-// Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
-// without these, every dependent useMemo invalidates on every render whenever
-// artifacts/apps are not loaded.
+// Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
+// Without these, every dependent useMemo invalidates on every render while
+// artifacts or apps are not loaded.
 const NO_ARTIFACTS: string[] = [];
 const NO_APPS: App[] = [];
 
@@ -72,10 +72,10 @@ interface Props {
    *  switch-teardown abort the engine is auto-resuming is deliberately not
    *  continuable. */
   isContinuableAbort?: boolean;
-  /** True when this is a chat follow-up the user typed while the agent was busy
-   *  — it's queued behind the active turn and not yet ingested. Computed in
-   *  `renderExchanges` (it needs thread-level busy state + the active-exchange
-   *  index); drives the "Queued" marker on the bubble. */
+  /** True when this is a chat follow-up typed while the agent was busy, queued
+   *  behind the active turn and not yet ingested. Computed in `renderExchanges`,
+   *  which has the thread-level busy state and the active-exchange index. Drives
+   *  the "Queued" marker on the bubble. */
   isQueued?: boolean;
   /** Lifted from `threadMap.value.get(threadId)?.meta.channel === 'claude_code'`
    *  in `renderExchanges` so this component does not subscribe to threadMap
@@ -88,9 +88,9 @@ interface Props {
    *  by raw status, but false while an optimistic resume is in flight. */
   threadIdle: boolean;
   /** Lifted from `threadMap.value.get(threadId)?.meta.status === 'waiting_for_user_answer'`.
-   *  Tells `exchangeStatus` the thread is parked on / resuming from a question or
-   *  permission card — never crashed — so a just-answered divider doesn't flash
-   *  "Aborted" during the answer→resume gap. See `exchangeStatus`. */
+   *  Tells `exchangeStatus` the thread is parked on a question or permission
+   *  card rather than crashed. A just-answered divider must not flash "Aborted"
+   *  during the answer-to-resume gap. */
   threadAwaitingAnswer: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
@@ -102,49 +102,37 @@ interface Props {
    *  ChangeProposed rode the thread). Primitives, so the memo stays cheap. */
   proposedChangeDesc?: string;
   proposedChangeFileCount?: number;
-  /** The event a detached wake delivered, resolved once per thread in
+  /** The event a *thread subscription* delivered, resolved once per thread in
    *  `renderExchanges` by following this exchange's
-   *  `UserPromptInjected.delivered_event_id`. Resolved THERE rather than here
-   *  because the target `EventWaitDelivered` sits in a different exchange, and
-   *  reading `threadMap` from this component would undo the memo that keeps a
-   *  29-exchange thread from re-parsing every markdown body per SSE event.
-   *  Both undefined unless this exchange is such a wake. */
-  wakeEventType?: string;
-  wakeEventId?: string;
-  wakePayloadJson?: string;
+   *  `UserPromptInjected.delivered_event_id`. Resolved THERE because the target
+   *  `EventWaitDelivered` sits in a different exchange. Reading `threadMap` from
+   *  this component would undo the memo keeping a 29-exchange thread from
+   *  re-parsing every markdown body per SSE event. All undefined unless this
+   *  exchange is such a delivery. */
+  matchedEventType?: string;
+  matchedEventId?: string;
+  matchedPayloadJson?: string;
 }
 
 /** Does this exchange mean the AGENT IS RUNNING on the thread being shown? The
  *  follow's live term (see `setThreadLive` in `scrollState`), and nothing else,
- *  which is why it can afford to be strict: it decides whether the reader's
- *  scroll means "stop dragging me" or merely "I am browsing".
+ *  so it can afford to be strict: it decides whether the reader's scroll means
+ *  "stop dragging me" or merely "I am browsing" (ADR 0064).
  *
- *  TWO sources have to agree, and the second is the load-bearing one. The
- *  exchange status alone was wrong, because it is a RENDERING verdict about one
- *  turn and its final fallthrough is `'pending'`, i.e. "a coding-agent turn that
- *  has not produced a step yet". A stepless SYSTEM boundary reaches that line
- *  too: `ChangeApplied` opens an exchange of its own, so a coding-agent thread
- *  whose change the user applied ends in an exchange with no steps and no
- *  terminal, and `'pending'` is in `ACTIVE_STATUSES`. That is invisible in the
- *  panel (a bare boundary draws no response row, so nothing painted the phantom
- *  "Requesting"), and it made the follow believe every such thread was live
- *  forever. Since most coding-agent threads here end in an applied change, that
- *  was nearly all of them, and one scroll retired a follow the reader had turned
- *  on deliberately.
+ *  TWO sources have to agree, and the second is load-bearing. The exchange
+ *  status alone is a RENDERING verdict about one turn, and its final
+ *  fallthrough is `'pending'`. A stepless SYSTEM boundary reaches that line
+ *  too. `ChangeApplied` opens an exchange of its own, so a coding-agent thread
+ *  whose change was applied ends with no steps and no terminal. `'pending'` is
+ *  in `ACTIVE_STATUSES` and nothing paints it, so the follow would believe such
+ *  a thread was live forever.
  *
  *  So ask the THREAD PROJECTION as well. `threadIdle` is the aggregate's own
- *  "this thread is quiescent", which is the exact question the live term wants
- *  and the only authority on it: a per-turn render status can be generous about
- *  a turn that might be starting, where the projection says whether anything is
- *  actually running. Parked on a question counts as idle, correctly, since
- *  nothing is being appended and nothing can drag the reader anywhere.
+ *  "this thread is quiescent", which is the exact question and the only
+ *  authority on it. Parked on a question counts as idle, correctly.
  *
- *  Deliberately NOT fixed in `exchangeStatus` instead. Its `'pending'`
- *  fallthrough is load-bearing for the real case (a coding-agent send takes
- *  seconds to produce its first step, and reading that gap as "Done ✓" is the
- *  regression the `!isCC` guard on the empty-exchange arm exists to avoid), and
- *  every status label in the app hangs off that function. The mistake was asking
- *  a per-turn question and treating the answer as a thread-level fact. */
+ *  Deliberately NOT fixed in `exchangeStatus`. Its `'pending'` fallthrough is
+ *  load-bearing, and every status label in the app hangs off that function. */
 export function exchangeMarksThreadLive(
   isLast: boolean,
   status: ExchangeStatus,
@@ -153,7 +141,7 @@ export function exchangeMarksThreadLive(
   return isLast && isStatusActive(status) && !threadIdle;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakeEventId, wakePayloadJson }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -175,11 +163,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // Here because this is the component that already derives the status, and
   // `scrollState` deliberately cannot import `store` to derive it itself.
   //
-  // Only the LAST exchange answers, since only it can be running, and the
-  // cleanup clears the answer rather than leaving it: a thread switch unmounts
-  // this exchange and the incoming thread's own last exchange sets its own
-  // value, but between the two nobody must be able to read the thread they
-  // just left. See `setThreadLive`.
+  // Only the LAST exchange answers, since only it can be running. The cleanup
+  // clears the answer rather than leaving it. A thread switch unmounts this
+  // exchange, and the incoming thread's last exchange sets its own value.
+  // Between the two nobody may read the thread they just left.
   const threadLive = exchangeMarksThreadLive(isLast, status, threadIdle);
   useEffect(() => {
     if (!isLast) return;
@@ -187,10 +174,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     return () => setThreadLive(false);
   }, [isLast, threadLive]);
 
-  // Cap detection reads ResponseGenerated.text directly via exchangeEngineLimitDetail —
-  // the cap is emitted without a preceding TextStreamed, so it never lands in
-  // responseTextRaw (which only concatenates streamed text). Without this side
-  // channel the agent appears to stop silently mid-task.
+  // Cap detection reads `ResponseGenerated.text` directly via
+  // `exchangeEngineLimitDetail`. The cap is emitted with no preceding
+  // TextStreamed, so it never lands in `responseTextRaw`, which only
+  // concatenates streamed text. Without this side channel the agent appears to
+  // stop silently mid-task.
   const engineLimitDetail = !streamingBuffer ? exchangeEngineLimitDetail(exchange) : '';
   const isEngineLimit = !!engineLimitDetail;
   // The live streaming buffer changes every token — opt it out of the markdown
@@ -213,16 +201,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // Is there a body to fold, and therefore a body to draw at all? One
   // definition, because `hasBody` on the panel below asks the same thing.
   //
-  // Deliberately NOT `hasEvents`. A fold swaps the body for a `⋯` stub, so on a
-  // turn whose body draws nothing it swaps nothing for a mark. In flight that
-  // is a real case rather than a corner: a coding-agent turn emits a
-  // whitespace-only text event before every tool call, and a reader who turned
-  // the steps control off is shown nothing else either, so `events.length` runs
-  // ahead of anything on screen for as long as the turn has produced only
-  // mechanics. Asking `drawsResponseRow` instead means the
-  // control is dead exactly while the turn is blank, and lights up with its
-  // first drawn row. Turning steps OFF can therefore unfold a step-only turn,
-  // which is right: folded or not, it is showing nothing either way.
+  // Deliberately NOT `hasEvents`. A fold swaps the body for a `⋯` stub, so on
+  // a turn whose body draws nothing it swaps nothing for a mark. In flight that
+  // is a real case. A coding-agent turn emits a whitespace-only text event
+  // before every tool call. A reader with steps off sees nothing else, so
+  // `events.length` runs ahead of anything on screen.
+  //
+  // Asking `drawsResponseRow` instead leaves the control dead exactly while the
+  // turn is blank, lighting up with its first drawn row. Turning steps OFF can
+  // therefore unfold a step-only turn, which is right: it is showing nothing
+  // either way.
   const canCollapse = hasResponse || events.some((e) => drawsResponseRow(e, showSteps));
   const isCollapsed = canCollapse && collapsedExchanges.value.has(`${threadId}:${exchange.userSeq}`);
 
@@ -267,10 +255,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     // (notifications, apps, triggers, …) even when linkifyPaths didn't
     // rewrite them. Catches: stale memo result rendered before the apps
     // list loaded; iOS PWA JS bundle predating the rewriter; any markdown
-    // link the LLM writes. Without this, the browser would navigate to
-    // the relative URL — for app entries to a file preview (via the
-    // engine's /data/* static mount), for panel names to a 404 on a
-    // non-existent /data/<panel> folder.
+    // link the LLM writes. Without this the browser navigates to the relative
+    // URL: an app entry lands on a file preview via the engine's /data/* static
+    // mount, and a panel name on a 404 for a /data/<panel> folder.
     const anchorTarget = (e.target as HTMLElement).closest('a') as HTMLAnchorElement | null;
     if (anchorTarget) {
       const rawHref = anchorTarget.getAttribute('href') || '';
@@ -293,9 +280,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // `[Habit Tracker](habit-tracker)` by analogy to `[Notifications](notifications)`.
       // Not caught by extractAppIdFromHref (no apps/ prefix, no app: scheme);
       // resolve it against the loaded apps list by id OR name. Runs AFTER nav so
-      // reserved panel names still route to their panel. Without this the browser
-      // navigates to the relative href, the SPA fallback serves the shell, and
-      // the whole workspace reloads (the "Opening workspace" splash on iOS PWA).
+      // reserved panel names still route to their panel. Without this the
+      // browser navigates to the relative href, the SPA fallback serves the
+      // shell, and the whole workspace reloads.
       const bareRef = extractBareAppRef(rawHref);
       if (bareRef) {
         const app = apps.find((a) => a.id === bareRef || a.name === bareRef);
@@ -305,26 +292,24 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           return;
         }
       }
-      // A path under the workspace's data/ tree (artifacts/, knowhow/, apps/,
-      // triggers/, system-knowhow/), recognized by SHAPE, so it works for a
-      // file the agent wrote seconds ago that the cached artifact list hasn't
-      // caught up with. That is precisely when linkifyPaths declines to rewrite
-      // and this fallback is the only thing standing between the click and a
-      // full workspace reload. Runs BEFORE the OS-open branch so an absolute
-      // /artifacts/… is never mistaken for a disk path.
+      // A path under the workspace's data/ tree, recognized by SHAPE. So it
+      // works for a file the agent wrote seconds ago that the cached artifact
+      // list has not caught up with. That is exactly when `linkifyPaths`
+      // declines to rewrite, and this fallback is all that stands between the
+      // click and a full workspace reload. Runs BEFORE the OS-open branch, so
+      // an absolute /artifacts/… is never mistaken for a disk path.
       const dataPath = extractDataPathTarget(rawHref);
       if (dataPath) {
         e.preventDefault();
         openFilePreview(dataPath);
         return;
       }
-      // A `file://` URL or an absolute filesystem path (a staged release .dmg
-      // under ~/…/.lucidos/release-worktrees/, an /Applications/… folder, …) —
-      // open it with the OS (mount the dmg / reveal the folder), NOT via the
-      // in-app file preview or the /data/* static mount (those are for
-      // workspace-relative paths only). Runs AFTER the app/nav extractors so
-      // their absolute routes (/apps/<id>/…, /notifications, …) keep working;
-      // http(s) URLs return null here and keep their browser/panel behavior.
+      // A `file://` URL or an absolute filesystem path, such as a staged
+      // release .dmg or an /Applications/… folder. Open it with the OS, never
+      // via the in-app file preview or the /data/* static mount, which are for
+      // workspace-relative paths only. Runs AFTER the app and nav extractors so
+      // their absolute routes keep working. An http(s) URL returns null here
+      // and keeps its browser or panel behavior.
       const localFile = extractLocalFileTarget(rawHref);
       if (localFile) {
         e.preventDefault();
@@ -335,12 +320,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // scheme it is a relative link into the SPA, and there are no relative
       // routes: the browser resolves it against the workspace base, the
       // engine's SPA fallback answers with the app shell, and the whole
-      // workspace reloads. That reload has now been reported five times, once
-      // per href shape the LLM invented (`app:<id>`, a bare app id,
-      // `data/<panel>`, a bare `app`, a data path), because the branches above
-      // are a whitelist and a whitelist is open at the bottom. Closing it here
-      // means the next unrecognized shape is a toast the user can read, not a
-      // reload. See docs/adr/0038.
+      // workspace reloads. The branches above are a whitelist, and a whitelist
+      // is open at the bottom. Closing it here makes the next unrecognized
+      // shape a toast the user can read rather than a reload. See ADR 0038.
       //
       // Two things deliberately pass through: a URL scheme (http(s), mailto,
       // tel, all real links the browser should handle) and a pure fragment
@@ -363,36 +345,25 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     }
   }
 
-  // The two turn controls (full response, steps) grow the turn the reader is
-  // looking at, so `withScrollAnchor` holds the `.chat-exchange` ROOT still
-  // across the growth. Everything the two reveal grows BELOW that root's top,
-  // so the reader keeps looking at the same thing and the transcript simply
-  // gets taller underneath them.
-  //
-  // Each toggle used to call `preserveOnToggle()` first, which marked the reader
-  // parked so the transcript's ResizeObserver would not read the growth as "the
-  // reader is riding the bottom" and re-pin them, scrolling the thing they just
-  // opened off the top. No resize re-pins anyone now, so the mark has nothing
-  // left to prevent.
+  // The two turn controls grow the turn the reader is looking at, so
+  // `withScrollAnchor` holds the `.chat-exchange` ROOT still across the growth.
+  // Everything they reveal grows BELOW that root's top, so the reader keeps
+  // looking at the same thing.
   //
   // Turning either ON also lifts THIS turn's fold, and only this turn's. A
-  // folded turn draws no body, so a reveal clicked from its header would land
-  // on every other turn in the transcript and do nothing where the click was
-  // made. The setting stays transcript-wide; what the unfold clears is the
-  // local override that would hide it here. One-way, via `expandExchange`
-  // rather than a toggle: turning a reveal off must never fold anything, since
-  // a fold is the reader's own explicit act.
+  // folded turn draws no body. A reveal clicked from its header would land on
+  // every other turn and do nothing where the click was made. The setting
+  // stays transcript-wide; the unfold clears the local override hiding it here.
+  // One-way, via `expandExchange` rather than a toggle: turning a reveal off
+  // must never fold anything, since a fold is the reader's explicit act.
   //
-  // Unconditional on the ON edge, deliberately, and NOT gated on `canCollapse`
-  // however much it looks like it wants to be. The turn this fires on is very
-  // often one where `canCollapse` is false precisely BECAUSE the thing being
-  // revealed is hidden: a folded step-only turn with the steps control off
-  // draws nothing, so it reads as uncollapsible right up until the click that
-  // turns steps on. Gate on `canCollapse` and that click leaves the key in the
-  // store, so the turn folds back to `⋯` the instant its steps become
-  // drawable, which is the dead-click this whole path exists to remove.
-  // `expandExchange` no-ops when the key is absent, so the unconditional call
-  // costs nothing on a turn that was never folded.
+  // Unconditional on the ON edge, and NOT gated on `canCollapse`. The turn this
+  // fires on is often one where `canCollapse` is false BECAUSE the thing being
+  // revealed is hidden. A folded step-only turn with steps off draws nothing,
+  // so it reads as uncollapsible until the click that turns steps on. Gated,
+  // that click leaves the key in the store and the turn folds back to `⋯` the
+  // instant its steps become drawable. `expandExchange` no-ops when the key is
+  // absent, so the unconditional call costs nothing on an unfolded turn.
   function reveal(setting: Signal<boolean>) {
     withScrollAnchor(rootRef.current, () => {
       setting.value = !setting.value;
@@ -461,13 +432,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     return { visibleEvents: visible, collapsedFallbackText: fallback };
   }, [hasEvents, showDetails, dropsEarlierProse, events, responseHtmlCombined]);
 
-  // Sections (split on section_break) tagged with each section's base index in
-  // visibleEvents, so `renderResponseEvents` can key rows by a stable index even
-  // when the list grows during streaming. `splitEventSections` drops the break
-  // markers, so re-walk `visibleEvents` to recover each section's offset (the
-  // while-loop handles consecutive breaks). The whole exchange renders — the open
-  // cost is bounded at the LOAD layer (the snapshot tail window) instead, so a
-  // huge coding-agent turn only ever holds a tail of its events.
+  // Sections tagged with each section's base index in `visibleEvents`, so
+  // `renderResponseEvents` can key rows stably as the list grows during
+  // streaming. `splitEventSections` drops the break markers, so re-walking
+  // `visibleEvents` recovers each section's offset. The whole exchange renders:
+  // the open cost is bounded at the LOAD layer instead, so a huge coding-agent
+  // turn only ever holds a tail of its events.
   const renderedSections = useMemo(() => {
     const sections = splitEventSections(visibleEvents);
     let cursor = 0;
@@ -479,11 +449,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     });
   }, [visibleEvents]);
 
-  // Exactly one running-text shimmer at a time: if an in-progress step is
-  // visible on screen, its own shimmer is the "live" affordance, so the
-  // "Working" status label below drops to a plain, static label. Otherwise —
-  // steps hidden, this exchange collapsed (steps body hidden), or expanded with
-  // no pending step — the label shimmers as the sole affordance.
+  // Exactly one running-text shimmer at a time. When an in-progress step is
+  // visible, its own shimmer is the live affordance and the "Working" label
+  // below drops to a plain static one. Otherwise the label shimmers as the sole
+  // affordance: steps hidden, this exchange collapsed, or no pending step.
   const liveStepOnScreen = hasVisibleLiveStep(showSteps, isCollapsed, visibleEvents);
 
   // Memoize linkified HTML — linkifyPaths builds 15+ regex batches per call when
@@ -506,9 +475,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   );
 
   const responseHtmlLinkified = useMemo(
-    // The streaming buffer's html changes every token — opt its linkify out of
-    // the LRU cache (mirrors renderMarkdown's cache:false for the same buffer
-    // above) so per-token html doesn't thrash the cache and evict stable entries.
+    // The streaming buffer's html changes every token, so its linkify opts out
+    // of the LRU cache, mirroring `renderMarkdown`'s `cache: false` above.
+    // Per-token html would otherwise thrash the cache and evict stable entries.
     () => linkifyPaths(responseHtmlCombined, artifactPaths, apps, { cache: !streamingBuffer }),
     [responseHtmlCombined, artifactPaths, apps, streamingBuffer],
   );
@@ -516,32 +485,30 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, { eventType: wakeEventType, eventId: wakeEventId, payloadJson: wakePayloadJson }),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakeEventId, wakePayloadJson],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
-  // Card-less treatment: a human chat message renders as a right-aligned
-  // accent-tinted bubble; change-lifecycle turns render flat. Both drop the
-  // actor chip (icon + "You"/name) — attribution moves to the clickable
-  // timestamp/summary. Predicate is event-type based, NOT label-based:
-  // user-driven control turns (cancel/restart/continue/auto-prompt/credential/
-  // consent) keep the chip slot but render it iconless with the action AS the
-  // label (see actionInitiator), and question/permission dividers keep their
-  // agent chip.
+  // Card-less treatment. A human chat message renders as a right-aligned
+  // accent-tinted bubble and change-lifecycle turns render flat. Both drop the
+  // actor chip, moving attribution to the clickable timestamp or summary. The
+  // predicate is event-type based, NOT label-based. A user-driven control turn
+  // keeps the chip slot, rendered iconless with the action AS the label (see
+  // `actionInitiator`). Question dividers keep their agent chip.
   const isUserMessageBubble = exchange.userEvent.type === 'MessageReceived' && initiator.variant === 'user';
-  // A queued follow-up (typed while the agent was busy, not yet ingested) shows
-  // a "Queued" tag in its own bubble header — where dividers show "Answered
-  // ✓" — instead of a faux "Lucidos Agent — Queued" response panel below it.
-  // The message is the user's, and a stack of them should each read as waiting.
+  // A queued follow-up shows a "Queued" tag in its own bubble header, where
+  // dividers show "Answered ✓". A faux "Lucidos Agent" response panel below it
+  // would misattribute it: the message is the user's, and a stack of them
+  // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
   const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
-  // The trash button lives INSIDE the status label (an existing `display:flex`
-  // row) rather than in a separate wrapper, so "Queued" and the trash stay on
-  // one line using only CSS that already ships — no dependency on a fresh rule.
+  // The trash button lives INSIDE the status label, an existing `display: flex`
+  // row, rather than in a separate wrapper. "Queued" and the trash then stay on
+  // one line using only CSS that already ships.
   const queuedStatus = (
     <span class="exchange-status-label exchange-status-queued">
       {'Queued'}
@@ -565,38 +532,35 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
   const isCanceledDivider = isCanceledQuestionDivider(exchange);
-  // Change lifecycle, abort-boundary, cancel-boundary, and canceled-question-
-  // divider exchanges are terminal — they have no response, just the initiator
-  // panel with optional actions (Diff/Revert on change panels, Continue on the
-  // unresumed abort, the QuestionCard's own ✓ Cancel button on the divider).
-  // Exception: a change banner whose session KEPT WORKING after the apply
-  // (no new user message → the continuation folded into this exchange as steps)
-  // must render its body, or that work + its follow-up proposal are invisible
-  // between two "Change applied" rows (real thread 76b4ee76).
+  // Change lifecycle, abort-boundary, cancel-boundary and canceled-question
+  // dividers are terminal. They have no response, just the initiator panel with
+  // optional actions. The exception is a change banner whose session KEPT
+  // WORKING after the apply, folding the continuation into this exchange as
+  // steps. It must render its body, or that work and its follow-up proposal are
+  // invisible between two "Change applied" rows.
   const isChangeContinuation = isChangePanel && changePanelHasContinuation(exchange);
   // Same exception, other boundary: an abort or cancel boundary that ACQUIRED
   // work must render it. The boundary is a statement about the turn that ended,
   // not a promise that nothing follows, and something can legitimately land
-  // under it. The sharpest case is an event-wait wake, whose anchor is not an
-  // exchange-start type, so its whole turn folds in here as steps.
+  // under it. The sharpest case is an event-wait delivery, whose anchor is not
+  // an exchange-start type, so its whole turn folds in here as steps.
   //
-  // Suppressing that is how a turn on 2026-08-06 applied a change, spawned a
-  // sub-thread and wrote a full summary while the UI showed only "Response
-  // interrupted" (real thread ebc787a4). A stepless boundary still renders bare,
-  // which is the common case and the one the panel was written for.
+  // Suppressing that hides a turn which applied a change, spawned a sub-thread
+  // and wrote a full summary, behind a bare "Response interrupted". A stepless
+  // boundary still renders bare, the common case the panel was written for.
   //
   // The test is RENDERABLE content, not `hasEvents`. A boundary picks up the
-  // drain of whatever the teardown just killed, and a coding-agent subprocess
-  // signs off with a bare `"\n\n"`, which becomes a `text` event that counts
-  // toward `hasEvents` and then draws nothing. That gave the switch-teardown
-  // boundary a response panel whose only visible content was its status badge,
-  // reading "Working" over a stopped engine.
+  // drain of whatever the teardown killed, and a coding-agent subprocess signs
+  // off with a bare `"\n\n"`. That becomes a `text` event counting toward
+  // `hasEvents` and drawing nothing. The switch-teardown boundary then gets a
+  // response panel whose only content is a "Working" badge over a stopped
+  // engine.
   const isTerminatedContinuation = (isAbortPanel || isCancelPanel)
     && (hasResponse || hasRenderableResponseContent(events));
-  // The user's Stop-waiting turn. Nothing resumes out of it (a stop is the one
-  // resolution with no wake), so unlike the abort and cancel boundaries above it
-  // takes no continuation exception: the header line IS the whole turn, and a
-  // response panel under it would be a status badge over an empty body.
+  // The user's Stop-waiting turn. Nothing resumes out of it, since a stop is
+  // the one resolution that re-enters nothing. So unlike the abort and cancel
+  // boundaries it takes no continuation exception: the header line IS the whole
+  // turn, and a response panel would be a status badge over an empty body.
   const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
   const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
@@ -604,9 +568,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     initiatorActions = changeActions(
       (exchange.userEvent as { change_id?: string }).change_id,
       exchange.userEvent.type === 'ChangeApplyFailed',
-      // ChangeApplied always resolves to at least a Revert button — reserve the
-      // footer row while the Change row loads so the buttons don't shift the
-      // panel down on first open (mirrors the body's ChangeProposed seed).
+      // ChangeApplied always resolves to at least a Revert button. Reserving
+      // the footer row while the Change row loads stops the buttons shifting
+      // the panel down on first open, mirroring the body's ChangeProposed seed.
       exchange.userEvent.type === 'ChangeApplied',
     );
   } else if (isAbortPanel && isContinuableAbort) {
@@ -616,18 +580,17 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
   function renderResponseEvents(eventsList: ResponseEvent[], baseIndex = 0) {
     return eventsList.map((evt, i) => {
-      // Key by ABSOLUTE index in visibleEvents (baseIndex + i), not the local
-      // per-section slice index: `splitEventSections` hands each section its base
-      // offset, so a row's key is stable across renders even as earlier sections
-      // grow during streaming — which keeps the visible rows stable instead of
-      // re-rendering the whole tail (and re-setting every
-      // `dangerouslySetInnerHTML`) on each streamed event.
+      // Key by ABSOLUTE index in `visibleEvents`, not the local per-section
+      // slice index. `splitEventSections` hands each section its base offset,
+      // so a row's key is stable even as earlier sections grow during
+      // streaming. That keeps the visible rows stable rather than re-rendering
+      // the whole tail on each streamed event.
       const k = baseIndex + i;
       if (evt.type === 'text' && evt.md?.trim()) {
-        // Classed so the chunk can own the space around itself. Interleaved with
-        // step rows, its markdown paragraph's bottom-only margin was the only
-        // thing separating prose from a log row, which put all the air on one
-        // side (see `.response-chunk` in chat/response.css).
+        // Classed so the chunk can own the space around itself. Interleaved
+        // with step rows, a markdown paragraph's bottom-only margin is all that
+        // separates prose from a log row, putting the air on one side. See
+        // `.response-chunk` in chat/response.css.
         return <div key={`t${k}`} class="response-chunk" dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
       }
       // `evt.type === 'step'` is `isStepMechanics` spelled inline, for the type
@@ -636,9 +599,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
       if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
       // Ungated, like every other marker. The park is the transcript's only
-      // record that the thread subscribed to something: the clock indicator
-      // holds the LIVE half and drops the wait the moment it resolves, so a
-      // toggle that defaults to off left a resolved wait recorded nowhere.
+      // record that the thread subscribed to something. The clock indicator
+      // holds the LIVE half and drops the wait as it resolves. A toggle
+      // defaulting to off would leave a resolved wait recorded nowhere.
       if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
@@ -731,17 +694,15 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       {error && (
         // The failure card is addressed by the `ResponseFailed`'s OWN event id,
         // not the exchange's. A notification raised by a failure deep-links to
-        // that event, and `ResponseFailed` is folded into the owning exchange as
-        // a terminal step (`REQUEST_ID_ROUTED_TYPES`), so the root's
-        // `data-event-id` above is the turn's STARTER and would never match.
-        // Stamping the card makes `scrollToEventAndPulse` land on and pulse the
-        // failure itself rather than the whole turn, and `isEventInViewport`
-        // report it (the notification in-app matrix's Row 1 auto-mark-read).
-        // The card is the only step-level surface that needs this today: every
-        // other deep-linkable event either starts its own exchange or, for a
-        // change, is addressed by `data-change-id`. Inline steps are NOT stamped
-        // on purpose, since the "Show steps" toggle can hide them, so an id
-        // there would resolve only sometimes.
+        // that event. `ResponseFailed` folds into the owning exchange as a
+        // terminal step, so the root's `data-event-id` is the turn's STARTER
+        // and never matches. Stamping the card lets `scrollToEventAndPulse`
+        // land on the failure itself and `isEventInViewport` report it.
+        //
+        // It is the only step-level surface needing this: every other
+        // deep-linkable event either starts its own exchange or is addressed by
+        // `data-change-id`. Inline steps are NOT stamped, since the "Show
+        // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
           <strong>Event stream error</strong>
           <p>{error.message}</p>
@@ -753,28 +714,22 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
  *
- *  Default `memo` would shallow-compare props; a from-scratch
- *  `computeExchanges` pass produces fresh Exchange objects, so the default
- *  would re-render every child on every SSE event. We compare a
- *  **content-relevant** fingerprint instead:
+ *  Default `memo` shallow-compares props, and a from-scratch `computeExchanges`
+ *  pass produces fresh Exchange objects, so it would re-render every child on
+ *  every SSE event. A **content-relevant** fingerprint is compared instead:
  *
- *   - `revision` — the in-place mutation counter, captured as a primitive at
+ *   - `revision`, the in-place mutation counter, captured as a primitive at
  *     render time. The incremental grouping cache keeps Exchange objects
- *     identity-stable and mutates them in place (steps push,
- *     questionOvertaken flip), so when `prev.exchange === next.exchange`
- *     every field compare below is a self-comparison and detects nothing —
- *     the captured revision numbers are the only honest change signal.
- *   - `userSeq` — the exchange boundary; switching to a different exchange.
- *   - `steps.length` + last step's `seq` — a new event landed in this
- *     exchange (covers the fresh-objects case where identities differ).
- *   - `questionOvertaken` — divider exchange flips this when the agent
- *     ignored a question; renders differently.
- *   - `continuationMoved` — the turn was handed to a later exchange, which
+ *     identity-stable and mutates them in place, so when
+ *     `prev.exchange === next.exchange` every field compare below is a
+ *     self-comparison. The captured revisions are the only honest signal.
+ *   - `userSeq`, the exchange boundary.
+ *   - `steps.length` plus the last step's `seq`: a new event landed here.
+ *   - `questionOvertaken`, flipped when the agent ignored a question.
+ *   - `continuationMoved`, the turn handed to a later exchange, which
  *     finalizes this one's pending Thinking marker.
  *
- *  All other props are primitives or strings — Object.is per field. When
- *  every field matches we return `true` to skip the re-render entirely.
- */
+ *  All other props are primitives or strings, compared with Object.is. */
 function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.revision !== next.revision) return false;
   if (prev.streamingBuffer !== next.streamingBuffer) return false;
@@ -792,9 +747,9 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadCanceling !== next.threadCanceling) return false;
   if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
   if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
-  if (prev.wakeEventType !== next.wakeEventType) return false;
-  if (prev.wakeEventId !== next.wakeEventId) return false;
-  if (prev.wakePayloadJson !== next.wakePayloadJson) return false;
+  if (prev.matchedEventType !== next.matchedEventType) return false;
+  if (prev.matchedEventId !== next.matchedEventId) return false;
+  if (prev.matchedPayloadJson !== next.matchedPayloadJson) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
@@ -811,21 +766,20 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
  *  on every per-SSE-event ThreadView re-render of the heavy thread. */
 export const ChatExchange = memo(ChatExchangeImpl, chatExchangePropsEqual);
 
-/** Whether the response panel gets a status badge at all. Two turns already
- *  state their own outcome in the panel ABOVE the response, and a second
- *  rendering of it is at best noise and at worst a contradiction:
+/** Whether the response panel gets a status badge at all. Two turns state
+ *  their own outcome in the panel ABOVE the response, so a second rendering is
+ *  noise at best and a contradiction at worst:
  *
  *  - A question card whose own Cancel-as-picked button carries the "Canceled ✕"
  *    signal.
  *  - A **switch-teardown boundary**. Its initiator panel reads "Paused by
- *    restart", which is the engine promising to bring the turn back, and the
- *    badge under it would be the "Aborted ⚠" the drain earns from the stale
- *    detector. Painting the failure affordance on a switch is precisely what
+ *    restart", the engine promising to bring the turn back. The badge under it
+ *    would be the "Aborted ⚠" the drain earns from the stale detector.
+ *    Painting a failure affordance on a switch is what
  *    `docs/plans/2026-08-06-paused-only-for-a-user-initiated-switch.md` removed
- *    from the status dot; the response badge is the same claim in another place.
- *    Narrowed to the switch fingerprint on purpose: an ordinary abort boundary
- *    CAN acquire a live turn (a `safety_net` abort over a loop that kept going,
- *    real thread ebc787a4), and that turn needs its "Working" badge. */
+ *    from the status dot. Narrowed to the switch fingerprint on purpose: an
+ *    ordinary abort boundary CAN acquire a live turn, and that turn needs its
+ *    "Working" badge. */
 export function shouldShowResponseStatusBadge(
   userEvent: ThreadEvent,
   statusClass: string,
@@ -916,28 +870,33 @@ function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVar
   return originMode(actor) === 'agent' ? 'lucidos' : 'system';
 }
 
-/** Map a `MessageOrigin` to its display icon + label. The chip answers "who
- *  decided this" with one of the closed set of known actors: **You** (a real
- *  browser device), **Lucidos Agent** (LLM acting on behalf of the user —
- *  rendered as the Lucidos mark), **Lucidos Engine** (deterministic engine
- *  work — rendered as the SAME Lucidos mark; the label is what tells it apart
- *  from the agent), **System** (host killed the process), or **API caller**
- *  (external HTTP caller that did NOT self-identify as one of the above).
+/** Map a `MessageOrigin` to its display icon and label. The chip answers "who
+ *  decided this" from a closed set of actors:
  *
- *  "You" is reserved for `kind: device` — a browser session bound to a known
- *  device row. Any other human-mode origin (anonymous API client, cross-workspace
- *  human, …) renders as "API caller" so an unauthenticated POST can never
- *  impersonate the user in the timeline. The popover still discloses the
- *  origin kind, user-agent, and workspace name underneath.
+ *  - **You**, a real browser device.
+ *  - **Lucidos Agent**, the LLM acting for the user, as the Lucidos mark.
+ *  - **Lucidos Engine**, deterministic engine work, as the SAME mark. The label
+ *    is what tells it apart from the agent.
+ *  - **System**, the host killing the process.
+ *  - **API caller**, an external HTTP caller that did not self-identify.
  *
- *  Lives in the view layer (not the store) because both Lucidos actor icons are
- *  a brand component (`<LucidosGlyph/>`), matching how `describeExecutor`
- *  resolves the same glyph — the store model stays free of UI components. */
+ *  "You" is reserved for `kind: device`, a browser session bound to a known
+ *  device row. Any other human-mode origin renders as "API caller", so an
+ *  unauthenticated POST can never impersonate the user in the timeline. The
+ *  popover still discloses the origin kind, user-agent and workspace name.
+ *
+ *  Lives in the view layer rather than the store, because EVERY actor icon is a
+ *  component, matching how `describeExecutor` resolves the same glyphs. The
+ *  store owns the LABELS and nothing else, staying free of UI components.
+ *  `ApiPlugIcon` records why the API caller gets a plug; the System chip's own
+ *  reason sits at its branch below. */
 export function actorInitiator(actor: MessageOrigin | undefined): { icon: ComponentChildren; label: string } {
-  if (actor?.kind === 'system') return { icon: SYSTEM_ICON, label: SYSTEM_LABEL };
-  if (actor?.kind === 'device') return { icon: '\u{1F464}', label: 'You' };
+  // The host system killed the process (engine shutdown, OS signal, crash), so
+  // the power symbol rather than the Lucidos mark the deliberate engine wears.
+  if (actor?.kind === 'system') return { icon: <PowerIcon />, label: SYSTEM_LABEL };
+  if (actor?.kind === 'device') return { icon: <PersonIcon />, label: 'You' };
   switch (originMode(actor)) {
-    case 'human':  return { icon: API_CALLER_ICON, label: API_CALLER_LABEL };
+    case 'human':  return { icon: <ApiPlugIcon />, label: API_CALLER_LABEL };
     case 'agent':  return { icon: <LucidosGlyph />, label: LUCIDOS_AGENT_LABEL };
     case 'engine': return { icon: <LucidosGlyph />, label: ENGINE_LABEL };
   }
@@ -948,7 +907,7 @@ export function actorInitiator(actor: MessageOrigin | undefined): { icon: Compon
  *  every arm where the device-owner is the initiator (MessageReceived from a
  *  device, divider-starter ActionRequired events, …). */
 function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescriptor {
-  return { variant: 'user', icon: '\u{1F464}', label: 'You', ...rest };
+  return { variant: 'user', icon: <PersonIcon />, label: 'You', ...rest };
 }
 
 /** Build a `'system'`-variant descriptor with the engine chip (Lucidos mark +
@@ -975,16 +934,20 @@ function actionInitiator(label: string, details?: ComponentChildren): InitiatorD
  *  agent racing past the prompt). */
 type DividerTerminalKind = 'canceled' | 'dropped';
 
-/** Resolution status for question / permission dividers — shown in the initiator
- *  header. The header describes what happened to the PROMPT, never the turn:
- *  "Answered"/"Resolved" (✓) when the user responded, "Canceled" (✕) when the
- *  user explicitly dismissed it, "Unanswered"/"Unresolved" (muted) when the turn
- *  ended without a response for any other reason, and a plain "Needs your answer"
- *  call-to-action while pending. The turn's own terminal cause (Aborted ⚠ /
- *  Error ✕) is carried by the response panel + the abort boundary — the header
- *  must NOT impersonate it (a system abort previously rendered here as the
- *  user-driven "Canceled", contradicting the "Aborted" panel right below it).
- *  Reuses the response panel's `.exchange-status-*` classes so the glyphs match. */
+/** Resolution status for question and permission dividers, shown in the
+ *  initiator header. The header describes what happened to the PROMPT, never
+ *  the turn:
+ *
+ *  - "Answered" or "Resolved" (✓) when the user responded.
+ *  - "Canceled" (✕) when they dismissed it.
+ *  - "Unanswered" or "Unresolved" when the turn ended for any other reason.
+ *  - "Needs your answer" while pending.
+ *
+ *  The response panel and the abort boundary carry the turn's own terminal
+ *  cause. The header must NOT impersonate it: a system abort rendering here
+ *  as the user-driven "Canceled" contradicts the "Aborted" panel below it.
+ *  Reuses the response panel's `.exchange-status-*` classes, so the glyphs
+ *  match. */
 function dividerStatus(
   resolved: boolean,
   resolvedLabel: string,
@@ -1011,23 +974,22 @@ export function describeInitiator(
    *  dividers. */
   threadIsCC: boolean = false,
   threadCodingAgent: CodingAgent = 'claude-code',
-  /** First line of the in-thread `ChangeProposed` description + its file count,
-   *  forwarded to <ChangeBody> for the change-lifecycle arms so the body paints
-   *  at full height on first open (before the per-id Change fetch lands). */
+  /** First line of the in-thread `ChangeProposed` description and its file
+   *  count, forwarded to <ChangeBody> for the change-lifecycle arms. The body
+   *  then paints at full height on first open. */
   proposedChangeDesc?: string,
   proposedChangeFileCount?: number,
-  /** The event a detached wake delivered, already resolved through this
-   *  exchange's `UserPromptInjected.delivered_event_id` (see
+  /** The event a *thread subscription* delivered, already resolved through
+   *  this exchange's `UserPromptInjected.delivered_event_id` (see
    *  `buildDeliveredEventInfo`). Undefined for every exchange that is not such
-   *  a wake.
+   *  a delivery.
    *
-   *  ONE object rather than three trailing `string | undefined` params, which is
-   *  what the third one made unsafe: at the end of a twelve-argument positional
-   *  list, same-typed neighbours mis-order without a type error, and adding
-   *  `eventId` in the middle silently re-bound an existing test's payload
-   *  argument to it. The fields are still flat primitives (never the payload
-   *  object) so `chatExchangePropsEqual` compares them without a deep walk. */
-  wake?: { eventType?: string; eventId?: string; payloadJson?: string },
+   *  ONE object rather than three trailing `string | undefined` params. At the
+   *  end of a twelve-argument positional list, same-typed neighbours mis-order
+   *  with no type error, and inserting one silently re-binds a caller's
+   *  argument. The fields are still flat primitives, never the payload object,
+   *  so `chatExchangePropsEqual` compares them without a deep walk. */
+  matched?: { eventType?: string; eventId?: string; payloadJson?: string },
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -1037,7 +999,7 @@ export function describeInitiator(
       // header drops its own summary line rather than saying it twice.
       return {
         variant: 'trigger',
-        icon: '⏰',
+        icon: <TriggerFiredIcon />,
         label: ENGINE_LABEL,
         details: <TriggerFiredBody event={ev} />,
       };
@@ -1059,7 +1021,7 @@ export function describeInitiator(
       // Exchange boundary — let the actor drive the chip (engine for crashes,
       // device for restarts and user-triggered stale-settle cleanups). A
       // device-driven abort (you hit Restart) renders iconless like a cancel;
-      // engine/system aborts keep their Lucidos-mark/⚙ chip.
+      // engine aborts keep the Lucidos mark and system ones the power symbol.
       if (ev.actor?.kind === 'device') {
         return actionInitiator(summary);
       }
@@ -1123,21 +1085,20 @@ export function describeInitiator(
       return {
         variant: actorVariant(ev.origin),
         ...actorInitiator(ev.origin),
-        // A detached event wake, resolved through `delivered_event_id`, is the
+        // An event delivery, resolved through `delivered_event_id`, is the
         // one injection whose text is NOT its content: the prose is the model's
         // prompt and carries the payload as raw JSON. Name the event instead
         // and fold the payload away. Falls back to the prose whenever the link
         // is absent (every other injection, legacy rows) or unresolved (the
         // delivery scrolled out of the loaded window).
         //
-        // No summary line on the wake: its event row already reads "Woke on
-        // <event>", so a header saying the same words printed it twice, once as
-        // plain prose and once in the card underneath (reported 2026-08-10).
+        // No summary line on the delivery: its event row already reads "Event
+        // arrived: <event>", so a header saying the same words prints it twice.
         // Same as the trigger and the child callback, whose rows own their
         // prefixes too.
-        summary: wake?.eventType ? undefined : summary,
-        details: wake?.eventType
-          ? <EventDeliveryBody eventType={wake.eventType} eventId={wake.eventId} payloadJson={wake.payloadJson} />
+        summary: matched?.eventType ? undefined : summary,
+        details: matched?.eventType
+          ? <EventDeliveryBody eventType={matched.eventType} eventId={matched.eventId} payloadJson={matched.payloadJson} />
           : <MarkdownBlock html={userMessageHtml} />,
       };
     case 'MessageReceived': {
@@ -1151,12 +1112,11 @@ export function describeInitiator(
     }
     case 'ChildThreadCompleted':
       // The EventBus fan-in path raises this on the parent when a child thread
-      // reaches a terminal event — deterministic engine plumbing, not LLM work
-      // — so attribute it to the engine (Lucidos mark + Lucidos Engine),
-      // consistent with every other engine-injected event (trigger fired,
-      // hardening, merge). The child agent's authored summary lives in the card
-      // body; the chip is non-clickable because the title-link is the origin
-      // affordance.
+      // reaches a terminal event. That is deterministic engine plumbing, not
+      // LLM work, so attribute it to the engine like every other
+      // engine-injected event. The child agent's authored summary lives in the
+      // card body. The chip is non-clickable, since the title-link is the
+      // origin affordance.
       return {
         variant: 'system',
         icon: <LucidosGlyph />,

@@ -84,10 +84,13 @@ pub struct PrefSpec {
     pub side_effect: PrefSideEffect,
 }
 
-/// Mirrors the OpenAI/Anthropic reasoning tiers in
-/// `crates/lucidos-app/src/store/models.ts` (`REASONING_LEVELS`). The engine
-/// clamps to what each model supports, so the catalog only checks membership.
-pub(crate) const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+/// The unified reasoning vocabulary, straight from `llm::reasoning`, which also
+/// decides which of these tiers a given model supports and clamps a request
+/// onto the closest one. The catalog only checks membership: a value that is a
+/// tier but unavailable on the user's current model is accepted here and
+/// snapped at the routing chokepoint, so changing the model can never make a
+/// stored preference unwritable.
+pub(crate) const REASONING_EFFORTS: &[&str] = crate::llm::EFFORT_LADDER;
 /// Mirrors `ImageModel` in `crates/lucidos-app/src/store/actions/preferences.ts`.
 const IMAGE_MODELS: &[&str] = &[
     "auto",

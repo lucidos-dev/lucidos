@@ -81,13 +81,12 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
  *  file count, and (when failed) the error message. The resolved timestamp is
  *  the panel header timestamp (the change-lifecycle event time IS resolved_at).
  *
- *  `seedDescription`/`seedFileCount` come from the in-thread `ChangeProposed`
- *  event (already loaded with the thread). They render the body at its FINAL
- *  height on first open — before the per-id `Change` lazy-fetch lands — so a
- *  thread that ends with "Change applied" doesn't jump when the fetched row
- *  pops the description + file count in (the open-path scroll-to-bottom would
- *  re-pin to the grown bottom, shifting everything up). The authoritative live
- *  row wins once loaded; it's normally identical to the seed. */
+ *  `seedDescription` / `seedFileCount` come from the in-thread `ChangeProposed`
+ *  event, already loaded with the thread. They render the body at its FINAL
+ *  height on first open, before the per-id `Change` lazy-fetch lands. So a
+ *  thread ending with "Change applied" does not jump when the fetched row pops
+ *  its description and file count in. The authoritative live row wins once
+ *  loaded, and is normally identical to the seed. */
 export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: { changeId?: string; error?: string; seedDescription?: string; seedFileCount?: number }) {
   const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
   const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
@@ -102,17 +101,16 @@ export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: 
     : undefined;
   const fileCount = change?.file_count ?? seedFileCount;
 
-  // Lifecycle error and any body content (live row OR in-thread seed) both win
-  // over the lazy-fetch state — a 404 for a row that arrives via SSE moments
-  // later shouldn't strand a stale "Failed to load" row, and a seeded body is
-  // already complete, so the fetch failure (which only gates the footer's
-  // Diff/Revert) must not surface a redundant error line beneath it.
+  // A lifecycle error and any body content both win over the lazy-fetch state.
+  // A 404 for a row arriving via SSE moments later must not strand a stale
+  // "Failed to load" line. A seeded body is already complete, and the fetch
+  // failure only gates the footer's Diff and Revert.
   const lazyFailedError = !error && !desc && fileCount == null && lazy.status === 'failed'
     ? `Failed to load change details: ${lazy.error}`
     : undefined;
-  // No "Loading..." line once the seed has already painted the body — the
-  // fetch is still running (the footer's Diff/Revert need the live row), but
-  // the body is complete, so a Loading line would just be a flicker + a shift.
+  // No "Loading..." line once the seed has painted the body. The fetch is still
+  // running for the footer's Diff and Revert. But the body is complete, so a
+  // Loading line would be a flicker and a shift.
   const lazyLoading = !desc && fileCount == null && lazy.status === 'loading' && showLoading;
 
   if (!desc && fileCount == null && !error && !lazyFailedError && !lazyLoading) return null;
@@ -181,36 +179,25 @@ export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
   );
 }
 
-/** The body of a detached event-wake exchange: the event that woke the thread,
- *  named, with its payload folded away (ADR 0047).
+/** The body of an event-delivery exchange: the event a *thread subscription*
+ *  delivered, named, with its payload folded away (ADR 0047).
  *
- *  The alternative it replaces is why this exists at all. The wake's
- *  `UserPromptInjected.text` has to spell the payload out as pretty-printed
- *  JSON, because that text IS the prompt the model reads, and rendering it
- *  through `MarkdownBlock` put a screen and a half of raw JSON in the
- *  transcript (with markdown helpfully auto-linking the email-shaped part of a
- *  path inside it). The engine links the anchor back to its
- *  `EventWaitDelivered` precisely so the client can show the same facts as
- *  structure instead.
+ *  The anchor's `UserPromptInjected.text` spells the payload out as
+ *  pretty-printed JSON, because that text IS the prompt the model reads.
+ *  Rendering it through `MarkdownBlock` puts a screen of raw JSON in the
+ *  transcript. The engine links the anchor to its `EventWaitDelivered` so the
+ *  client can show the same facts as structure. Closed by default: the NAME
+ *  answers "why did this thread start talking again". It names no arming reason
+ *  either. That reason lives on the `EventWaitStarted`, routinely outside the
+ *  loaded window by then, and a row states no fact its own event carries.
  *
- *  Closed by default: the event's NAME is the answer to "why did this thread
- *  start talking again", and the payload is for the rare follow-up question.
+ *  **"Event arrived", never "Woke on".** The anchor records no idle flag.
+ *  `resume_from_event_wake` injects the delivery into a live turn when there is
+ *  one, so the card must be true of both lanes. See
+ *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
  *
- *  It names no arming reason, deliberately. The reason lives on the
- *  `EventWaitStarted`, which is routinely outside the loaded window by the time
- *  the wake lands, and a row states no fact its own event carries.
- *
- *  **This is where the jump to the matched event lives** (moved here on
- *  2026-08-10 from the arming card, which is about the moment the wait was SET
- *  UP and had no business linking to something that happened hours later). This
- *  card IS the arrival, so a link out of it goes to the thing that arrived.
- *
- *  **The event's NAME is that jump**, as of 2026-08-10. It used to be a separate
- *  "Go to event" link on the facts line, which put two things to read on the
- *  card for one destination while the chip right above it already named the
- *  destination.
- *
- *  The thin hook-holding wrapper; the markup is `eventDeliveryBody`. */
+ *  The jump to the matched event lives here and the NAME is it, since this card
+ *  IS the arrival. The markup is `eventDeliveryBody`. */
 export function EventDeliveryBody({
   eventType,
   eventId,
@@ -220,9 +207,9 @@ export function EventDeliveryBody({
   eventId?: string;
   payloadJson?: string;
 }) {
-  // Resolving the matched event's thread is a round-trip in every case except a
-  // match in this same thread, so the chip dims and goes inert while the jump
-  // is in flight rather than accepting a second tap. See `showEventWhereItLives`.
+  // Resolving the matched event's thread is a round-trip except for a match in
+  // this same thread. So the chip dims and goes inert while the jump is in
+  // flight, rather than accepting a second tap. See `showEventWhereItLives`.
   const opening = useSignal(false);
   const linkable = useEventTarget(eventId);
   return eventDeliveryBody({
@@ -257,17 +244,17 @@ function useEventTarget(eventId: string | undefined): boolean {
   return eventHasTarget(eventId);
 }
 
-/** The row's markup, hookless for the same reason `eventWaitRowBody` is: there
+/** The row's markup, hookless for the same reason `eventWaitRowBody` is. There
  *  is no jsdom in the test infra, so a component carrying a hook cannot be
- *  invoked as a plain function and the tests drive this instead.
+ *  invoked as a plain function. The tests drive this instead.
  *
- *  `onOpenMatched` absent means there is nowhere to go, and then the event name
- *  is inert text: no link, no affordance, no dead tap. Both of the ways that
- *  happens are ordinary rather than exceptional, which is why the plain form is
- *  the default and not a fallback. The engine may have recorded no `event_id`
- *  for the delivery at all, and a recorded one may point at an event that no
- *  transcript draws (a workspace domain event belongs to no conversation; a
- *  `BackgroundBashCompleted` merely landed inside whichever turn was open). */
+ *  `onOpenMatched` absent means there is nowhere to go, and the event name is
+ *  then inert text: no link, no affordance, no dead tap. Both of the ways that
+ *  happens are ordinary, which is why the plain form is the default rather than
+ *  a fallback. The engine may have recorded no `event_id` for the delivery, and
+ *  a recorded one may point at an event no transcript draws. A workspace domain
+ *  event belongs to no conversation, and a `BackgroundBashCompleted` merely
+ *  landed inside whichever turn was open. */
 export function eventDeliveryBody({
   eventType,
   payloadJson,
@@ -280,17 +267,16 @@ export function eventDeliveryBody({
   onOpenMatched?: () => void;
 }) {
   return eventRowBody({
-    kind: 'wake',
+    kind: 'delivery',
     mark: 'arrived',
     role: 'event-delivery',
-    // The matched event usually lives somewhere ELSE: the headline cases are a
-    // `CodingAgentIdled` or a `ChangeProposed` from the coding-agent thread this
-    // one was watching. So the jump resolves the owning thread first and
-    // navigates there, rather than searching the open thread's DOM for an event
-    // that is by construction not in it.
+    // The matched event usually lives somewhere ELSE: a `CodingAgentIdled` or a
+    // `ChangeProposed` from the coding-agent thread this one watched. So the
+    // jump resolves the owning thread first and navigates there, rather than
+    // searching the open thread's DOM for an event not in it.
     subject: (
       <>
-        {'Woke on '}
+        {'Event arrived: '}
         {eventNameChip({
           kind: 'chip',
           name: eventType,
@@ -309,26 +295,23 @@ export function eventDeliveryBody({
 type TriggerStartedEvent = Extract<Exchange['userEvent'], { type: 'TriggerStarted' }>;
 
 /** A trigger firing, as an **event row**: the same marker an event wait, an
- *  event wake and a child callback use. Something outside the thread happened
+ *  event delivery and a child callback use. Something outside the thread happened
  *  and started a turn, which is the one thing all four report.
  *
- *  The prompt goes in the fold. It used to be the whole body, rendered as
- *  markdown, which put a trigger's full instructions above the response it
- *  produced every time one fired.
+ *  The prompt goes in the fold, rather than being the whole body: rendered as
+ *  markdown it put a trigger's full instructions above every response.
  *
  *  **It names no schedule.** `TriggerStarted` carries `invocation: { kind:
- *  'Schedule' }` and no cron expression, so a scheduled run says `scheduled` and
- *  stops rather than inventing one. An event-driven run does carry its
- *  `event_type`, and gets the chip.
+ *  'Schedule' }` and no cron expression, so a scheduled run says `scheduled`
+ *  rather than inventing one. An event-driven run carries its `event_type` and
+ *  gets the chip.
  *
- *  **That chip is the jump, when there is one.** It was a separate "Go to event"
- *  link beside the chip, and on this row it was usually a guaranteed toast: a
- *  trigger fires on a workspace domain event, which belongs to no conversation
- *  and therefore has no transcript to open. The engine does also fire triggers
- *  on thread-scoped events (`TriggerInvocation::Event` carries an
- *  `origin_thread_id`), and those genuinely do open, so the rule is the same one
- *  the wake card uses rather than a blanket "never link here": the chip links
- *  only when the event turns out to live somewhere.
+ *  **That chip is the jump, when there is one.** A trigger usually fires on a
+ *  workspace domain event, which belongs to no conversation and has no
+ *  transcript to open. The engine also fires triggers on thread-scoped events
+ *  (`TriggerInvocation::Event` carries an `origin_thread_id`), and those do
+ *  open. So the rule is the delivery card's rather than a blanket "never link
+ *  here": the chip links only when the event turns out to live somewhere.
  *
  *  The thin hook-holding wrapper; the markup is `triggerFiredBody`. */
 export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
@@ -352,9 +335,9 @@ export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
   });
 }
 
-/** The row's markup, hookless for the same reason `eventWaitRowBody` is: there
+/** The row's markup, hookless for the same reason `eventWaitRowBody` is. There
  *  is no jsdom in the test infra, so a component carrying a hook cannot be
- *  invoked as a plain function and the tests drive this instead.
+ *  invoked as a plain function. The tests drive this instead.
  *
  *  `onOpenMatched` absent means the matched event has nowhere to open, and the
  *  chip is then inert text. See the wrapper above for why that is the common
@@ -403,11 +386,11 @@ export function triggerFiredBody({
  *  change has no relevant actions (e.g. ChangeApplyFailed leaves the change
  *  pending — user reads the error, doesn't diff/revert).
  *
- *  `reserveWhileLoading` (set for ChangeApplied panels, which always get at
- *  least a Revert button) renders a hidden button placeholder while the per-id
- *  `Change` row is still being fetched — so the real Diff/Revert buttons slot
- *  into an already-reserved footer row without a vertical shift on first open.
- *  Mirrors the body's `seed*` props in <ChangeBody>. */
+ *  `reserveWhileLoading` renders a hidden button placeholder while the per-id
+ *  `Change` row is being fetched. The real Diff and Revert buttons then slot
+ *  into an already-reserved footer row, with no vertical shift on first open.
+ *  It is set for ChangeApplied panels, which always get at least a Revert
+ *  button. Mirrors the body's `seed*` props in <ChangeBody>. */
 export function changeActions(changeId?: string, suppress?: boolean, reserveWhileLoading?: boolean): ComponentChildren {
   if (suppress || !changeId) return null;
   const change = findChangeById(changeId);
@@ -427,18 +410,18 @@ export function changeActions(changeId?: string, suppress?: boolean, reserveWhil
   );
 }
 
-/** Shared header click handler for InitiatorPanel/ResponsePanel — toggles the
- *  panel's collapsed state, but ignores clicks that originated on a button or
- *  link inside the header (actor info, executor info, stop). */
+/** Shared header click handler for InitiatorPanel and ResponsePanel. It toggles
+ *  the panel's collapsed state, ignoring clicks that originated on a button or
+ *  link inside the header. */
 function handlePanelHeaderClick(e: MouseEvent, onToggle?: () => void): void {
   if (!onToggle) return;
   if ((e.target as HTMLElement).closest('button, a')) return;
   onToggle();
 }
 
-/** Shown in place of a collapsed panel's body (initiator OR response) so a
- *  folded turn never reads as an empty row — a muted "⋯", rendered as an
- *  accent stub bubble for user messages. Clicking it expands the panel. */
+/** Shown in place of a collapsed panel's body, so a folded turn never reads as
+ *  an empty row. A muted "⋯", rendered as an accent stub bubble for user
+ *  messages. Clicking it expands the panel. */
 function CollapsedIndicator({ bubble = false, onToggle }: { bubble?: boolean; onToggle?: () => void }) {
   return (
     <div class={`turn-collapsed${bubble ? ' turn-collapsed-bubble' : ''}`} onClick={onToggle}>
@@ -546,19 +529,17 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
 // Body is the response content; collapses when the user clicks the header.
 // ---------------------------------------------------------------------------
 
-/** Triggers invoke the Lucidos agent rather than running their own executor,
- *  so the label always reflects the LLM that produced the response. The model
- *  is shown in the executor info popover, not in the header. The "Lucidos
- *  Agent" name matches the initiator label used when one Lucidos thread
- *  spawns another — same entity, same display. */
-/** Claude Code reads "Claude" HERE and nowhere else. This row is the tightest in
- *  the app on a phone (the executor, then three turn controls, then the status,
- *  then the timestamp) and the coding agent's own name was the longest thing in
- *  it. Every other "Claude Code" in the app names the BACKEND the user is
- *  choosing between (the compose destination, the settings binaries row, the
- *  coding-agent control menu, the drawer's channel tag), and there the full
- *  product name is the point, so those stay. The icon beside it carries the rest
- *  of the identity, and the popover the label opens names the model exactly. */
+/** Triggers invoke the Lucidos agent rather than running their own executor, so
+ *  the label always reflects the LLM that produced the response. The model is
+ *  shown in the executor info popover, not in the header. "Lucidos Agent"
+ *  matches the initiator label used when one Lucidos thread spawns another.
+ *
+ *  Claude Code reads "Claude" HERE and nowhere else. This row is the app's
+ *  tightest on a phone, and the coding agent's own name was the longest thing
+ *  in it. Every other "Claude Code" names the BACKEND the user is choosing
+ *  between, where the full product name is the point, so those stay. The icon
+ *  beside it carries the rest of the identity, and the popover the label opens
+ *  names the model exactly. */
 export function describeExecutor(
   isCC: boolean,
   codingAgent: CodingAgent = 'claude-code',
@@ -575,10 +556,9 @@ interface TurnControlsProps {
   /** This turn folded to its `⋯` stub. Unlike the two above, per-turn state. */
   collapsed: boolean;
   /** Whether this turn HAS a body to fold (`canCollapse`). False on a panel
-   *  that is only a status line so far, and the collapse control is disabled
-   *  there: the store would take the fold and hold it, so the click would look
-   *  dead and then land later, folding the turn the moment its first content
-   *  arrived. */
+   *  that is only a status line so far, where the collapse control is disabled.
+   *  The store would otherwise take the fold and hold it. The click then looks
+   *  dead and lands later, folding the turn as its first content arrives. */
   collapsible: boolean;
   onToggleDetails: () => void;
   onToggleSteps: () => void;
@@ -589,55 +569,28 @@ interface TurnControlsProps {
  *  executor label, evenly spaced as one run.
  *
  *  The first two are the detail toggles, the full response and the step log,
- *  both ON until the reader turns one off. They were text links at the top of the
- *  response BODY ("More" / "Less" and "Show steps" / "Hide steps"), which
- *  pushed the answer down by a row and reflowed that row on every click, since
- *  both labels change width as they toggle. As icons in the header they cost
- *  the body nothing and the row's width never moves.
+ *  both ON until the reader turns one off. Both always render, whatever this
+ *  turn holds. What they flip is a per-user setting spanning the whole
+ *  transcript. A turn with no steps is still a place to set how turns read.
+ *  Rendering them conditionally leaves holes in a column of identical headers.
  *
- *  Both always render, whatever this particular turn happens to hold. What they
- *  flip is a per-user setting that spans the whole transcript, so a turn with
- *  no steps of its own is not a turn where "show steps" means nothing: the
- *  reader is setting how turns read, from wherever they are looking. The links
- *  were conditional, and that made the pair jump around from turn to turn and
- *  left holes in a column of otherwise identical headers.
+ *  The third folds THIS turn to its `⋯` stub, and is the only one whose effect
+ *  stops at the turn it sits on. Its LABEL is what says so. The run stays
+ *  evenly spaced (styles/chat/response.css): a 2+1 break reads as "two things
+ *  and a stray" rather than as a scope split. It is also the only one stating
+ *  its state in its GLYPH rather than its brightness. `CollapseTurnIcon` and
+ *  `FullResponseIcon` carry the long form.
  *
- *  The third folds THIS turn to its `⋯` stub, and it is the only one whose
- *  effect stops at the turn it sits on. Its LABEL is what says so, naming the
- *  turn where the other two name what they reveal. An extra 0.3125rem of gap
- *  used to say it too, and that is gone (styles/chat/response.css): a run of
- *  three icons broken 2+1 makes a claim the eye reads before any tooltip, and
- *  it lands as "two things and a stray" rather than as a scope split. It used
- *  to be a click anywhere on the header row, which nothing announced; the row
- *  is inert now and this is the affordance.
- *
- *  It is also the only one that states its state in its GLYPH rather than its
- *  brightness: the arrowheads point together to fold and apart to unfold, and
- *  the brightness rule skips it. Both halves of that are the scope split again.
- *  Bright means "on, you are seeing MORE" on the pair, so bright-means-FOLDED
- *  would be the same cue inverted 0.125rem away from the two it contradicts,
- *  and it would report a state the `⋯` stub below is already unmissable about.
- *  The pair keeps a fixed glyph for the reason `FullResponseIcon` records, and
- *  this is a deliberate EXCEPTION to that reason, not a case it fails to reach.
- *  The line above used to claim the latter, on the grounds that the two forms
- *  here are one mark reflected; the banned mark was built that way too, so the
- *  geometry separates nothing and the argument was false. What separates them
- *  is the payoff: there, `aria-pressed` and brightness already answered "is it
- *  on", so the movement bought nothing. Here brightness is gone, which leaves
- *  direction as the only state cue there is. `CollapseTurnIcon` carries the
- *  long form.
- *
- *  Each is a `<button>`, which is what keeps a click off the initiator header's
+ *  Each is a `<button>`, which keeps a click off the initiator header's
  *  collapse handler: `handlePanelHeaderClick` ignores anything inside a
  *  `button, a`. */
 export function turnControls({
   detailsOn, stepsOn, collapsed, collapsible, onToggleDetails, onToggleSteps, onToggleCollapsed,
 }: TurnControlsProps): ComponentChildren {
-  // "the LATEST answer" and not "the answer": turning the full response off keeps
-  // only what follows the last text block (`getCollapsedVisibleEvents`), so a turn
-  // that said something, worked, and then said something else loses the first of
-  // the two. The old wording promised one answer where there had been several,
-  // and read as though the turn had only ever given one.
+  // "the LATEST answer" and not "the answer". Turning the full response off
+  // keeps only what follows the last text block (`getCollapsedVisibleEvents`).
+  // A turn that said something, worked, then said something else loses the
+  // first of the two.
   const detailsLabel = detailsOn ? 'Show the latest answer only' : 'Show the full response';
   const stepsLabel = stepsOn ? 'Hide steps' : 'Show steps';
   const collapseLabel = collapsed ? 'Expand this turn' : 'Collapse this turn';
@@ -741,10 +694,10 @@ function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/** Longest prompt we surface as an image tooltip. A generation prompt runs to
- *  several paragraphs routinely, and a tooltip that fills the pane is worse
- *  than a short one; the untruncated prompt stays one click away in the
- *  generating step's detail modal. */
+/** Longest prompt surfaced as an image tooltip. A generation prompt routinely
+ *  runs to several paragraphs, and a tooltip filling the pane is worse than a
+ *  short one. The untruncated prompt stays one click away in the generating
+ *  step's detail modal. */
 const IMAGE_PROMPT_SUMMARY_MAX = 240;
 
 /** A generated image's description: the prompt it came from, flattened to one
@@ -787,9 +740,9 @@ function lastLinePreview(text: string, max = 120): string {
 /** The context-usage suffix on a step row.
  *
  *  `compact` keeps only the percentage. The full "178k / 1000k (18%)" is wider
- *  than a narrow row's remaining space, and since the row is `nowrap` the excess
- *  would push the description out rather than wrap. The percentage is the part
- *  that is read at a glance anyway.
+ *  than a narrow row's remaining space. The row is `nowrap`, so the excess
+ *  pushes the description out rather than wrapping. The percentage is the part
+ *  read at a glance anyway.
  *
  *  Which form the user sees is decided in CSS, not here: `InlineStep` renders
  *  both and a container query on the row picks one (see `.step-context-compact`
@@ -814,9 +767,9 @@ export function contextLabel(
  *  a row rather than taking two (see `nameThinkingRow` in the projection).
  *
  *  The row therefore has TWO click targets, which is why it is a `<div>` around
- *  two buttons rather than one button (a `<button>` may not contain another
- *  interactive element). The main target opens what the step DID; the context
- *  counter opens what the model was SENT. */
+ *  two buttons rather than one button: a `<button>` may not contain another
+ *  interactive element. The main target opens what the step DID, and the
+ *  context counter opens what the model was SENT. */
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const { label, icon, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
@@ -837,11 +790,11 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
 
   const isPending = event.outcome === 'pending';
   // Both forms go into the DOM and CSS shows exactly one, because what decides
-  // is the ROW's own width, which nothing here can read: the row is as wide as
-  // the thread pane the user dragged the divider to, so a narrow pane on a
-  // desktop crowds the counter exactly the way a phone does. The gate is a
-  // container query on `.inline-step` (steps.css). Measuring in JS instead would
-  // mean re-rendering every step row on every frame of that drag.
+  // is the ROW's own width, which nothing here can read. The row is as wide as
+  // the thread pane the divider was dragged to. So a narrow desktop pane crowds
+  // the counter the way a phone does. The gate is a container query on
+  // `.inline-step` (steps.css). Measuring in JS would mean re-rendering every
+  // step row on every frame of that drag.
   const counter = hasContext && (
     <>
       <span class="step-context-full">
@@ -902,37 +855,44 @@ type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
 
 /** How each state reads on the row: the mark, and the state WORD with its tone.
  *
- *  None of these is a step outcome, and that is the point. The row rendered
- *  through `stepStatus` until 2026-08-10, which mapped `waiting` to `success`
- *  and therefore painted a green check on a subscription that might sleep for
- *  hours. A marker reports a fact; only the child-thread row legitimately shows
- *  a verdict, and that verdict is the CHILD's.
+ *  None of these is a step outcome, and that is the point. `stepStatus` takes a
+ *  `StepOutcome`, which has no `waiting`. Routing this row through it would
+ *  have to call a sleeping subscription `success` and paint a green check on
+ *  it. A marker reports a fact. Only the child-thread row shows a verdict, and
+ *  that verdict is the CHILD's.
  *
  *  `waiting` reads as live rather than in-progress: a shimmer would run for
  *  however long the thread sleeps and claim a turn was running when none is.
  *  `timed_out` and `canceled` are told apart by their words, not by red:
- *  nothing failed either time, the watch simply ended without its event. */
+ *  nothing failed either time, the watch simply ended without its event.
+ *
+ *  **`matched`, never "woke"**, and that is a fact about the subscription
+ *  rather than about the thread. A delivery does not require an idle thread:
+ *  `resume_from_event_wake` injects into a live turn when there is one, and
+ *  frames it to the model as arriving "while you were working". The row cannot
+ *  tell the two lanes apart (its anchor records no such flag), so it says the
+ *  thing that is true of both. Same reason `eventDeliveryBody` reads "Event
+ *  arrived" below. */
 const EVENT_WAIT_ROW_STATE: Record<
   EventWaitState,
   { mark: EventRowMark; label: string; tone: EventRowTone }
 > = {
   waiting: { mark: 'pending', label: 'waiting', tone: 'live' },
-  woke: { mark: 'arrived', label: 'woke', tone: 'arrived' },
+  matched: { mark: 'arrived', label: 'matched', tone: 'arrived' },
   timed_out: { mark: 'pending', label: 'timed out', tone: 'lapsed' },
   canceled: { mark: 'pending', label: 'stopped', tone: 'halted' },
 };
 
 /** Who stopped a subscription, in the words of whatever they pressed.
  *
- *  The word is **stopped**, never "discarded": *discarded* already means
- *  throwing a thing away in Lucidos (a discarded thread, change or draft), and
- *  one of these causes literally IS a discarded thread, so reusing it here
- *  would collide. "Stop waiting" is what the button says, so a stop is what
- *  this reads as. (The `canceled` identifiers underneath keep their names: they
- *  are on disk in persisted rows.)
+ *  The word is **stopped**, never "discarded". *Discarded* already means
+ *  throwing a thing away in Lucidos, and one of these causes IS a discarded
+ *  thread, so reusing it would collide. "Stop waiting" is what the button says.
+ *  The `canceled` identifiers underneath keep their names: they are on disk in
+ *  persisted rows.
  *
- *  A pre-2026-08-07 row carries no cause and falls back to the bare note, which
- *  says it stopped without claiming to know how. */
+ *  A row carrying no cause falls back to the bare note, which says it stopped
+ *  without claiming to know how. */
 const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
   user_stop: 'stopped from the panel',
   agent_stand_down: 'stood down',
@@ -944,33 +904,25 @@ const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
   unknown: 'stopped',
 };
 
-/** An event wait, as an **event row** (ADR 0047, amended 2026-08-06 and
- *  2026-08-10).
+/** An event wait, as an **event row** (ADR 0047). It shares one marker with the
+ *  event delivery, the child callback and the trigger fire.
  *
- *  It was a boxed `.step-note-card` until the box was dropped as too heavy for
- *  one action with no affordance in it, and then an `.inline-step` until that
- *  turned out to be the opposite mistake: it read as a finished tool call,
- *  green check and all, and ellipsized the reason and the subscription, which
- *  are the only two things the row has to say. It now shares one marker with
- *  the event wake, the child callback and the trigger fire.
- *
- *  Still deliberately NOT an exchange divider: an attached delivery resumes the
- *  SAME exchange, so the wake's steps continue below this row rather than under
+ *  Deliberately NOT an exchange divider: an attached delivery resumes the SAME
+ *  exchange, so the delivery's steps continue below this row rather than under
  *  a fresh boundary.
  *
- *  It holds no hook and no affordance. The jump to the matched event lived here
- *  until 2026-08-10 and moved to the wake card below, where the event actually
- *  arrived: this card is about the ARMING, and a link out of it to something
- *  that happened hours later did not read as belonging to it. */
+ *  It holds no hook and no affordance. The jump to the matched event lives on
+ *  the delivery card below, where the event arrived. This card is about the
+ *  ARMING, and a link out of it to something hours later does not read as
+ *  belonging to it. */
 export function EventWaitRow({ event }: { event: Extract<ResponseEvent, { type: 'event_wait' }> }) {
   return eventWaitRowBody({ event });
 }
 
 /** The row's markup, hookless so it stays a pure function of its state (same
- *  split as `eventWaitIndicatorBody` next door). The component above owns the
- *  one hook, which is also why the split exists: there is no jsdom in the test
- *  infra, so a component carrying a hook cannot be invoked as a plain function
- *  and the tests drive this instead. */
+ *  split as `eventWaitIndicatorBody` next door). There is no jsdom in the test
+ *  infra, so a component carrying a hook cannot be invoked as a plain function.
+ *  The tests drive this instead. */
 export function eventWaitRowBody({
   event,
 }: {
@@ -979,22 +931,18 @@ export function eventWaitRowBody({
   const { mark, label, tone } = EVENT_WAIT_ROW_STATE[event.state];
   const stopped = event.state === 'canceled';
   // A stop is a different action from an arming and says so. The wording comes
-  // from `eventWaitStoppedSummary` rather than being spelled again here, because
-  // the user's own stop renders as a TURN with that same header (see
-  // `describeInitiator`) and one concept must not acquire two phrasings.
-  // It also handles the reason-less row: a pre-2026-08-07 `EventWaitCanceled`
-  // carries no copy of what it stopped, so the line says the one thing it does
-  // know rather than trailing an empty colon.
+  // from `eventWaitStoppedSummary` rather than being spelled again here: the
+  // user's own stop renders as a TURN with that same header, and one concept
+  // must not acquire two phrasings. It also handles the reason-less row, whose
+  // `EventWaitCanceled` carries no copy of what it stopped.
   //
   // "event wait" is the canonical term in both glossaries, and the indicator
-  // beside this already reads "Watching for an event". "event tracking" was the
-  // phrasing this line was sketched with and is a synonym for the same concept,
-  // which is exactly the drift `.claude/rules/glossary.md` exists to stop.
+  // beside this reads "Watching for an event". A synonym here is exactly the
+  // drift `.claude/rules/glossary.md` exists to stop.
   //
-  // A colon rather than "for", because `reason` is the model's own words and it
-  // reaches for a gerund as often as a noun phrase: "…an event wait for Watching
-  // for the next code edit" is what the preposition produced on a real thread.
-  // The colon reads as an introduction either way.
+  // A colon rather than "for", because `reason` is the model's own words and
+  // reaches for a gerund as often as a noun phrase. The colon reads as an
+  // introduction either way.
   const subject = stopped
     ? eventWaitStoppedSummary(event.reason)
     : `Set up an event wait: ${event.reason}`;
@@ -1009,23 +957,22 @@ export function eventWaitRowBody({
     tone,
     facts: [
       // A stop names how it ended instead of what it watched: the subscription
-      // is over, and how it ended is the new fact. A pre-2026-08-07 row knows
-      // neither cause nor types, and then says only that it stopped.
+      // is over, and how it ended is the new fact. A row knowing neither cause
+      // nor types says only that it stopped.
       stopped && event.cause ? { kind: 'text' as const, text: EVENT_WAIT_STOP_NOTE[event.cause] } : null,
-      // The matched event REPLACES the subscription list on a wake: one of the
+      // The matched event REPLACES the subscription list on a match: one of the
       // types it was watching for is now a specific thing that happened.
-      ...(event.state === 'woke'
+      ...(event.state === 'matched'
         ? [event.matched_event_type ? { kind: 'chip' as const, name: event.matched_event_type } : null]
         : stopped
           ? []
           : subscriptionFacts(event.subscriptions)),
       deadline ? { kind: 'text' as const, text: deadline } : null,
-      // **No jump from here.** This card records the ARMING: an action the agent
-      // took, at the moment it took it. A link out to the event that eventually
-      // matched reads as belonging to a card about that event, and there is one,
-      // directly below (the wake, `EventDeliveryBody`), which is where the jump
-      // now lives. Naming the matched type here is still right, since it says
-      // how this wait ended.
+      // **No jump from here.** This card records the ARMING: an action the
+      // agent took, at the moment it took it. A link out to the matched event
+      // belongs on a card about that event, which is the delivery below
+      // (`EventDeliveryBody`). Naming the matched type here is still right,
+      // since it says how this wait ended.
     ],
   });
 }
@@ -1043,18 +990,16 @@ function subscriptionFacts(subscriptions: string[]): EventRowFact[] {
 
 /** When an unresolved wait gives up, as a fact rather than a countdown.
  *
- *  Deliberately not ticking. ADR 0047's amendment puts the live countdown on the
- *  subscription indicator and says the transcript record gets LIGHTER, and a
- *  per-second span here would re-render inside `ChatExchange`, which is the
- *  component the whole store is shaped around not re-rendering. The panel's own
- *  countdown keeps its interval because it is one open popover, not one row per
- *  wait in a scrollback.
+ *  Deliberately not ticking. ADR 0047 puts the live countdown on the
+ *  subscription indicator and keeps the transcript record LIGHTER. A per-second
+ *  span here would re-render inside `ChatExchange`, the component the whole
+ *  store is shaped around not re-rendering. The panel's own countdown keeps its
+ *  interval, being one open popover rather than one row per wait.
  *
  *  **The day is named whenever the deadline is not today.** An `await_event`
- *  timeout runs up to 24 hours, so a deadline is routinely tomorrow, and a bare
- *  "until 09:15" read at 14:00 points at a time that already passed this
- *  morning. Same-day is compared in the user's configured timezone, which is
- *  what `isSameDayInUserTz` exists for.
+ *  timeout runs up to 24 hours, so a deadline is routinely tomorrow. A bare
+ *  "until 09:15" read at 14:00 points at a time that already passed. Same-day
+ *  is compared in the user's configured timezone (`isSameDayInUserTz`).
  *
  *  Absent when the deadline is unparseable or missing, rather than rendering an
  *  "Invalid Date": a row states no fact its event does not carry. */
@@ -1071,9 +1016,9 @@ function waitDeadline(expiresAt: string): string | undefined {
  *  recorded when it diffed the checkpoint's two snapshots.
  *
  *  `null` when both are 0, which is a checkpoint written before the counts
- *  existed rather than one that changed nothing (a command that changed nothing
- *  git-visible emits no card at all). Saying "restore 0 files" there would
- *  invent a fact; saying nothing leaves the diff as the way to find out. */
+ *  existed rather than one that changed nothing: a command changing nothing
+ *  git-visible emits no card. Saying "restore 0 files" there would invent a
+ *  fact, and saying nothing leaves the diff as the way to find out. */
 export function checkpointUndoScope(restores: number, removes: number): string | null {
   const parts: string[] = [];
   if (restores > 0) parts.push(`restore ${formatFileCount(restores)}`);
@@ -1081,14 +1026,13 @@ export function checkpointUndoScope(restores: number, removes: number): string |
   return parts.length > 0 ? `Undo will ${parts.join(' and ')}.` : null;
 }
 
-/** The command-guard checkpoint card (ADR 0002, Phase 4): an inline affordance
- *  for an in-workspace destructive command, with a one-click Undo that restores
- *  the workspace from the snapshot taken before it and removes the files it
- *  created. Diff opens the change between those two snapshots, so the Undo
- *  beside it is not a blind button, and it is the same `.action-btn` Diff the
- *  changes list and the change banners carry rather than a one-off link. Once
- *  reverted (live via the paired `CommandCheckpointReverted` event, or on
- *  reload), Undo is replaced with a reverted marker, while the diff stays
+/** The command-guard checkpoint card (ADR 0002, Phase 4). An inline affordance
+ *  for an in-workspace destructive command. Its one-click Undo restores the
+ *  workspace from the snapshot taken before the command and removes the files
+ *  it created. Diff opens the change between those two snapshots, so the Undo
+ *  beside it is not a blind button. It is the same `.action-btn` Diff the
+ *  changes list and the change banners carry, not a one-off link. Once
+ *  reverted, Undo is replaced with a reverted marker and the diff stays
  *  available. */
 export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type: 'checkpoint' }> }) {
   const pending = useSignal(false);

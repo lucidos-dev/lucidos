@@ -1,10 +1,16 @@
-.PHONY: build check lint lint-fmt lint-rust lint-shell fix test clean run start stop restart status logs
+.PHONY: build check lint lint-fmt lint-rust lint-rust-clippy lint-shell fix test clean run start stop restart status logs
+
+# Run a heavy build under a *build slot*, so parallel coding-agent worktrees
+# cannot pile N full compiles onto one host. Degrades to a plain run when the
+# `lucidos` binary is not there, so a fresh `git clone` still builds (ADR 0070).
+BUILD_SLOT := ./scripts/with-build-slot.sh
 
 # Default workspace for development
 WORKSPACE ?= ./test-workspace
 
 # THE canonical clippy invocation — single source of truth for the lint gate.
-# Consumed by `lint-rust` below (and therefore by `lint` / `check`).
+# Consumed by `lint-rust-clippy` below, which `lint-rust` runs inside a build
+# slot (and therefore by `lint` / `check`).
 # `/harden` Phase 4.5 (the per-change gate) and
 # `.claude/skills/clean-build/SKILL.md` both run `make lint`; neither repeats
 # these flags. Change them here only.
@@ -85,7 +91,16 @@ lint-fmt:
 # Cargo fingerprints artifacts per feature set, so both stay cached in target/
 # and alternating between them does not thrash — the second pass is near-free
 # once warm.
+# Both passes run inside ONE build slot rather than one each, so a queued lint
+# is admitted once and does not re-queue between them. `lint-shell` and
+# `lint-fmt` stay outside the slot: seconds of work must not wait behind
+# minutes of clippy.
 lint-rust:
+	@$(BUILD_SLOT) --label "make lint" -- $(MAKE) --no-print-directory lint-rust-clippy
+
+# The clippy pair itself. Reached through `lint-rust`, which is what holds the
+# slot; invoking this target directly deliberately skips it.
+lint-rust-clippy:
 	cargo clippy $(CLIPPY_FLAGS) --all-features -- -D warnings
 	cargo clippy $(CLIPPY_FLAGS) -- -D warnings
 
@@ -114,13 +129,25 @@ test-full:
 	./scripts/test-engine.sh --full
 
 # Clean build artifacts (preserves workspace artifacts)
+#
+# Deliberately does NOT remove `.launch/`, the published launch binaries
+# (ADR 0063). That directory holds the `lucidos` CLI the engine puts on PATH for
+# every spawned trigger and coding-agent session, so removing it here would
+# disable a running workspace exactly the way the `cargo clean` under it used
+# to. Do not "fix" this by adding `.launch` below: use `clean-all`, which is the
+# deliberate reclaim, or `rm -rf .launch` directly.
 clean:
 	cargo clean
 	rm -rf test-workspace/data test-workspace/.lucidos
 
 # Clean everything including artifacts (use with caution)
+#
+# Includes `.launch/`, which `clean` deliberately spares. Stop your workspaces
+# first: a running engine loses the CLI it hands to its subprocesses, and the
+# next `web-dev.sh -b` is what puts it back.
 clean-all:
 	cargo clean
+	rm -rf .launch
 	rm -rf test-workspace
 	docker-compose down --volumes --remove-orphans
 

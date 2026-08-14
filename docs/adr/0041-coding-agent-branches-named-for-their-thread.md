@@ -1,6 +1,6 @@
 # 0041: Coding-agent branches are named for their thread, not a timestamp
 
-- **Status**: Accepted
+- **Status**: Accepted (the accepted allocation race is superseded by 0076)
 - **Date**: 2026-08-04
 
 ## Context
@@ -98,6 +98,9 @@ reader and every future parser then has to know about.
   `worktree add` a pre-existing branch, which blurs "did this attempt create it"
   exactly where `cleanup_failed_spawn` needs the answer to decide what it may
   delete.
+- **That race was reversed by ADR 0076.** Four of six siblings spawned in one
+  response died on it. The name now carries the thread's short id, and the
+  create retries. 0076 leaves the `cleanup_failed_spawn` answer alone.
 - **Names are lowercase-only.** Git refs are case-sensitive but loose refs are
   files, so on a case-insensitive filesystem (macOS default) a mixed-case slug
   could collide with its own lowercase twin.

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { INDICATOR_HIDE_DELAY_MS } from './useThreadScrollIndicator';
 // `atRules` is what lets these tests assert WHERE a rule applies, which is the
 // whole point here: the suppression and the replacement have to share one gate.
-import { cssRules } from '../styles/__tests__/css-rule-helpers';
+import { cssRules, rulesTargeting } from '../styles/__tests__/css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, '..');
@@ -172,6 +172,25 @@ describe('the native indicator is only suppressed where a replacement is drawn',
     expect(optedIn.length).toBeGreaterThan(0);
     for (const file of optedIn) {
       expect(readFileSync(file, 'utf8')).toContain('class="thread-scroll-indicator"');
+    }
+  });
+});
+
+describe('the parked thumb tracks the chrome above the transcript', () => {
+  // At the top of a thread the thumb sits at the track's top, so this inset is
+  // what the reader judges the indicator by. Both heights above it are live:
+  // the title bar grows when a title wraps to a second line, and a literal here
+  // would leave the parked thumb inside the bar.
+  const mobileCss = read('styles/mobile.css');
+
+  it('derives the track top from the header and title bar heights', () => {
+    const positioned = rulesTargeting(mobileCss, 'thread-scroll-indicator').filter(r =>
+      r.props.has('top'),
+    );
+    expect(positioned.length).toBe(1);
+    const top = positioned[0].props.get('top')!;
+    for (const chrome of ['--mobile-header-height', '--mobile-thread-title-height']) {
+      expect(top).toContain(chrome);
     }
   });
 });

@@ -10,7 +10,7 @@ vi.mock('../../hooks/sw-update', () => ({
   wasSwUpdateDismissed: vi.fn(() => false),
   noteUpdateBuildId: vi.fn(),
   // store.ts (imported transitively) pulls this from the same module.
-  markSwitchDismissed: vi.fn(),
+  markEngineVersionDismissed: vi.fn(),
 }));
 
 import { syncClientUpdateFromBuild } from './client-update';

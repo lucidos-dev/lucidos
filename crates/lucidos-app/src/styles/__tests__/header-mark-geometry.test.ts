@@ -1,43 +1,8 @@
 /**
  * Source scans over the mobile header's structural promises, plus the one the
  * desktop brand span repeats verbatim. Each is a property of the STYLESHEET
- * rather than of a rendered frame, so each is cheaper and sharper to assert
- * here than in a browser: the e2e specs measure the painted result, this pins
- * the rule that produces it.
- *
- * 1. All three mobile header rows are the same height BY CONSTRUCTION. Under
- *    the `min-height` this replaces, each row was as tall as its own tallest
- *    in-flow control, and the threads row alone carried the Lucidos mark in flow
- *    (the thread pane's sat in the absolutely-positioned nav cluster), so it
- *    stood 0.1rem taller than the other two. Every row's mark is in a cluster
- *    now; the fixed height is what guards the next in-flow control.
- * 2. The mark says its connection state in ONE dimension, strength. Connected
- *    is the brand at full light and nothing else; the other two recede from it.
- *    That holds only if nothing anywhere paints a ring, a tint or a hue onto
- *    any of the three.
- * 3. The badge rides the mark's corner out of flow, so it cannot widen the slot
- *    and slide the centred mark off the row's axis.
- * 4. The chevrons are pinned by one shared span, so the thread pane and the
- *    content pane put them in the same two places, and the threads pane's mark
- *    takes that same span's trailing edge, so all three rows agree on where
- *    that column is.
- * 5. The menu's connection notice reads as a notice: a raised surface with no
- *    frame and nothing that promises a tap, and a dot on the sentence's first
- *    line. Whether it is SHOWN at all is a property of the component and is
- *    pinned in `components/layout/__tests__/connection-notice.test.ts`; this is
- *    the half only the stylesheet can answer.
- * 6. A transparent centred span restores pointer events to its members, and
- *    STANDS DOWN while an overlay owns the screen. Two hosts carry that pair now
- *    (the mobile cluster here, the desktop brand span in panels/shell.css), and
- *    the gate is the half that gets forgotten: the inert-behind contract only
- *    inherits, so an ungated restore quietly leaves that span live behind a
- *    scrim. Scanned together so the second host cannot drift from the first.
- *
- * Plus an orphan check on the two custom properties the deleted mobile collapse
- * measurement used to publish. That one is not fussiness: an `env`-style
- * `var(--gone, fallback)` left behind reads as the fallback and a spec that
- * asserted on the published value reads it as `0`, so both halves fail silently
- * rather than loudly.
+ * rather than of a rendered frame: the e2e specs measure the painted result,
+ * this pins the rule that produces it.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -58,12 +23,10 @@ const mobileCss = styles('mobile.css');
 const shellCss = styles('panels/shell.css');
 
 /** The menu carries the Restart control, and the toast most likely to be on
- *  screen when a user reaches for it is the persistent "Restart needed" /
- *  "New version available" one. `--z-modal` (2300) sits deliberately BELOW
- *  `--z-toast` (2400), so the ordinary modal layer would put the toast on top of
- *  the very control the menu was opened for. The retired workspace switcher
- *  rebased above the toast layer for exactly this reason; the menu inherited the
- *  surface and has to inherit the rebase with it.
+ *  screen when a user reaches for it is the persistent "Restart needed" one.
+ *  `--z-modal` (2300) sits deliberately BELOW `--z-toast` (2400), so the
+ *  ordinary modal layer would put the toast over the very control the menu was
+ *  opened for.
  *
  *  Asserted on the DECLARATION rather than on a computed number, because the
  *  failure mode is someone "tidying" these to `var(--z-modal)`, which no
@@ -90,10 +53,9 @@ describe('the unfolded workspace list scrolls instead of overflowing the panel',
   });
 
   it('the panel itself is bounded by the room below the header', () => {
-    // The floor under the list's own cap, and the fix for a shape that predates
-    // it: the panel is `position: fixed`, so a phone in landscape could not
-    // reach its last rows at all. Horizontal stays clipped, since the rounded
-    // corners are what clip the rows' hover backgrounds.
+    // The floor under the list's own cap: the panel is `position: fixed`, so a
+    // phone in landscape cannot reach its last rows. Horizontal stays clipped,
+    // since the rounded corners are what clip the rows' hover backgrounds.
     const panel = block(markCss, '.brand-menu {');
     expect(decl(panel, 'max-height')).toContain('var(--app-header-bottom)');
     expect(decl(panel, 'overflow')).toBe('hidden auto');
@@ -108,11 +70,10 @@ describe('the unfolded workspace list scrolls instead of overflowing the panel',
   });
 });
 
-/** The notice the panel leads with while the mark is dim. Its PRESENCE is a
- *  property of `connectionNoticeRow` and is pinned in
- *  `components/layout/__tests__/connection-notice.test.ts`; what only the
- *  stylesheet can say is that it reads as a notice rather than as a row, and
- *  that its dot is drawn at all. */
+/** The notice the panel leads with while the mark is dim. Its PRESENCE is
+ *  pinned in `components/layout/__tests__/connection-notice.test.ts`. Only the
+ *  stylesheet can say that it reads as a notice rather than as a row, and that
+ *  its dot is drawn at all. */
 describe('the connection notice is a raised statement, not a row', () => {
   const notice = block(markCss, '.brand-menu-notice {');
 
@@ -224,20 +185,16 @@ describe('the mark says its connection in strength alone', () => {
   });
 
   it('reduced motion actually beats the animation it is cancelling', () => {
-    // The cascade half, which is where this silently failed before: a media
-    // query adds no specificity, so an override has to reach the animated
-    // rule's own specificity to win at all. Asserting that the reduce block
-    // targets the SAME selector is the durable way to say that, since a
+    // The cascade half. A media query adds no specificity, so the override has
+    // to reach the animated rule's own specificity to win. Asserting that the
+    // reduce block targets the SAME selector is the durable way to say that: a
     // broader one would parse fine, read fine, and never apply.
-    // Scoped to the MARK's own rules (`.brand-mark…`), not to every rule in the
-    // file. The stylesheet also dresses the menu, whose panel and scrim each
-    // carry the one-shot `modal-in` entrance every overlay in the app uses
-    // (global/modal-overlay.css, and the switcher's scrim in panels/shell.css).
-    // What this test is about is the mark's CONNECTION states, where a looping
-    // animation is the signal and cancelling it has to leave the state legible.
-    // A one-shot fade shared with every other overlay is a different question,
-    // and sweeping it in here would make this a tripwire on any animation the
-    // file ever grows rather than a guard on the cascade.
+    //
+    // Scoped to the MARK's own rules, not to every rule in the file. The
+    // stylesheet also dresses the menu, whose panel and scrim carry the
+    // one-shot `modal-in` entrance every overlay uses. This test is about the
+    // mark's CONNECTION states, where a looping animation is the signal and
+    // cancelling it has to leave the state legible.
     const markRules = cssRules(markCss).filter(r => r.selector.startsWith('.brand-mark'));
     const animated = markRules.filter(r => r.props.has('animation') && r.props.get('animation') !== 'none');
     expect(animated.map(r => r.selector), 'connecting is meant to be the only animated state').toEqual([
@@ -277,27 +234,20 @@ describe('the mark says its connection in strength alone', () => {
 });
 
 describe('the press cue changes a transform value, never creates one', () => {
-  // The mark is the only control in the header with an `:active` transform, and
-  // it was the only one whose press moved anything. `transform: none` to
-  // `scale(0.93)` is a change of KIND, not of value: an untransformed box is
-  // neither a stacking context nor a containing block nor a candidate for its
-  // own compositing layer, and a transformed one is all three. So a press built
-  // that structure inside the brand cluster and a release tore it down, and
-  // Safari (hence the packaged macOS app) re-rasterised the enclosing cluster
-  // each time: the mark, both thread chevrons and the workspace name shifted
-  // while the button was held and dropped back on release.
+  // `transform: none` to `scale(0.93)` is a change of KIND, not of value. An
+  // untransformed box is neither a stacking context nor a containing block nor
+  // its own compositing layer; a transformed one is all three. A press that
+  // builds that structure inside the brand cluster makes Safari re-rasterise
+  // the cluster. The mark, both chevrons and the workspace name then shift
+  // while the button is held.
   //
   // A source scan because nothing this repo can drive reproduces it. It is not
-  // a LAYOUT move (`getBoundingClientRect` is identical held and at rest, in
-  // both engines), and Playwright's WebKit is a different port from Safari and
-  // paints it steady. So the assertion is on the rule that removes the
-  // structural change, not on a frame.
+  // a LAYOUT move (`getBoundingClientRect` is identical held and at rest), and
+  // Playwright's WebKit is a different port from Safari and paints it steady.
   //
-  // Parsed rather than string-matched, and that is not fussiness here: the
-  // reduced-motion note further down this same stylesheet quotes
-  // `.brand-mark .brand-mark-glyph { animation: none }`, which CONTAINS the
-  // needle a `block()` lookup would search for. It resolves correctly today only
-  // because the real rule happens to come first.
+  // Parsed rather than string-matched: the reduced-motion note further down
+  // this stylesheet quotes `.brand-mark .brand-mark-glyph { animation: none }`,
+  // which CONTAINS the needle a `block()` lookup would search for.
   const rule = (selector: string) => {
     const found = cssRules(markCss).filter(r => r.selector === selector);
     expect(found.length, `expected exactly one \`${selector}\` rule`).toBe(1);
@@ -336,11 +286,10 @@ describe('the badge rides the mark rather than sitting beside it', () => {
 
   it('takes the GLYPH corner, derived, not the tap target corner', () => {
     // `top/right: 0` is the tap target's corner, and it lands on the glyph only
-    // while the target happens to hug it. Both are style-remote tunables: a
-    // 2.6rem target around a 1.8rem glyph left the badge 8px up and 8px right of
-    // the glyph box, floating clear of the mark's ink. Half the difference
-    // between the host's own box and the glyph IS the glyph's corner, at any
-    // tuning, so the offset must reference --header-mark-size.
+    // while the target happens to hug it. Both are style-remote tunables, so a
+    // wider target floats the badge clear of the mark's ink. Half the
+    // difference between the host's box and the glyph IS the glyph's corner at
+    // any tuning, so the offset must reference --header-mark-size.
     expect(decl(badge, '--brand-badge-corner'))
       .toBe('calc((100% - var(--header-mark-size)) / 2)');
     for (const side of ['top', 'right']) {
@@ -424,11 +373,11 @@ describe('the nav chevrons are pinned to one shared span', () => {
   });
 
   it('the threads pane hangs its mark off the same span, at the trailing edge', () => {
-    // The ask: the one glyph present on all three mobile rows must not move as
-    // the user swipes between them. It lands on the forward chevron's column
-    // only if it takes the SAME box and is pinned to its end. `space-between`
-    // (the base rule) puts a lone member at the START, so the override is what
-    // makes this the trailing edge rather than the leading one.
+    // The one glyph present on all three mobile rows must not move as the user
+    // swipes between them. It lands on the forward chevron's column only if it
+    // takes the SAME box and is pinned to its end. The base rule's
+    // `space-between` puts a lone member at the START, so this override is
+    // what makes it the trailing edge.
     const end = block(markCss, '.header-mark-end-cluster {');
     expect(decl(end, 'justify-content')).toBe('flex-end');
     for (const own of ['width', 'max-width', 'transform', 'left', 'right']) {
@@ -437,10 +386,9 @@ describe('the nav chevrons are pinned to one shared span', () => {
   });
 
   it('the threads title reserve is derived from that span, not from a rem constant', () => {
-    // The mark's inner edge is now half the CLUSTER in from the row's middle,
-    // and the cluster is clamped against the row, so the two only agree at one
-    // ui-scale if the reserve restates a constant. They kissed at 150% under
-    // the old `calc(100% - 10.5rem)`.
+    // The mark's inner edge is half the CLUSTER in from the row's middle, and
+    // the cluster is clamped against the row. So a reserve that restates a rem
+    // constant agrees with it at one ui-scale only.
     const title = block(mobileCss, '.mobile-header-title {');
     const reserve = decl(title, 'max-width') ?? '';
     expect(reserve, 'the reserve must read the cluster it has to clear')
@@ -464,11 +412,10 @@ describe('the nav chevrons are pinned to one shared span', () => {
 
   it('the empty span cannot swallow a tap aimed at the row underneath', () => {
     // The box is a fixed span with its members at the ends, absolutely
-    // positioned over the row, so most of it is transparent and raised: a tap
-    // in the empty part reaches nothing instead of the edge control the user
-    // aimed at. `.mobile-dot-indicator` learned this exact rule ("a transparent
-    // div is a hit target all the same"), so the pair has to stay together:
-    // none on the box, auto back on the members.
+    // positioned over the row, so most of it is transparent and raised. A
+    // transparent div is a hit target all the same. A tap in the empty part
+    // would reach nothing instead of the edge control the user aimed at, so
+    // the pair stays together: none on the box, auto back on the members.
     expect(decl(cluster, 'pointer-events')).toBe('none');
     const restore = cssRules(markCss)
       .filter(r => /\.header-nav-cluster > \*$/.test(r.selector))
@@ -478,15 +425,12 @@ describe('the nav chevrons are pinned to one shared span', () => {
       'the members must get their events back, or nothing in the cluster is tappable',
     ).toBe(1);
 
-    // And the restore must stand down while the app is deliberately inert. Both
+    // The restore must stand down while the app is deliberately inert. Both
     // regimes set `none` on an ANCESTOR and let it inherit, so an UNGATED value
-    // on the members beats them at any specificity and quietly punches a live
-    // hole in each: the chevrons would answer a stray thumb with the keyboard up
-    // (`:root[data-keyboard-active] .app-header`, mobile.css) and stay live
-    // behind an open overlay (`:root[data-overlay-open] .app-shell > *`,
-    // global/modal-overlay.css). Gating here rather than naming the cluster in
-    // those two rules is also what leaves the overlay's `[data-overlay-anchor]`
-    // exemption able to win on the chevron that opened its own history menu.
+    // on the members beats them at any specificity and punches a live hole in
+    // each. Gate here rather than naming the cluster in those two rules: that
+    // also lets the overlay's `[data-overlay-anchor]` exemption win on the
+    // chevron that opened its own menu.
     for (const state of ['data-keyboard-active', 'data-overlay-open']) {
       expect(
         restore[0].selector,
@@ -505,18 +449,15 @@ describe('the desktop brand span pays for the same pattern the same way', () => 
   it('none on the box, auto on the members, and the restore stands down behind an overlay', () => {
     // `.pane-header-brand-label` is the desktop copy of the cluster above: a
     // fixed span absolutely centred over the row, mostly transparent, so it
-    // takes the same pair (none on the box, auto back on the members) for the
-    // same reason. It therefore inherits the same trap, and it inherited it
-    // UNGATED: the inert-behind half of the overlay contract sets
-    // `pointer-events: none` on an ANCESTOR and lets it inherit, and a value
-    // applied directly to a child beats an inherited one at any specificity, so
-    // with the Lucidos menu up the two thread chevrons and the brand centre were
-    // the only things behind the scrim still answering the pointer.
+    // takes the same pair for the same reason. It inherits the same trap. A
+    // value applied directly to a child beats an inherited one at any
+    // specificity. An ungated restore therefore leaves the chevrons and the
+    // brand centre live behind the scrim.
     //
     // Only the overlay gate here, where the mobile twin also carries
-    // `[data-keyboard-active]`: that regime is a mobile.css rule inside the
-    // mobile breakpoint and this one lives in the desktop breakpoint, so the two
-    // can never co-apply. Asserting a gate that can never fire would be noise.
+    // `[data-keyboard-active]`. That regime is a mobile.css rule inside the
+    // mobile breakpoint and this one is in the desktop breakpoint, so the two
+    // can never co-apply.
     const label = cssRules(shellCss).find(
       r => r.selector === '.app-header .pane-header-brand .pane-header-brand-label',
     );

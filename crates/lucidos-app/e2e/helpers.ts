@@ -9,16 +9,16 @@ const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/work
 export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';
 
 /** Drawer rows for compose drafts share the `.thread-row` class and a
- *  `data-thread-nav` attr with real thread rows. Tests that want a real
- *  thread (e.g. to click and load messages) must filter drafts out — the
- *  draft variants additionally carry `compose-draft-row` / `data-draft-id`. */
+ *  `data-thread-nav` attr with real thread rows. A test that wants a real
+ *  thread must filter drafts out: the draft variants also carry
+ *  `compose-draft-row` and `data-draft-id`. */
 export const REAL_THREAD_ROW = '.thread-row:not(.compose-draft-row)';
 export const REAL_THREAD_NAV = '[data-thread-nav]:not([data-draft-id])';
 
-/** Start of the thread-drawer toggle's `aria-label` (from the `toggleThreadDrawer`
- *  shortcut label). Always match it as a PREFIX: `ThreadToggleButton` appends
- *  " (N needing attention)" whenever the thread list is hidden and something is
- *  waiting on the user, so an exact-match selector silently stops resolving. */
+/** Start of the thread-drawer toggle's `aria-label`. Always match it as a
+ *  PREFIX. `ThreadToggleButton` appends " (N needing attention)" whenever the
+ *  thread list is hidden and a thread awaits the user, so an exact-match
+ *  selector silently stops resolving. */
 export const DRAWER_TOGGLE_LABEL = 'Show or hide thread drawer';
 
 /** Locator for the first physically visible user-message body (dual-layout safe). */
@@ -32,11 +32,10 @@ export function isMobileViewport(page: Page): boolean {
   return vp ? vp.width < 769 : false;
 }
 
-/** Navigate to a mobile pane by name. No-op on desktop or if already on the target pane.
- *  Re-clicks the dot inside the wait loop so a click absorbed by a concurrent
- *  re-render (e.g., dismiss-thread fan-out updating the drawer) gets retried.
- *  polling: 250 caps re-clicks at 4/sec instead of the rAF default (~60/sec)
- *  to avoid event-storming Preact handlers while the pane settles. */
+/** Navigate to a mobile pane by name. No-op on desktop, or when already there.
+ *  Re-clicks the dot inside the wait loop, so a click absorbed by a concurrent
+ *  re-render is retried. `polling: 250` caps re-clicks at 4/sec instead of the
+ *  rAF default, to avoid event-storming Preact while the pane settles. */
 export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads' | 'content'): Promise<void> {
   if (!isMobileViewport(page)) return;
   await page.waitForFunction((target) => {
@@ -65,9 +64,9 @@ export function getBaseUrl(): string {
 }
 
 /** Wait for a physically visible prompt input (dual-layout safe).
- *  At mobile viewports the desktop layout is display:none, so .first() may pick
- *  the hidden one — we wait for any prompt-input to become visible, then return
- *  the visible locator. */
+ *  At mobile viewports the desktop layout is `display: none`, so `.first()` can
+ *  pick the hidden one. Wait for any prompt input to become visible, then
+ *  return the visible locator. */
 export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise<Locator> {
   await page.waitForFunction(() => {
     const els = document.querySelectorAll('[data-role="prompt-input"]');
@@ -80,42 +79,21 @@ export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise
   return page.locator('[data-role="prompt-input"]:visible').first();
 }
 
-/** Navigate to `url` (main-document commit) with a BOUNDED per-attempt timeout and a
- *  retry. THE canonical way to load the app in e2e — specs should route their
+/** Navigate to `url` (main-document commit) with a BOUNDED per-attempt timeout
+ *  and a retry. THE canonical way to load the app in e2e: specs route their
  *  `page.goto` through this rather than calling `page.goto` directly.
  *
- *  THE WEDGE IT GUARDS. On the `mobile-webkit` project (WebKit engine) the FIRST
- *  navigation in a fresh context intermittently wedged — `page.goto('/')` hung
- *  until its 30s timeout, the app-specific readiness checks never ran, a
- *  (random) test failed, and it passed only on Playwright's fresh-context retry.
- *  WebKit-only. Two distinct causes were identified (2026-06 — see docs/e2e-test-decisions.md
- *  "mobile-webkit navigation wedge"); neither is the dev server, engine,
- *  reverse-proxy, transport, or product code (all ruled out: reproduces against
- *  bundled `dist`, over HTTP/1.1 + HTTP/2, over IPv4 + IPv6, engine never sees
- *  the `/` request):
+ *  On the `mobile-webkit` project the FIRST navigation in a fresh context
+ *  intermittently wedges. Both causes, and everything ruled out, are in
+ *  docs/e2e-test-decisions.md § "mobile-webkit navigation wedge". The primary
+ *  one is fixed at the source in playwright.config.ts, and a pre-commit
+ *  cold-context stall is handled by the preflight in e2e/fixtures.ts.
  *
- *  1. PRIMARY — macOS system proxy / PAC (WPAD) auto-discovery, which WebKit's
- *     network process runs synchronously when it initialises a fresh network
- *     session (per context). On a managed/MDM Mac on a corp network that does a
- *     DNS/captive-portal/PAC round trip that stalls for tens of seconds, so the
- *     `/` request queues *behind* proxy resolution and never reaches the engine.
- *     FIXED AT THE SOURCE in playwright.config.ts: the `mobile-webkit` project
- *     sets an explicit `proxy` (inert server + localhost `bypass`) so WebKit
- *     skips system proxy discovery and connects to our localhost-only suite
- *     DIRECT. Deterministic; needs no retry.
- *  2. RESIDUAL — a WebContent cold-start / document lifecycle stall under heavy
- *     host contention, seen even on a no-proxy host. The app does not require
- *     DOMContentLoaded as a readiness signal; callers wait for visible UI state
- *     afterwards. Waiting only for the main-document response commit avoids
- *     converting a post-commit browser lifecycle stall into a false app-load
- *     failure. A pre-commit cold-context stall is handled earlier by the
- *     mobile-webkit context preflight in e2e/fixtures.ts.
- *
- *  What this helper does after the fixture preflight: CAP any later pre-commit
- *  hang (fail at ATTEMPTS*timeout instead of the full 120s test budget) and
- *  re-navigate once.
- *  Callers assert real readiness explicitly afterwards (waitForVisibleInput, an
- *  :visible iframe/#ask, etc.). */
+ *  What is left for this helper: CAP any later pre-commit hang, failing at
+ *  ATTEMPTS*timeout rather than the full test budget, and re-navigate once.
+ *  Waiting only for the response commit keeps a post-commit lifecycle stall
+ *  from reading as a failed app load, so callers assert real readiness
+ *  afterwards. */
 export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
   const ATTEMPTS = 2;
   const PER_ATTEMPT_TIMEOUT_MS = 30_000;
@@ -134,8 +112,6 @@ export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
 }
 
 export async function navigateToApp(page: Page): Promise<void> {
-  // gotoWithRetry avoids WebKit document-lifecycle stalls; SPA readiness is
-  // asserted explicitly below via visible UI state.
   await gotoWithRetry(page, '/');
   await ensureOnThreadPane(page);
   await waitForVisibleInput(page);
@@ -199,23 +175,17 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
   return response;
 }
 
-/** Leave the step log ON, which is the door to everything a step row carries
- *  (the context counter, the detail modal).
+/** Leave the step log ON, which is the door to everything a step row carries.
  *
  *  Steps SHOW by default (`stepsExpanded`, persisted in localStorage), so on a
- *  fresh context this is a no-op and the click is the exception rather than the
- *  point: it exists so a spec still gets its step rows from a context that
- *  carries the off state, and so a spec reads as declaring what it needs. That
- *  is why it asks for the control in any state and clicks conditionally. An
- *  unconditional click would TURN STEPS OFF on the ordinary run, and a locator
- *  pinned to `aria-pressed="false"` would simply time out there.
+ *  fresh context this is a no-op. It asks for the control in any state and
+ *  clicks conditionally: an unconditional click would TURN STEPS OFF on the
+ *  ordinary run, and a locator pinned to `aria-pressed="false"` would time out
+ *  there.
  *
- *  The control is an icon in the response header (`turnControls`) with no text
- *  to match on, and `aria-pressed` is the state the icon draws.
- *
- *  It does NOT wait for a step to exist: every response turn carries the
- *  control, whatever it holds. Keep asserting on the step row itself
- *  afterwards, which is what actually waits for the work to land. */
+ *  It does NOT wait for a step to exist. Every response turn carries the
+ *  control, whatever it holds, so keep asserting on the step row itself
+ *  afterwards. */
 export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
   const toggle = page
     .locator('.response-controls [data-role="toggle-steps"]:visible')
@@ -240,20 +210,18 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
 }
 
 /** Click a content-header action by its ACTION class (`.file-edit-btn`,
- *  `.diff-whole-file-toggle`, …) wherever progressive collapse put it.
+ *  `.diff-whole-file-toggle`) wherever progressive collapse put it.
  *
- *  The content header collapses its leading context actions into a `⋯` overflow
- *  menu when the row runs out of room for the title (`useHeaderActionCollapse`),
- *  so on a phone an ordinary long title can fold EVERY action behind `⋯`. A test
- *  that waits on the bare header button therefore times out on a layout that is
- *  behaving exactly as designed, which is what happened to file-edit.spec.ts and
- *  repo-files.spec.ts once a title could collapse the row completely. Placement
- *  is the layout's business; the test's business is that the action works.
+ *  The content header folds its leading actions into a `⋯` overflow menu when
+ *  the row runs out of room for the title (`useHeaderActionCollapse`). On a
+ *  phone an ordinary long title can fold EVERY action behind `⋯`. A test
+ *  waiting on the bare header button then times out on a layout behaving
+ *  exactly as designed. Placement is the layout's business; the test's
+ *  business is that the action works.
  *
- *  Both renderings carry the action class (`ContentHeaderActions.renderHeaderAction`
- *  / `renderMenuAction`), so one selector finds it either way. This still fails
- *  loudly when the action is genuinely absent: neither placement appears and the
- *  wait times out. */
+ *  Both renderings carry the action class, so one selector finds it either way.
+ *  This still fails loudly when the action is genuinely absent: neither
+ *  placement appears and the wait times out. */
 export async function clickHeaderAction(page: Page, actionSelector: string, timeout = 10_000): Promise<void> {
   const menuRow = `.thread-overflow-item${actionSelector}`;
   // Settled = the action has a placement: its own header button, or the `⋯`
@@ -278,13 +246,11 @@ export async function clickHeaderAction(page: Page, actionSelector: string, time
 
 /** Is a content-header action OFFERED to the reader, in EITHER placement?
  *
- *  The reading counterpart of `clickHeaderAction`, and needed for the sharper
- *  half of the same problem. A folded action has no header button, so a bare
+ *  The reading counterpart of `clickHeaderAction`, and the sharper half of the
+ *  same problem. A folded action has no header button, so a bare
  *  `expect('.the-action').toHaveCount(0)` is satisfied by a folded action
- *  exactly as it is by an absent one: a "this surface does not offer that
- *  control" assertion written that way stops being able to fail. Both of
- *  repo-files.spec.ts's went quietly vacuous the day three actions began
- *  folding whole.
+ *  exactly as by an absent one. A "this surface does not offer that control"
+ *  assertion written that way stops being able to fail.
  *
  *  Leaves no state behind: the `⋯` menu is only opened when the action has no
  *  header button, and is closed again through its own trigger before returning. */
@@ -320,14 +286,10 @@ export async function headerActionOffered(page: Page, actionSelector: string, ti
  *  `localStorage` key the app persists it under.
  *
  *  This is the identity-safe way to answer "which thread did I just create?"
- *  after a `sendMessage` + `waitForResponse`. Reading it off the drawer instead
- *  (`REAL_THREAD_NAV` + a positional `.first()`) is unsafe for the reason
- *  `threadRowFor` documents below: a coding-agent session left running by an
- *  EARLIER spec re-inserts its projection row with `last_activity = NOW()` and
- *  sorts above the thread this test just made, so `.first()` silently captures a
- *  foreign thread id and every later assertion measures the wrong thread.
- *  Throws when nothing is focused, since a caller asking for the id always
- *  believes a thread is. */
+ *  after a `sendMessage` + `waitForResponse`. Reading it off the drawer with a
+ *  positional `.first()` is unsafe, for the reason `threadRowFor` documents
+ *  below. Throws when nothing is focused, since a caller asking for the id
+ *  always believes a thread is. */
 export async function focusedThreadId(page: Page): Promise<string> {
   const id = await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'));
   if (!id) throw new Error('focusedThreadId: no thread is focused (lucidos-focused-thread is unset)');
@@ -336,33 +298,29 @@ export async function focusedThreadId(page: Page): Promise<string> {
 
 /** Selector for ONE specific thread's drawer row.
  *
- *  Use this — never `REAL_THREAD_ROW` plus a positional `.first()` — whenever a
- *  test means "the thread I just created". Positional row selection is unsafe in
- *  this suite: `clearAllThreads()` truncates only the `thread_summaries`
+ *  Use this, never `REAL_THREAD_ROW` plus a positional `.first()`, whenever a
+ *  test means "the thread I just created". Positional row selection is unsafe
+ *  in this suite: `clearAllThreads()` truncates only the `thread_summaries`
  *  PROJECTION, so a coding-agent session left running by an EARLIER spec
- *  re-inserts its own row the moment its next event lands — with
- *  `last_activity = NOW()`, which sorts it ABOVE the row this test just made.
- *  `.first()` then clicks a foreign thread and every later assertion silently
- *  measures the wrong one. That is the entire `drafts.spec.ts:65` "NOT-STORED"
- *  flake (docs/plans/2026-06-27-mobile-webkit-shard-contention.md, session 8).
+ *  re-inserts its own row with `last_activity = NOW()`. That sorts it ABOVE the
+ *  row this test just made. `.first()` then clicks a foreign thread, and every
+ *  later assertion silently measures the wrong one.
  *
  *  Keys on `data-flip-id`, which `ThreadDrawer.tsx` stamps on every row wrapper
- *  for its FLIP animation and keyboard nav — the one stable per-thread hook the
- *  list already carries. Rename that attribute and this must move with it. */
+ *  for its FLIP animation and keyboard nav. That is the one stable per-thread
+ *  hook the list carries, so a rename there must move this with it. */
 export function threadRowFor(threadId: string): string {
   return `[data-flip-id="${threadId}"] .thread-row`;
 }
 
 /** Click a SPECIFIC thread's drawer row (dual-layout safe, identity-based).
- *  Waits for that row to render, then clicks it via `el.click()` — the same
- *  touch-routing bypass `clickVisibleElement` uses. Never falls back to another
- *  row: if this thread's row doesn't appear, that is itself the bug and it
- *  throws naming the thread.
+ *  Waits for that row to render, then clicks it through the same touch-routing
+ *  bypass `clickVisibleElement` uses. Never falls back to another row: a row
+ *  that does not appear is itself the bug, and it throws naming the thread.
  *
- *  The wait is a PRECONDITION (does the row exist yet?), not the assertion a
- *  caller is testing, so it is deliberately generous — a WebContent paint stall
- *  must not turn "click my row" into a flake, and a row that never renders still
- *  fails loudly and specifically here. */
+ *  The wait is a PRECONDITION, not the assertion a caller is testing, so it is
+ *  deliberately generous. A WebContent paint stall must not turn "click my row"
+ *  into a flake. */
 export async function clickThreadRow(page: Page, threadId: string, timeout = 10_000): Promise<void> {
   const selector = threadRowFor(threadId);
   try {
@@ -409,25 +367,15 @@ export async function openDrawerView(page: Page, label: string): Promise<void> {
 /** Click compose button to start a new thread (dual-layout safe).
  *  On mobile the compose button navigates to thread pane automatically.
  *
- *  The two layouts reach it differently: the desktop thread-pane header carries
- *  New thread as an icon button (`ThreadHeaderActions`), while both mobile
- *  headers have no room for it and keep it inside the Lucidos (brand) menu as a
- *  `.brand-menu-item` (`HeaderMark`). Clicking the icon selector alone therefore
- *  hit nothing at all on mobile, and the caller only found out via the
- *  compose-view wait below timing out five seconds later.
+ *  The two layouts reach it differently. The desktop thread-pane header carries
+ *  New thread as an icon button. Both mobile headers have no room for it and
+ *  keep it inside the Lucidos menu as a `.brand-menu-item`.
  *
- *  The menu route is gated on the mobile viewport because that is the only place
- *  the menu HAS that item (`LucidosMenu`'s `actionsInRow` drops the three action
- *  rows on desktop, where the header row carries them). Running it on desktop
- *  would open the Lucidos menu, find nothing, and leave it open over the app for
- *  the rest of the spec. A miss stays non-fatal, as before: the caller may
- *  already be sitting on the compose view, in which case the waits below pass
- *  anyway.
- *
- *  Same shape of problem as `clickHeaderAction` above, which finds a CONTENT
- *  header action wherever progressive collapse put it. This one is not routed
- *  through it: that helper knows the content header's `⋯`, and the two
- *  placements here are a different header's button and a different menu. */
+ *  The menu route is gated on the mobile viewport, because that is the only
+ *  place the menu HAS that item. Running it on desktop would open the Lucidos
+ *  menu, find nothing, and leave it standing over the app for the rest of the
+ *  spec. A miss stays non-fatal: the caller may already be on the compose view,
+ *  in which case the waits below pass anyway. */
 export async function newThread(page: Page): Promise<void> {
   const clicked = await clickVisibleElement(page, 'button[aria-label="New thread"]');
   if (!clicked && isMobileViewport(page)) {
@@ -465,27 +413,20 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     });
   });
   if (!isOpen) {
-    // The desktop header's own slot. There used to be a second, faded copy
-    // inside .pane-header-brand for the other drawer state, so this had to name
-    // the interactable one; the toggle is a single element that travels between
-    // the two positions now (.thread-toggle-slot), and the mobile header's copy
-    // is the only other one in the app. Still scoped rather than bare, because
-    // that mobile copy stays mounted under a desktop viewport.
+    // Scoped to the desktop header's own slot rather than bare, because the
+    // mobile header's copy stays mounted under a desktop viewport.
     //
-    // Match the label as a PREFIX, never exact: ThreadToggleButton appends the
-    // needs-attention count to its own aria-label ("... (1 needing attention)")
-    // because the badge itself is decorative markup, and it does so exactly
-    // while the thread list is hidden, which is every case this branch runs in.
-    // An `=` match therefore found nothing the moment any thread awaited the
-    // user, the seeded state of most of coding-agent-question.spec.ts.
+    // Match the label as a PREFIX, never exact. ThreadToggleButton appends the
+    // needs-attention count to its own aria-label, exactly while the thread
+    // list is hidden. That is every case this branch runs in, so an `=` match
+    // finds nothing the moment any thread awaits the user.
     await page.locator(`.thread-toggle-slot button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();
   }
-  // Wait for the drawer's open width-transition (`width var(--duration-slow)`)
-  // to SETTLE — not merely to be non-zero. Returning at width > 0 catches the
-  // drawer mid-slide, where the still-narrow title column wraps a long title to
-  // one character per line; geometry assertions then read a degenerate layout
-  // (the drawer-family-collapse title/badge overlap flake). Poll until the width
-  // is stable across two frames and past the collapsed strip.
+  // Wait for the drawer's open width-transition to SETTLE, not merely to be
+  // non-zero. Returning at width > 0 catches the drawer mid-slide, where the
+  // still-narrow title column wraps a long title to one character per line.
+  // Geometry assertions then read a degenerate layout. Poll until the width is
+  // stable across two frames and past the collapsed strip.
   await page.waitForFunction(() => {
     const drawer = Array.from(document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)'))
       .find(el => {
@@ -520,14 +461,12 @@ export async function getHeaderTop(page: Page): Promise<number> {
   });
 }
 
-/** Opt out of the default-ON "Keep header visible" mobile preference so the
- *  header's hide-on-scroll / hide-on-keyboard-open behavior becomes
- *  exercisable. `currentMobileHeaderSticky()` defaults to ON (commit fd16089cf,
- *  "default Keep header visible to on"), which pins the header — with it on, the
- *  header never slides off and the hide assertions time out. Set the GLOBAL pref
- *  to 'false' BEFORE navigating so the page boots with hide enabled (device_id
- *  omitted → the app's device-scoped preference load merges the global value).
- *  Must be called before `navigateToApp`. */
+/** Opt out of the default-ON "Keep header visible" mobile preference, so the
+ *  header's hide-on-scroll and hide-on-keyboard-open behavior is exercisable.
+ *  With the pin on, the header never slides off and the hide assertions time
+ *  out. Set the GLOBAL pref to 'false' BEFORE navigating so the page boots with
+ *  hide enabled: with `device_id` omitted, the app's device-scoped preference
+ *  load merges the global value. Must be called before `navigateToApp`. */
 export async function disableMobileHeaderSticky(page: Page): Promise<void> {
   const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'false' },
@@ -536,12 +475,11 @@ export async function disableMobileHeaderSticky(page: Page): Promise<void> {
 }
 
 /** Force-ON the default "Keep header visible" pin. `mobile_header_sticky` is a
- *  GLOBAL preference and the e2e DB is reset only between projects, not between
- *  tests — so a test that called `disableMobileHeaderSticky` leaks the off state
- *  into later tests that assume the pinned default (the header then slides off on
- *  any input focus and header controls land outside the viewport). A test that
- *  depends on the pinned header calls this in its beforeEach BEFORE navigating,
- *  so it boots pinned regardless of order. Pairs with `disableMobileHeaderSticky`. */
+ *  GLOBAL preference, and the e2e DB is reset only between projects. So a test
+ *  that called `disableMobileHeaderSticky` leaks the off state into later tests
+ *  assuming the pinned default. A test depending on the pinned header calls
+ *  this in its beforeEach BEFORE navigating, so it boots pinned whatever the
+ *  order. Pairs with `disableMobileHeaderSticky`. */
 export async function enableMobileHeaderSticky(page: Page): Promise<void> {
   const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'true' },
@@ -564,11 +502,11 @@ const MENU_OPTION = '.dropdown-menu .dropdown-option';
 
 /** Drive a shared `Dropdown` (components/shared/Dropdown.tsx): open the
  *  trigger inside `rootSelector`, click the option containing `optionLabel`,
- *  and wait for the menu to close. Failures throw at the pick — silently
+ *  and wait for the menu to close. Failures throw at the pick, because silently
  *  proceeding with the previous value sends the test down a minutes-long
- *  wrong-path timeout instead. Waiting on menu CLOSE (not on the trigger
- *  label) is deliberate: the trigger's hidden .dropdown-sizer spans contain
- *  EVERY option label, so a label assertion would always pass.
+ *  wrong-path timeout. Waiting on menu CLOSE rather than on the trigger label
+ *  is deliberate: the trigger's hidden .dropdown-sizer spans contain EVERY
+ *  option label, so a label assertion would always pass.
  *
  *  Only the TRIGGER lives under `rootSelector`; the options come from
  *  `MENU_OPTION` above. */
@@ -594,10 +532,9 @@ export async function pickDropdownOption(page: Page, rootSelector: string, optio
   }, MENU_OPTION, { timeout: 3_000 });
 }
 
-/** Pick an option in the compose destination picker — dual-layout safe.
- *  Defaults to 'Lucidos source' (spawns a Lucidos-internal coding-agent
- *  thread on the next send); pass another option label (e.g. 'Lucidos Agent'
- *  or 'my-app · app') to target it instead. */
+/** Pick an option in the compose destination picker (dual-layout safe).
+ *  Defaults to 'Lucidos source', which spawns a Lucidos-internal coding-agent
+ *  thread on the next send. Pass another option label to target it instead. */
 export async function pickComposeDestination(page: Page, optionLabel = 'Lucidos source'): Promise<void> {
   await ensureOnThreadPane(page);
   await pickDropdownOption(page, '.compose-destination-picker', optionLabel);
@@ -730,14 +667,12 @@ export async function waitForActiveSession(page: Page, threadId: string, timeout
 }
 
 /** Assert that all given markers appear in visible user-message body elements.
- *  POLLS until every marker is visible (or the timeout elapses) rather than
- *  snapshotting once: a just-confirmed follow-up swaps its optimistic pending
- *  row for the persisted exchange on the next Preact flush, so a single
- *  evaluate() can read the one-frame gap where the last follow-up's body hasn't
- *  repainted yet (the `coding-agent-follow-ups` "user body not settled" race).
- *  A genuinely missing message (never persisted / dropped) still fails loudly
- *  when the poll times out — the recomputed `missing` set names which markers,
- *  so this does NOT mask a real loss, it only tolerates the render frame. */
+ *  POLLS until every marker is visible rather than snapshotting once. A
+ *  just-confirmed follow-up swaps its optimistic pending row for the persisted
+ *  exchange on the next Preact flush. A single evaluate() can therefore read
+ *  the one-frame gap before that body repaints. A genuinely missing message
+ *  still fails loudly when the poll times out, and the recomputed `missing`
+ *  set names which markers. */
 export async function assertUserMessagesVisible(page: Page, markers: string[], timeout = 15_000): Promise<void> {
   await expect(async () => {
     const missing = await page.evaluate(({ sel, ms }) => {
@@ -764,11 +699,10 @@ export async function countVisibleResponses(page: Page): Promise<number> {
 }
 
 /** Wait until at least `count` visible response-content elements have non-empty
- *  text. Polls the end-state directly. Prefer this over waitForResponse() before
- *  a "got N responses" assertion in a multi-turn test: waitForResponse() only
- *  checks that no status label reads Working/Requesting, so right after a prior
- *  turn settles (its label already says Done/Canceled) it can resolve before the
- *  next turn starts streaming — the count then runs one response short. */
+ *  text. Prefer this over waitForResponse() before a "got N responses"
+ *  assertion in a multi-turn test. waitForResponse() only checks that no status
+ *  label reads Working or Requesting. Just after a prior turn settles it can
+ *  therefore resolve before the next turn streams, leaving the count short. */
 export async function waitForVisibleResponseCount(
   page: Page,
   count: number,
@@ -807,13 +741,12 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
 }
 
 /** Wait for the prompt-area Cancel button, click it, then wait for Canceled
- *  status. The cancel is no longer guarded by a confirm dialog (removed in
- *  7fe30c930) — clicking the stop button cancels immediately.
- *  Works for both chat and Claude Code threads (single hard-cancel path).
- *  Identify the Send→Cancel morph by its `aria-label="Cancel"` — the stop
- *  button no longer carries `action-btn-danger` (it stays blue now), and the
- *  disabled `Cancel...` (canceling) state shares the same aria-label, so
- *  :not(:disabled) is load-bearing to hit the actionable stop state. */
+ *  status. Clicking the stop button cancels immediately, with no confirm
+ *  dialog, on both chat and Claude Code threads.
+ *
+ *  The Send-to-Cancel morph is identified by its `aria-label="Cancel"`. The
+ *  disabled canceling state shares that label, so `:not(:disabled)` is
+ *  load-bearing to hit the actionable stop state. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
   await waitAndClick(page, 'button.send-cancel-morph[aria-label="Cancel"]:not(:disabled)', undefined, 30_000);
 
@@ -965,18 +898,15 @@ export interface PushLogEntry {
   device_id: string;
   notification_id: string;
   sent_at: string;
-  /** The JSON string the real transport would have encrypted and sent —
-   *  populated by every current write. Lets §5.3 scenarios assert the
-   *  Declarative Web Push envelope shape (`{web_push: 8030, notification: {…}}`)
-   *  in addition to delivery. Absent on rows recorded before the
-   *  20260523114252_add_payload_to_push_log migration. */
+  /** The JSON string the real transport would have encrypted and sent. Lets
+   *  §5.3 scenarios assert the Declarative Web Push envelope shape as well as
+   *  delivery. */
   payload?: string | null;
 }
 
-/** Page-scoped fetch (uses Playwright's APIRequestContext) — required so the
- *  self-signed localhost cert that the engine serves is trusted via the
- *  browser context that already accepts it, rather than Node's stricter
- *  fetch which would reject with "unable to verify the first certificate". */
+/** Page-scoped fetch, through Playwright's APIRequestContext. Required so the
+ *  engine's self-signed localhost cert is trusted via the browser context that
+ *  already accepts it. Node's stricter fetch rejects it. */
 async function fetchPushLog(
   page: Page,
   params: {

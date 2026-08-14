@@ -1,46 +1,23 @@
-//! Auto-update wiring (`tauri-plugin-updater`).
+//! Auto-update wiring (`tauri-plugin-updater`). No-op in development.
 //!
-//! A packaged build surfaces updates INSIDE the workspace UI — not a native
-//! launch dialog, not the picker. Most users have a single workspace and auto-open
-//! straight into it, so the web app (running in the packaged Tauri client) polls
-//! [`check_app_update`] on startup, on an interval, and whenever the window comes
-//! back to the foreground, and shows an in-app "Update & restart" toast. The three
-//! nets and their throttling live in
-//! `crates/lucidos-app/src/store/actions/app-update.ts`. The toast's action calls
-//! [`install_app_update_and_restart`], which installs the new signed bundle and
-//! restarts the WHOLE stack onto the new version — the launchd background service
-//! (gateway + per-workspace engines + embedded Postgres) AND the GUI client —
-//! rather than only relaunching the window.
+//! A packaged build surfaces updates INSIDE the workspace UI, not a native
+//! launch dialog and not the picker. The web app polls [`check_app_update`] and
+//! shows an in-app toast whose action calls
+//! [`install_app_update_and_restart`]. That installs the new signed bundle and
+//! restarts the WHOLE stack: the launchd background service AND the GUI client.
 //!
-//! **The client comes back frontmost**, via `desktop::schedule_relaunch_after_exit`
-//! rather than `app.restart()`. That module documents why: a fork/exec'd
-//! relaunch has to win a race for the front slot against its own dying parent,
-//! and the updated client is left sitting behind everything when it loses.
+//! **The client comes back frontmost**, via
+//! `desktop::schedule_relaunch_after_exit` rather than `app.restart()`. ADR 0072
+//! records why.
 //!
-//! **The install narrates itself.** Downloading ~100 MB, verifying it, swapping the
-//! `.app` bundle and restarting the stack takes long enough that a silent `await`
-//! reads as a frozen app — which is exactly what it did until the progress
-//! callbacks below were wired up. Every step emits an [`AppUpdateProgress`] frame
-//! on the [`PROGRESS_EVENT`] Tauri event, so the page can say what is happening and
-//! how far along it is (`crates/lucidos-app/src/store/actions/app-update.ts`).
-//! The phases are ordered: `checking` → `downloading` → `verifying` → `installing`
-//! → `restarting-services` → `relaunching`, with `cancelled`, `failed` and
-//! `bundle-swap-failed` as the three terminal off-ramps.
+//! **The install narrates itself.** Every step emits an [`AppUpdateProgress`]
+//! frame on the [`PROGRESS_EVENT`] Tauri event, because a silent `await` across
+//! a bundle download reads as a frozen app.
 //!
-//! **Only the download is cancellable.** Until the bytes are verified they exist
-//! only in memory, so abandoning them changes nothing on disk. Once the bundle
-//! swap starts there is nothing to go back to, so [`cancel_app_update`] is refused
-//! from that point on — the [`AppUpdateRun`] state machine is what makes that a
-//! structural guarantee rather than a timing accident.
-//!
-//! Distribution model: the `.dmg` is for first install; the updater ships the
-//! `.app.tar.gz` + its `.sig` and `latest.json` (all on the same GitHub Release).
-//! Update artifacts are signed with the Tauri updater key (`plugins.updater.pubkey`
-//! in config; `TAURI_SIGNING_PRIVATE_KEY` at build time) — separate from Apple
-//! notarization, which gates the first-install `.dmg`.
-//!
-//! No-op in development (the updater endpoint isn't reachable and there's no
-//! launchd service to restart).
+//! **Only the download is cancellable.** Until the bytes are verified they
+//! exist only in memory, so abandoning them changes nothing on disk. The
+//! [`AppUpdateRun`] state machine makes that structural, and ADR 0073 covers a
+//! swap that fails anyway.
 
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -51,9 +28,8 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
 
 /// Tauri event carrying [`AppUpdateProgress`] frames to the page. Emitted with
-/// `AppHandle::emit`, so every webview of the client sees it — the same mechanism
-/// `native-notification-tapped` uses, and already covered by `core:default` on both
-/// the local and the gateway origin (see `desktop::gateway_capability`).
+/// `AppHandle::emit`, so every webview of the client sees it. Already covered
+/// by `core:default` on both the local and the gateway origin.
 const PROGRESS_EVENT: &str = "app-update-progress";
 
 /// Minimum byte advance between two `downloading` frames when the server declared
@@ -96,11 +72,8 @@ enum AppUpdatePhase {
     /// destructive upstream case reports `Err` (see [`installed_bundle_fault`]),
     /// and the rarer one reports `Ok` over an app that is not there.
     ///
-    /// Its own terminal phase rather than a [`AppUpdatePhase::Failed`] with a
-    /// longer string, because the two need different handling and not just
-    /// different wording: `failed` is retryable and this is not, the recovery is
-    /// a reinstall from the .dmg, and the page must not re-offer the update.
-    /// See [`bundle_swap_message`].
+    /// Its own terminal phase rather than a longer [`AppUpdatePhase::Failed`]
+    /// string, because the two need different handling. ADR 0073 records why.
     BundleSwapFailed { message: String },
 }
 
@@ -113,9 +86,9 @@ struct AppUpdateProgress {
     phase: AppUpdatePhase,
 }
 
-/// Announce a phase to the page. Best-effort by design: the last frames race the
-/// client teardown, and a progress frame that fails to reach a webview must never
-/// be the thing that fails an update.
+/// Announce a phase to the page. Best-effort by design: the last frames race
+/// the client teardown, and a frame that fails to reach a webview must never
+/// fail an update.
 fn emit(app: &AppHandle, version: Option<&str>, phase: AppUpdatePhase) {
     let _ = app.emit(
         PROGRESS_EVENT,
@@ -126,10 +99,9 @@ fn emit(app: &AppHandle, version: Option<&str>, phase: AppUpdatePhase) {
     );
 }
 
-/// Announce a terminal failure AND return it as the command's error string. Both
-/// halves matter: the event gives the page a terminal phase even if the promise
-/// rejection races the teardown, and the returned string is what the caller's
-/// `catch` reports.
+/// Announce a terminal failure AND return it as the command's error string.
+/// Both halves matter: the event gives the page a terminal phase even if the
+/// rejection races the teardown, and the string is what the `catch` reports.
 ///
 /// `phase` picks WHICH terminal phase carries the message. Ordinary failures go
 /// through [`fail`]; the bundle-swap case has its own phase because the page has
@@ -177,13 +149,12 @@ struct DownloadFrame {
 /// Byte-progress bookkeeping for a single download, kept out of the callback so
 /// the throttle is unit-testable on its own.
 ///
-/// The plugin invokes the chunk callback once per network chunk — thousands of
-/// times for the bundle — and every frame is an IPC message plus a signal-graph
+/// The plugin invokes the chunk callback once per network chunk, thousands of
+/// times for the bundle. Every frame is an IPC message plus a signal-graph
 /// update. So a frame is only produced on a *meaningful* advance: a whole
-/// percentage point when the size is known, [`PROGRESS_BYTE_STEP`] bytes when it
-/// isn't. The first chunk and the final byte count always produce one, so the page
-/// never sits at "0 bytes" during a slow first chunk, and never freezes one step
-/// short of the true total.
+/// percentage point when the size is known, [`PROGRESS_BYTE_STEP`] bytes when
+/// it is not. The first chunk and the final byte count always produce one, so
+/// the page never sits at "0 bytes" and never freezes one step short.
 #[derive(Default)]
 struct DownloadTracker {
     downloaded: u64,
@@ -239,10 +210,10 @@ fn percent(bytes: u64, total: u64) -> u64 {
     bytes.saturating_mul(100) / total
 }
 
-/// What the single update slot is doing. Modelled as a state machine because the
-/// cancellation rule *is* a state question: a cancel must abort the download and
-/// must not touch an install already under way, and no timing accident should be
-/// able to blur the two.
+/// What the single update slot is doing. Modelled as a state machine because
+/// the cancellation rule *is* a state question. A cancel must abort the
+/// download and must not touch an install already under way, and no timing
+/// accident may blur the two.
 #[derive(Default)]
 enum Phase {
     #[default]
@@ -266,9 +237,9 @@ enum Phase {
 pub struct AppUpdateRun(Mutex<Phase>);
 
 impl AppUpdateRun {
-    /// Claim the slot. `false` when a run is already under way — the caller must
-    /// then bail out WITHOUT emitting a terminal phase, or it would wipe the live
-    /// run's narration out of the UI.
+    /// Claim the slot. `false` when a run is already under way. The caller must
+    /// then bail out WITHOUT emitting a terminal phase, or it would wipe the
+    /// live run's narration out of the UI.
     fn begin(&self) -> bool {
         let mut phase = self.lock();
         if !matches!(*phase, Phase::Idle) {
@@ -293,13 +264,11 @@ impl AppUpdateRun {
 
     /// The bytes are in hand — take the run past the point of no return.
     ///
-    /// `false` when a cancel got there FIRST: the download resolves and the
-    /// awaiting command is scheduled, but a cancel landing in that gap has
-    /// already been accepted (`cancel` returned true and put the slot back to
-    /// `Idle`) even though the buffered result still arrives. Committing anyway
-    /// would install an update the user cancelled and told them nothing. Nothing
-    /// is on disk yet, so honouring the cancel is both possible and the only
-    /// honest outcome — the caller discards the bytes.
+    /// `false` when a cancel got there FIRST. A cancel landing between the
+    /// download resolving and this command being scheduled has already been
+    /// accepted, even though the buffered result still arrives. Committing
+    /// anyway would silently install an update the user cancelled. Nothing is
+    /// on disk yet, so the caller discards the bytes.
     fn commit(&self) -> bool {
         let mut phase = self.lock();
         if !matches!(*phase, Phase::Downloading(_)) {
@@ -319,7 +288,7 @@ impl AppUpdateRun {
         *self.lock() = Phase::Idle;
     }
 
-    /// Abort an in-flight download. `false` when there is nothing abortable —
+    /// Abort an in-flight download. `false` when there is nothing abortable:
     /// either no run at all, or one that has already committed.
     fn cancel(&self) -> bool {
         let mut phase = self.lock();
@@ -340,10 +309,9 @@ impl AppUpdateRun {
         }
     }
 
-    /// A poisoned lock here would mean a panic while holding it; the guarded state
-    /// is a plain enum with no invariant a panic could have broken mid-write, so
-    /// recovering is strictly better than propagating the panic into every later
-    /// update attempt.
+    /// A poisoned lock here would mean a panic while holding it. The guarded
+    /// state is a plain enum with no invariant a panic could have broken
+    /// mid-write, so recovering beats propagating into every later attempt.
     fn lock(&self) -> std::sync::MutexGuard<'_, Phase> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -351,23 +319,19 @@ impl AppUpdateRun {
 
 /// A newer signed build, and what is in it.
 ///
-/// The notes are the whole reason this is a struct rather than the bare version
-/// string it used to be. They are the ONLY way a client can say what a pending
-/// update contains: the offered version postdates the binary doing the offering,
-/// so it is by construction absent from the changelog baked into it (see
-/// `lucidos-engine`'s `engine::changelog`). Showing the installed changelog on an
-/// update offer would show the notes for the version already running, which is
-/// worse than showing none, because it looks like it worked.
+/// The notes are the ONLY way a client can say what a pending update contains.
+/// The offered version postdates the binary doing the offering, so it is by
+/// construction absent from the changelog baked into it. Showing the installed
+/// changelog instead would name the version already running, which is worse
+/// than showing none because it looks like it worked.
 #[derive(Clone, Serialize)]
 pub struct AppUpdateOffer {
     version: String,
     /// The release's notes as raw markdown, or `None` when the manifest carries
     /// none. `latest.json`'s `notes` is written from this repo's own
-    /// `CHANGELOG.md` section for that release (`scripts/lib/release_notes.sh`),
-    /// so in practice it is present and is the same prose the What's New panel
-    /// shows for every earlier release. Optional because nothing structurally
-    /// guarantees it for a hand-cut or older release, and a missing note must
-    /// degrade to "no notes shown" rather than to an empty panel.
+    /// `CHANGELOG.md` section for that release, so in practice it is present.
+    /// Optional because nothing structurally guarantees it for a hand-cut or
+    /// older release, and a missing note must degrade to no notes shown.
     notes: Option<String>,
 }
 
@@ -472,15 +436,13 @@ async fn check_and_download(
 
 /// The main executable inside the `.app`, relative to the bundle root. Tauri
 /// derives `mainBinaryName` from the crate's binary name, NOT from
-/// `productName`, so the bundle is `Lucidos.app` and the executable inside it is
-/// `lucidos-app`. This is also the path `desktop::desired_plist` hands launchd as
-/// the job's `ProgramArguments`, which is what makes its absence a crash loop
-/// rather than a cosmetic problem.
+/// `productName`, so the bundle is `Lucidos.app` and the executable inside it
+/// is `lucidos-app`. This is also the path launchd is handed as the job's
+/// `ProgramArguments`, which is what makes its absence a crash loop.
+///
 /// Derived from `CARGO_PKG_NAME` rather than spelled out, because a spelled-out
-/// name that drifted would not fail loudly here: the check would look for a path
-/// that cannot exist and report `bundle-swap-failed` on EVERY update, blocking
-/// all of them over a rename. `concat!` folds it at compile time, so a crate
-/// rename moves the constant with it.
+/// name that drifted would not fail loudly. The check would look for a path
+/// that cannot exist and block every update over a rename.
 #[cfg(target_os = "macos")]
 const BUNDLE_MAIN_EXECUTABLE: &str = concat!("Contents/MacOS/", env!("CARGO_PKG_NAME"));
 
@@ -520,9 +482,8 @@ impl BundleVerdict {
 }
 
 /// Is there a runnable app at `bundle`? Split out from
-/// [`installed_bundle_fault`] with the path as a parameter so the rule can be
-/// tested against a directory a test builds, rather than only against whatever
-/// this machine happens to have installed.
+/// [`installed_bundle_fault`] with the path as a parameter, so the rule can be
+/// tested against a directory a test builds.
 #[cfg(target_os = "macos")]
 fn installed_bundle_verdict(bundle: &Path) -> BundleVerdict {
     use std::os::unix::fs::PermissionsExt;
@@ -536,9 +497,8 @@ fn installed_bundle_verdict(bundle: &Path) -> BundleVerdict {
     if !meta.is_file() {
         return BundleVerdict::ExecutableMissing;
     }
-    // Any execute bit at all is the floor. The question being asked is "did the
-    // swap land a real executable", not "are these the ideal permissions", and a
-    // mode that grants execute to nobody is the only one that answers it no.
+    // Any execute bit at all is the floor. The question is whether the swap
+    // landed a real executable, not whether the permissions are ideal.
     if meta.permissions().mode() & 0o111 == 0 {
         return BundleVerdict::ExecutableNotExecutable;
     }
@@ -550,11 +510,8 @@ fn installed_bundle_verdict(bundle: &Path) -> BundleVerdict {
 ///
 /// Both halves are deliberate. `UpdaterBuilder::build` sets `extract_path` from
 /// `current_exe()` whenever no `executable_path` override is given, and `lib.rs`
-/// registers the plugin with a bare `Builder::new().build()`, so this resolves
-/// the same path `Update::install` wrote to. Hardcoding `/Applications/Lucidos.app`
-/// instead would report a false failure for anyone running from `~/Applications`
-/// or a dev location, and would miss a real one for anyone whose install lives
-/// elsewhere.
+/// registers the plugin bare. So this resolves the same path `Update::install`
+/// wrote to, and ADR 0073 records why a hardcoded one is wrong.
 #[cfg(target_os = "macos")]
 fn installed_bundle_path() -> Result<std::path::PathBuf, String> {
     let exe = tauri::utils::platform::current_exe()
@@ -567,27 +524,17 @@ fn installed_bundle_path() -> Result<std::path::PathBuf, String> {
     })
 }
 
-/// What is wrong with the app on disk after an install attempt, as the middle of
-/// a sentence, or `None` when there is a runnable app there.
+/// What is wrong with the app on disk after an install attempt, as the middle
+/// of a sentence. `None` when there is a runnable app there.
 ///
-/// Upstream `tauri-plugin-updater` 2.10.1 moves the current `.app` into a
-/// `TempDir` and has no restore branch if the final rename fails, so a failed
-/// swap deletes the backup on the way out (`src/updater.rs:1253-1302`; written up
-/// for upstream in `docs/upstream-issues/tauri-plugin-updater-macos-no-rollback.md`).
-/// We ship that, and the blast radius here is bigger than a typical Tauri app's:
-/// the launchd job `gui/<uid>/com.lucidos.engine` has `KeepAlive=true` and its
-/// `ProgramArguments` point INTO the bundle, so kickstarting it onto a missing
-/// binary is a crash loop on a 10-second `ThrottleInterval` that takes the
-/// gateway, every workspace engine and the embedded Postgres down with it.
-/// Asking here turns a silent later-boot failure into an immediate one the user
-/// can act on.
+/// Upstream `tauri-plugin-updater` moves the current `.app` into a `TempDir`
+/// and has no restore branch if the final rename fails. A failed swap therefore
+/// deletes the backup on the way out. ADR 0073 records the blast radius here
+/// and both decisions below.
 ///
 /// **Fail closed on a path we cannot resolve.** Not knowing where the bundle is
-/// is exactly as informative as finding nothing there, and the recovery advice is
-/// the same either way. The case is close to unreachable in practice (`app.updater()`
-/// resolved the same path a moment earlier, or the install would never have run),
-/// so the cost of the strict direction is near zero and the cost of the lenient
-/// one is the crash loop this exists to prevent.
+/// is exactly as informative as finding nothing there, and the recovery advice
+/// is the same either way.
 #[cfg(target_os = "macos")]
 fn installed_bundle_fault() -> Option<String> {
     match installed_bundle_path() {
@@ -609,15 +556,12 @@ fn installed_bundle_fault() -> Option<String> {
 ///
 /// Both callers compose through here so the recovery advice cannot drift apart,
 /// but the OPENING differs and that difference is the point. `install_error` is
-/// `Some` when the plugin itself reported failure, which is where the destructive
-/// upstream case actually lands: the old bundle was already in the `TempDir` when
-/// the final rename failed, and the `TempDir` took it away on the way out. So the
-/// same underlying disaster reaches us as an `Err`, and telling that user "the
-/// update reported success" would be a lie. It is `None` for the rarer shape
-/// where `install` returned `Ok` over an app that is not there.
+/// `Some` when the plugin itself reported failure, which is where the
+/// destructive upstream case lands. Telling that user "the update reported
+/// success" would be a lie. It is `None` for the rarer shape where `install`
+/// returned `Ok` over an app that is not there.
 ///
-/// Pure, so the wording the user actually reads is unit-tested rather than
-/// inspected.
+/// Pure, so the wording the user reads is unit-tested rather than inspected.
 fn bundle_swap_message(fault: &str, install_error: Option<&str>) -> String {
     let opening = match install_error {
         Some(e) => format!("The update failed and {fault}. The installer reported: {e}."),
@@ -631,14 +575,12 @@ fn bundle_swap_message(fault: &str, install_error: Option<&str>) -> String {
 }
 
 /// Install the available update and restart EVERYTHING onto the new version:
-/// download + swap the bundle, restart the launchd background service (gateway +
-/// engines + embedded Postgres) so it runs the NEW binaries, then relaunch the GUI
-/// client. Never returns on success (the client re-execs).
+/// swap the bundle, restart the launchd background service so it runs the NEW
+/// binaries, then relaunch the GUI client. Never returns on success.
 ///
-/// Ordering is load-bearing: install first (new bytes on disk), then the service
-/// restart, then the never-returning `app.restart()`. The service restart is
-/// best-effort — a failure is logged but does not abort the client relaunch (the
-/// service otherwise picks up the new binary on its next restart / reboot).
+/// Ordering is load-bearing: install first, then the service restart, then the
+/// never-returning relaunch. The service restart is best-effort, since a
+/// failure is logged and the service picks the new binary up on its next start.
 #[tauri::command]
 pub async fn install_app_update_and_restart(
     app: AppHandle,
@@ -705,9 +647,8 @@ pub async fn install_app_update_and_restart(
     let version = update.version.clone();
 
     emit(&app, Some(&version), AppUpdatePhase::Installing);
-    // `Update::install` is synchronous — a signature-verified tar extract plus an
-    // in-place `.app` bundle swap — so it goes to a blocking thread instead of
-    // stalling an async runtime worker that the progress IPC also rides on.
+    // `Update::install` is synchronous, so it goes to a blocking thread rather
+    // than stalling an async runtime worker the progress IPC also rides on.
     let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await;
     let outcome = match installed {
         Ok(outcome) => outcome,
@@ -716,12 +657,9 @@ pub async fn install_app_update_and_restart(
             return Err(fail(&app, Some(&version), format!("install task: {e}")));
         }
     };
-    // BOTH outcomes have to ask the same question, and this one is the reason F9
-    // exists. Upstream moves the old bundle into a `TempDir`, and when the final
-    // rename fails it returns Err and drops the `TempDir`, deleting the backup.
-    // So the destructive case arrives here as an ERROR, not as a false success.
-    // Reporting it as an ordinary `failed` would tell a user whose app is gone to
-    // try again, which is the one thing that cannot work.
+    // BOTH outcomes have to ask the same question. The destructive case arrives
+    // here as an ERROR, not as a false success. Reporting it as an ordinary
+    // `failed` would tell a user whose app is gone to try again. See ADR 0073.
     if let Err(e) = outcome {
         run.release();
         let e = e.to_string();
@@ -737,18 +675,12 @@ pub async fn install_app_update_and_restart(
     }
 
     // The rarer shape: `install` returned Ok over an app that is not actually
-    // there (a partial unpack, or a swap that half-succeeded). Prove there is
-    // something runnable to restart INTO before touching the launchd job, because
-    // `restart_service()` is a `kickstart -k` against a KeepAlive job whose
-    // ProgramArguments point into that bundle, which is the crash loop this whole
-    // check exists to avoid.
+    // there. Prove there is something runnable to restart INTO before touching
+    // the launchd job, which is a KeepAlive job whose ProgramArguments point
+    // into that bundle.
     //
     // On failure the job is deliberately left ALONE rather than booted out, on
-    // both paths. The service that is running right now still holds the deleted
-    // inode, so it keeps serving the user's workspaces; `stop_service` would kill
-    // it AND remove the agent, and with no app on disk nothing could bring either
-    // back. Reinstalling from the .dmg restores the exact path the job already
-    // points at, so the untouched job is what makes the recovery a drag-and-drop.
+    // both paths. See ADR 0073.
     if let Some(fault) = installed_bundle_fault() {
         run.release();
         return Err(fail_as(
@@ -760,31 +692,25 @@ pub async fn install_app_update_and_restart(
     }
 
     // Window geometry is already current on disk: the debounced flush in `run()`
-    // persists it ~600ms after the user stops moving/resizing, well within the
-    // multi-second download+install above. We deliberately do NOT call
-    // `save_window_state` here — this runs on a Tokio worker thread, off the main
-    // thread, where that call can deadlock the UI (see persist_window_state_on_main
-    // in lib.rs). The final save happens on the way out instead, from the main
-    // thread, in `exit_after_relaunch_scheduled`.
+    // persists it well within the download and install above. We deliberately
+    // do NOT call `save_window_state` here, because this runs on a Tokio worker
+    // thread where that call can deadlock the UI. The final save happens from
+    // the main thread, in `exit_after_relaunch_scheduled`.
     //
-    // New bytes are on disk. Restart the whole background service onto them BEFORE
-    // relaunching the client — `app.restart()` never returns.
+    // New bytes are on disk. Restart the whole background service onto them
+    // BEFORE relaunching the client, which never returns.
     emit(&app, Some(&version), AppUpdatePhase::RestartingServices);
     if let Err(e) = crate::desktop::restart_service() {
         eprintln!("[updater] background service restart failed: {e}");
     }
-    // Relaunch the client onto its new bytes. Never returns.
-    //
-    // Through LaunchServices when we can, because `app.restart()` fork/execs the
-    // new binary and leaves it to inherit the front slot from this dying process,
-    // a race the updated client loses whenever it registers with the window
-    // server a moment too late. It then comes up BEHIND everything, which is what
-    // 0.20 → 0.20.1 did on 2026-08-03. See `desktop::schedule_relaunch_after_exit`.
+    // Relaunch the client onto its new bytes. Never returns. Through
+    // LaunchServices when we can, so the updated client comes up in front
+    // rather than behind everything. See ADR 0072.
     emit(&app, Some(&version), AppUpdatePhase::Relaunching);
     match crate::desktop::schedule_relaunch_after_exit() {
-        // This command runs on the async runtime, so the exit is marshalled onto
-        // the main thread; it does not return, so `app.restart()` cannot also run
-        // and bring up a second client.
+        // This command runs on the async runtime, so the exit is marshalled to
+        // the main thread. It does not return, so `app.restart()` cannot also
+        // run and bring up a second client.
         Ok(()) => crate::exit_after_relaunch_scheduled(&app),
         Err(e) => {
             eprintln!("[updater] no LaunchServices relaunch ({e}); respawning directly");
@@ -793,11 +719,10 @@ pub async fn install_app_update_and_restart(
     }
 }
 
-/// Abandon an in-flight app-update download. Only the check + download can be
-/// cancelled — once the bundle swap has started the run has committed and this is
-/// a no-op, which is the honest answer (there is no half-installed state to
-/// return to). The page learns the outcome from the `cancelled` progress frame the
-/// aborted run's command emits, not from this call.
+/// Abandon an in-flight app-update download. Only the check and download can be
+/// cancelled. Once the bundle swap has started the run has committed and this
+/// is a no-op, which is the honest answer. The page learns the outcome from the
+/// `cancelled` progress frame the aborted run emits, not from this call.
 #[tauri::command]
 pub fn cancel_app_update(run: State<'_, AppUpdateRun>) {
     run.cancel();
@@ -955,8 +880,8 @@ mod tests {
         assert!(!run.cancel());
     }
 
-    // The window between claiming the slot and handing over the task is tiny but
-    // real; a cancel landing in it is honoured when the task arrives.
+    // The window between claiming the slot and handing over the task is tiny
+    // but real. A cancel landing in it is honoured when the task arrives.
     #[test]
     fn a_cancel_during_startup_is_honoured_when_the_task_arrives() {
         let run = AppUpdateRun::default();
@@ -1055,7 +980,7 @@ mod tests {
     }
 
     // A directory where the executable should be is the same failure as no
-    // executable at all, and `metadata` succeeds on it, so the file-type test is
+    // executable at all. `metadata` succeeds on it, so the file-type test is
     // what separates them.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1070,7 +995,7 @@ mod tests {
     }
 
     // An unpack that dropped the mode bits produces a file launchd can no more
-    // start than a missing one, so "it exists" is not the question.
+    // start than a missing one. "It exists" is not the question.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_main_binary_with_no_execute_bit_is_not_runnable() {

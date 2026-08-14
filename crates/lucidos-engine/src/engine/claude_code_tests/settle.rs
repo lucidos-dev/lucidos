@@ -55,7 +55,7 @@ fn user_device_actor() -> crate::engine::thread_events::MessageOrigin {
 ///     instead of "Paused by restart" (device actor's default abort summary) or
 ///     "Response interrupted" (system actor's default abort summary).
 ///   - User actor so the chip reads "You" (the user *did* push the button)
-///     rather than "⚙ System".
+///     rather than "System".
 ///   - Thread status lands at `idle` (not `failed`): the projection branches
 ///     on `cause=StaleSettle` to use the cancel-style status mapping, so the
 ///     thread list doesn't show a red error indicator on a thread the user

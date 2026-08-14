@@ -57,6 +57,13 @@
 .response-executor-icon svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
+}
+
+/* Scoped to the coding agent's own logo, never every SVG in the slot. See the
+   `.initiator-icon .claude-icon` rule in chat/input-messages.css, which is where
+   the reasoning lives: the two chips sit one above the other in a turn and must
+   tint the same way. */
+.response-executor-icon .claude-icon {
     color: var(--initiator-coding-agent);
 }
 

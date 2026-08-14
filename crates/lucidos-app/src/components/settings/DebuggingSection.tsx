@@ -3,6 +3,7 @@ import { currentCaptureContext, setCaptureContext } from '../../store/actions/pr
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { animationSpeed, enginePackaged, speedMultiplier } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
+import { openSettingsSubview } from '../../store/actions/menu';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 
@@ -23,6 +24,10 @@ import { Explainer } from '../shared/Explainer';
  *    It lives here as a diagnostic — slowing animations down makes transition
  *    glitches inspectable; reading `animationSpeed.value` in render subscribes
  *    to the signal so the multiplier label updates live as you drag.
+ *  - "Communication surfaces" opens the surface gallery, which renders every
+ *    toast, banner and dialog against realistic content and performs no
+ *    operation. It is its own subview rather than rows here, because it is a
+ *    page of samples rather than a setting.
  *  - "Restart engine" is shown on a PACKAGED install only, and is the packaged
  *    counterpart of System > Overview's dev-only "Rebuild & Restart". Both sites
  *    branch on `restartControlHome`, so exactly one of the two ever renders. A
@@ -128,6 +133,24 @@ export function DebuggingSection() {
           />
           <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">{speedMultiplier.value.toFixed(1)}x</span>
         </div>
+      </div>
+      <div class="settings-row" data-search-anchor="debugging:communication-surfaces">
+        <span class="settings-row-label">
+          Communication surfaces
+          <Explainer title="Communication surfaces">
+            <p>
+              Every way Lucidos speaks to you, on one page: toasts, banners and
+              dialogs, each rendered against realistic content.
+            </p>
+            <p>
+              Nothing on that page performs an operation. It exists so these surfaces
+              can be compared and iterated on without provoking the real thing.
+            </p>
+          </Explainer>
+        </span>
+        <button class="action-btn" onClick={() => openSettingsSubview('communication-surfaces')}>
+          Open
+        </button>
       </div>
       {restartControlHome(enginePackaged.value) === 'debugging' && (
         <div class="settings-row" data-search-anchor="debugging:restart-engine">

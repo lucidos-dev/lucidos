@@ -25,7 +25,7 @@ mod injection_coalescing_tests {
         let groups = group_injected_prompts(vec![
             prompt("one", InjectedPromptKind::UserText),
             prompt("two", InjectedPromptKind::UserText),
-            prompt("wake", InjectedPromptKind::WakeFromChild),
+            prompt("reentry", InjectedPromptKind::ReentryFromEngine),
             prompt("three", InjectedPromptKind::UserText),
         ]);
 

@@ -212,6 +212,18 @@ export interface EngineVersionStatus {
    *  so the Switch is never a dead-end. Absent/false when packaged or git is
    *  unavailable. */
   source_behind_head?: boolean;
+  /** Dev only: the checkout's HEAD commit, present only while something is
+   *  pending. **Identity, never display**: it is what a dismissal of the
+   *  *pending* version toast is pinned to, the way the Switch toast's dismissal
+   *  is pinned to `disk_build_id`. A pending version has no on-disk build to
+   *  name (that absence is what makes it pending), so without this the toast
+   *  had nothing to remember and could not be dismissed at all. */
+  head_commit?: string;
+  /** Dev only: a rebuild for this HEAD already completed and produced nothing
+   *  switchable, so pressing *Rebuild* runs the same build from the same source
+   *  and lands right back here. The UI withholds the button and names the
+   *  operator fix instead. Absent/false when packaged. */
+  rebuild_wedged?: boolean;
   /** Dev only: the checkout-shared engine-build lock is currently held — a
    *  background rebuild of the shared binary is in flight (a co-located peer
    *  workspace's build OR this engine's own). Lets a workspace that lost the

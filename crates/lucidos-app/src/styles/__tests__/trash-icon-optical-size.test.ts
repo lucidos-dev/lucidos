@@ -21,10 +21,11 @@
  * still carries the class the rule selects, and that it is still drawn at the
  * stroke-width the rule divides.
  *
- * The second describe covers what the `--icon-glyph` indirection is FOR: one
- * context (the queued message's trash) picks a smaller nominal while every
- * other caller keeps the default, and only the glyph moves, never the 2.25rem
- * tap target the box rule exists to guarantee.
+ * The second describe covers what the `--icon-glyph` indirection is FOR: the
+ * header band and a list row take different nominals off one shared box, and
+ * only the glyph moves, never the 2.25rem tap target the box rule exists to
+ * guarantee. It also pins the split as the SINGLE source of both sizes, since a
+ * caller that reintroduces a local nominal is back to two places to look.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -33,7 +34,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { cssRules, rulesTargeting } from './css-rule-helpers';
+import { cssRules, rulesTargeting, selectorList } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, '../global/host-components.css'), 'utf8');
@@ -42,11 +43,12 @@ const baseCss = readFileSync(resolve(here, '../global/base.css'), 'utf8');
 const groupCss = readFileSync(resolve(here, '../skills.css'), 'utf8');
 const icons = readFileSync(resolve(here, '../../components/shared/icons.tsx'), 'utf8');
 const chatExchange = readFileSync(resolve(here, '../../components/chat/ChatExchange.tsx'), 'utf8');
+const groupHeader = readFileSync(resolve(here, '../../components/triggers/TriggerGroupHeader.tsx'), 'utf8');
 
 /** The correction rule, found by a member of its selector list so grouping it
  *  with the row-icon twin cannot make this lookup silently miss. */
 const rule = cssRules(css).find(r =>
-  r.selector.split(',').some(s => s.trim() === '.icon-btn.header-icon .trash-icon'),
+  selectorList(r.selector).includes('.icon-btn.header-icon .trash-icon'),
 );
 
 describe('the trash is sized by its ink', () => {
@@ -85,18 +87,6 @@ describe('the trash is sized by its ink', () => {
   });
 });
 
-/** Classes in the SUBJECT of the selector-list member aiming at `className`,
- *  which is what the cascade weighs. Counted rather than assumed, so the
- *  comparison below is between two real specificities. */
-function subjectClasses(selector: string, className: string): string[] {
-  // Token-boundary, so `.row-icon` is not answered by a `.row-icon-something`
-  // that happens to share its prefix.
-  const token = new RegExp(`\\.${className}(?![\\w-])`);
-  const one = selector.split(',').find(s => token.test(s)) ?? '';
-  const subject = one.trim().split(/\s+/).pop() ?? '';
-  return subject.match(/\.[\w-]+/g) ?? [];
-}
-
 /** The `--icon-size-*` scale, read from its own source rather than restated
  *  here, so "a smaller step" is measured against the real tokens. Rem only:
  *  the numbers are compared to each other, so a step that moved to another
@@ -111,83 +101,95 @@ for (const r of cssRules(baseCss)) {
   }
 }
 
-/** Every rule that sets a nominal for a `.row-icon` box, in either sheet. */
-const sharedNominals = rulesTargeting(css, 'row-icon').filter(r => r.props.has('--icon-glyph'));
-const queuedRules = rulesTargeting(chatCss, 'queued-message-remove');
-const queuedNominals = queuedRules.filter(r => r.props.has('--icon-glyph'));
+/** The rule that owns the 2.25rem tap target the two bands share. */
+const boxRule = cssRules(css).find(r => {
+  const members = selectorList(r.selector);
+  return members.includes('.icon-btn.header-icon') && members.includes('.icon-btn.row-icon');
+});
 
-describe('the nominal glyph size is a per-context knob', () => {
-  it('defaults to the large step on the shared box, so the trigger group heading is unchanged', () => {
-    // One declaration, on the box rule itself: a second one in this sheet would
-    // be a silent second default, and whichever lost would be dead code.
-    expect(sharedNominals.length, 'the shared sheet does not declare exactly one nominal').toBe(1);
-    const box = sharedNominals[0];
-    expect(box.props.get('--icon-glyph'), 'the default nominal moved off the large step')
-      .toBe('var(--icon-size-lg)');
-    // Same rule, so the box the nominal is declared on is the tap target itself.
-    expect(box.props.get('width'), 'the nominal is not declared on the 2.25rem box').toBe('2.25rem');
-    expect(box.props.get('height')).toBe('2.25rem');
+/** Every rule that sets a nominal for one of the two boxes, per band. */
+const nominals = (className: string) =>
+  rulesTargeting(css, className).filter(r => r.props.has('--icon-glyph'));
+const headerNominals = nominals('header-icon');
+const rowNominals = nominals('row-icon');
 
-    // The default is only worth anything while the glyph actually reads it.
-    const svg = cssRules(css).find(r =>
-      r.selector.split(',').some(s => s.trim() === '.icon-btn.row-icon svg'),
-    );
-    expect(svg, 'no .icon-btn.row-icon svg rule').toBeDefined();
-    expect(svg!.props.get('width'), 'the glyph is not sized from the nominal').toBe('var(--icon-glyph)');
-    expect(svg!.props.get('height')).toBe('var(--icon-glyph)');
+/** The `--icon-size-*` step a nominal rule names, or undefined if it is not on
+ *  the scale at all. */
+const step = (value: string) => /^var\((--icon-size-[\w-]+)\)$/.exec(value)?.[1];
 
-    // And the trigger group's pair takes that default: nothing in their own
-    // sheet retunes it, which is what keeps their rendered size untouched by
-    // the queued override below (measured for real by
-    // e2e/trigger-group-icon-optics.spec.ts).
-    for (const name of ['trigger-group-delete', 'trigger-group-rename']) {
-      for (const r of rulesTargeting(groupCss, name)) {
-        expect(r.props.has('--icon-glyph'), `${name} picked up a local nominal`).toBe(false);
-      }
+/** Every rule in a caller's own sheet aimed at one of the two row buttons. */
+const callerRules = [
+  ...rulesTargeting(chatCss, 'queued-message-remove'),
+  ...rulesTargeting(groupCss, 'trigger-group-delete'),
+  ...rulesTargeting(groupCss, 'trigger-group-rename'),
+];
+
+describe('the nominal glyph size is declared per band, on the shared tap target', () => {
+  it('keeps the tap target on one rule and puts a nominal on each class it names', () => {
+    expect(boxRule, 'no shared .icon-btn.header-icon, .icon-btn.row-icon rule').toBeDefined();
+    expect(boxRule!.props.get('width'), 'the shared rule is not the 2.25rem tap target').toBe('2.25rem');
+    expect(boxRule!.props.get('height')).toBe('2.25rem');
+    // The two bands take different nominals, so one riding the shared rule
+    // would be a default that silently reaches both again.
+    expect(boxRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for both bands').toBe(false);
+
+    for (const [className, found] of [['header-icon', headerNominals], ['row-icon', rowNominals]] as const) {
+      // Exactly one: a second in this sheet would be a silent second default,
+      // and whichever lost would be dead code.
+      expect(found.length, `.${className} does not declare exactly one nominal`).toBe(1);
+      // On a selector the shared box rule itself names, which is what keeps a
+      // nominal from landing on anything that is not one of these tap targets.
+      expect(selectorList(boxRule!.selector), `.${className}'s nominal is not on a shared tap target`)
+        .toContain(found[0].selector);
+      // And the nominal rule moves the glyph only. The box was grown
+      // deliberately after the trash was reported unhittable on mobile.
+      expect([...found[0].props.keys()], `"${found[0].selector}" sets more than the nominal`)
+        .toEqual(['--icon-glyph']);
+    }
+
+    // The nominals are only worth anything while the glyph actually reads them.
+    for (const sel of ['.icon-btn.header-icon svg', '.icon-btn.row-icon svg']) {
+      const svg = cssRules(css).find(r => selectorList(r.selector).includes(sel));
+      expect(svg, `no ${sel} rule`).toBeDefined();
+      expect(svg!.props.get('width'), `${sel} is not sized from the nominal`).toBe('var(--icon-glyph)');
+      expect(svg!.props.get('height')).toBe('var(--icon-glyph)');
     }
   });
 
-  it('lets the queued trash pick a smaller step, on a selector that outranks the default', () => {
-    expect(queuedNominals.length, 'the queued trash does not declare exactly one nominal').toBe(1);
-    const queued = queuedNominals[0];
-
-    // Specificity, not sheet order: the override must win wherever the two
-    // sheets land relative to each other, so it carries more classes in its
-    // subject than the default it is beating.
-    const defaultClasses = subjectClasses(sharedNominals[0].selector, 'row-icon');
-    const queuedClasses = subjectClasses(queued.selector, 'queued-message-remove');
-    expect(queuedClasses.length, `"${queued.selector}" does not outrank "${sharedNominals[0].selector}"`)
-      .toBeGreaterThan(defaultClasses.length);
-    // Naming the box's own two classes is what makes it a specificity win over
-    // that exact rule rather than a differently-shaped selector that misses.
-    expect(queuedClasses).toEqual(expect.arrayContaining(['.icon-btn', '.row-icon', '.queued-message-remove']));
-
-    // A step on the scale, and a smaller one: the point of the override.
-    const value = queued.props.get('--icon-glyph')!;
-    const token = /^var\((--icon-size-[\w-]+)\)$/.exec(value)?.[1];
-    expect(token, `${value} is not an --icon-size-* step`).toBeDefined();
-    const lg = steps.get('--icon-size-lg');
-    expect(lg, '--icon-size-lg is not a rem step in base.css').toBeGreaterThan(0);
-    expect(steps.get(token!), `${token} is not a rem step in base.css`).toBeGreaterThan(0);
-    expect(steps.get(token!), `${token} is not smaller than --icon-size-lg`).toBeLessThan(lg!);
-
-    // The three classes are only a specificity win while the button carries all
-    // three; drop one in the TSX and the rule quietly stops matching.
-    expect(chatExchange, 'the queued button no longer carries the classes the override names')
-      .toContain('class="icon-btn row-icon queued-message-remove"');
+  it('gives the header band the large step and puts a row one step below it', () => {
+    const header = step(headerNominals[0].props.get('--icon-glyph')!);
+    const row = step(rowNominals[0].props.get('--icon-glyph')!);
+    expect(header, 'the header nominal is not an --icon-size-* step').toBeDefined();
+    expect(row, 'the row nominal is not an --icon-size-* step').toBeDefined();
+    expect(header, 'the header nominal moved off the large step').toBe('--icon-size-lg');
+    expect(steps.get(header!), `${header} is not a rem step in base.css`).toBeGreaterThan(0);
+    expect(steps.get(row!), `${row} is not a rem step in base.css`).toBeGreaterThan(0);
+    // The whole point of the split: a row glyph reads against the header icons
+    // a few rows up, and the pencil paints more of its box than they do, so at
+    // one nominal it looked a fifth too big (e2e/trigger-group-icon-optics.spec.ts
+    // measures the pair's real ink).
+    expect(steps.get(row!), `${row} is not smaller than ${header}`).toBeLessThan(steps.get(header!)!);
   });
 
-  it('shrinks the glyph only, leaving the 2.25rem tap target alone', () => {
-    // The box was grown deliberately after this trash was reported unhittable
-    // on mobile, so no rule aimed at this button may resize or re-pad it: the
-    // glyph is the only thing the override is allowed to move.
-    for (const r of queuedRules) {
+  it('is the single source: no caller retunes it in its own sheet', () => {
+    // Both row callers want the same step, so neither carries a local override
+    // that would have to out-rank the shared rule on specificity.
+    for (const r of callerRules) {
+      expect(r.props.has('--icon-glyph'), `"${r.selector}" picked up a local nominal`).toBe(false);
       for (const prop of ['width', 'height', 'min-width', 'min-height', 'padding']) {
         expect(r.props.has(prop), `"${r.selector}" sets ${prop} on the tap target`).toBe(false);
       }
       for (const prop of r.props.keys()) {
         expect(prop.startsWith('padding-'), `"${r.selector}" sets ${prop} on the tap target`).toBe(false);
       }
+    }
+
+    // A caller only gets the nominal while it still wears the class.
+    expect(chatExchange, 'the queued button no longer carries the row-icon class')
+      .toContain('class="icon-btn row-icon queued-message-remove"');
+    for (const name of ['trigger-group-rename', 'trigger-group-delete']) {
+      expect(groupHeader, `${name} no longer carries the row-icon class`)
+        .toContain(`class="icon-btn row-icon ${name}"`);
     }
   });
 });

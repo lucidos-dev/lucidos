@@ -49,7 +49,7 @@ The blocklist contains exactly the per-token streaming variants — many fires p
 - `CodingAgentTextStreamed`
 - `CodingAgentThoughtStreamed`
 
-Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable**: they fire once per discrete action, scoped with per-entry `condition:` filters (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). A condition reads TOP-LEVEL payload fields only, with operators `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` and a bare value meaning `$eq`. There is no regex operator and no nested path, and an unsupported one never matches, so a filter on the command text inside `args` silently never fires.
+Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemoryRecalled`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable**: they fire once per discrete action, scoped with per-entry `condition:` filters (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). A condition reads TOP-LEVEL payload fields only, with operators `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` and a bare value meaning `$eq`. There is no regex operator and no nested path, and an unsupported one never matches, so a filter on the command text inside `args` silently never fires.
 
 **`thread_id` is available on every event in this file, and on none of their payloads.** The engine supplies it at matching time from the thread the event belongs to, so `condition: { thread_id: "<uuid>" }` scopes a subscription to one thread whatever the event type: one coding-agent session reaching a turn boundary (`CodingAgentIdled`), one thread's next response (`ResponseGenerated`), one thread's next tool call. It is a matching-time field only, so it never appears in a payload you read back with `query_events`, where the event row's own thread column carries it instead. A **domain event** (`emit_event`) belongs to no thread and therefore has no `thread_id` to filter on.
 
@@ -126,7 +126,7 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 | `TextStreamed` | A complete chunk of assistant text was committed to the thread (post-stream finalize for chat; one event per appended chunk). | high-volume-streaming | yes | **no (blocked)** |
 | `ThoughtStreamed` | The model emitted a `thinking` / reasoning block (extended-thinking models). One event per chunk. Legacy alias: `Thinking`. | high-volume-streaming | yes | **no (blocked)** |
 | `ContextCaptured` | One snapshot of the LLM context the engine assembled for a single LLM call (prompt sections, tools, estimated tokens, real `usage` when the provider reports it). One per LLM call; the modal reads these to show context drift. | per-action | yes | yes (use condition) |
-| `MemorySearched` | The chat-side memory consumer ran a vector search to assemble context. Carries `results: usize`, `queries: Vec<String>`. | per-action | yes | yes (use condition) |
+| `MemoryRecalled` | The engine's **automatic pre-turn recall**: before the model saw anything, a classifier derived sub-queries, the chat-side memory consumer vector-searched long-term memory, and the hits were injected into the turn's context. Carries `results: usize` (how many were injected) and `queries: Vec<String>` (the classifier's sub-queries). **Not the agent's own lookup**: when the injection misses, the agent calls the `memory` tool's `search` action mid-turn with a query of its own, and that arrives as a `ToolCalled`. Subscribe to this one for "the engine recalled something", to `ToolCalled` for "the agent went looking". Legacy alias: `MemorySearched` (renamed 2026-08-12, because the two names were one word apart and read as the same event). Rows persisted under the old name still deserialize and still render, but **subscriptions do not follow a rename**: `on_event: MemorySearched` on a trigger, and an `await_event` waiting on that name, match the event type as an exact string and so stop firing. Re-point them at `MemoryRecalled`. | per-action | yes | yes (use condition) |
 | `ToolCalled` | The chat agentic loop invoked a tool (`name`, `args`, optional `description`). Distinct from `CodingAgentToolCalled` — those are coding-agent tool calls. | per-action | yes | yes (use condition) |
 | `ToolResult` | The result returned to the chat agentic loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true), and optional `tool_called_event_id: Uuid` set only by the post-restart recovery sweep (`recover_orphan_tool_calls`) for synthetic backfills: the frontend's `groupIntoExchanges` uses it to land the synthetic result in the same exchange as its orphan `ToolCalled` so the "Executing …" spinner resolves. Live emits omit it; chronological name pairing handles those. **Inline image bytes are stubbed out of `result`**, so a tool that returned an image persists something like `[image image/png, 641.2 KB omitted, not embedded in event]` or `[screenshot image/png, 1.5 MB omitted, not embedded in event]` followed by the page DOM. The model that made the call saw the actual image; the stub exists only because a megabyte of base64 per row made heavy threads unloadable. Reading one back via `query_events` means the image was shown and not persisted, never that it failed or was withheld. | per-action | yes | yes (use condition) |
 | `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command) OR `run_python_background` (venv-rooted Python script — the engine wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes it through the same registry). The `command` field captures the exact shell invocation. Paired with a later `BackgroundBashCompleted`. | per-action | yes | yes |
@@ -137,7 +137,7 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 | `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` triggers this for coding-agent threads too). Carries `error: String`. For an empty chat completion, `ResponseFailed` is reserved for the *genuine* failure shapes — output **truncated** (`max_tokens` / `MAX_TOKENS` / `length`), **blocked** by a safety/policy classifier (`refusal` / `SAFETY` / `content_filter`), **dropped output** (provider billed tokens but nothing parsed; Anthropic-only signal), or an **unrecognised** stop reason (fail-safe). A clean model-decided empty stop is benign and emits an empty `ResponseGenerated` instead (see that row). Classification is uniform across providers and thread types — see `classify_empty_completion` / `normalize_finish_reason` (`agentic_loop/helpers.rs`). | one-per-turn | yes | yes |
 | `UserPromptInjected` | A user interjection (a message sent while the turn was already running) OR an engine-injected mid-flight message (resume note, child-thread callback in legacy paths) was relayed into the live agentic loop. Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`, optional `delivered_event_id`. The loop wraps the text before the model sees it (`framed_injected_prompt`, `agentic_loop/helpers.rs`), keyed on `mode` **and** on whether the message lands mid-turn or starts a turn of its own. Mid-turn: a `Human` message is framed as an interjection to answer *and then resume the work in progress* (a redirect still overrides, but answering alone is not a reason to end the turn), while `Agent`/`Engine` messages are framed as a system update to fold into the response in progress. An injection the previous turn ended before draining is re-processed as its own turn (`api::chat::process_orphan_chain`) and gets no resume directive at all: that turn is over, so there is no work left to carry on with. **Every** orphan in such a batch is announced, the first included (`announce_orphan_batch`). The re-processed turn reuses the already-persisted `MessageReceived` as its starter event, so this is the only event in it whose lifecycle rule sets the thread back to `running`, and the client uses `injected_message_id` to absorb it into that message's own panel rather than rendering a second one. The event itself always stores the user's raw `text`, never the framing. | per-action | yes | yes (use condition) |
 | `ImageDescribed` | A background Flash call produced a text description for one of the images attached to a `MessageReceived`. One event per attached `user_image_hashes` entry, all carrying the same description text. Emitted from the agentic loop after iteration 1 of a chat turn; a message that arrives while the thread is already working is injected mid-turn instead of starting one, so that path emits from the chat injection fast-path as a detached task (before, such an image got no `ImageDescribed` at all and left no record once its bytes aged out of context). Replaced an in-place `jsonb_set` mutation that used to write `image_description` back into the source row. Carries `source_event_id: Uuid` (the originating `MessageReceived`), `hash: String` (the described blob's sha256), `description: String` (post `is_bad_image_description` filter), `model: String` (literal `"backfill"` on rows produced by the startup backfill, otherwise the actual Flash model). The `description` is indexed into memory (it carries real shared content — screenshots, tickets, photos), so an image-only turn isn't a memory black hole. | per-action | yes | yes (use condition) |
-| `TodoListWritten` | The *Lucidos Agent* called the `todo_write` LLM tool, OR the engine's `todo_consumer` settled the still-open items when the thread stopped working the list. Replace-whole-list semantics: `items: Vec<TodoItem>` is the new complete *todo list*, fully superseding any prior `TodoListWritten` in the thread. Each `TodoItem` has `content: String` (imperative form, "Run tests"), `active_form: String` (present continuous, "Running tests"), `status: TodoStatus` (`pending` / `in_progress` / `completed` / `waiting` / `abandoned`, snake_case on the wire). LLM tool handler enforces ≤ 50 items, at most one `in_progress`, and rejects BOTH `waiting` and `abandoned` (engine-only); empty list is valid and means "cleared". The engine-side `todo_consumer` subscribes to every terminator (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`) and re-emits the latest list with every still-open item settled, so the panel shows an honest state once a response ends. **Which status it settles to answers "parked or walked away?":** `waiting` when the thread still holds a live *event wait* as of that terminator (`await_event` does not hold the turn, per ADR 0049, so a subscribed thread terminates normally and sleeps), `abandoned` otherwise. `waiting` is itself still open, so a wait that resolves without the agent picking the list back up settles to `abandoned`; `abandoned` is terminal and a later subscription never reverses it. The consumer's **second trigger is `EventWaitCanceled`**, and it exists because a terminator is not the only moment a thread stops being parked: `EventWaitDelivered` and `EventWaitExpired` each write a `UserPromptInjected` wake anchor, so the woken turn's own terminator settles the list, while a cancel wakes nothing and would otherwise leave an idle thread reading `waiting` with no next terminator to correct it. It is skipped when a turn still owns the list (thread status `running` / `waiting_for_user_answer` / `paused`, which is the agent standing its own watch down mid-turn), since `abandoned` is terminal and that turn's terminator could not walk it back. Cancelling N subscriptions in one cascade still writes at most one settle: at cancel k the waits above it are unresolved at that sequence, so the target is `waiting` again and the already-settled short-circuit holds. Chat-agent tool only: *coding-agent threads* render backend-native todo/tool output instead. UI: frontend walks the thread's events backwards, finds the most recent `TodoListWritten`, and renders the items in the prompt-bar collapsible panel; abandoned rows render with a dashed strike-through and an `abandoned` tag, waiting rows with a clock marker, full-strength text and a `waiting` tag. | per-action | yes | yes (use condition) |
+| `TodoListWritten` | The *Lucidos Agent* called the `todo_write` LLM tool, OR the engine's `todo_consumer` settled the still-open items when the thread stopped working the list. Replace-whole-list semantics: `items: Vec<TodoItem>` is the new complete *todo list*, fully superseding any prior `TodoListWritten` in the thread. Each `TodoItem` has `content: String` (imperative form, "Run tests"), `active_form: String` (present continuous, "Running tests"), `status: TodoStatus` (`pending` / `in_progress` / `completed` / `waiting` / `abandoned`, snake_case on the wire). LLM tool handler enforces ≤ 50 items, at most one `in_progress`, and rejects BOTH `waiting` and `abandoned` (engine-only); empty list is valid and means "cleared". The engine-side `todo_consumer` subscribes to every terminator (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`) and re-emits the latest list with every still-open item settled, so the panel shows an honest state once a response ends. **Which status it settles to answers "parked or walked away?":** `waiting` when the thread still holds a live *event wait* as of that terminator (`await_event` does not hold the turn, per ADR 0049, so a subscribed thread terminates normally and sleeps), `abandoned` otherwise. `waiting` is itself still open, so a wait that resolves without the agent picking the list back up settles to `abandoned`; `abandoned` is terminal and a later subscription never reverses it. The consumer's **second trigger is `EventWaitCanceled`**, and it exists because a terminator is not the only moment a thread stops being parked: `EventWaitDelivered` and `EventWaitExpired` each write a `UserPromptInjected` re-entry anchor, so the re-entered turn's own terminator settles the list, while a cancel re-opens nothing and would otherwise leave an idle thread reading `waiting` with no next terminator to correct it. It is skipped when a turn still owns the list (thread status `running` / `waiting_for_user_answer` / `paused`, which is the agent standing its own watch down mid-turn), since `abandoned` is terminal and that turn's terminator could not walk it back. Cancelling N subscriptions in one cascade still writes at most one settle: at cancel k the waits above it are unresolved at that sequence, so the target is `waiting` again and the already-settled short-circuit holds. Chat-agent tool only: *coding-agent threads* render backend-native todo/tool output instead. UI: frontend walks the thread's events backwards, finds the most recent `TodoListWritten`, and renders the items in the prompt-bar collapsible panel; abandoned rows render with a dashed strike-through and an `abandoned` tag, waiting rows with a clock marker, full-strength text and a `waiting` tag. | per-action | yes | yes (use condition) |
 
 Terminator set for chat-mode (`TERMINATOR_EVENT_TYPES` constant): `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ResponseFailed`. Used by `has_terminator_for` for idempotent terminator emission.
 
@@ -195,7 +195,7 @@ Not prefixed `CodingAgent*` because the same machinery serves any agent that nee
 
 Because the fast-path reroutes typed text, an answer that carries composer text (`FreeText`, or `MultiSelected` with `text`) **clears the thread's stored compose draft** (but only when the draft is exactly what was submitted: trimmed text compare, and no attached images, since an answer carries none) and **broadcasts a `ThreadComposeChanged`** carrying the now-empty state and the thread's new *compose epoch*, so every device learns of it live and a draft write composed before the answer can no longer be applied after it. Nothing else on this path would do either: no `MessageReceived` is emitted, so the send-side clear never runs, and the draft would otherwise re-sync to every device (or linger on peers until their next thread-summary reload). A click-only answer submits no text, so it clears nothing and broadcasts nothing, and a different draft still in progress on another device survives.
 
-The FreeText fast-path is additionally gated to **human-authored** follow-ups (`ActorMode::Human`). Only a real person typing answers an open question; agent- and engine-driven re-entries on the same thread are not the user's answer and must fall through. The case that motivated this: a **child-thread completion** wakes the parent via `notify_parent_of_child_completion` with `ActorMode::Agent`, feeding a `[CHILD THREAD COMPLETED] …` block through the same chat-turn entry point. Before the guard, that block was consumed as a bogus `UserQuestionAnswered { FreeText }` (actor = `thread_link`/`child`), silently killing the user's open question. Now the wake falls through to the injection fast-path (queued as `WakeFromChild`), so the question stays live for the user and the child's result is processed right after they answer it.
+The FreeText fast-path is additionally gated to **human-authored** follow-ups (`ActorMode::Human`). Only a real person typing answers an open question; agent- and engine-driven re-entries on the same thread are not the user's answer and must fall through. The case that motivated this: a **child-thread completion** re-opens the parent via `notify_parent_of_child_completion` with `ActorMode::Agent`, feeding a `[CHILD THREAD COMPLETED] …` block through the same chat-turn entry point. Before the guard, that block was consumed as a bogus `UserQuestionAnswered { FreeText }` (actor = `thread_link`/`child`), silently killing the user's open question. Now the re-entry falls through to the injection fast-path (queued as `ReentryFromEngine`), so the question stays live for the user and the child's result is processed right after they answer it.
 
 ## Thread lifecycle
 
@@ -253,8 +253,8 @@ the wait, and the dispatcher's live set is rebuilt from these rows at boot.
 |---|---|---|---|---|---|
 | `EventWaitStarted` | A thread registered a subscription. Emitted between the `ToolCalled` and that call's `ToolResult`, so the pair closes normally and the turn carries on. Carries `wait_id`, `tool_use_id`, `on: EventSubscription[]` (same shape as a trigger's `on:`), `reason` (the model's own words, shown to the user), `armed_at`, `expires_at`, and `watermark` (the event `sequence` at registration, which the catch-up scan reads forward from). `armed_at` is recorded rather than derived from `expires_at`, because the age is what `list_event_waits` reports and a derived one drifts; rows written before 2026-08-07 lack it and fall back to the event row's own `created`. Writes NO status. | per-action (rare) | yes | yes | **no** |
 | `EventWaitDelivered` | A matching event resolved the wait. Carries `wait_id`, the matched `event_id` / `event_type` / `payload` (self-contained, so replay never dangles), and `matched_index` (which `on:` entry fired). | per-action (rare) | yes | yes | **no** |
-| `EventWaitExpired` | The wait passed `expires_at`. **Wakes the thread** with an explanatory message rather than dropping it: a silently dropped wait is a permanently stalled thread, which is worse than the polling this replaces. Carries `wait_id`. | per-action (rare) | yes | yes | **no** |
-| `EventWaitCanceled` | The subscription was stopped short of its own resolution. `cause` is one of `user_stop` (the **Stop waiting** button), `agent_stand_down` (the agent retired one of its own), `thread_archived`, `thread_discarded`. Note what is absent: neither an ordinary user message nor a thread-level **Stop** disturbs a subscription in any way. `thread_canceled` is a RETIRED cause, still read so pre-2026-08-07 rows replay, never emitted. Also carries `on` and `reason`, a copy of what was stopped, so the transcript entry is self-contained on replay the way a delivery is: a stop renders at its own place in the timeline and its `EventWaitStarted` is routinely outside the loaded window by then. Both are absent on pre-2026-08-07 rows. One side effect the other two resolutions do not have: because a cancel wakes nothing, it is the moment `todo_consumer` settles a *todo list* the thread parked, unless a turn still owns it (see `TodoListWritten`). | per-action (rare) | yes | yes | **no** |
+| `EventWaitExpired` | The wait passed `expires_at`. **Re-opens the thread** with an explanatory message rather than dropping it: a silently dropped wait is a permanently stalled thread, which is worse than the polling this replaces. Carries `wait_id`. | per-action (rare) | yes | yes | **no** |
+| `EventWaitCanceled` | The subscription was stopped short of its own resolution. `cause` is one of `user_stop` (the **Stop waiting** button), `agent_stand_down` (the agent retired one of its own), `thread_archived`, `thread_discarded`. Note what is absent: neither an ordinary user message nor a thread-level **Stop** disturbs a subscription in any way. `thread_canceled` is a RETIRED cause, still read so pre-2026-08-07 rows replay, never emitted. Also carries `on` and `reason`, a copy of what was stopped, so the transcript entry is self-contained on replay the way a delivery is: a stop renders at its own place in the timeline and its `EventWaitStarted` is routinely outside the loaded window by then. Both are absent on pre-2026-08-07 rows. One side effect the other two resolutions do not have: because a cancel re-opens nothing, it is the moment `todo_consumer` settles a *todo list* the thread parked, unless a turn still owns it (see `TodoListWritten`). | per-action (rare) | yes | yes | **no** |
 
 ### A subscription does not hold the turn
 
@@ -277,32 +277,32 @@ call**. If a match landed in the few minutes just before it, registration finds
 it and names it in the `await_event` result, with its payload and how long ago
 it was.
 
-**That is a report, not a wake.** The subscription watches FORWARD from the
+**That is a report, not a delivery.** The subscription watches FORWARD from the
 moment it was armed, so it will never fire for anything the result names, and a
 turn that ends without acting on it ends with the thing unhandled. It is not
-delivered as a wake because only you can tell an event you missed from one you
+delivered to you because only you can tell an event you missed from one you
 handled yourself earlier in the same turn. Act on it now, or decide out loud
 that you already did.
 
 Nothing suppresses that report except an event you were literally handed by an
 earlier wait (an `EventWaitDelivered`), so a re-arm right after a **delivery** is
-never told about the event that just woke it.
+never told about the event it was just handed.
 
-Read that promise narrowly: it covers a delivery, not every wake. A
-*child-completion* wake is the other way an event re-opens a thread, and the
+Read that promise narrowly: it covers a delivery, not every re-entry. A
+*child-completion* callback is the other way an event re-opens a thread, and the
 fan-in writes no `EventWaitDelivered`, so if you re-arm on
-`ChildThreadCompleted` in a wake turn the report can name the very callback that
-woke you. Recognise it by its `child_thread_id` and its age and carry on. Better
+`ChildThreadCompleted` in such a turn the report can name the very callback that
+re-opened you. Recognise it by its `child_thread_id` and its age and carry on. Better
 still, do not subscribe to your own child at all: see the `ChildThreadCompleted`
 section below for why that wait buys nothing.
 
-#### Which wakes leave you still watching, and which do not
+#### Which resolutions leave you still watching, and which do not
 
 | Wake | Subscription after it | What to do |
 |---|---|---|
 | **Delivery** (`EventWaitDelivered`) | **Spent.** The first match resolves the wait and consumes it. Any *other* live wait on the thread is untouched. | This one has stopped watching. To catch the next one, call `await_event` again *before the turn ends*. Saying you will re-subscribe is not re-subscribing: a turn that ends with no new call leaves nothing watching for it. |
 | **Expiry** (`EventWaitExpired`) | Gone. | Report what you were waiting for, rather than subscribing again to the same thing. |
-| **Stopped** (`EventWaitCanceled`) | Gone, because somebody stopped it: the **Stop waiting** button, an archive or discard, or you standing it down yourself. There is no wake at all, so the thread is left exactly as it was. | Report back. Do not re-register unless they ask. |
+| **Stopped** (`EventWaitCanceled`) | Gone, because somebody stopped it: the **Stop waiting** button, an archive or discard, or you standing it down yourself. There is no re-entry at all, so the thread is left exactly as it was. | Report back. Do not re-register unless they ask. |
 
 Delivery is the one that bites. It is the only resolution that consumes the
 subscription *and* hands you a payload to act on, so it reads like the wait is
@@ -325,7 +325,7 @@ silently killed unrelated watches armed hours earlier.
 
 **No `EventWait*` event writes a status**, and that absence is the rule rather
 than an omission. Registration happens mid-turn, so the turn's own terminator
-decides. A resolution lands on a thread that is either idle (its wake's own
+decides. A resolution lands on a thread that is either idle (its own
 `UserPromptInjected` sets `running`) or running something unrelated, which a
 write here would misreport as revived.
 
@@ -340,17 +340,23 @@ one exchange. It bought continuity, and it cost an unpaired `tool_use` in the
 message array, which is a provider 400 the moment anything else runs on the
 thread. Paying for that needed detach-on-interruption with a filler result, an
 attachment probe at every resolution site, a `was_attached` field on all three
-resolutions, two wake-anchor shapes, a `waiting_for_event` status, a restart
+resolutions, two anchor shapes, a `waiting_for_event` status, a restart
 preserve guard, and a bar on the injection fast path. All of it is gone. See
 `docs/plans/2026-08-06-every-event-wait-is-detached.md`.
 
-### The wake anchor
+### The re-entry anchor
 
 Every delivery and every expiry is immediately followed by exactly one more
 event, which is where the payload goes: a **`UserPromptInjected`** carrying it as
-prose. It starts a new exchange, which is the honest shape for a wake that may
+prose. It starts a new exchange, which is the honest shape for something that may
 arrive hours later, and it is the same shape a child-thread completion uses to
-wake its parent.
+re-open its parent.
+
+**It says the event arrived, never that you were asleep.** Registration does not
+hold your turn, so a match can land while this thread is still working, and the
+engine then folds it into the running turn and tells you it arrived "while you
+were working". The transcript card reads `Event arrived: <type>` for the same
+reason: nothing about a delivery knows which of the two lanes it took.
 
 On a *delivery* it also carries `delivered_event_id`, the id of the
 `EventWaitDelivered` above it. The prose is the prompt the model reads and
@@ -362,7 +368,7 @@ point at.
 
 Worth knowing when reading a transcript, and load-bearing on restart: a
 resolution followed *only* by its anchor is one whose turn never ran, which is
-how the engine re-drives a wake lost to a crash.
+how the engine re-drives a re-entry lost to a crash.
 
 ### Both agents, one registration
 
@@ -385,12 +391,12 @@ the same turn rather than discovering later:
 - `timeout_secs` is **required** and capped at **24 hours**. There is no
   unbounded wait. For anything longer, the right shape is a trigger.
 - A thread may hold **25 live waits** at once, and may not register the same
-  `on:` list twice (one event would then wake it twice). The limit is on how
-  many separate wakes can be outstanding, not on how much you can watch: one
+  `on:` list twice (one event would then be delivered twice). The limit is on how
+  many separate re-entries can be outstanding, not on how much you can watch: one
   wait's `on:` list is uncapped, so watching a dozen things in one subscription
-  (any entry wakes you) costs one of the 25.
+  (any entry delivers) costs one of the 25.
 - A thread may subscribe **10 times in a row** with no message from the user in
-  between. That bounds a thread that wakes itself, two threads ping-ponging,
+  between. That bounds a thread that re-opens itself, two threads ping-ponging,
   and a model simply stuck. An agent- or engine-authored message does not reset
   the count, since those are exactly what such a loop is made of.
 
@@ -770,11 +776,11 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 
 `status` is `success` / `failure` / `no_changes` / `canceled`. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
 
-**The parent is woken BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, named with a `child_thread_id` condition. Matching is workspace-wide, so that is any thread's child and not only a descendant of the awaiting thread's: the card is persisted on whichever thread is the parent, and the wait resolves off that row wherever it lands.
+**The parent is re-opened BY this callback, so it never has to wait for one.** The fan-in persists it on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers it, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, named with a `child_thread_id` condition. Matching is workspace-wide, so that is any thread's child and not only a descendant of the awaiting thread's: the card is persisted on whichever thread is the parent, and the wait resolves off that row wherever it lands.
 
 **One callback per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
 
-**A steer is not a completion.** A `ResponseCanceled` whose cause is `superseded_by_followup` is the mid-turn redirect the engine arms when a follow-up lands on a live Codex turn: the caller steered, they did not abandon, and the child runs the redirected turn immediately afterwards. It fires no `ChildThreadCompleted` and no parent wake. The redirected turn's own terminal is the report.
+**A steer is not a completion.** A `ResponseCanceled` whose cause is `superseded_by_followup` is the mid-turn redirect the engine arms when a follow-up lands on a live Codex turn: the caller steered, they did not abandon, and the child runs the redirected turn immediately afterwards. It fires no `ChildThreadCompleted` and no parent callback. The redirected turn's own terminal is the report.
 
 ### `TriggerStarted` / `TriggerCompleted`
 

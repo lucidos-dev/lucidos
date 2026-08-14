@@ -83,9 +83,21 @@
 }
 
 /* The notes are a card's contents, indented past the chevron so a release's
-   prose lines up under its own version rather than under the toggle. */
+   prose lines up under its own version rather than under the toggle.
+
+   The size is here because `.markdown-content` deliberately sets none: it is the
+   shared rule served to app iframes as well as the host, so every surface that
+   wears it names its own size (.response-content, .notification-detail-body,
+   .plugin-install-setup-body, .file-preview-content). This one did not, and an
+   unsized block falls all the way back to the root font size, which is the ui
+   scale rather than a step on the type scale. So the release notes rendered
+   larger than everything around them, including the version heading they sit
+   under. --font-size-sm with 1.5 leading is what the app's other prose surfaces
+   read at. */
 .whats-new-notes {
     padding: 0 0 0.75rem 1.5rem;
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
 }
 
 /* The list is the page's own content, so its first heading should not add a

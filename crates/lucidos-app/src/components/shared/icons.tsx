@@ -657,6 +657,145 @@ export function PowerIcon() {
   );
 }
 
+/** The *trigger* actor chip's glyph: a trigger fired and this turn is the
+ *  result. Worn by the `TriggerStarted` initiator panel.
+ *
+ *  Deliberately NOT `EventWaitClockIcon`, the clock a few lines up, and the two
+ *  can appear within a screen of each other in one transcript. That one marks an
+ *  *event wait*: something that has NOT happened, which will wake the turn when
+ *  it does. This marks the opposite, something that already fired. A clock here
+ *  would also quietly claim every trigger is scheduled, which is wrong: an event
+ *  trigger has no clock in it at all.
+ *
+ *  FILLED, against this file's outlined default, and the reason is the shape
+ *  rather than a preference. A bolt's waist is where its two halves cross, and
+ *  an outline puts two strokes through that crossing: at the `--icon-size-sm`
+ *  the chip renders (0.875rem, ~14px on a plain desktop root, so 24 units map to
+ *  ~0.58px each) the 2-unit stroke is ~1.2px and the daylight left in the waist
+ *  is under a device pixel. That is the arithmetic `CollapseTurnIcon` records
+ *  for three horizontal marks, reached here by a different route. A solid body
+ *  has no interior to lose, so it degrades to a smaller bolt rather than to a
+ *  blob. The tradeoff accepted with it is ink: this is heavier than the outlined
+ *  marks it sits among, which is tolerable because the chip holds exactly one
+ *  glyph and nothing competes with it inside the slot. */
+export function TriggerFiredIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
+      <polygon points="13 2 4 14 11 14 10 22 19 10 12 10 13 2" />
+    </svg>
+  );
+}
+
+/** The *You* actor chip's glyph: this turn was started from one of your
+ *  devices. The one origin the chip is allowed to call "You" (see
+ *  `actorInitiator`), so it must not resemble `ApiPlugIcon` below, which is
+ *  precisely the origin that must never be mistaken for you.
+ *
+ *  FILLED, for the reason `TriggerFiredIcon` sets out at length and for the same
+ *  measured cause: the outlined form's daylight is the gap between the head and
+ *  the shoulders, ~2 units, and at chip size that closes into a smudge with a
+ *  notch. Solid keeps head and shoulders legible as two masses at any size.
+ *  The head sits clear of the cap rather than touching it, so the pair still
+ *  reads as a figure and not as a single lump. */
+export function PersonIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+      <circle cx="12" cy="7.75" r="4" />
+      <path d="M12 13.5c-4.4 0-8 2.9-8 6.5v1h16v-1c0-3.6-3.6-6.5-8-6.5z" />
+    </svg>
+  );
+}
+
+/** The *API caller* actor chip's glyph: an external HTTP caller that did not
+ *  self-identify (no device id, no agent-origin token, no known workspace).
+ *
+ *  A plug, keeping the metaphor `API_CALLER_LABEL`'s own definition reaches for:
+ *  an external integration plugging into the API. Outlined rather than filled,
+ *  unlike its two neighbours above, and that difference is load-bearing rather
+ *  than incidental. The chip exists so an anonymous mutating POST can never be
+ *  rendered as "You", so this glyph's whole job is to not be mistaken for
+ *  `PersonIcon`: two open prongs over a hollow body against one solid mass is a
+ *  difference in weight as well as in shape, legible before either outline is.
+ *  The prongs are 6 units apart, three times the daylight a stroke needs at chip
+ *  size, so what survives shrinking is exactly the part that distinguishes it. */
+export function ApiPlugIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 2v6" />
+      <path d="M15 2v6" />
+      <path d="M6 8.5h12V12a6 6 0 0 1-12 0z" />
+      <path d="M12 18v4" />
+    </svg>
+  );
+}
+
+/** A directory row in the directory picker. Renders at 1.25rem rather than the
+ *  chip's 0.875rem, which is what affords a single closed outline here where the
+ *  actor chips needed solids. */
+export function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2.25 2.75H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
+  );
+}
+
+/** The `..` row in the directory picker: go up to the parent directory.
+ *
+ *  A folder with an arrow out of it, not a second folder shape. The row is a
+ *  BUTTON that moves you, where every row under it names a place, so the arrow
+ *  is carrying the only thing that distinguishes them. It affords three marks
+ *  only because this slot is 1.25rem; at the chip size used elsewhere in this
+ *  file an arrow inside a folder is exactly the smudge `CollapseTurnIcon` bans,
+ *  so do not reuse this one in a chip. */
+export function FolderUpIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2.25 2.75H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+      <polyline points="9.5 15 12 12.5 14.5 15" />
+      <line x1="12" y1="12.5" x2="12" y2="17.5" />
+    </svg>
+  );
+}
+
+/** THE apps glyph. A package: a box with its lid seam and front edge.
+ *
+ *  Single definition on purpose, and the single one there is. Three surfaces
+ *  mark an app and all three read it from here: Search Everywhere's result rows
+ *  and the content-pane back/forward history menu (both via `CategoryIcon`'s
+ *  `apps` case, which renders this rather than drawing its own), and the message
+ *  route panel's fallback for an app whose manifest declares no icon. A concept
+ *  with two glyphs diverges on the next tweak, which is what this replaced: the
+ *  category set carried a 2x2 rounded tile grid, one spark short of the Lucidos
+ *  mark that appears on every Lucidos Agent chip in the same transcript.
+ *
+ *  Authored in a 16-unit box at stroke-width 1.5, NOT this file's 24-unit
+ *  stroke-2 default, and it carries its own `width`/`height` where most icons
+ *  here take theirs from a class. Both come from the category family, whose
+ *  glyphs all take exactly those numbers from one shared props spread in
+ *  `CategoryIcon`. Matching the stroke keeps it from sitting heavier than the
+ *  file, thread and trigger glyphs beside it in a row.
+ *
+ *  The inline SIZE is load-bearing rather than tidy, and dropping it is a real
+ *  bug rather than a style slip. `.search-everywhere-result-icon`, the slot on
+ *  every Search Everywhere result row, HAS NO CSS RULE AT ALL: that surface has
+ *  always sized its glyphs purely from the attributes that spread put on each
+ *  `<svg>`. So an unsized `AppsIcon` there falls back to the default replaced
+ *  element box and paints an app hit's mark at ~300px. Its other two consumers
+ *  hide the fault, because both do size the slot in CSS
+ *  (`.nav-history-icon svg`, `.message-route-panel .route-app-icon svg`), and a
+ *  CSS rule beats a presentation attribute, so those keep overriding this
+ *  default exactly as before. */
+export function AppsIcon({ size = '1rem' }: { size?: string } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M2 5 8 2l6 3v6l-6 3-6-3z" />
+      <path d="m2 5 6 3 6-3" />
+      <path d="M8 8v6" />
+    </svg>
+  );
+}
+
 // The Lucidos mark: three rounded squares and a four-point spark, the same
 // geometry as `public/favicon.svg` and the installed PWA icon. Kept as paths
 // with no tile behind them, so a caller can put it on the brand gradient

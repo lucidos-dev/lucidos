@@ -14,8 +14,9 @@ const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 // for every other invocation, including a manual `npm run dev`.
 const previewProxy = frontendPreviewProxy(process.env[PREVIEW_API_ORIGIN_ENV]);
 
-// Resolve TLS cert/key: local .certs/ first, then LUCIDOS_TLS_CERT/KEY env vars
-// (needed in worktrees where .certs/ is gitignored — mirrors detect_tls() in workspace.sh).
+// Resolve TLS cert/key: local .certs/ first, then LUCIDOS_TLS_CERT/KEY env
+// vars, which a worktree needs because .certs/ is gitignored there. Mirrors
+// detect_tls() in workspace.sh.
 function resolveTlsFile(localName: string, envVar: string | undefined): string | undefined {
   const localPath = resolve(__dirname, '../../.certs', localName);
   if (fs.existsSync(localPath)) return localPath;
@@ -25,27 +26,6 @@ function resolveTlsFile(localName: string, envVar: string | undefined): string |
 const certFile = resolveTlsFile('cert.pem', process.env.LUCIDOS_TLS_CERT);
 const keyFile = resolveTlsFile('key.pem', process.env.LUCIDOS_TLS_KEY);
 const hasCerts = !!(certFile && keyFile);
-
-/**
- * The engine's CalVer VERSION is deliberately NOT baked into the client bundle.
- *
- * A `virtual:engine-version` plugin used to do exactly that, so the System page
- * could show it as the "Client" version. It was a lie by construction: the value
- * froze at whatever VERSION happened to be when the bundle was last built, while
- * the running engine's own VERSION kept bumping on every engine-only Apply — two
- * numbers on one page that could disagree with nothing the user could do about it
- * (no reload changes a baked string). The `addWatchFile` that was supposed to
- * re-bake it went inert when the `--built` dev mode replaced `vite build --watch`
- * with `dev-build-watch.mjs`'s one-shot builds, which don't watch VERSION anyway.
- *
- * Keeping them in sync is worse than dropping the row: re-baking on every VERSION
- * bump makes each engine-only change produce a byte-different bundle → a new
- * sw.js BUILD_ID → a "New version available — refresh to sync" toast whose entire
- * payload is a version string. Today an engine-only Switch correctly surfaces
- * nothing (see store/actions/connection.ts). The client's honest identity is its
- * own `CLIENT_BUILD_ID` (`virtual:build-id`, below) — that is what the System
- * page shows and what the refresh badge compares.
- */
 
 /**
  * Suppress Vite full-reload during git merge bursts.
@@ -94,19 +74,14 @@ function suppressMergeReload(): Plugin {
 /**
  * Expose the per-build id to the app bundle as the virtual module
  * `virtual:build-id` (`CLIENT_BUILD_ID`). The module ships the
- * `__LUCIDOS_BUILD_ID__` placeholder; the `lucidos-sw-stamp` plugin's
- * writeBundle rewrites it to the real id in the emitted JS — the SAME id it
- * stamps into sw.js — so the running bundle knows EXACTLY which build produced
- * it.
+ * `__LUCIDOS_BUILD_ID__` placeholder, and the `lucidos-sw-stamp` plugin's
+ * writeBundle rewrites it to the real id in the emitted JS: the SAME id it
+ * stamps into sw.js. This is the client's own identity, never the engine's
+ * VERSION (ADR 0069).
  *
- * This is what lets the client judge "is the loaded code stale?" honestly: it
- * compares CLIENT_BUILD_ID (the build that produced the code executing now)
- * against the served sw.js BUILD_ID, instead of the controlling service
- * worker's id (which can run ahead of the loaded page after a claim-without-
- * reload). No `apply` gate — the virtual module must resolve in both `vite
- * serve` (the live dev server) and `vite build`; in serve the stamp plugin is
- * inert, so it stays the literal `__…__` placeholder, which
- * syncClientUpdateFromBuild treats as "no signal" (no update).
+ * No `apply` gate: the virtual module must resolve in both `vite serve` and
+ * `vite build`. In serve the stamp plugin is inert, so the literal placeholder
+ * stands, which syncClientUpdateFromBuild treats as "no signal".
  */
 function buildIdVirtualModule(): Plugin {
   const moduleId = 'virtual:build-id';
@@ -137,16 +112,14 @@ function buildIdVirtualModule(): Plugin {
  *    the running code carries its own build id and can compare it against the
  *    served sw.js to detect when the loaded bundle is stale.
  *
- * The id is derived from the emitted asset filenames (which embed content
- * hashes), so it is DETERMINISTIC: a no-op rebuild (e.g. relaunching the dev
- * harness with unchanged source) yields the same id and does not spuriously
- * report an update. Rewriting the placeholder in already-hashed JS leaves the
- * filename (and thus the next build's id) untouched, so determinism holds.
- * sw.js must already be in the outDir here: in a single-shot build Vite copies
- * public/ before this writeBundle hook, and in the dev build-watch
- * `syncPublicDir` (ordered before this plugin) re-copies it on every rebuild —
- * see that plugin for why Vite alone isn't enough. `apply: 'build'` keeps it
- * inert during `vite serve`, where the literal placeholder is harmless.
+ * The id is derived from the emitted asset filenames, which embed content
+ * hashes, so it is DETERMINISTIC: a no-op rebuild yields the same id and does
+ * not spuriously report an update. Rewriting the placeholder in already-hashed
+ * JS leaves the filename, and so the next build's id, untouched.
+ *
+ * sw.js must already be in the outDir here. A single-shot build copies public/
+ * before this writeBundle hook, and the dev build-watch's `syncPublicDir`
+ * (ordered before this plugin) re-copies it on every rebuild.
  */
 function stampServiceWorker(): Plugin {
   return {
@@ -238,22 +211,19 @@ function inlineAppearanceBoot(): Plugin {
 /**
  * Re-copy public/ into the build outDir on EVERY build of the dev build-watch.
  *
- * `vite build --watch` copies publicDir only on the INITIAL build — public files
- * (sw.js, manifest.json, the favicons, icons/, splash/) aren't part of the
- * bundle graph, so the watcher skips them on incremental rebuilds
- * (vitejs/vite#18655). On its own that just leaves them stale; combined with
- * `atomicDistPublish` swapping the WHOLE staging dir onto the live dist/, the
- * first incremental rebuild WIPES them from the served dist/ entirely. The
- * engine then serves the SPA shell for /sw.js (text/html), so service-worker
- * registration fails with a MIME error ("push notifications may not work") and
- * the PWA manifest + icons 404 — on direct AND gateway access alike.
+ * `vite build --watch` copies publicDir only on the INITIAL build. Public files
+ * are not part of the bundle graph, so the watcher skips them on incremental
+ * rebuilds (vitejs/vite#18655). Combined with `atomicDistPublish` swapping the
+ * whole staging dir onto the live dist/, the first incremental rebuild WIPES
+ * them from the served dist/. The engine then serves the SPA shell for /sw.js,
+ * so service-worker registration fails on a MIME error and the PWA manifest and
+ * icons 404.
  *
- * This runs in writeBundle ordered BEFORE stampServiceWorker (earlier in the
- * plugins array) so the freshly re-copied sw.js is present for its BUILD_ID
- * stamp — copying after the stamp would overwrite it with the unstamped source
- * (IS_BUILT=false, no update toast). Scoped to the dev build-watch
- * (LUCIDOS_ATOMIC_DIST): a single-shot production build (npm run build / CI /
- * Tauri) copies public correctly on its own, so it stays byte-identical.
+ * This runs in writeBundle ordered BEFORE stampServiceWorker, so the freshly
+ * re-copied sw.js is present for its BUILD_ID stamp. Copying after the stamp
+ * would overwrite it with the unstamped source. Scoped to the dev build-watch
+ * (LUCIDOS_ATOMIC_DIST), since a single-shot production build copies public
+ * correctly on its own.
  */
 function syncPublicDir(): Plugin {
   const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
@@ -274,20 +244,17 @@ function syncPublicDir(): Plugin {
 /**
  * Atomic dist publish for `vite build --watch` (the `--built` dev mode).
  *
- * Vite empties the outDir at the start of every (re)build, so an interrupted or
- * failed watch rebuild leaves the SERVED dist/ with only the public/ copy and no
- * index.html — `vite preview` then 404s every route until the next *successful*
- * rebuild, which only fires on the next source change. That exact failure took
- * the dev frontend down. To make a failed build a no-op for the running app,
- * this plugin (active only when LUCIDOS_ATOMIC_DIST is set — i.e. the built-watch
- * launch in workspace.sh) redirects the build to a staging dir and atomically
- * publishes it onto the live dist/ in `closeBundle`, which Rollup runs ONLY after
- * a complete build (and after every `writeBundle`, so the sw-stamp has already
- * run on the staged files). A crashed build never reaches closeBundle, so the
- * last good dist/ stays in place and preview keeps serving it.
+ * Vite empties the outDir at the start of every rebuild. So a failed watch
+ * rebuild leaves the SERVED dist/ with only the public/ copy and no
+ * index.html. `vite preview` then 404s every route until the next successful
+ * rebuild, which only fires on the next source change.
  *
- * Production builds (npm run build / CI / Tauri) run without the env var → outDir
- * stays the default dist/, no staging, byte-identical to before.
+ * To make a failed build a no-op for the running app, this plugin redirects the
+ * build to a staging dir. It publishes atomically onto the live dist/ in
+ * `closeBundle`, which Rollup runs ONLY after a complete build, and after every
+ * `writeBundle`. A crashed build never reaches closeBundle, so the last good
+ * dist/ stays in place. Active only under LUCIDOS_ATOMIC_DIST, so a production
+ * build keeps the default dist/ with no staging.
  */
 function atomicDistPublish(): Plugin {
   const enabled = !!process.env.LUCIDOS_ATOMIC_DIST;
@@ -302,15 +269,15 @@ function atomicDistPublish(): Plugin {
     },
     closeBundle() {
       if (!enabled) return;
-      // Refuse to publish a build that didn't emit the app shell — never let a
+      // Refuse to publish a build that did not emit the app shell: never let a
       // degenerate build clobber a working dist/.
       if (!fs.existsSync(resolve(staging, 'index.html'))) {
         console.warn('[atomic-dist] staged build has no index.html — keeping previous dist/');
         return;
       }
-      // rename() is atomic but can't overwrite a populated dir, so swap via a
-      // backup: the only window where dist/ is absent is the two back-to-back
-      // renames (sub-millisecond), and only on a SUCCESSFUL build.
+      // rename() is atomic but cannot overwrite a populated dir, so swap via a
+      // backup. The only window where dist/ is absent is the two back-to-back
+      // renames, and only on a SUCCESSFUL build.
       fs.rmSync(prev, { recursive: true, force: true });
       if (fs.existsSync(live)) fs.renameSync(live, prev);
       fs.renameSync(staging, live);
@@ -321,42 +288,30 @@ function atomicDistPublish(): Plugin {
 
 export default defineConfig({
   // Relative asset base (ADR 0013): the built index.html references its bundle
-  // as `./assets/…` so the same build serves under both `/` (dev/gateway root)
-  // and `/ws/<id>/` (a workspace behind the gateway, where the gateway injects
-  // `<base href="/ws/<id>/">` to scope these). At the root with no <base> they
-  // resolve to `/assets/…` exactly as before — backward-compatible for the
-  // engine static-serve, `vite preview`, and Tauri. In `vite serve` (HMR) a
+  // as `./assets/...`, so one build serves under both `/` and a workspace
+  // behind the gateway, which injects a `<base href>` to scope them. At the
+  // root with no `<base>` they resolve to `/assets/...`. In `vite serve` a
   // relative base falls back to `/`, so the dev server is unaffected.
   base: './',
   plugins: [buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
   build: {
-    // The eager entry chunk is the first-paint-critical app core (shell, store,
-    // SSE/event handling, signals, layout): ~585 kB minified / ~179 kB gzipped,
-    // a healthy first-load for a feature-rich SPA. Views are already extensively
-    // lazy-loaded and the heavy libs (marked, highlight.js) + the framework
-    // (vendor, below) are split out, so the remaining core is irreducible without
-    // lazy-loading first-paint code (a UX regression) or gaming the per-chunk
-    // metric. Rollup's 500 kB default advisory is too conservative here; raise it
-    // to 600 kB so the guard still fires on a genuine regression (e.g. a heavy
-    // lib accidentally pulled into the eager graph) without flagging the baseline.
+    // The eager entry chunk is the first-paint-critical app core: shell, store,
+    // event handling, signals, layout. Views are lazy-loaded and the heavy libs
+    // are split out below, so the remaining core is irreducible without
+    // lazy-loading first-paint code. Rollup's 500 kB default advisory is too
+    // conservative for it.
     //
-    // 600 is a CEILING, not a budget to spend: it was tripped once already, by
-    // ordinary app growth rather than by any one heavy import, and the fix was to
-    // code-split the workspace picker out of the entry chunk (main.tsx), not to
-    // raise the number. Raising it is the move this repo has already made and
-    // backed out of once ("bump chunkSizeWarningLimit to 800 for SPA bundle",
-    // reverted two commits later once real code-splitting landed). When this
-    // fires again, find the next thing the eager graph does not need on first
-    // paint.
+    // 600 is a CEILING, not a budget to spend. When it fires, code-split the
+    // next thing the eager graph does not need on first paint, rather than
+    // raising the number.
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
         // Split third-party code out of the always-loaded entry chunk. The
-        // markdown/highlight libs get their own buckets (they're heavy and only
-        // pulled in by the chat/markdown paths); everything else under
-        // node_modules — preact, @preact/signals, @tauri-apps/api — lands in a
-        // shared `vendor` chunk. Without this the framework rode in the entry
-        // chunk, pushing it past Rollup's 500 kB advisory.
+        // markdown and highlight libs get their own buckets, being heavy and
+        // pulled in only by the chat paths. Everything else under node_modules
+        // lands in a shared `vendor` chunk. Without this the framework rides in
+        // the entry chunk and pushes it past Rollup's advisory.
         manualChunks(id) {
           if (id.includes('node_modules')) {
             if (id.includes('highlight.js')) return 'highlight';
@@ -368,10 +323,9 @@ export default defineConfig({
     },
   },
   test: {
-    // Cover both .test.ts and .test.tsx — JSX-bearing tests live in .tsx.
-    // Without the explicit `.tsx` glob, files like
-    // `src/components/chat/__tests__/permission-card.test.tsx` silently never
-    // run (no error, just zero discovery — a vitest convention quirk).
+    // Cover both .test.ts and .test.tsx, since JSX-bearing tests live in .tsx.
+    // Without the explicit `.tsx` glob those files silently never run: no
+    // error, just zero discovery.
     include: [
       'src/**/*.test.ts',
       'src/**/*.test.tsx',
@@ -384,10 +338,10 @@ export default defineConfig({
       '@': resolve(__dirname, 'src'),
       '@lucidos/sdk': resolve(__dirname, '../../packages/lucidos-sdk/src/index.ts'),
       // The appearance boot contract, reached WITHOUT the SDK barrel above.
-      // Deliberate: the barrel pulls the whole SDK in at module load, and the
-      // host store imports this from a module that installs an OS-theme
-      // listener at import time, so widening its graph reorders side effects
-      // for no gain. Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      // The barrel pulls the whole SDK in at module load. The host store
+      // imports this from a module that installs an OS-theme listener at
+      // import time, so widening that graph reorders side effects.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/appearance': resolve(__dirname, '../../packages/lucidos-sdk/src/appearance.ts'),
     },
   },
@@ -396,9 +350,9 @@ export default defineConfig({
     port: VITE_PORT,
     strictPort: true,
     hmr: {
-      // HMR WebSocket connects directly to Vite (not through engine proxy).
-      // The browser opens the engine port, which reverse-proxies HTTP to Vite,
-      // but WebSocket HMR needs a direct connection to Vite's own port.
+      // HMR connects directly to Vite, not through the engine proxy. The
+      // browser opens the engine port, which reverse-proxies HTTP to Vite, but
+      // the WebSocket needs a direct connection to Vite's own port.
       port: VITE_PORT,
       protocol: hasCerts ? 'wss' : 'ws',
     },
@@ -409,17 +363,16 @@ export default defineConfig({
       },
     }),
     ...(previewProxy && { proxy: previewProxy }),
-    // The `server` block is used by a manual `vite serve` (`npm run dev`) and by
-    // the frontend preview, which is the engine running this same dev server from
-    // a coding-agent worktree (engine/frontend_preview.rs). It is still NOT part
-    // of the dev harness (ADR 0014): web-dev / tauri-dev / e2e all build dist/
-    // and the engine serves it directly via LUCIDOS_STATIC_DIR, with no
-    // engine-to-Vite proxy in the workspace's own serving path. The preview is a
-    // separate origin the user opens deliberately, never that path (ADR 0055).
+    // The `server` block serves a manual `vite serve` and the frontend preview
+    // (engine/frontend_preview.rs). It is NOT part of the dev harness (ADR
+    // 0014): web-dev, tauri-dev and e2e all build dist/ and let the engine
+    // serve it via LUCIDOS_STATIC_DIR, with no engine-to-Vite proxy in the
+    // workspace's own serving path. The preview is a separate origin the user
+    // opens deliberately, never that path (ADR 0055).
   },
-  // `vite preview` (used by web-dev.sh --built to serve the built dist/) reads
-  // `preview.*`, NOT `server.*` — mirror host/port/strictPort and TLS here so the
-  // engine proxy and the iPhone reach it identically over Tailscale.
+  // `vite preview` reads `preview.*`, NOT `server.*`. Mirror host, port,
+  // strictPort and TLS here so the engine proxy and a phone reach it
+  // identically.
   preview: {
     host: true,
     port: VITE_PORT,

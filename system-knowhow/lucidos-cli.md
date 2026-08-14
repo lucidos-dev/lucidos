@@ -333,7 +333,7 @@ Five things worth knowing:
 
 `--event-id` defaults from `$LUCIDOS_EVENT_ID` and stamps the child's message-route panel so the follow-up links back to the originating event.
 
-**A cancellation is not done when the ack returns.** The ack says the message is on the child's timeline, nothing more: even with `--urgent` the child still has to wake, read it, and do the work of stopping. If you told a child to kill a running job, verify the job is actually gone (no processes, no lock file) before you report the cancellation as complete. Reporting off the ack is how a nightly pipeline once announced a clean host while its e2e suite ran on for another seven minutes.
+**A cancellation is not done when the ack returns.** The ack says the message is on the child's timeline, nothing more: even with `--urgent` the child still has to pick it up, read it, and do the work of stopping. If you told a child to kill a running job, verify the job is actually gone (no processes, no lock file) before you report the cancellation as complete. Reporting off the ack is how a nightly pipeline once announced a clean host while its e2e suite ran on for another seven minutes.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
 
@@ -387,18 +387,18 @@ Reach for it whenever the thing you are waiting on is something the engine
 emits: a change appearing (`ChangeProposed`), a trigger firing
 (`TriggerExecuted`), a workspace domain event your own scripts emit. It is
 **not** for external state with no Lucidos event (a third-party API you can only
-re-query, a file another process may write): nothing would ever wake you, so
+re-query, a file another process may write): nothing would ever be delivered, so
 poll for those.
 
 **And never subscribe to your own child's completion.** A thread spawned with
-`lucidos spawn-thread --relation child` already wakes this one: when it finishes, the
+`lucidos spawn-thread --relation child` already re-opens this one: when it finishes, the
 engine emits `ChildThreadCompleted` here and re-opens this thread with the
 child's status, summary and `pending_change_ids`, which is everything a
 subscription would have handed you. So a wait on it buys nothing, and it costs
 two things: one of the consecutive subscriptions the loop cap below allows, and
 a second clock, since
-a child that outlives `--timeout-secs` wakes this thread with a pointless expiry
-and then wakes it again when it actually finishes. Await a `ChildThreadCompleted`
+a child that outlives `--timeout-secs` re-opens this thread with a pointless expiry
+and then re-opens it again when it actually finishes. Await a `ChildThreadCompleted`
 only for a completion that is **not** your own child's, named with
 `--condition '{"child_thread_id": "<uuid>"}'`. Matching is workspace-wide, so
 that is any thread's child and not only a descendant of yours: a coding-agent
@@ -418,12 +418,12 @@ might be in the past, look at state first as you would anyway. What you do not
 have to worry about is the race between that check and this command: if a match
 landed in the few minutes just before it, the response names it, with its age.
 Read that part rather than skimming to the `"status":"subscribed"`, and act on
-it before you finish, because nothing will wake you for it. It is a report and
-not a wake because only you can tell an event you missed from one you handled
+it before you finish, because nothing will deliver it to you. It is a report and
+not a delivery because only you can tell an event you missed from one you handled
 yourself a few minutes ago.
 
 - `--on` names the event type, PascalCase past tense. Repeat it to watch
-  several: any one of them wakes the thread.
+  several: any one of them re-opens the thread.
 - `--condition` is a JSON object filtering the event's OWN payload fields (the
   ones `lucidos events query` prints), applied to every `--on` name. Equality by
   default, or an operator object: `{"$eq":v}`, `{"$ne":v}`, `{"$lt":n}`,
@@ -435,8 +435,8 @@ yourself a few minutes ago.
   thread in its own column), and a **domain event** belongs to no thread and so
   has none to filter on.
 - `--timeout-secs` is required and capped at 86400 (24 h). There is no unbounded
-  subscription. Waking early with a timeout costs one turn; waking too late
-  costs the user the whole wait.
+  subscription. Giving up early costs one turn; giving up too late costs the
+  user the whole wait.
 - `--reason` is one short line in the user's language. They read it in the
   subscription indicator, and it is how they tell a sleeping thread from a
   stalled one.
@@ -445,7 +445,7 @@ Refusals arrive as a `400` carrying the reason, and are worth reading rather
 than retrying: a per-token streaming event (`TextStreamed` and friends) or an
 `EventWait*` type is refused outright, a thread may hold at most 25 live
 subscriptions, the same `--on` list twice on one thread is refused (it would
-wake you twice for one event), and 10 subscriptions in a row with no message
+deliver one event to you twice), and 10 subscriptions in a row with no message
 from the user is the loop cap.
 
 ```bash
@@ -459,6 +459,62 @@ $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}
     --timeout-secs 1800 --reason "waiting for the refactor to propose its change"
 ```
 
+### `lucidos build-slot [--label <T>] [--max-wait <SECS>] -- <command>` / `--status` / `--set-capacity <N>`
+
+Run a heavy build under a *build slot*, so parallel *worktrees* cannot pile N
+full compiles onto one host and OOM it.
+
+**Wrap anything heavy** that a coding-agent session runs: `cargo build`,
+`cargo test`, a Gradle or Xcode build, a large bundler run. The slot is taken
+before the command starts and freed when it exits, or when this process dies.
+Do NOT wrap cheap work (a type-check, a unit-test run of a small package):
+it would sit in a slot for minutes to save seconds.
+
+```bash
+# The normal shape. Blocks until a slot frees, then runs the build.
+$ lucidos build-slot -- cargo test --release
+
+# Name it for the listing, when the command line is not the useful label.
+$ lucidos build-slot --label "integration suite" -- ./gradlew test
+
+# Who is building right now, and where the count came from.
+$ lucidos build-slot --status
+build slots: 1/3 held, capacity from host RAM
+pool: /Users/me/.lucidos/build-slots
+  slot 0  HELD  cargo test --release  pid 41231  2m14s  /path/to/worktree
+  slot 1  free
+  slot 2  free
+
+# Set the count for this machine. Not per workspace: the pool spans them.
+$ lucidos build-slot --set-capacity 2
+```
+
+**In the Lucidos repo you do not need this.** `make lint`, `make test` and the
+build scripts already take a slot themselves, so type the ordinary command.
+Reach for the wrapper in any OTHER repo, where nothing wraps it for you.
+
+**It waits, it does not fail.** A second build is wanted, just not
+concurrently, so the loser blocks with no deadline and prints progress.
+`--max-wait <secs>` opts into a deadline and exits **75** when it passes. If
+you set one and hit it, do not retry on a timer: subscribe and end your turn.
+
+```bash
+$ lucidos await-event --on BuildSlotReleased --timeout-secs 3600 \
+    --reason "waiting for a build slot before running the test suite"
+```
+
+Notes that matter:
+
+- **Nesting is safe.** A wrapped command that wraps again runs straight
+  through, so a script you call cannot deadlock against the slot you hold.
+- **It never blocks a build it cannot govern.** No `lucidos` binary, no
+  writable pool, or no engine to announce to all mean the command just runs.
+- **The exit code is the command's**, and a signalled command reports
+  `128 + signal`, so a killed build never reads as a pass.
+- **Every release is announced.** `BuildSlotReleased` fires whenever a slot
+  frees, so a session that gave up on `--max-wait` and subscribed is always
+  woken. `BuildSlotWaiting` and `BuildSlotAcquired` fire only under contention.
+
 ### `lucidos event-waits list` / `lucidos event-waits cancel [--wait-id <ID>] [--on <EVENT_TYPE>] [--all]`
 
 Read and stop the **calling thread's** own subscriptions, the ones
@@ -470,7 +526,7 @@ neither can reach another thread's subscriptions.
 
 **`list` is how you answer "am I still watching for that?", and you cannot
 answer it any other way.** Nothing tells you when a subscription ends. A
-delivery wakes you, but a timeout or a user pressing **Stop waiting** lands
+delivery re-opens the thread, but a timeout or a user pressing **Stop waiting** lands
 while your session is not running, and a subscription is *spent* the moment it
 fires. Answering from memory is a guess: on 2026-08-06 a thread told its user
 twice that a watch was armed when it had been dead for two hours. Run it before
@@ -489,7 +545,7 @@ $ lucidos event-waits list
   "expires_at":"2026-08-07T09:44:22Z","expires_in":"22m"}]}
 ```
 
-**`cancel` is how you stop watching.** A subscription you leave live wakes this
+**`cancel` is how you stop watching.** A subscription you leave live re-opens this
 thread later whatever you told the user, so when they say to stop, drop it, or
 never mind, run this rather than promising. Use it too when the thing turns out
 to have already happened, or when a new subscription supersedes an old one.
@@ -509,15 +565,15 @@ does not. It ends every subscription watching that event type, whatever
 One sharp edge, because a subscription can watch several event types at once
 (repeated `--on` at `await-event`): naming ONE of them ends that whole
 subscription, the other names included. A wait is a single rendezvous with
-several triggers, spent by the first match, so there is no leg left to be woken
-by once you have stopped watching for the other. The result names every type it
+several triggers, spent by the first match, so there is no leg left to deliver
+once you have stopped watching for the other. The result names every type it
 ended, so read it rather than assuming; when you meant to keep watching for the
 rest, arm a new subscription for them.
 
 ```bash
 # The user changed their mind about one of several watches.
 $ lucidos event-waits cancel --wait-id 3f2b1c04-...
-{"status":"stopped","message":"Stopped watching for ChangeProposed. It will not wake this thread."}
+{"status":"stopped","message":"Stopped watching for ChangeProposed. It will not re-open this thread."}
 
 # The release build finished while you were doing something else.
 $ lucidos event-waits cancel --on ReleasePublished

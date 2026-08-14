@@ -1531,7 +1531,9 @@ textarea.thread-title-edit-input {
 
 /* The row already separates its items with its own `gap`, so the explainer's
    base `margin-left` (for the ordinary case of an icon following inline text)
-   would double it here. The row owns its gap, so the row owns the correction. */
-.thread-filter-option > .explainer-btn {
+   would double it here. The row owns its gap, so the row owns the correction.
+   It goes on `.explainer-slot`, the wrapper carrying that margin, which is also
+   the flex item the gap applies to. */
+.thread-filter-option > .explainer-slot {
     margin-left: 0;
 }

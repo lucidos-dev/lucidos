@@ -5,97 +5,23 @@ import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 
 /** Shared scroll-position signals for the chat area.
- *  Writers MUST gate on isElementVisible(el) before mutating these signals, and
- *  readers before measuring one: a transcript element laid out at 0x0 answers
- *  every geometric question wrongly (isScrollable=false, so it clears notAtTop),
+ *
+ *  Writers MUST gate on `isElementVisible(el)` before mutating these signals,
+ *  and readers before measuring one. A transcript laid out at 0x0 answers every
+ *  geometric question wrongly (`isScrollable` false, so it clears `notAtTop`),
  *  and the app's own chrome routinely produces one. A COLLAPSED pane is the
- *  everyday case, the desktop split at ratio 0 or mobile's `.content-row`, which
- *  collapses to height 0 rather than display:none so its position:fixed children
- *  still render. See makeScrollObservers below.
+ *  everyday case: the desktop split at ratio 0, or mobile's `.content-row`,
+ *  which collapses to height 0 rather than `display: none` so its
+ *  `position: fixed` children still render.
  *
- *  This used to say the gate exists because ThreadView and CreateThreadView are
- *  each mounted twice, once per layout. They are not, and have not been since
- *  App.tsx started mounting only the visible layout's pane tree (SplitLayout or
- *  MobileSwipeContainer, gated on viewportIsMobile), because dual-mounting fanned
- *  every signal write out to both subtrees. `.thread-content` exists once. The
- *  phrase "the hidden dual-mount copy" survives further down this file and in a
- *  few neighbours as shorthand for the thing the check actually rejects, an
- *  element with no box; read it that way rather than as a live second mount.
+ *  The policy this module implements is ADR 0064, docs/adr/. The transcript's
+ *  position belongs to the reader, and the follow toggle is the one standing
+ *  request. Read it before changing what arms or retires a follow.
  *
- *  ── The transcript's scroll position belongs to the reader ──────────────────
- *  Nothing in this module moves the transcript on its own. The app may move it
- *  ONLY as the direct result of an explicit user action that asks for it, which
- *  is an exhaustive list: the two chevrons (`scrollToTop` /
- *  `scrollToBottomAnimated`), the FOLLOW TOGGLE (`setFollowLiveEdge`), the four
- *  SUBMITS (sending a message, submitting an answer to a question card, deciding
- *  a permission card, and Continue after an abort, all through `followSubmit`),
- *  ⌘↑/⌘↓ turn stepping (`stepThreadTurn`), a notification / Changes deep-link
- *  (`scrollToEventAndPulse` / `scrollToChangeAndPulse`), and `useScrollMemory`
- *  returning a reader to the position they left. Everything else leaves the
- *  reader exactly where they are: a streaming reply, a question or permission
- *  card ARRIVING, a thread sync, a thread opening.
- *
- *  ONE of those asks is STANDING rather than one-shot: the follow toggle means
- *  "take me to the live edge and KEEP me there until I say otherwise", so it
- *  arms the follow described further down. That is a rule about the DURATION of
- *  an ask, not an exception to the rule above. The down CHEVRON is the one-shot
- *  half of the same journey and arms nothing, which is why they are two
- *  controls: one button cannot be go-there, stay-here and stop-staying at once.
- *
- *  A SUBMIT ARMS NOTHING. It is one ask with one reaction, whichever of the four
- *  shapes it takes: a reader who is already riding the live edge is taken there,
- *  because that is the chevron's standing ask being served; everyone else gets a
- *  one-shot LANDING that brings the turn they acted on as far up the viewport as
- *  the transcript can actually reach, so what they submitted is on screen with
- *  the agent status line under it. Neither outcome outlives the moment. This is a
- *  change from the earlier rule, where a send and an answer armed the follow:
- *  riding is the chevron's alone now.
- *
- *  THE LANDING LINE IS SHARED. A turn comes to rest in the same place whatever
- *  put it there, a submit, ⌘↑/⌘↓ turn stepping or a deep link: `scroll-margin-top`
- *  below the container's top edge, clear of the chrome stacked there. See
- *  `turnLandingClearancePx`. It is reachable for any turn with a screenful of
- *  content below it, which the NEWEST turn by definition has not got, so a submit
- *  on one lands by the modest ask instead: show the turn. NOTHING IS RESERVED
- *  UNDER IT to make the line reachable. A screenful of `min-height` was, until
- *  2026-08-12, and it is gone: see `landOnOwnTurn` for what replaced it and why.
- *
- *  A SUBMIT WRITES NOTHING ONLY WHEN THERE IS NOWHERE TO GO, and that is decided
- *  by measuring the landing rather than by predicting it: if the turn is already
- *  resting at or above the landing line, the target is behind the reader and
- *  nothing is written. Two earlier branches tried to reach the same conclusion
- *  BEFORE the turn rendered, and both got the ordinary case wrong; see
- *  `followSubmit`.
- *
- *  Four things retire a standing follow, and all four are the reader: their own
- *  scroll GESTURE, a chevron or turn-nav press, opening another thread, and a
- *  DEEP-LINK LANDING. A link is the reader asking to be at one specific place,
- *  so the ride ends where it puts them and the transcript stops moving
- *  underneath them. A GESTURE and not merely a scroll, because the platform
- *  scrolls the container too (see "Was this scroll the reader's own GESTURE?");
- *  the last three are presses rather than gestures, so each retires the ride at
- *  its own call site.
- *
- *  Three of those four ask first whether the agent is LIVE, and so does the
- *  follow's own writing. Nothing about a standing follow happens on a thread
- *  that is doing nothing: the reader scrolls and clicks freely, keeps the lit
- *  toggle, and is picked back up the moment the thread runs again. Opening
- *  another thread is the one that asks nothing, because it is not this thread's
- *  question. See `_threadLive` and `followIsCarrying`.
- *
- *  This module used to hold the opposite policy, and most of its size was the
- *  machinery for deciding WHEN to pin: an 80px stickiness window (`scrolledUp`),
- *  two ResizeObserver modes behind a 500ms suppression window, a 16ms
- *  re-pinning loop with a frame budget, and a per-caller set of "was the user at
- *  the bottom" reads. All of it is gone. What survives is the reader's own
- *  navigation, plus ANCHOR PRESERVATION (holding them on the same content when
- *  layout shifts around them), which is the opposite of a pin.
- *
- *  `awayFromBottom` carries the whole weight of the live edge now: with no pin,
- *  a reader who has not asked to follow is routinely away from the bottom while
- *  a reply streams, and the down chevron is their only way back. It flips on the
- *  first pixel off the bottom and is reconciled on every scroll AND every
- *  resize. */
+ *  `awayFromBottom` carries the whole weight of the live edge. An unarmed reader
+ *  is routinely away from the bottom while a reply streams, and the down chevron
+ *  is their only way back. It flips on the first pixel off the bottom and is
+ *  reconciled on every scroll AND every resize. */
 export const awayFromBottom = signal(false);
 export const notAtTop = signal(false);
 /** True while a notification deep-link is resolving a scroll to a specific event
@@ -107,41 +33,37 @@ export const notAtTop = signal(false);
  *  var) so the render subscribes. */
 export const deepLinkRenderAll = signal(false);
 /** True once the transcript is scrolled even slightly from the very top (2px
- *  subpixel slack). Drives the mobile thread-title fade overlay so it eases in
- *  the moment content slides under the sticky title — unlike `notAtTop`, whose
- *  80px chevron threshold left the fade absent until a clear scroll. */
+ *  subpixel slack). Drives the mobile thread-title fade overlay, so it eases in
+ *  the moment content slides under the sticky title. `notAtTop`'s 80px chevron
+ *  threshold is too coarse for that. */
 export const scrolledFromTop = signal(false);
 
-/** The currently-active scroll container element.
+/** The currently-active scroll container element, set by `useScrollObservers`
+ *  when it attaches listeners to a new element. Resolving it by
+ *  `querySelector('.thread-content')` instead is fragile: a container with no
+ *  box can be first in document order, and the selector would find it.
  *
- *  Set by useScrollObservers when it attaches listeners to a new element.
- *  Used by scrollToBottom() instead of document.querySelector('.thread-content')
- *  which is fragile — on mobile both desktop (hidden) and mobile scroll containers
- *  exist in the DOM, and querySelector finds the hidden one first.
- *
- *  Design decision: this is a plain mutable variable, not a signal, because
- *  nothing needs to react to it changing — it's only read imperatively by
- *  scrollToBottom(). */
+ *  A plain mutable variable rather than a signal, since it is only ever read
+ *  imperatively. */
 let _activeScrollElement: HTMLElement | null = null;
 
 export function setActiveScrollElement(el: HTMLElement | null) {
   _activeScrollElement = el;
 }
 
-/** True if the element is actually visible — not hidden via display:none
- *  AND not clipped by a zero-height ancestor with overflow:hidden (e.g.
- *  mobile .content-row which collapses to height:0 instead of display:none
- *  so that position:fixed children like ThreadDrawer still render). */
+/** True if the element is actually visible: not `display: none`, and not
+ *  clipped by a zero-height `overflow: hidden` ancestor. Mobile's
+ *  `.content-row` is the everyday second case, since it collapses to height 0
+ *  so `position: fixed` children like ThreadDrawer still render. */
 export function isElementVisible(el: HTMLElement): boolean {
   const r = el.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return false;
-  // Walk up to detect clipping ancestors — an element inside a zero-height
-  // overflow:hidden container reports non-zero dimensions from layout but
-  // is visually invisible.
+  // An element inside a zero-height overflow:hidden container reports non-zero
+  // dimensions from layout, so the clipping ancestor has to be found by walking.
   let ancestor = el.parentElement;
   while (ancestor && ancestor !== document.documentElement) {
-    // display:contents removes the element's box — getBoundingClientRect()
-    // returns 0×0 but children are fully visible. Skip these ancestors.
+    // display:contents removes the element's own box, so it measures 0x0 while
+    // its children are fully visible. Skip these ancestors.
     if (getComputedStyle(ancestor).display === 'contents') {
       ancestor = ancestor.parentElement;
       continue;
@@ -153,8 +75,7 @@ export function isElementVisible(el: HTMLElement): boolean {
   return true;
 }
 
-/** Fallback for when _activeScrollElement hasn't been set yet.
- *  Uses visibility check to skip hidden duplicates on mobile. */
+/** Fallback for when `_activeScrollElement` has not been set yet. */
 function findVisibleThreadContent(): HTMLElement | null {
   if (typeof document === 'undefined' || !document.querySelectorAll) return null;
   const elements = document.querySelectorAll('.thread-content');
@@ -168,84 +89,49 @@ export function getActiveScrollElement(): HTMLElement | null {
   return _activeScrollElement;
 }
 
-/** Resolve the visible scroll container — re-checks on each call so
- *  layout switches (desktop ↔ mobile) mid-animation don't scroll a stale element. */
+/** Resolve the visible scroll container. Re-checked on each call, so a layout
+ *  switch mid-animation cannot scroll a stale element. */
 function resolveTarget(): HTMLElement | null {
   let el = _activeScrollElement;
   if (el && !isElementVisible(el)) el = null;
   return el ?? findVisibleThreadContent();
 }
 
-/** The ONE programmatic-scroll animation, driven by requestAnimationFrame (NOT
- *  setTimeout): rAF is vsync-aligned so the motion stays smooth and "alive",
- *  whereas a setTimeout(16) loop races the refresh cycle and stutters — on iOS
- *  that read as the scroll "dragging / not wanting to move". We assign scrollTop
- *  DIRECTLY (not `scrollTo({behavior:'smooth'})`/`scrollIntoView`, which iOS
- *  silently no-ops during viewport transitions, can't be customized, and can't
- *  reach the post-render-all top).
- *
- *  Shared by EVERY navigation that moves the transcript — the up/down chevrons,
- *  ⌘↑/⌘↓ turn-nav, AND the notification / Changes-panel "navigation to element"
- *  deep-link (which used to use the browser's native `scrollIntoView` smooth
- *  scroll — a separate, un-tunable, slower motion). Routing them all through this
- *  one tween means every jump feels identical, and the deep-link inherits the
- *  same iOS-reliable direct-scrollTop write + moving-target tracking.
- *
- *  The curve is a TIME-BASED easeOutCubic tween over a distance-scaled, clamped
- *  duration — NOT distance-based exponential smoothing. Exponential smoothing
- *  (`current += remaining * fraction`) has an UNBOUNDED asymptotic tail: as it
- *  nears the target every frame moves a tinier amount, the sub-pixel tail rounds
- *  to alternating 0px/1px steps (the "jank on the slowdown settle"), and a hard
- *  SNAP_PX cutoff was needed to end it — leaving a small visible jump. A
- *  fixed-duration eased tween instead:
- *   - Has a single continuous, controlled deceleration that the easing curve owns
- *     end-to-end, and lands EXACTLY on the target at t=1 (no snap, no jump).
- *   - Keeps the responsive feel: easeOutCubic front-loads velocity, so the first
- *     frame still takes a big step and the scroll reacts instantly to the tap.
- *   - Has a SETTLE that looks identical at any distance (the easing SHAPE is the
- *     same whether it scrolled 400px or 20000px — only the speed scales), and is
- *     frame-rate independent because progress is measured in elapsed ms, not
- *     per-frame fractions, so it feels identical at 60 and 120 Hz.
- *   - Is inherently bounded (t reaches 1 within `duration`), so a moving target
- *     (a streaming thread's growing bottom, re-read each frame) can't loop. */
-// Pace knobs. Tuned to the smooth "navigation to element" feel the deep-link had
-// with native scrollIntoView, but a little quicker at the top end so the old
-// deep-link's "a bit slow" landing sits between it and the snappier chevron.
-// To make every navigation faster, lower SCROLL_MAX_MS and/or SCROLL_PX_PER_MS;
-// slower, raise them.
-const SCROLL_MIN_MS = 240;         // floor so a short scroll still reads as a deliberate glide, not a snap
-const SCROLL_MAX_MS = 760;         // ceiling: keeps a very long scroll brisk (and bounds the tween), a touch gentler than the old snappy 680
-const SCROLL_PX_PER_MS = 6.5;      // distance→duration rate between the floor and ceiling (lower = a more gradual, navigation-like glide)
-const SCROLL_FRAME_MS = 1000 / 60; // nominal-frame head start so the first painted frame already steps (responsive, not a dead frame)
-// easeOutCubic: strong initial velocity, smooth controlled deceleration to a clean stop.
+/** Pace knobs for the ONE programmatic-scroll animation, `animateScroll` below.
+ *  Its shape is ADR 0065, docs/adr/: rAF, a direct fractional `scrollTop` write,
+ *  and a time-based easeOutCubic curve over a distance-scaled duration. To make
+ *  every navigation faster, lower SCROLL_MAX_MS and SCROLL_PX_PER_MS. */
+const SCROLL_MIN_MS = 240;         // floor, so a short scroll reads as a glide rather than a snap
+const SCROLL_MAX_MS = 760;         // ceiling, so a very long scroll stays brisk and the tween stays bounded
+const SCROLL_PX_PER_MS = 6.5;      // distance to duration rate between the two; lower is more gradual
+const SCROLL_FRAME_MS = 1000 / 60; // head start, so the first painted frame already steps
 const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
 
-/** Active navigation rAF id (animateScroll + the reduced-motion re-assert). One
- *  at a time: every entry point cancels the one in flight, so a down-tap right
- *  after an up-tap wins cleanly. */
+/** Active navigation rAF id (`animateScroll`, plus the reduced-motion
+ *  re-assert). ONE at a time: every entry point cancels the one in flight, so a
+ *  down-tap right after an up-tap wins cleanly. */
 let _scrollAnimRaf: number | null = null;
-/** Whether the tween in flight is a HELD scroll (see `markHeldScroll`) rather
- *  than a one-off navigation. Set from the marker `animateScroll` was handed, so
- *  it cannot disagree with who is writing the frames. Read by
- *  `stopFollowingBottom` and `cancelLanding`, which must stop our own motion and
- *  no one else's. */
+/** Is the tween in flight a HELD scroll (see `markHeldScroll`) rather than a
+ *  one-off navigation? Set from the marker `animateScroll` was handed, so it
+ *  cannot disagree with who is writing the frames. Read by
+ *  `stopFollowingBottom` and `cancelLanding`, which must stop our own motion
+ *  and no one else's. */
 let _heldAnim = false;
-/** WHICH of the two held glides is in flight, when one is: the live edge (a
- *  submit made while the standing follow was already armed) or the reader's own
- *  turn (the landing every other submit runs). `_heldAnim` cannot answer this,
- *  and the difference decides two things. What a submit arriving mid-tween does:
- *  leave a live-edge glide alone (it is already going where this submit wants),
- *  supersede a landing (its target is the wrong answer for a reader who is now
- *  riding). And what the reader's own scroll cancels: a landing always, a
- *  live-edge glide only through the follow's disarm. Set by each glide right
- *  after it starts, and cleared with the tween, so a glide that forgot to set it
- *  reads as supersede-able, which is the harmless direction. */
+/** WHICH of the two held glides is in flight: the live edge (a submit made
+ *  while the standing follow was armed) or the reader's own turn (the landing
+ *  every other submit runs).
+ *
+ *  It decides two things `_heldAnim` cannot answer. A submit arriving mid-tween
+ *  leaves a live-edge glide alone, and supersedes a landing whose target is now
+ *  the wrong answer. And the reader's own scroll cancels a landing always, a
+ *  live-edge glide only through the follow's disarm.
+ *
+ *  Set by each glide right after it starts, and cleared with the tween. A glide
+ *  that forgot to set it reads as supersede-able, the harmless direction. */
 let _heldAnimTarget: 'live-edge' | 'own-turn' | null = null;
-/** Forget the tween: no rAF pending, and nobody owning one. Every way a tween
- *  ENDS goes through this, the natural landing included, so both flags above
- *  mean "in flight" rather than "was in flight last time". A landing that left
- *  them set would answer for a tween that finished seconds ago, and
- *  `glideToLiveEdge` would stand down for it. */
+/** Forget the tween: no rAF pending, and nobody owning one. EVERY way a tween
+ *  ends goes through this, the natural landing included. So both flags above
+ *  mean "in flight" rather than "was in flight last time". */
 function endScrollAnim() {
   _scrollAnimRaf = null;
   _heldAnim = false;
@@ -257,15 +143,15 @@ function cancelScrollAnim() {
 }
 
 /** When one of our own navigations last wrote `scrollTop`, and to WHICH element.
- *  Every such write goes through `markNavigationScroll`, so these cannot fall out
- *  of sync with the writes they describe (the same construction, and the same
- *  reason, as `lastNudgeAt` in utils/iosRepaint.ts).
+ *  Every such write goes through `markNavigationScroll`, so these cannot fall
+ *  out of sync with the writes they describe. Same construction, and the same
+ *  reason, as `lastNudgeAt` in utils/iosRepaint.ts.
  *
- *  The element is half the answer, not bookkeeping: `useScrollMemory` positions
- *  three different containers (the transcript, the content pane's body, the
- *  thread drawer's list) and marks all of them here, while two of the three
- *  consumers ask only about the transcript. Without the element a content-pane
- *  restore would claim the transcript's next 64ms of scroll events. */
+ *  The element is half the answer rather than bookkeeping. `useScrollMemory`
+ *  positions three containers and marks all of them here: the transcript, the
+ *  content pane's body, the thread drawer's list. Two of the three consumers ask
+ *  only about the transcript. Without the element, a content-pane restore would
+ *  claim the transcript's next 64ms of scroll events. */
 let _navScrollAt = -Infinity;
 let _navScrollEl: HTMLElement | null = null;
 
@@ -284,39 +170,57 @@ function nowMs(): number {
 /** Write `top` to `el` and record it as OURS, so the scroll event it fires a
  *  frame later is not mistaken for the reader's (see `isNavigationScroll`).
  *
- *  Every navigation write in this module goes through it, and so does
- *  `useScrollMemory`'s positioning of the transcript on open: a saved-position
- *  restore and the open-at-the-top reset are the app placing the reader just as
- *  much as a chevron tap is, and both fire a scroll event that the mobile
- *  header would otherwise read as the reader scrolling down (hiding it on a
- *  restore) and the window-expansion would read as the reader asking for older
- *  turns. */
+ *  EVERY navigation write in this module goes through it, and so does
+ *  `useScrollMemory`'s positioning of the transcript on open. A saved-position
+ *  restore and the open-at-the-top reset are the app placing the reader, just
+ *  as a chevron tap is. Unmarked, the mobile header reads either one as the
+ *  reader scrolling down and hides. The render-window expansion reads it as the
+ *  reader asking for older turns. */
 export function markNavigationScroll(el: HTMLElement, top: number) {
   _navScrollAt = nowMs();
   _navScrollEl = el;
   el.scrollTop = top;
 }
 
+/** Record that the app just REVEALED something, so the scroll the platform is
+ *  about to fire for it is not mistaken for the reader's.
+ *
+ *  The counterpart of `markNavigationScroll` for a navigation that does not
+ *  write `scrollTop` itself: it calls `scrollIntoView` and lets the platform
+ *  pick the offset. `choiceCardNav`'s arrow-key step is the one today. Both
+ *  signals that would otherwise catch it are blind here. Nothing stamps a
+ *  position, and the keydown lands on the choice BUTTON rather than on the
+ *  transcript, so no gesture is recorded either.
+ *
+ *  It routes through `markNavigationScroll`, writing the position back onto
+ *  itself, so those two variables keep their single writer. Writing an
+ *  unchanged `scrollTop` fires no scroll event, so this moves nobody:
+ *  `scrollIntoView` has already settled the offset synchronously.
+ *
+ *  Three consumers gain by it. The mobile hide-on-scroll header stops sliding
+ *  away under an arrow-key step, and the render-window expansion stops reading
+ *  one as a request for older turns. The third is the platform-scroll
+ *  correction in `makeScrollObservers`' onScroll, for which an unmarked reveal
+ *  is indistinguishable from the keyboard adjusting the offset. */
+export function markRevealScroll(el?: HTMLElement | null): void {
+  const target = el ?? resolveTarget();
+  if (!target) return;
+  markNavigationScroll(target, target.scrollTop);
+}
+
 /** Did one of OUR OWN navigations produce the scroll event being handled?
  *
- *  Those events look exactly like the reader's, and two consumers must tell them
- *  apart: the mobile hide-on-scroll header, which would otherwise slide away
- *  under a chevron tap or half-cover the event a deep-link just landed on, and
- *  the mobile scroll indicator, which must not read our own write as the reader
- *  summoning it.
+ *  Those events look exactly like the reader's, and two consumers must tell
+ *  them apart. The mobile hide-on-scroll header would otherwise slide away
+ *  under a chevron tap, or half-cover the event a deep link just landed on. The
+ *  mobile scroll indicator must not read our own write as the reader summoning
+ *  it.
  *
- *  Two terms, and the window is the load-bearing one. A live tween is the easy
+ *  Two terms, and the WINDOW is the load-bearing one. A live tween is the easy
  *  half. The hard half is that a write's scroll event lands a frame or more
- *  LATER: the instant navigations (`scrollToBottom`, and every reduced-motion
- *  path) run no tween at all, and even a tween clears its rAF handle on the
- *  frame it lands, so an "is a tween running" test alone answers false for
- *  exactly the events it exists to catch, and the header hides on a chevron tap.
- *
- *  This replaces the old `getResizeMode() === 'scroll'` read, which covered the
- *  same events only by accident: the bottom-pin's 500ms suppression window
- *  happened to be open across them. The question is now asked directly, and
- *  scoped to the frames it can actually be true for rather than to half a
- *  second. */
+ *  later. The instant navigations run no tween at all, and even a tween clears
+ *  its rAF handle on the frame it lands. So an "is a tween running" test alone
+ *  answers false for exactly the events it exists to catch. */
 export function isNavigationScroll(el?: HTMLElement | null): boolean {
   if (_scrollAnimRaf !== null) return true;
   if (nowMs() - _navScrollAt >= NAV_SCROLL_EVENT_WINDOW_MS) return false;
@@ -327,102 +231,24 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
 }
 
 /* ── The standing request to ride the live edge ──────────────────────────────
- *  ONE reader action means "take me to the bottom and KEEP me there" rather than
- *  "jump once": the FOLLOW TOGGLE in the prompt area (`setFollowLiveEdge`). It
- *  arms the flag below, and while it is armed AND the agent is LIVE, content
- *  growth writes the reader back to the live edge (the growth branch in
- *  `makeScrollObservers`' onResize, which is where the old force-pin used to
- *  live).
+ *  The flag below is the ARMED half of the follow. ADR 0064 (docs/adr/) is the
+ *  policy: what may arm it, what retires it, and every arming rule tried and
+ *  rejected. Read it before changing either list.
  *
- *  ARMED and CARRYING are two states, and the flag below is only the first. The
- *  request persists across an idle spell untouched, so the reader keeps the lit
- *  toggle, keeps the recorded live-edge reading position, and is picked back up
- *  when the thread runs again. What stops while idle is the writing: there is
- *  nothing to be carried toward on a thread that is doing nothing, and growth
- *  there is the transcript finishing its own rendering. See `followIsCarrying`.
+ *  ARMED and CARRYING are two states, and the flag is only the first. The
+ *  request persists across an idle spell untouched. A reader who scrolls away on
+ *  a quiet thread keeps the lit toggle and the recorded live-edge reading
+ *  position. What stops for them while idle is the WRITING. See
+ *  `followIsCarrying`.
  *
- *  Nothing else arms it. Not the down chevron, which navigates and nothing else,
- *  and not any SUBMIT: a submit gets the one-shot reaction `followSubmit`
- *  describes, so a reader is carried through a reply only when they asked to be
- *  carried through replies. Nor an SSE sync confirming a pending message, a
- *  change applied / discarded / reverted, a granted permission, a coding-agent
- *  action, a lazy load, a deep link, or a thread opening. Nor the question card
- *  ARRIVING, which is the agent's doing. Being AT the bottom does not arm it
- *  either: a position is not a request, and a reader who merely happens to sit
- *  at the live edge has asked for nothing.
+ *  TWO functions arm it and no others, both through `armFollowOn`:
+ *  `setFollowLiveEdge` (the toggle) and `resumeFollowingBottom` (which replays a
+ *  toggle request recorded in this thread). Being AT the bottom arms nothing.
  *
- *  Two earlier arming rules are named because both were deliberate and both are
- *  gone. A SEND AND AN ANSWER used to arm it, so the reply dragged the reader
- *  down through itself. And the CHEVRON did, briefly, which was the same mistake
- *  one step along: it left the mode with no visible state, no way off but
- *  scrolling, and no way ON for a reader already at the live edge, since the
- *  chevron is hidden exactly there. Putting the state on the chevron does not
- *  rescue it, because one button cannot hold both jobs: go-to-bottom, then arm,
- *  then disarm is a three-step cycle with no state left over for a plain jump to
- *  the bottom.
- *
- *  A SUBMIT MADE WHILE IT IS ARMED goes to the live edge, whichever of the four
- *  submits it is, and that is this same request being SERVED rather than a
- *  second arming point. Riding the live edge means "keep me at the bottom", so
- *  landing such a reader on their own turn would answer a request they did not
- *  make with one they did not make either. Armed but off the edge is ordinary,
- *  not a corner: the growth branch stands down while a tween owns the scroll, so
- *  a reply that streams entirely during a glide leaves the reader parked above
- *  the bottom with the follow still armed and no growth left to carry them out
- *  of it.
- *
- *  The flag is a SIGNAL rather than a plain boolean because the toggle renders
- *  it: the button has to say whether the reader is riding, and it has to go off
- *  by itself when the reader's own scroll retires the follow underneath it. It
- *  is exported as a `ReadonlySignal<boolean>`, which the compiler refuses to let
- *  a component assign, so reading the state cannot become a way of setting it.
- *  That is the same reasoning `_followArmedListeners` records for staying a
- *  callback set: an exported WRITABLE signal would be an arming point no source
- *  scan could stop.
- *
- *  The request BELONGS TO A THREAD and outlives leaving it. The flag here is one
- *  global, so `focusThread` retires it on every open (a thread the reader just
- *  opened is not one they asked to follow), and that used to be the end of the
- *  request: coming back landed on the pixel offset the transcript had when they
- *  walked away, with everything the agent produced meanwhile below them and
- *  nothing following. So the request is WRITTEN DOWN per thread, as one of the
- *  two forms a reading position takes (`hooks/useScrollMemory.ts`), and
- *  `resumeFollowingBottom` re-arms it on re-entry. That is the same request
- *  resumed, not a second arming point: only a TOGGLE request can ever be
- *  recorded, since only the toggle arms, so the resume can only ever replay one
- *  the reader made in this thread. A reader who merely parked at the bottom
- *  saves the offset instead and comes back to it following nothing.
- *  `isFollowScroll` and `onFollowArmed` are the two things the recording side
- *  needs; both are below.
- *
- *  The resume has TWO PLACEMENTS, and the second exists because one open is not
- *  this hook's to position: a DEEP LINK. Ordinarily the resume writes today's
- *  live edge and rides from there. On a deep-linked open it writes nothing and
- *  arms where the reader already is, because the link owns the POSITION and the
- *  record owns the REQUEST, and those are two different answers that both hold.
- *  Without it the retire above had no matching resume on exactly that open, so a
- *  notification tap into a thread the reader was riding landed them on the event
- *  with the toggle dark. See `FollowResumeFrom`.
- *
- *  The condition for following is this flag AND the agent being live, and
- *  nothing else. There is no proximity term (the retired 80px stickiness window)
- *  and no timing term (the retired 500ms suppression window); both of those
- *  tried to INFER the request that the flag now records. The live term infers
- *  nothing either: it asks whether there is anything to follow.
- *
- *  A DEEP LINK is the one navigation that retires the follow by calling
- *  `stopFollowingBottom` rather than being read off the position (see
- *  `markHeldScroll`), because a link into the thread the reader is riding
- *  usually points at its newest turn, and a landing at the live edge is exactly
- *  the shape of "content changed and the reader did not leave". Read off the
- *  position alone it would keep the follow, and the next token would carry the
- *  reader off the event they asked for. On an IDLE thread it retires nothing, in
- *  step with every other retirement: there is no next token, and the reader who
- *  followed a link into a finished thread has not asked to stop riding the ones
- *  that come later. Nothing about the link's own OPEN retires it either, which
- *  needed the in-place resume above to be true rather than merely intended: the
- *  link cost the reader the ride through the thread switch it rode in on, not
- *  through anything the landing did. */
+ *  A SIGNAL rather than a plain boolean, because the toggle renders it. It has
+ *  to go off by itself when a scroll retires the follow underneath it. Exported
+ *  as a `ReadonlySignal<boolean>`, which the compiler refuses to let a component
+ *  assign, so reading the state cannot become a way of setting it. */
 const _followingBottom = signal(false);
 
 /** Is the standing follow armed? Read by the follow toggle, which RENDERS it.
@@ -430,26 +256,23 @@ const _followingBottom = signal(false);
 export const followingLiveEdge: ReadonlySignal<boolean> = _followingBottom;
 
 /* ── The follow SEED ─────────────────────────────────────────────────────────
- *  The reader's last PRESS of the toggle, remembered across threads and reloads,
- *  and what a thread with no *reading position* of its own starts as. Same shape
- *  as `selectedScope` for the destination picker: a last-used value that seeds
- *  the NEXT thread and is never read by one that already remembers, which is
- *  exactly what keeps it from leaking into threads the reader has parked in.
+ *  The reader's last PRESS of the toggle, remembered across threads and
+ *  reloads. It is what a thread with no *reading position* of its own starts as.
+ *  Same shape as `selectedScope` for the destination picker: a last-used value
+ *  read only by a thread that does not already remember. That is what keeps it
+ *  out of the threads a reader has parked in.
  *
- *  It answers the thing the per-thread record cannot. The record is written by
- *  being in a thread, so a BRAND-NEW thread has none by construction, and a
- *  reader who rides everything had to press the button again on every one. The
- *  seed is also the only state the toggle can show in the compose view, which has
- *  no transcript, and showing it there is what lets the follow be armed BEFORE
- *  the first send, which is when a reader most reliably knows they want it.
+ *  It also gives the toggle something to show in the compose view, which has no
+ *  transcript. Showing it there is what lets the follow be armed BEFORE the
+ *  first send.
  *
  *  Written by the toggle and by nothing else. A scroll retiring the follow is
- *  about THIS thread and records itself as that thread's offset; it must not
+ *  about THIS thread and records itself as that thread's offset. It must not
  *  quietly cancel a standing preference for every future thread.
  *
- *  Device-scoped, because whether to ride the live edge is a property of the
- *  screen in front of the reader rather than of the account, and it has to be
- *  right on the first paint with no server round trip. */
+ *  Device-scoped. Whether to ride the live edge is a property of the screen in
+ *  front of the reader, not of the account. It must be right on the first paint
+ *  with no server round trip. */
 const FOLLOW_SEED_KEY = 'lucidos-follow-live-edge';
 
 /** `localStorage` is absent in the DOM-free unit environment this module is
@@ -474,25 +297,22 @@ function recordFollowSeed(on: boolean): void {
   if (typeof localStorage !== 'undefined') localStorage.setItem(FOLLOW_SEED_KEY, String(on));
 }
 
-/** Apply the seed to `el`: arm the follow if that is what the reader last chose,
- *  and report whether the SEED SPOKE. The caller has to know, because a
- *  `live-edge` resume writes the live edge and its own no-position reset would
- *  undo it; an `in-place` one writes nothing, and the caller that asks for that
- *  has no reset of its own to skip.
+/** Apply the seed to `el`: arm the follow if that is what the reader last
+ *  chose, and report whether the SEED SPOKE. A `live-edge` caller needs the
+ *  answer, because its own no-position reset would undo the write.
  *
- *  Named for what it DOES rather than for when it is right to call, because it
- *  checks only the seed. WHERE the seed may speak is the caller's to decide and
- *  is the load-bearing half: `attachScrollMemory` calls it in the two branches
- *  with no *reading position* at all (the ordinary open, and the one a deep link
- *  owns), and only for the transcript. A thread the reader HAS parked in must
- *  keep deciding for itself, and the content pane and the thread drawer must
- *  never arm the transcript's follow.
+ *  WHERE the seed may speak is the caller's to decide, and is the load-bearing
+ *  half. `attachScrollMemory` calls it only for the transcript, and only in the
+ *  two branches with no *reading position* at all. A thread the reader HAS
+ *  parked in keeps deciding for itself. The content pane and the thread drawer
+ *  must never arm the transcript's follow.
  *
- *  Deliberately routed through `resumeFollowingBottom` rather than arming
- *  directly: it is the same act (arm this thread's request, writing the live edge
- *  or not per `from`), the write is what stops the reader being left at the
- *  outgoing thread's offset in the shared container, and reusing it keeps the
- *  arming entry points at two. */
+ *  Routed through `resumeFollowingBottom` rather than arming directly. It is the
+ *  same act, and reusing it keeps the arming entry points at two.
+ *
+ *  For `in-place` the return is NOT the same as "the follow is now armed": that
+ *  branch declines over a link that has already landed, and this cannot see it.
+ *  Only the `live-edge` caller reads the return, and there the two coincide. */
 export function applyFollowSeed(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): boolean {
   if (!_followSeed.value) return false;
   resumeFollowingBottom(el, from);
@@ -501,67 +321,45 @@ export function applyFollowSeed(el: HTMLElement, from: FollowResumeFrom = 'live-
 
 /** Is the agent LIVE on the thread being shown, i.e. is anything running on it?
  *  Told to this module by `ChatExchange` for its `isLast` turn, because
- *  `scrollState` must not import `store` (see `parseNavigatedTurn`) and the
- *  answer is the store's to derive. The derivation is
- *  `exchangeMarksThreadLive`, which needs BOTH the turn's status and the thread
- *  projection's own quiescence; read its comment before treating the last
- *  turn's status as the whole answer. A plain mutable variable, like
- *  `_activeScrollElement`:
- *  nothing needs to react to it changing, it is read imperatively.
+ *  `scrollState` must not import `store` (see `parseNavigatedTurn`). The
+ *  derivation is `exchangeMarksThreadLive`, which needs BOTH the turn's status
+ *  and the thread projection's own quiescence. A plain mutable variable, read
+ *  imperatively, like `_activeScrollElement`.
  *
- *  It answers ONE question, asked through `threadIsLive` at every site that
- *  moves a reader on the follow's behalf or takes the follow away from them:
- *  IS ANYTHING RUNNING. Nothing about a standing follow happens on a thread that
- *  is doing nothing. The reader's scroll does not end the ride (they are
- *  browsing, not fleeing a reply), the up chevron, turn stepping and a
- *  deep-link landing do not either, and growth does not carry them, because on
- *  an idle thread growth is the transcript finishing its own rendering rather
- *  than the agent producing anything to be carried toward.
+ *  It decides what happens to a reader who is somewhere OTHER than the live
+ *  edge. On a quiet thread their scroll does not end the ride, and neither does
+ *  the up chevron or turn stepping. Growth does not carry them back down either,
+ *  since growth there is the transcript finishing its own rendering.
  *
- *  It used to gate the disarm ALONE, and that narrowness was written here as the
- *  invariant. It was half a rule: the reader kept the ride when they scrolled an
- *  idle thread and was then written back to the live edge by the next thing that
- *  changed the transcript's height, which on an idle thread is markdown
- *  settling, an image decoding or a card mounting. Reported 2026-08-11, while
- *  reading a finished reply parked on a question card.
- *
- *  What that narrowness was PROTECTING still holds, and is now protected by
- *  something else: a lull between two tool calls must never cost the reader
- *  their ride. It cannot, because a lull is not idle. `exchangeMarksThreadLive`
- *  keeps the last turn's status generous through the gap, and a SUBMIT claims
- *  live by itself for `SUBMIT_LIVE_CLAIM_MS` before any status can say so.
+ *  A reader still ON the live edge asks it nothing. The app's own rendering must
+ *  not move a rider off an edge they never left. See `keepTheLiveEdge`.
  *
  *  Two things deliberately DO NOT ask it, and both are the reader asking
- *  directly rather than the follow acting on their behalf: pressing the toggle
- *  (`setFollowLiveEdge`) and resuming a request recorded in this thread
- *  (`resumeFollowingBottom`). Pressing the toggle on a finished thread must
- *  still take the reader to the bottom. */
+ *  directly: pressing the toggle (`setFollowLiveEdge`), and resuming a request
+ *  recorded in this thread (`resumeFollowingBottom`). Pressing the toggle on a
+ *  finished thread must still take the reader to the bottom. */
 let _threadLive = false;
 
 /** When the SUBMIT's own claim that the thread is live runs out. A submit says
- *  so before any status can (see `followSubmit`), and that claim has to EXPIRE
- *  rather than stand until something contradicts it, because the thing that
- *  would contradict it may never come: a Continue whose POST fails, or a
- *  permission decision the engine never answers, leaves the last turn's status
- *  exactly as it was, so `ChatExchange`'s effect never re-runs and never writes
- *  `false`. Left standing, the claim would quietly cost the reader their follow
- *  the next time they browsed an idle thread, which is the one thing the live
- *  term exists to prevent. */
+ *  so before any status can (see `followSubmit`), and that claim must EXPIRE
+ *  rather than stand until something contradicts it. What would contradict it
+ *  may never come. A Continue whose POST fails leaves the last turn's status
+ *  exactly as it was, and so does an unanswered permission decision. So
+ *  `ChatExchange`'s effect never re-runs and never writes `false`. Left
+ *  standing, the claim would cost the reader their follow the next time they
+ *  browsed an idle thread. */
 let _submitLiveUntil = -Infinity;
 
 /** How long a submit's claim outlives the submit. It has to cover the POST round
  *  trip AND the whole gap before the thread projection says `running`, which is
- *  the longer of the two and the reason this is not a couple of seconds: the
- *  client's `meta.status` only advances when a per-event aggregate carrying
- *  `running` arrives, and `store.ts`'s `isRenderedThreadIdle` documents that gap
- *  running to about eight seconds on a resume (its own carve-out covers only the
- *  part before the message is ingested).
+ *  the longer of the two. `meta.status` only advances when a per-event aggregate
+ *  carrying `running` arrives. `store.ts`'s `isRenderedThreadIdle` documents
+ *  that gap running to about eight seconds on a resume.
  *
- *  Being wrong in the LONG direction merely restores the pre-live-term behaviour
- *  for a few more seconds (a scroll retires the follow) on a thread the reader
- *  just submitted to, which is the least likely moment for them to be idly
- *  browsing. Being wrong in the SHORT direction re-opens the gap the claim exists
- *  for. */
+ *  Being wrong LONG costs a few more seconds in which a scroll retires the
+ *  follow, on a thread the reader just submitted to. That is the least likely
+ *  moment for them to be idly browsing. Being wrong SHORT re-opens the gap the
+ *  claim exists for. */
 const SUBMIT_LIVE_CLAIM_MS = 20_000;
 
 /** Tell this module whether the thread on screen has a turn in flight. Called by
@@ -569,19 +367,17 @@ const SUBMIT_LIVE_CLAIM_MS = 20_000;
  *  unmounts, so a thread switch cannot leave the previous thread's answer
  *  standing.
  *
- *  A `true` retires a submit's claim, because the thing the claim was guessing at
- *  has arrived and there is nothing left to guess. A `false` DOES NOT, and that
- *  asymmetry is the whole point: `false` is exactly what a lagging source says
- *  during the window the claim covers. `exchangeMarksThreadLive` needs the thread
- *  projection to agree, and the projection is the slow half, so the render right
- *  after a send writes `false` while the agent is on its way. Clearing the claim
- *  there destroyed it in the one window it was invented for, and a reader who
- *  submitted and then scrolled away kept a follow they had just fled (reported
- *  2026-08-10, intermittent because it depended on landing inside the gap).
- *  Nothing is lost by ignoring `false`: the claim expires on its own.
+ *  A `true` retires a submit's claim, because what the claim was guessing at has
+ *  arrived. A `false` DOES NOT, and that asymmetry is the whole point: `false`
+ *  is exactly what a lagging source says inside the window the claim covers.
+ *  `exchangeMarksThreadLive` needs the thread projection to agree, and the
+ *  projection is the slow half. The render right after a send therefore writes
+ *  `false` while the agent is on its way. Clearing the claim there would destroy
+ *  it in the one window it exists for. Nothing is lost by ignoring `false`,
+ *  since the claim expires on its own.
  *
  *  A `true` that WAKES the thread also does the growth round the observer
- *  missed, because this call arrives too late to be seen by it: see
+ *  missed, because this call arrives too late to be seen by it. See
  *  `honourWake`. */
 export function setThreadLive(live: boolean): void {
   const waking = live && !_threadLive;
@@ -594,36 +390,22 @@ export function setThreadLive(live: boolean): void {
  *
  *  The follow does its work from the transcript's ResizeObserver
  *  (`honourGrowth`), and this module learns the thread is live from a Preact
- *  `useEffect` in `ChatExchange`. Those two are delivered in the wrong order for
- *  exactly the mutation that matters: the new turn's row mounting fires the
- *  observer inside the same frame, while Preact defers its effects to a task
- *  AFTER that frame. So the WAKING resize is handed to `honourGrowth` while this
- *  module still believes the thread is idle, and is the one resize the follow
- *  stands down for.
+ *  `useEffect` in `ChatExchange`. Those two arrive in the wrong order. The new
+ *  turn's row mounting fires the observer inside the same frame, while Preact
+ *  defers its effects to a task after it. So the WAKING resize is handed to
+ *  `honourGrowth` while this module still believes the thread is idle.
  *
- *  Usually invisible, because a streaming reply resizes again milliseconds later
- *  and that round carries the reader. The case where it is not invisible is a
- *  turn that mounts its row and then produces nothing for a while, which is
- *  ordinary rather than exotic: a coding-agent turn RESUMING its subprocess sits
- *  on `SessionStarted` for fifteen to twenty seconds before its first tool call
- *  (see the live row in `ChatExchange`). An armed reader would spend that
- *  stranded short of the live edge with the toggle lit, which is the toggle
- *  lying about what it is doing.
+ *  Usually invisible, because a streaming reply resizes again a moment later. It
+ *  is visible for a turn that mounts its row and then produces nothing: a
+ *  coding-agent turn RESUMING sits on `SessionStarted` for fifteen to twenty
+ *  seconds, stranding an armed reader short of the edge with the toggle lit.
  *
  *  So the transition replays the missed round through `honourGrowth` itself,
- *  guards and all: it stands down for a tween in flight and resolves a pending
- *  landing exactly as a resize would. Nothing here decides anything of its own,
- *  which is the point, since a second copy of the follow's rule would be a
- *  second thing to keep in step. It is a no-op for everyone else: an unarmed
- *  reader is not carried by growth either.
+ *  guards and all, rather than growing a second copy of the follow's rule.
  *
- *  Only on the false to true EDGE, never on a repeat. `ChatExchange` re-runs its
- *  effect whenever the derived liveness changes, and a `true` that says what the
- *  module already knew describes no new content. Writing on every one of those
- *  would put the reader back at the live edge after they had scrolled away from
- *  a reply, which is the disarm's job to prevent and this must not undo.
- *
- *  Found by the Codex reviewer in `/harden`, 2026-08-11. */
+ *  Only on the false to true EDGE. A repeated `true` describes no new content,
+ *  and acting on one would put a reader back at the live edge after they had
+ *  scrolled away. It replays the LIVE arm alone, needing no edge reading. */
 function honourWake(): void {
   const el = resolveTarget();
   if (el) honourGrowth(el);
@@ -635,33 +417,23 @@ function threadIsLive(): boolean {
 }
 
 /** Is the standing follow CARRYING the reader right now, as opposed to merely
- *  being armed? Armed and live, and those are two different states on purpose.
+ *  being armed? Armed AND live. See `_followingBottom` for why those are two
+ *  states, and ADR 0064 for the policy.
  *
- *  ARMED is the reader's request, and it persists: the toggle stays lit, the
- *  live-edge form of this thread's *reading position* keeps recording it, and
- *  nothing about an idle spell takes it away. CARRYING is whether the app is
- *  acting on that request this instant, and on an idle thread it is not. The
- *  reader is free to scroll and to click, and the transcript stays where they
- *  put it; the moment the thread runs again the same armed request picks them
- *  back up with no second press.
+ *  It answers for a reader who is somewhere OTHER than the live edge, which is
+ *  the only place the liveness term decides anything. A reader ON the edge is
+ *  kept there whatever the thread is doing, by `keepTheLiveEdge`.
  *
- *  Three writers ask it and they are the whole of what the follow DOES: the
- *  growth branch (`honourGrowth`), the reveal snap (`honourAnchoredMutation`),
- *  and `withScrollAnchor`'s decision to skip the anchor correction. The last
- *  two are one act split across the DOM/layout line, so they must answer the
- *  same or an idle armed reader gets neither the correction nor the snap and
- *  drifts on the content that grew above them.
+ *  Three callers ask it: the growth branch (`honourGrowth`), the reveal snap
+ *  (`honourAnchoredMutation`), and `withScrollAnchor`'s decision to skip the
+ *  anchor correction. The last two are ONE act split across the DOM/layout
+ *  line, so they must answer the same. Otherwise an idle armed reader gets
+ *  neither the correction nor the snap, and drifts on the content above them.
  *
- *  What a reader on an idle thread is NOT being denied: growth there is the
- *  transcript finishing its own rendering (markdown settling, an image
- *  decoding, a card mounting), never the agent producing something worth being
- *  carried toward. Being written to the bottom for it was the 2026-08-11
- *  report.
- *
- *  Deliberately NOT asked by the reader's own explicit requests, which write
- *  the live edge directly: pressing the toggle, resuming a recorded request on
- *  re-entry, and the seed. Pressing the toggle on a finished thread must still
- *  take the reader to the bottom. */
+ *  Deliberately NOT asked by the reader's own explicit requests, which write the
+ *  live edge directly: pressing the toggle, resuming a recorded request on
+ *  re-entry, and the seed. Nor by `keepTheLiveEdge`, whose three events are the
+ *  app moving a rider who never left, rather than carrying one who did. */
 export function followIsCarrying(): boolean {
   return _followingBottom.value && threadIsLive();
 }
@@ -670,17 +442,15 @@ export function followIsCarrying(): boolean {
  *  One consumer today: `attachScrollMemory`, which records the request as this
  *  thread's reading position.
  *
- *  The asymmetry is the design, not an omission. A retirement has two causes that
- *  must be recorded differently, and this side cannot tell them apart: the reader
+ *  The asymmetry is the design. A retirement has two causes that must be
+ *  recorded differently, and this side cannot tell them apart. The reader
  *  scrolling away arrives WITH the scroll event that already records the offset
- *  they landed on, while `focusThread` retiring on a thread switch must record
- *  nothing at all, or the thread being LEFT would have its live edge overwritten
- *  by whatever offset the shared container happens to hold. Broadcasting only the
- *  arm leaves the second case with no save path to reach.
+ *  they landed on. `focusThread` retiring on a thread switch must record nothing
+ *  at all. Otherwise the thread being LEFT has its live edge overwritten by
+ *  whatever offset the shared container happens to hold.
  *
- *  A plain callback set rather than a signal, for the same reason `armFollowBottom`
- *  is private: an exported writable `followingBottom` signal would be a fourth
- *  arming point that no source scan could stop, and it would broadcast the
+ *  A plain callback set rather than a signal. An exported writable signal would
+ *  be an arming point no source scan could stop, and it would broadcast the
  *  retirement this deliberately does not. */
 const _followArmedListeners = new Set<() => void>();
 
@@ -699,70 +469,57 @@ export function onFollowArmed(listener: () => void): () => void {
 type TurnResolver = (el: HTMLElement) => HTMLElement | null;
 
 /** A submit whose own turn has not rendered yet, holding its resolver and when
- *  the submit happened. Two of the four submits are in this shape: the turn a
+ *  the submit happened. Two of the four submits are in this shape. The turn a
  *  send lands on is its optimistic message row, which arrives a frame or more
- *  after the send while the composer collapsing has already fired a resize, and
- *  the turn Continue lands on does not exist at all when the button is pressed
- *  (the continuation renders as a fresh `ContinuationStarted` exchange). So the
- *  landing cannot just run on the next growth: it waits until its own turn is
- *  there, and moves nobody until then. Null when no submit is waiting.
+ *  after the send, while the composer collapsing has already fired a resize.
+ *  The turn Continue lands on does not exist at all when the button is pressed.
+ *  So the landing cannot just run on the next growth: it waits until its own
+ *  turn is there, and moves nobody until then. Null when no submit is waiting.
  *
- *  The two card submits never use it, because the card the reader just tapped is
- *  on screen by construction, so their landing resolves at submit time and
- *  glides immediately. */
+ *  The two card submits never use it. The card the reader just tapped is on
+ *  screen by construction, so their landing resolves at submit time. */
 let _pendingLanding: { resolveTurn: TurnResolver; at: number } | null = null;
 
 /** How long a deferred landing waits for its own turn before LAPSING and moving
  *  nobody.
  *
- *  Generous, because it is only ever reached when the turn is not individually
- *  addressable rather than merely late: the second and subsequent queued
- *  follow-ups fold into a CLOSED `<details class="queued-message-group">` (see
- *  `CreateThreadView`), whose contents have no box at all, so the message the
- *  reader just sent has no rect to land on.
+ *  Generous, because it is only ever reached when the turn is not addressable
+ *  rather than merely late. The second and later queued follow-ups fold into a
+ *  CLOSED `<details class="queued-message-group">`, see `CreateThreadView`.
+ *  Its contents have no box, so the message the reader just sent has no rect to
+ *  land on.
  *
- *  Lapsing moves nobody, and does NOT fall back to the live edge. It used to,
- *  because the send had armed a standing follow that had to be honoured somehow;
- *  with no arming there is nothing to honour, and the case the deadline covers
- *  is precisely a turn with no box, so there is nothing to show the reader even
- *  if they were taken there. Without the deadline a pending landing would sit
- *  forever and hold the growth branch inert. */
+ *  Lapsing moves nobody, and does NOT fall back to the live edge: a submit arms
+ *  nothing, so there is no ride to honour, and a turn with no box is nothing to
+ *  show. Without the deadline a pending landing would sit forever and hold the
+ *  growth branch inert. */
 const LANDING_DEADLINE_MS = 1000;
 
 /** The ONE at-the-live-edge threshold. 2px of slack absorbs subpixel rounding
- *  (mobile zoom, device-pixel snapping) and the iOS overscroll bounce without
+ *  (mobile zoom, device-pixel snapping) and the iOS overscroll bounce, without
  *  making the chevron look stuck. Shared by the chevron's reconcile, the send's
- *  "are they already there" test and both observers, so they cannot drift.
- *
- *  There used to be a second, 80px threshold beside it, the stickiness window
- *  inside which growth counted as the reader riding the live edge and re-pinned
- *  them. Riding the live edge is an explicit request now, so one threshold
- *  answers the one remaining geometric question. */
+ *  "are they already there" test and both observers, so they cannot drift. */
 function isAtLiveEdge(el: HTMLElement): boolean {
   return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
 }
 
 /** The scroll offset the live edge sits at: the MAX offset rather than
  *  `scrollHeight`, which the browser would clamp to the same place. Naming the
- *  real target keeps every write meaningful instead of leaning on the clamp, and
- *  one definition keeps everything that aims at the live edge (the follow's
- *  per-growth write, its resume, its submit glide, the down chevron's tween) or
- *  measures against it (turn-nav's chevron reconcile) from drifting apart,
- *  exactly as `isAtLiveEdge` does for the threshold. */
+ *  real target keeps every write meaningful instead of leaning on the clamp.
+ *  One definition also keeps everything aiming at the live edge, or measuring
+ *  against it, from drifting apart. Same reason as `isAtLiveEdge` above. */
 function liveEdgeTop(el: HTMLElement): number {
   return Math.max(0, el.scrollHeight - el.clientHeight);
 }
 
 /** Can this transcript be scrolled at all? One definition, read by the up
  *  chevron (`notAtTop`), the mobile title fade (`scrolledFromTop`) and the
- *  submit's landing test below, so a transcript with a hair of overflow (a
- *  border, a rounded line height) answers the same for all three: nothing to go
- *  up to, nothing to slide under the title, and nowhere for a submit to take
- *  anybody. That is what the 10px absorbs.
+ *  submit's landing test. A transcript with a hair of overflow, from a border or
+ *  a rounded line height, then answers the same for all three. That is what the
+ *  10px absorbs.
  *
- *  The DOWN chevron deliberately asks something else, `isAtLiveEdge`'s 2px,
- *  because it describes where the reader IS rather than whether the thread can
- *  move at all. */
+ *  The DOWN chevron deliberately asks something else, `isAtLiveEdge`'s 2px. It
+ *  describes where the reader IS, not whether the thread can move at all. */
 function isScrollable(el: HTMLElement): boolean {
   return el.scrollHeight > el.clientHeight + 10;
 }
@@ -772,25 +529,20 @@ function isScrollable(el: HTMLElement): boolean {
  *  container. Two things hold a reader deliberately and both need it: the
  *  standing follow (its per-growth write and its live-edge glide) and a submit's
  *  landing. For the follow the answer retires the request; for the landing it
- *  cancels the glide, which used to come free as a side effect of the follow's
- *  disarm and needs saying now that a submit arms nothing.
+ *  cancels the glide.
  *
- *  A held write is marked as a navigation scroll like every other write the app
- *  makes, but `isNavigationScroll`'s 64ms window cannot answer THIS question: a
- *  streaming thread re-marks itself every frame, so a flick landing inside the
- *  window would read as ours and the reader would fight us. The POSITION answers
- *  it exactly instead. Content growing below the reader changes `scrollHeight`
- *  and never `scrollTop`, so growth can never look like a gesture; every gesture
- *  (wheel, scrollbar drag, touch flick, momentum, keys, a mobile pane swipe)
- *  changes `scrollTop`, so one always does.
+ *  A held write is marked as a navigation scroll like every other write, but
+ *  `isNavigationScroll`'s 64ms window cannot answer THIS question. A streaming
+ *  thread re-marks itself every frame, so a flick landing inside the window
+ *  would read as ours and the reader would fight us. The POSITION answers it
+ *  exactly instead. Content growing below the reader changes `scrollHeight` and
+ *  never `scrollTop`, while every gesture changes `scrollTop`.
  *
  *  It is also what ends both for a navigation that deliberately puts the reader
- *  somewhere else (the up chevron, turn stepping, a saved-scroll restore), with
- *  no call site of its own: none of those is a held write, so the first frame of
- *  one already reads as the reader being elsewhere. And it is what keeps the
- *  follow ALIVE across everything that is not a scroll: a card resolving,
- *  granting a permission, expanding a turn all change content without moving the
- *  reader off the live edge. */
+ *  somewhere else, with no call site of its own: none of those is a held write,
+ *  so the first frame of one already reads as the reader being elsewhere. And it
+ *  keeps the follow ALIVE across everything that is not a scroll, such as
+ *  resolving a card, granting a permission or expanding a turn. */
 let _heldEl: HTMLElement | null = null;
 let _heldTop = -1;
 
@@ -815,18 +567,17 @@ function markHeldScroll(el: HTMLElement, top: number) {
 
 /** Arm the standing follow at the position the caller's own scroll just reached,
  *  so the trailing scroll event of that scroll cannot retire the request it just
- *  made. Two callers and no more: `setFollowLiveEdge` (the follow toggle) and
- *  `resumeFollowingBottom` (which replays a toggle request the reader made in
- *  this thread earlier). It takes its element rather than resolving one, for the
- *  restore, which holds the container it is positioning and must not ask
- *  `resolveTarget` for a different one (a thread opening mid-layout-swap can
- *  answer with the outgoing mount).
+ *  made. Two callers and no more: `setFollowLiveEdge` (the toggle) and
+ *  `resumeFollowingBottom` (which replays a recorded toggle request).
  *
- *  Notifies only on the unarmed to armed transition, so the recording side is
- *  told about a request the moment it is made even when arming produces no scroll
- *  event at all. That case is ordinary rather than exotic: a reader already at the
- *  live edge who presses the toggle gets no write at all, and an idle thread then
- *  grows nothing, so no scroll ever carries the request anywhere. */
+ *  It takes its element rather than resolving one, for the restore. That caller
+ *  holds the container it is positioning, and a thread opening mid-layout-swap
+ *  can make `resolveTarget` answer with the outgoing mount.
+ *
+ *  Notifies only on the unarmed to armed transition, so the recording side hears
+ *  about a request even when arming produces no scroll event. That case is
+ *  ordinary: a reader already at the live edge gets no write, and an idle thread
+ *  then grows nothing, so no scroll carries the request anywhere. */
 function armFollowOn(el: HTMLElement | null) {
   const wasArmed = _followingBottom.value;
   _followingBottom.value = true;
@@ -844,54 +595,57 @@ function armFollowOn(el: HTMLElement | null) {
  *  MOVES the reader.
  *
  *  `live-edge` is the ordinary re-entry, and the write is required rather than
- *  tidy: `.thread-content` is one element reused across threads, so on arrival it
- *  holds the OUTGOING thread's offset, and arming alone would leave the reader
+ *  tidy. `.thread-content` is one element reused across threads, so on arrival
+ *  it holds the OUTGOING thread's offset. Arming alone would leave the reader
  *  there until the next growth round.
  *
- *  `in-place` writes nothing, because something else owns where the reader is
- *  looking on this open, and there is exactly one such thing: a DEEP LINK. The
- *  link owns the POSITION and the record owns the REQUEST, so both answers hold
- *  and the reader gets the event they tapped AND the ride they never asked to
- *  end. Only `standDownForDeepLink` asks for it. */
+ *  `in-place` writes nothing, because a DEEP LINK owns where the reader is
+ *  looking on this open. It holds the ride open for a link still IN FLIGHT, so a
+ *  link that turns out dead costs the reader nothing. A link that LANDS ends the
+ *  ride, and the guard in the branch below keeps this from reinstating it. Asked
+ *  for by `standDownForDeepLink` and by `onPageWake`'s claim-held branch. */
 export type FollowResumeFrom = 'live-edge' | 'in-place';
 
 /** Resume a standing follow the reader armed in this thread BEFORE they left it:
  *  arm, then write the live edge, so the growth branch carries them from there.
  *
  *  Called only by `attachScrollMemory`, on a thread whose recorded reading
- *  position is the live edge (or, through `applyFollowSeed`, on one with no
- *  record at all). The write goes through `markHeldScroll` like every other
- *  follow write, so the mobile header stands down for it and the render window
- *  does not read it as the reader asking for older turns.
+ *  position is the live edge, or through `applyFollowSeed` on one with no record
+ *  at all. The write goes through `markHeldScroll` like every other follow
+ *  write, so the mobile header stands down for it.
  *
  *  Nothing waits for content here, unlike the offset restore's observer retries.
- *  An offset can only be honoured once the transcript is tall enough to hold it,
- *  whereas the live edge is wherever the content currently ends: the write lands
- *  on today's bottom and the armed follow rides every later arrival to the real
- *  one. */
+ *  An offset can only be honoured once the transcript is tall enough to hold it.
+ *  The live edge is wherever the content currently ends, so the write lands on
+ *  today's bottom and the armed follow rides every later arrival. */
 export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): void {
   if (from === 'in-place') {
     // Two guards, and both are about what resuming may NOT undo.
     //
-    // ALREADY ARMED means the reader never lost the request: a link into the
-    // thread they are already in re-attaches nothing and `focusThread` retires
-    // nothing, so there is no request to resume. Arming again would clear the
-    // held stamp `isFollowScroll` reads, which silently switches what this
-    // landing records from the live edge to an offset.
+    // ALREADY ARMED means the reader never lost the request. Arming again would
+    // clear the held stamp `isFollowScroll` reads, which silently switches what
+    // this landing records from the live edge to an offset.
     if (_followingBottom.value) return;
-    // LIVE means the landing has just ended the ride ON PURPOSE
-    // (`scrollToSelectorAndPulse`), because a link into a streaming thread is a
-    // request to be at ONE place and the next token would carry the reader off
-    // it. This runs afterwards, so resuming would undo that decision. The
-    // question is the same one every other retirement asks, and it is fresh
-    // here: `ChatExchange` publishes the incoming thread's liveness from a
-    // child effect, which Preact flushes before this attachment's.
-    if (threadIsLive()) return;
+    // ALREADY LANDED means the link has ended the ride ON PURPOSE
+    // (`scrollToSelectorAndPulse`), because a link is a request to be at ONE
+    // place. Resuming afterwards would undo that decision, so the resume is
+    // only for a link still IN FLIGHT: it holds the ride open until the answer
+    // is known.
+    //
+    // It asks whether the LANDING happened, NOT whether the agent is running.
+    // Liveness is the wrong proxy in the commonest deep-link case, because
+    // `waiting_for_user_answer` is quiescent (`isRenderedThreadIdle`). A thread
+    // parked on a question card therefore reads as IDLE.
+    //
+    // Both callers get it: `standDownForDeepLink`, which can run either side of
+    // the landing, and `onPageWake`'s claim-held branch. One guard rather than
+    // an ordering rule at each.
+    if (deepLinkHasResolved()) return;
     // No stamp: the reader is wherever the LINK put them, which is not a
-    // position the follow wrote and must not be recorded as the live edge. The
-    // landing is an ordinary offset, exactly as it is for a same-thread link
-    // (see `currentPosition` in `hooks/useScrollMemory.ts`). The first growth
-    // round after the thread wakes stamps it properly.
+    // position the follow wrote and must not be recorded as the live edge. It
+    // is an ordinary offset, as it is for a same-thread link (see
+    // `currentPosition` in `hooks/useScrollMemory.ts`). The first growth round
+    // after the thread wakes stamps it properly.
     armFollowOn(null);
     return;
   }
@@ -901,46 +655,42 @@ export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 
 
 /** Is the scroll event being handled the FOLLOW's own write rather than the
  *  reader's gesture? Armed, and the container still exactly where the follow put
- *  it (see `isWhereWeHeldIt` for the 1px slack and why position is the right
- *  question).
+ *  it. See `isWhereWeHeldIt` for the 1px slack.
  *
  *  Exported for the recording side, which must write the live edge for the
  *  follow's own writes and a plain offset for everything else. It asks the
- *  POSITION rather than the flag alone on purpose: `.thread-content` carries two
- *  scroll listeners, the disarm lives in `makeScrollObservers` and the save lives
- *  in `attachScrollMemory`, and a save that merely asked whether the flag was
- *  armed would answer differently depending on which of the two ran first. A
- *  reader's gesture moves `scrollTop` away from the stamp by definition, so this
- *  answers the same in either order. */
+ *  POSITION rather than the flag alone on purpose. `.thread-content` carries two
+ *  scroll listeners, the disarm here and the save in `attachScrollMemory`. A
+ *  save asking only about the flag would answer differently depending on which
+ *  ran first. A gesture moves `scrollTop` away from the stamp by definition, so
+ *  this answers the same in either order. */
 export function isFollowScroll(el: HTMLElement): boolean {
   return _followingBottom.value && isWhereWeHeldIt(el);
 }
 
 /** Retire the standing follow, and with it anything we were doing to serve it or
- *  any other request. Called by the disarm in `onScroll` (the reader taking the
- *  container away from where a held write put it), and exported for the two
- *  navigations that cannot be read off a scroll.
+ *  any other request. Called by the disarm in `onScroll`, and exported for the
+ *  two navigations that cannot be read off a scroll.
  *
- *  Opening a DIFFERENT thread: a thread the reader just opened is not one they
- *  asked to follow, and a restore that happens to land on that thread's saved
- *  bottom position writes no scroll the disarm could see. See `focusThread`.
+ *  Opening a DIFFERENT thread. A thread the reader just opened is not one they
+ *  asked to follow. A restore landing on that thread's saved bottom writes no
+ *  scroll the disarm could see. See `focusThread`.
  *
- *  A DEEP-LINK LANDING on a LIVE thread: the reader asked to be at one specific
- *  place, so the ride ends there and nothing may carry them off it. The disarm
- *  cannot see this one either, and the case it misses is the ordinary one rather
- *  than a corner: a link into the thread the reader is already riding usually
- *  points at its newest turn, so the landing leaves them AT the live edge, where
- *  the disarm's first condition is false and the follow survives to drag them
- *  along with the next token. On an idle thread the landing calls nothing, since
- *  there is no next token and the reader is browsing. See
- *  `scrollToSelectorAndPulse`, which owns that test. */
+ *  A DEEP-LINK LANDING, on any thread. The reader asked to be at one specific
+ *  place, so the ride ends there. The disarm cannot see this one either, and the
+ *  case it misses is the ordinary one. Such a link usually points at the
+ *  thread's newest turn. The landing therefore leaves the reader AT the live
+ *  edge, where the disarm's first condition is false.
+ *
+ *  It is deliberately NOT gated on the thread being live, unlike every other
+ *  retirement here. See `scrollToSelectorAndPulse`, which owns that call, and
+ *  ADR 0064. */
 export function stopFollowingBottom() {
   // Both of the things that hold a reader are OUR motion, so both stop here.
-  // Without it the reader who just scrolled away is dragged back for the rest of
-  // the tween (the disarm would say one thing and the next frame do another),
-  // and a thread opened mid-glide is scrolled with the previous thread's turn as
-  // the target. Only a held tween: a deep-link or up-chevron glide belongs to a
-  // navigation this has no business cancelling.
+  // Without it the reader who just scrolled away is dragged back for the rest
+  // of the tween. A thread opened mid-glide is scrolled with the previous
+  // thread's turn as the target. Only a HELD tween: a deep-link or up-chevron
+  // glide belongs to a navigation this has no business cancelling.
   if (_heldAnim) cancelScrollAnim();
   _followingBottom.value = false;
   _heldEl = null;
@@ -949,14 +699,12 @@ export function stopFollowingBottom() {
 
 /** Cancel a submit's LANDING: drop one still waiting for its turn to render, and
  *  stop one already gliding. The landing's half of what `stopFollowingBottom`
- *  does, for the reader who has no follow to retire, which since a submit arms
- *  nothing is every reader who only submitted.
+ *  does, for the reader who has no follow to retire.
  *
- *  Only the landing's own tween. A live-edge glide is the standing follow's
- *  motion and ends with the follow, on the follow's own two-part test; ending it
- *  here would retire the ride on a scroll event the disarm deliberately ignores
- *  (a shrink clamping the reader down, the reflow correction holding them still
- *  while the layout moves). */
+ *  Only the landing's OWN tween. A live-edge glide is the standing follow's
+ *  motion and ends with the follow, on the follow's own two-part test. Ending it
+ *  here would retire the ride on a scroll event the disarm deliberately ignores,
+ *  such as a shrink clamping the reader down. */
 function cancelLanding() {
   if (_heldAnim && _heldAnimTarget === 'own-turn') cancelScrollAnim();
   _pendingLanding = null;
@@ -980,61 +728,39 @@ function landingInFlight(): boolean {
 
 /** Carry the held stamp onto a scroll THE APP just wrote to hold the reader on
  *  the same content while the layout moved under them. Two writers, and they are
- *  the same act on either side of the DOM/layout line: `restoreAfterReflow`
- *  (a pane resize re-wrapped the transcript) and `withScrollAnchor` (a toggle
- *  mutated it). Neither is the reader taking over, so neither may retire a
- *  standing follow or cancel a pending landing, and without the stamp the scroll
- *  event each fires arrives at a position we do not recognise and does both.
+ *  the same act on either side of the DOM/layout line: `restoreAfterReflow` for
+ *  a pane resize, `withScrollAnchor` for a toggle. Neither is the reader taking
+ *  over, so neither may retire a standing follow or cancel a pending landing.
+ *  Without the stamp, the scroll event each fires arrives at a position we do
+ *  not recognise and does both.
  *
- *  It CARRIES a hold rather than taking one, hence the guard: with no hold on
- *  this element there is no follow and no landing to protect, and stamping would
- *  claim a position nobody asked for. */
+ *  It CARRIES a hold rather than taking one, hence the guard. With no hold on
+ *  this element there is nothing to protect, and stamping would claim a position
+ *  nobody asked for. */
 function carryHeldScroll(el: HTMLElement): void {
   if (_heldEl === el) _heldTop = el.scrollTop;
 }
 
 /** What the transcript owes the reader after the APP mutated it and corrected
- *  the scroll to hold them still: `withScrollAnchor`'s side of `honourGrowth`,
+ *  the scroll to hold them still. `withScrollAnchor`'s side of `honourGrowth`,
  *  and the two say the same thing in the two worlds. Every reveal in the
  *  transcript goes through it: the collapse fold, the per-turn unfold, and the
- *  two transcript-wide turn controls (steps, full response).
+ *  two transcript-wide turn controls.
  *
  *  ONLY A SCROLL MAY RETIRE THE FOLLOW, so the first line is not optional. A
- *  toggle is a click on a control, not a gesture, and the reader who made it
- *  asked for more of the turn rather than for less of the ride. The correction
- *  moves the container all the same, and without the stamp that write reads as
- *  the reader taking over. The transcript-wide reveals are what make it bite:
- *  they grow every turn, including the ones BELOW the anchored root, so the
- *  correction (which pins that root) leaves the reader short of the live edge
- *  and the follow saw a move it had not made.
+ *  toggle is a click on a control, not a gesture. The correction moves the
+ *  container all the same, and without the stamp that write reads as the reader
+ *  taking over. The transcript-wide reveals grow every turn, including those
+ *  BELOW the anchored root, so the correction leaves the reader short.
  *
  *  Then, while the follow is CARRYING them, put them back ON the live edge in
  *  ONE held write, in the same frame the caller unfreezes: `snapToLiveEdge`.
- *  Being short of the edge is exactly what the standing follow exists to undo,
- *  and here it is not a position the reader ever occupied, only one the mutation
- *  left them at between two writes the browser has not painted yet.
+ *  That is not a position the reader ever occupied.
  *
- *  Carrying rather than merely ARMED (see `followIsCarrying`), and this is the
- *  half of that test `withScrollAnchor` cannot make on its own: it asks the same
- *  question to decide whether to skip the anchor correction, and the two answers
- *  are one decision. On an IDLE thread the reveal is the reader clicking around
- *  a finished thread, so they get the anchor correction like anybody else and
- *  nothing snaps them anywhere.
- *
- *  A TWEEN was tried here first, on the reasoning that one click can add the
- *  height of the whole transcript and an instant write teleports the reader. It
- *  is what the reader then reported (2026-08-11): turning the steps on grows
- *  every turn ABOVE them too, so the transcript arrived a screenful or more
- *  short of the live edge and then scrolled itself down. The teleport argument
- *  does not survive contact with what a riding reader is looking at, which is
- *  the newest content: this write keeps that content exactly where it is on
- *  screen and lets the growth appear above it, while it is the ANCHOR
- *  correction, and the pause before a tween, that move it. So the snap is the
- *  SMALLER motion of the two, and it is invisible rather than instant, because
- *  it lands before the paint the mutation causes.
- *
- *  Nothing at all for an unarmed reader: a toggle is not a request to be moved,
- *  and the anchor correction has already kept them on what they were reading. */
+ *  Carrying rather than merely ARMED (see `followIsCarrying`). This is the half
+ *  of that test `withScrollAnchor` cannot make alone, and the two answers are
+ *  one decision. Nothing at all for an unarmed reader. A tween here was tried
+ *  and rejected, see ADR 0064. */
 export function honourAnchoredMutation(el: HTMLElement): void {
   carryHeldScroll(el);
   if (!followIsCarrying() || isAtLiveEdge(el)) return;
@@ -1051,52 +777,36 @@ function isWhereWeHeldIt(el: HTMLElement): boolean {
 
 /* ── Was this scroll the reader's own GESTURE? ───────────────────────────────
  *  The position test above answers "did the container move away from our
- *  write", and the block over it states the premise that made that the same
- *  question as "did the reader take over": content growth changes
- *  `scrollHeight` and never `scrollTop`, so growth cannot look like a gesture.
- *
- *  That premise covers growth and nothing else, and three things move the
+ *  write". That equals "did the reader take over" only because content growth
+ *  changes `scrollHeight` and never `scrollTop`. Three things move the
  *  container with no gesture behind them at all:
  *
- *  - The iOS soft keyboard. Opening or closing it rewrites `--app-height`
- *    (`MobileSwipeContainer`), the transcript's height changes with it, and
- *    WebKit adjusts the offset ASYNCHRONOUSLY through the ~350ms animation, so
- *    the correction lands well after any write of ours to stamp it against.
+ *  - The iOS soft keyboard. Opening or closing it rewrites `--app-height` and
+ *    WebKit adjusts the offset ASYNCHRONOUSLY through the animation, well after
+ *    any write of ours to stamp it against.
  *  - An app backgrounded and resumed. The PWA restores an offset nobody wrote.
- *  - Anything the platform decides to scroll on its own (a focus ring brought
- *    into view, a restored session).
+ *  - Anything else the platform scrolls on its own, such as a focus ring
+ *    brought into view or a restored session.
  *
- *  Each of those retired a follow the reader had armed and never touched, while
- *  a reply was streaming, which is the whole value of the feature gone at the
- *  moment it is worth most. So the question is asked of the INPUT instead: a
- *  scroll may retire the follow only while a reader gesture is in flight. That
- *  is a direct signal where the position was an inference, which is what this
- *  module says it wants everywhere else.
- *
- *  The gesture term is added to the position one rather than replacing it: both
- *  must hold. A real scroll satisfies both by construction (a gesture moves the
- *  container), so nothing that used to retire the follow stops doing so, and
- *  the pairing keeps a stray tap during a growth write from ever standing in
- *  for a scroll.
- *
- *  A NAVIGATION is not a gesture and must say so itself, which is what the up
- *  chevron, turn stepping and the deep link do (see `stopFollowingBottom`). */
+ *  So the question is asked of the INPUT instead: a scroll may retire the follow
+ *  only while a reader gesture is in flight. The gesture term is ADDED to the
+ *  position one, so both must hold. A NAVIGATION is not a gesture and says so
+ *  itself, which is what the up chevron, turn stepping and the deep link do.
+ *  Answering the question is not ACTING on it: `keepTheLiveEdge` is the other
+ *  half, and undoes a scroll that was nobody's gesture. */
 
 /** How long after the reader lifts off their scroll events still count as
- *  theirs: `USER_SCROLL_WINDOW_MS`, which `utils/scrollActivity.ts` already
- *  defines as "the drag plus the momentum tail" for the repaint nudge's own
- *  stand-down. The same question, so the same answer, shared rather than
- *  restated: it has to outlive `touchend` because iOS momentum fires its scroll
- *  events after the finger is gone, and a flick that only crosses the live-edge
- *  threshold during the coast would otherwise read as the platform's. Two
- *  constants that must agree and nothing saying so is exactly the drift the
- *  repo's glossary rule is about.
+ *  theirs. `utils/scrollActivity.ts` already defines `USER_SCROLL_WINDOW_MS` as
+ *  the drag plus the momentum tail, for the repaint nudge's own stand-down. The
+ *  same question, so the same answer, shared rather than restated. It has to
+ *  outlive `touchend` because iOS momentum fires its scroll events after the
+ *  finger is gone.
  *
  *  The EVENT SET is deliberately not shared. `utils/userAction.ts` owns "the
- *  user did something" for the surfaces that stand down on any interaction, and
- *  it includes `pointerdown`, which is right there and wrong here: a press is
- *  how the reader answers a question or grants a permission, and this signal
- *  must survive both. See `_scrollbarPressEl`. */
+ *  user did something" for surfaces that stand down on any interaction, and it
+ *  includes `pointerdown`, which is wrong here. A press is how the reader
+ *  answers a question or grants a permission, and this signal must survive
+ *  both. See `_scrollbarPressEl`. */
 const READER_GESTURE_WINDOW_MS = USER_SCROLL_WINDOW_MS;
 
 /** The element the last MOVEMENT was on, so a gesture in one pane cannot speak
@@ -1108,17 +818,14 @@ let _gestureAt = -Infinity;
  *
  *  Only a scrollbar press goes in here, and that narrowness is the whole of the
  *  variable's job. A press on CONTENT is how the reader answers a question,
- *  grants a permission or expands a turn, all inside the transcript and all
- *  changing content; a mouse drag on content selects text and scrolls nothing.
- *  Recording those too would let the jitter every real click carries reach
- *  `pointermove` below and stamp a gesture, putting the window back over
- *  exactly the interactions this module documents as KEEPING the follow. With
- *  only the gutter recorded, that is unrepresentable rather than merely
- *  avoided.
+ *  grants a permission or expands a turn. A mouse drag on content selects text
+ *  and scrolls nothing. Recording those too would let the jitter every click
+ *  carries reach `pointermove` below and stamp a gesture. That would put the
+ *  window over exactly the interactions that must KEEP the follow.
  *
- *  What it buys is the length of a drag: the press itself stamps once, and a
- *  slow haul down the scrollbar can outlast the window, so `pointermove` keeps
- *  it fresh while the thumb is held. */
+ *  What it buys is the length of a drag. The press itself stamps once, and a
+ *  slow haul down the scrollbar can outlast the window. So `pointermove` keeps
+ *  the stamp fresh while the thumb is held. */
 let _scrollbarPressEl: HTMLElement | null = null;
 
 /** Record MOVEMENT: a wheel notch, a finger travelling, a drag, a scroll key.
@@ -1131,13 +838,11 @@ function stampGesture(el: HTMLElement) {
 /** Did the reader move `el` themselves, counting the coast after a flick?
  *
  *  Freshness is the whole test, with no "still holding" term beside it. A drag
- *  fires movement continuously, so a real one keeps re-stamping for as long as
- *  it lasts, and a finger resting on the transcript scrolls nothing for the
- *  question to be asked about. A held-down term would also be a state that can
- *  STICK: a release the page never sees (a touch that ends while the PWA is
- *  backgrounded) would leave the reader's hand permanently on the transcript,
- *  and the first platform scroll after the resume would retire the follow,
- *  which is one of the three bugs this exists to fix. */
+ *  fires movement continuously, so a real one keeps re-stamping. A held-down
+ *  term would also be a state that can STICK. A release the page never sees,
+ *  such as a touch ending while the PWA is backgrounded, would leave the
+ *  reader's hand permanently on the transcript. The first platform scroll after
+ *  the resume would then retire the follow. */
 function readerGestureActive(el: HTMLElement): boolean {
   return _gestureEl === el && nowMs() - _gestureAt < READER_GESTURE_WINDOW_MS;
 }
@@ -1150,28 +855,25 @@ const SCROLL_KEYS = new Set([
 ]);
 
 /** Wire the reader-gesture signal to a scroll container, returning its
- *  teardown. NOT exported and NOT called by the view: `makeScrollObservers`
- *  owns it, so the signal and the `onScroll` that consumes it are attached
- *  together by construction. Wiring them separately would make "observers
- *  attached, gestures forgotten" expressible, and that state is silent: the
- *  transcript behaves normally right up until a reader scrolls away from a live
- *  reply and is dragged back.
+ *  teardown. NOT exported and NOT called by the view. `makeScrollObservers` owns
+ *  it, so the signal and the `onScroll` that consumes it are attached together
+ *  by construction. Wiring them separately would make "observers attached,
+ *  gestures forgotten" expressible. That state is silent until a reader scrolls
+ *  away from a live reply and is dragged back.
  *
  *  `pointermove` is the one that needs the press beside it. On a mouse it fires
- *  for the pointer merely CROSSING the transcript, which is most of a desktop
- *  session, so stamping it unconditionally would leave a gesture permanently
- *  in flight; gated on the press it means a drag, which is how a scrollbar is
- *  pulled. `touchmove` needs no such gate: a finger on the glass is already a
- *  press by definition.
+ *  for the pointer merely CROSSING the transcript, so stamping it
+ *  unconditionally would leave a gesture permanently in flight. Gated on the
+ *  press it means a drag, which is how a scrollbar is pulled. `touchmove` needs
+ *  no such gate, since a finger on the glass is already a press.
  *
- *  The release goes on `window` rather than the element: a drag that ends with
- *  the pointer outside the transcript (a scrollbar drag flung past the pane
- *  edge) would otherwise leave the press recorded forever.
+ *  The release goes on `window` rather than the element. A drag ending with the
+ *  pointer outside the transcript would otherwise leave the press recorded
+ *  forever.
  *
- *  A container with no `addEventListener` is a test double, and gets a no-op
- *  teardown; such a test drives the signal through `readerGestureForTest`. So
- *  is a `window` without one, which is what the unit-test setup's minimal stub
- *  can be. */
+ *  A container with no `addEventListener` is a test double and gets a no-op
+ *  teardown; such a test drives the signal through `readerGestureForTest`. So is
+ *  a `window` without one. */
 function attachReaderGestures(el: HTMLElement): () => void {
   const root = typeof window !== 'undefined' && typeof window.addEventListener === 'function'
     ? window
@@ -1180,19 +882,15 @@ function attachReaderGestures(el: HTMLElement): () => void {
   const onDown = (e: PointerEvent) => {
     // A press in the SCROLLBAR gutter is a scroll by itself, with no movement
     // to follow it: clicking the track pages the transcript in one jump. It is
-    // also the ONLY press that can be a scroll at all, which is why it is the
-    // only one recorded. The gutter is outside the client box, so it cannot be
-    // a content control, and a mouse drag anywhere else in the transcript
-    // selects text rather than scrolling.
+    // also the ONLY press that can be a scroll at all. The gutter is outside the
+    // client box, so it cannot be a content control.
     //
     // `e.target === el` is load-bearing, not a tidy-up. `offsetX` is measured
     // from the padding box of the TARGET, and `pointerdown` bubbles from the
-    // deepest element under the pointer, so on a press that lands on a
-    // descendant the comparison is against the wrong box entirely: in a turn
-    // taller than the viewport, an ordinary tap in the body reads as past the
-    // gutter and stamps a gesture, which is the bare-press case the whole
-    // signal exists to refuse. Only a press on the container ITSELF can be in
-    // its gutter.
+    // deepest element under the pointer. On a press landing on a descendant the
+    // comparison is therefore against the wrong box: in a turn taller than the
+    // viewport, an ordinary tap in the body reads as past the gutter. Only a
+    // press on the container ITSELF can be in its gutter.
     //
     // Horizontal only: `.thread-content` is `overflow-x: hidden`, so there is
     // no bottom scrollbar for an `offsetY` arm to ever be right about. Always
@@ -1203,46 +901,75 @@ function attachReaderGestures(el: HTMLElement): () => void {
   };
   const onDrag = (e: PointerEvent) => {
     // A move with no button held means the press ended somewhere this listener
-    // never saw: released over a nested iframe, or while the PWA was
-    // backgrounded. Clearing here is what stops `_scrollbarPressEl` becoming a
-    // state that can STICK, where a mouse merely crossing the transcript would
-    // then read as a drag.
+    // never saw: over a nested iframe, or while the PWA was backgrounded.
+    // Clearing here stops `_scrollbarPressEl` becoming a state that can STICK,
+    // where a mouse merely crossing the transcript reads as a drag.
     if (e.buttons === 0) { if (_scrollbarPressEl === el) _scrollbarPressEl = null; return; }
     if (_scrollbarPressEl === el) stampGesture(el);
   };
   // `wheel` and `touchmove` are stamped WHEREVER in the transcript they land,
-  // and the asymmetry with the two gated listeners is the point rather than an
-  // oversight. Those two can be ACTIVATIONS: a press is how a card is answered,
-  // Space on a focused button is the same act from the keyboard, and neither
-  // scrolls anything, so each is gated to the container itself. A wheel notch
-  // and a finger travelling are scroll intent by definition, whatever they land
-  // on. The worst they can be wrong about is a nested scroller (a step detail's
-  // `<pre>`), where the reader is still scrolling, just not this box.
+  // and the asymmetry with the two gated listeners is the point. Those two can
+  // be ACTIVATIONS: a press answers a card, and Space on a focused button is
+  // the same act from the keyboard. Neither scrolls anything, so each is gated
+  // to the container itself. A wheel notch and a finger travelling are scroll
+  // intent whatever they land on. The worst they can be wrong about is a nested
+  // scroller, where the reader is still scrolling, just not this box.
   const onMove = () => stampGesture(el);
   const onUp = () => { if (_scrollbarPressEl === el) _scrollbarPressEl = null; };
   const onKey = (e: KeyboardEvent) => {
-    // Only a key the CONTAINER itself received scrolls it. `keydown` bubbles
-    // like everything else here, and the transcript is full of controls that
-    // take these very keys and scroll nothing: Space on a focused button is how
-    // the reader ANSWERS a question card, Arrow and Home/End move a caret in a
-    // text field. Each of those changes content, so stamping them would put a
-    // window over the interactions the press rule above already refuses. The
-    // container is `tabindex=0`, so a reader scrolling it by keyboard has focus
-    // on it and is the target.
-    if (e.target !== el) return;
     // A CHORD is a shortcut, not a scroll key. The two overlap: turn stepping
     // is Cmd+Arrow, and its own keystroke stamping a gesture would defeat the
     // one case `stepThreadTurn` deliberately keeps the ride for, a step onto
     // the last turn, by retiring it from `onScroll` mid-glide instead.
     if (e.metaKey || e.ctrlKey || e.altKey) return;
-    if (SCROLL_KEYS.has(e.key)) stampGesture(el);
+    if (!SCROLL_KEYS.has(e.key)) return;
+    // Only a key the CONTAINER itself received stamps a GESTURE. `keydown`
+    // bubbles, and the transcript is full of controls that take these very keys
+    // and scroll nothing. Space on a focused button ANSWERS a question card, and
+    // Arrow or Home/End move a caret in a text field. Treating those as a scroll
+    // would put a disarm window over the interactions the press rule above
+    // already refuses.
+    //
+    // A scroll key on a DESCENDANT can still scroll the transcript. The browser
+    // scrolls the nearest scrollable ancestor for any key the focused control
+    // does not consume. That is the reader scrolling by keyboard, and it is the
+    // ordinary case: the choice-card seeding parks focus on a button inside the
+    // transcript. So it is marked as a REVEAL rather than stamped as a gesture,
+    // which is the narrow half of the two. The correction stands down, and the
+    // disarm's four terms are left as they were.
+    //
+    // Marked generously, for any unconsumed scroll key wherever it lands. A key
+    // the control DOES consume moves nothing and fires no scroll event.
+    if (e.target !== el) { markRevealScroll(el); return; }
+    stampGesture(el);
   };
+  /** FOCUS LANDING somewhere inside the transcript, the OTHER way the container
+   *  scrolls with nobody writing `scrollTop`. The browser reveals an off-screen
+   *  focused control, as it does for Tab, Shift+Tab, a screen reader moving the
+   *  cursor, and any `focus()` without `preventScroll`.
+   *
+   *  It is a NAVIGATION rather than a gesture, which is why it is stamped here
+   *  rather than through `stampGesture`. A gesture retires the ride. Tabbing to
+   *  a control is the reader going somewhere specific, so they keep the lit
+   *  toggle AND the place the browser took them to.
+   *
+   *  Without it the platform-scroll correction writes the reader back to the
+   *  live edge, leaving the control they just tabbed to off screen. Tab then
+   *  appears to do nothing, which a keyboard or screen-reader user has no way
+   *  around.
+   *
+   *  `focusin` rather than `focus` because it BUBBLES, so one listener covers
+   *  every control inside the container. It is dispatched during the focus
+   *  operation, a frame or more before the scroll event it causes. That puts the
+   *  stamp inside `NAV_SCROLL_EVENT_WINDOW_MS` of that event. */
+  const onFocusIn = () => markRevealScroll(el);
 
   el.addEventListener('pointerdown', onDown as EventListener, { passive: true });
   el.addEventListener('pointermove', onDrag as EventListener, { passive: true });
   el.addEventListener('touchmove', onMove, { passive: true });
   el.addEventListener('wheel', onMove, { passive: true });
   el.addEventListener('keydown', onKey);
+  el.addEventListener('focusin', onFocusIn, { passive: true });
   root.addEventListener('pointerup', onUp, { passive: true });
   root.addEventListener('pointercancel', onUp, { passive: true });
   root.addEventListener('touchend', onUp, { passive: true });
@@ -1254,6 +981,7 @@ function attachReaderGestures(el: HTMLElement): () => void {
     el.removeEventListener('touchmove', onMove);
     el.removeEventListener('wheel', onMove);
     el.removeEventListener('keydown', onKey);
+    el.removeEventListener('focusin', onFocusIn);
     root.removeEventListener('pointerup', onUp);
     root.removeEventListener('pointercancel', onUp);
     root.removeEventListener('touchend', onUp);
@@ -1266,14 +994,13 @@ function attachReaderGestures(el: HTMLElement): () => void {
 /** Test seam: record that the reader just MOVED `el`, or forget it.
  *
  *  The observer tests drive plain objects rather than DOM nodes, so there is no
- *  event to dispatch and no listener to dispatch it to. This is the same fact
- *  the listeners record, stated directly, which keeps "the reader scrolls" one
- *  line in a test instead of a fake event system. Production never calls it:
- *  there the fact comes from the input events, and it expires on its own.
+ *  event to dispatch and no listener to dispatch it to. This states the same
+ *  fact the listeners record, which keeps "the reader scrolls" one line in a
+ *  test instead of a fake event system. Production never calls it.
  *
- *  `moved: false` forgets it, which is what a test asserting the PLATFORM moved
- *  the container (the keyboard, an app resume) needs, and what the shared reset
- *  in a `beforeEach` uses so one test's flick cannot carry into the next. */
+ *  `moved: false` forgets it. A test asserting the PLATFORM moved the container
+ *  needs that. So does the shared reset in a `beforeEach`, so one test's flick
+ *  cannot carry into the next. */
 export function readerGestureForTest(el: HTMLElement | null, moved = true): void {
   if (!el || !moved) {
     _gestureEl = null;
@@ -1289,14 +1016,12 @@ export function readerGestureForTest(el: HTMLElement | null, moved = true): void
  *  optimistic row a send inserts carries it too, so this resolves the just-sent
  *  message the moment it renders.
  *
- *  Strictly the last one, never the last one that happens to be visible: a
- *  backwards scan for the newest VISIBLE panel would answer with an older
- *  message whenever the newest has no box, and the send's landing would glide to
- *  the wrong turn. The case is real, not hypothetical: a second queued follow-up
- *  folds itself and the first into a closed `<details>` group. So an invisible
- *  newest panel is reported as "not there yet" and the landing waits it out (see
- *  `LANDING_DEADLINE_MS`). The visibility test also rejects the hidden
- *  dual-mount copy, and is one call rather than a scan. */
+ *  Strictly the last one, never the last VISIBLE one. A backwards scan for the
+ *  newest visible panel would answer with an older message whenever the newest
+ *  has no box. The send's landing would then glide to the wrong turn, and the
+ *  case is real: a second queued follow-up folds itself and the first into a
+ *  closed `<details>` group. So an invisible newest panel is reported as "not
+ *  there yet" and the landing waits it out (see `LANDING_DEADLINE_MS`). */
 function lastUserMessage(el: HTMLElement): HTMLElement | null {
   if (typeof el.querySelectorAll !== 'function') return null;
   const panels = el.querySelectorAll<HTMLElement>('.initiator-panel-user');
@@ -1315,26 +1040,22 @@ function lastTurn(el: HTMLElement): HTMLElement | null {
 }
 
 /** The turn holding the card whose `attr` is `value`, matched among the elements
- *  `bodySelector` picks out: the `.initiator-panel` around it, which is a card
- *  submit's counterpart to `lastUserMessage`'s panel. Two callers, the question
- *  card and the three permission-shaped cards, which differ only in the class
- *  the body wears and the attribute carrying its id.
+ *  `bodySelector` picks out. It answers with the `.initiator-panel` around that
+ *  card, a card submit's counterpart to `lastUserMessage`'s panel. Two callers,
+ *  the question card and the three permission-shaped cards.
  *
  *  The PANEL and not the body inside it, for two reasons that agree. It is the
- *  whole of what the reader produced (the question, their picks, the chrome
- *  around both) and is what the reply then grows underneath, exactly as it does
- *  under a sent message. And it is the part that SURVIVES being answered:
- *  `QuestionBody` swaps its live body for `AnsweredBody`, a different component,
- *  so Preact unmounts the body node a frame in, while the panel around it is the
- *  same vnode in the same position and is reused. Anchoring the landing on the
- *  panel is therefore a resolve-once, exactly like the send's, rather than a
- *  per-frame re-query. Never the enclosing `.chat-exchange`, which also contains
- *  the growing reply.
+ *  whole of what the reader produced, and is what the reply then grows
+ *  underneath. And it SURVIVES being answered. `QuestionBody` swaps its live
+ *  body for `AnsweredBody`, so Preact unmounts the body node a frame in. The
+ *  panel is reused as the same vnode in the same position, so anchoring on it is
+ *  a resolve-once rather than a per-frame re-query. Never the enclosing
+ *  `.chat-exchange`, which also holds the growing reply.
  *
  *  Matched on the attribute rather than through a `[data-tool-use-id="…"]`
- *  selector so no id has to be escaped into CSS syntax. Both the live body and
- *  the answered one carry the id, so which of the two is in the DOM when this
- *  runs does not decide whether the card is found. */
+ *  selector, so no id has to be escaped into CSS syntax. Both the live body and
+ *  the answered one carry the id, so which is in the DOM does not decide whether
+ *  the card is found. */
 function cardTurn(el: HTMLElement, bodySelector: string, attr: string, value: string): HTMLElement | null {
   if (typeof el.querySelectorAll !== 'function') return null;
   for (const body of el.querySelectorAll<HTMLElement>(bodySelector)) {
@@ -1350,36 +1071,33 @@ function cardTurn(el: HTMLElement, bodySelector: string, attr: string, value: st
  *  `--deep-link-focus-gap`. */
 const TURN_LANDING_FALLBACK_GAP_PX = 8;
 
-/** Slack on "can the container reach the landing line": a turn that falls a few
+/** Slack on "can the container reach the landing line". A turn falling a few
  *  fractional pixels short of tall enough takes the line anyway, and the browser
  *  clamps it those few pixels lower.
  *
  *  It matters only at the boundary, where a turn is within a rounding error of a
- *  screenful. `scrollHeight` and `clientHeight` are integers while the turn's own
- *  top is fractional, so an exact test flips there for reasons no reader can see,
- *  and flipping is not a small difference in outcome: the other branch lands the
- *  turn a whole `padding-bottom` lower. Everywhere else the two answers are a
- *  viewport apart and 4px decides nothing. */
+ *  screenful. `scrollHeight` and `clientHeight` are integers while the turn's
+ *  own top is fractional, so an exact test flips there for reasons no reader can
+ *  see. Flipping is not a small difference in outcome, since the other branch
+ *  lands the turn a whole `padding-bottom` lower. Everywhere else the two
+ *  answers are a viewport apart and 4px decides nothing. */
 const LANDING_REACH_SLACK_PX = 4;
 
 /** THE LANDING LINE: how far below the transcript's top edge a turn comes to
  *  rest when the app navigates to it, read off `.chat-exchange`'s computed
  *  `scroll-margin-top` (chat/response.css).
  *
- *  ONE number for every navigation that puts a turn at the top, which is now all
- *  three of them: a deep link (which gets it from `scroll-margin-top` directly,
- *  through `smoothScrollToElement`), ⌘↑/⌘↓ turn stepping, and a SUBMIT's landing.
- *  They must agree or the same turn would come to rest in three different places
- *  depending on what put it there.
+ *  ONE number for all three navigations that put a turn at the top: a deep link,
+ *  turn stepping, and a SUBMIT's landing. They must agree, or the same turn
+ *  would rest in three places depending on what put it there.
  *
- *  It has to be read rather than written here because what it clears is a stack
- *  of chrome that differs per breakpoint and is described in CSS: the desktop
- *  top-fade band and the floating up-chevron, the mobile app header and sticky
- *  thread-title row, plus the focus highlight's own bloom. Keeping the number
- *  beside the things it measures is the same reasoning that keeps the deep-link
- *  clearance in CSS, and it is why this is not a constant.
+ *  It is READ rather than written here because what it clears is a stack of
+ *  chrome that differs per breakpoint and is described in CSS. That stack is the
+ *  desktop top-fade band and floating up-chevron, the mobile app header and
+ *  sticky thread-title row, and the focus highlight's own bloom. Keeping the
+ *  number beside the things it measures is why this is not a constant.
  *
- *  Read off the TURN, since that is where the rule is declared; a caller holding
+ *  Read off the TURN, since that is where the rule is declared. A caller holding
  *  an inner panel resolves its `.chat-exchange` first. */
 function turnLandingClearancePx(turn: HTMLElement): number {
   if (typeof getComputedStyle !== 'function') return TURN_LANDING_FALLBACK_GAP_PX;
@@ -1388,55 +1106,29 @@ function turnLandingClearancePx(turn: HTMLElement): number {
 }
 
 /* ── THE TRANSCRIPT RESERVES NOTHING UNDER ITS NEWEST TURN ───────────────────
- *  It did between 2026-08-11 and 2026-08-12: one viewport of `min-height`, the
- *  TAIL ROOM, measured here and applied in chat/response.css, so that the newest
- *  turn could be scrolled all the way up to the landing line and the reply would
- *  grow into the room rather than past the fold.
+ *  No `min-height` tail room, and nothing else either. The transcript's height
+ *  is a function of its content, and no layout rule reads the follow flag. A
+ *  reserved screenful was tried and rejected: see ADR 0064, docs/adr/.
  *
- *  It was reserved AIR, and air below the last turn is a lie about how much
- *  thread there is. Three reports in two days, each a different reader meeting
- *  the same screenful:
- *
- *   - A rider was carried into it. The room extends the scrollable range past
- *     where the content ends, so the live edge stopped being "the newest content
- *     at the bottom of the screen" and became "the newest turn at the top, with
- *     air under it", taking the running reply off the screen.
- *   - Withholding it from a rider fixed that and bought a worse one: the air's
- *     absence then depended on the follow being ARMED, so any path that failed to
- *     re-arm showed a screenful of blank as its symptom. A layout that reads the
- *     follow flag makes every arming bug a visible one.
- *   - And it appeared MID-TURN either way, because the room is withheld from a
- *     queued follow-up (which grows no reply) until the agent picks it up. The
- *     transcript then grew by a screen in one step under a reader who was riding
- *     it.
- *
- *  So the reservation is gone and nothing replaced it. What the landing does
- *  without it is not a clamp by accident: `landOnOwnTurn` asks for the line only
- *  when the turn can actually reach it, and otherwise asks the modest question,
- *  SHOW THE TURN. A submit therefore brings the reader's own message as far up
- *  the screen as the real content allows, which for a long reply is the landing
- *  line itself and for a fresh turn is the bottom of the screen with the status
- *  line under it. The reply then grows the transcript for real, and a rider rides
- *  actual content.
- *
- *  Nothing here reads the follow flag any more, which is the property worth
- *  keeping: the transcript's height is a function of its content and nothing
- *  else. */
+ *  What the landing does without it is not a clamp by accident. `landOnOwnTurn`
+ *  asks for the line only when the turn can reach it, and otherwise asks the
+ *  modest question, SHOW THE TURN. A submit therefore brings the reader's own
+ *  message as far up the screen as the real content allows. For a long reply
+ *  that is the landing line. For a fresh turn it is the bottom of the screen,
+ *  with the status line under it. */
 
 /** Put the container ON the live edge in one held write, and reconcile the
- *  chevron behind it: the write can land where the container already was, and
+ *  chevron behind it. The write can land where the container already was, and
  *  then no scroll event arrives to do that reconcile itself.
  *
- *  The instant half of `glideToLiveEdge`, factored out because two callers want
- *  exactly it and neither may drift from the other on what the live edge is or
- *  on the bookkeeping a write there owes: the reduced-motion branch below, and
- *  `honourAnchoredMutation`, where landing inside the frame IS the point.
+ *  The instant half of `glideToLiveEdge`, factored out for two callers that want
+ *  exactly it: the reduced-motion branch below, and `honourAnchoredMutation`,
+ *  where landing inside the frame IS the point. Neither may drift from the other
+ *  on where the live edge is.
  *
  *  It supersedes EVERY tween, including a live-edge one that `glideToLiveEdge`
  *  would have stood down for. That stand-down exists so a second call cannot
- *  restart the easing part-way, and there is no easing here: a reader who
- *  toggles the steps 200ms into a submit's glide lands on the same live edge,
- *  just at once, which is what they asked for by toggling. */
+ *  restart the easing part-way, and there is no easing here. */
 function snapToLiveEdge(el: HTMLElement): void {
   cancelScrollAnim();
   markHeldScroll(el, liveEdgeTop(el));
@@ -1445,22 +1137,17 @@ function snapToLiveEdge(el: HTMLElement): void {
 
 /** Glide to the LIVE EDGE, marking every frame as a held scroll: what a submit
  *  does for a reader who was ALREADY riding it (see `followSubmit`). The target
- *  is `scrollHeight - clientHeight` re-read per frame, so a reply streaming
- *  during the glide is tracked and the tween lands on the bottom the transcript
- *  has when it ENDS rather than the one it had when the reader pressed the
- *  button.
+ *  is re-read per frame. A reply streaming during the glide is therefore
+ *  tracked, and the tween lands on the bottom the transcript has when it ENDS.
  *
- *  Stands down for one tween only: a live-edge glide already in flight, which is
- *  the composer's second call for one send finding the first call's glide.
- *  Re-targeting that would only restart the easing from wherever it had got to.
- *  Every other tween is superseded, a deep-link's and a chevron's included: a
- *  submit is the reader saying otherwise, as it is for every other navigation.
+ *  Stands down for ONE tween only, a live-edge glide already in flight. That is
+ *  the composer's second call for one send finding the first call's glide, and
+ *  re-targeting it would only restart the easing part-way. Every other tween is
+ *  superseded, a deep-link's and a chevron's included.
  *
  *  A LANDING glide cannot be the tween it finds. Reaching this branch means the
  *  follow is armed, and the only thing that arms it cancels whatever tween is in
- *  flight on its way (`scrollToBottom`, and `scrollToBottomAnimated` through
- *  `animateScroll`). The supersede-a-landing case the earlier rule described was
- *  reachable only while a send armed the follow itself. */
+ *  flight on its way. */
 function glideToLiveEdge(el: HTMLElement): void {
   if (_heldAnim && _heldAnimTarget === 'live-edge') return;
   if (prefersReducedMotion()) {
@@ -1475,111 +1162,61 @@ function glideToLiveEdge(el: HTMLElement): void {
 }
 
 /** THE SUBMIT REACTION. One function, because "same reaction everywhere" is a
- *  structural claim rather than four copies kept in step by hand: a submit is
- *  any user action in the transcript the agent is expected to respond to, and
- *  the four of them (a sent message, an answered question card, a decided
- *  permission card, Continue after an abort) differ only in `resolveTurn`, which
- *  finds the turn the reader acted on.
+ *  structural claim rather than four copies kept in step by hand. A submit is
+ *  any user action in the transcript the agent must respond to, and the four of
+ *  them differ only in `resolveTurn`. It ARMS NOTHING: see ADR 0064.
  *
- *  IT ARMS NOTHING. Whatever it does here is over when it is done; riding the
- *  live edge is the down chevron's request alone. A send and an answer used to
- *  arm, and the reader was then dragged through the whole reply by a request
- *  they never made.
+ *  It splits two ways. A reader already riding the live edge glides there, since
+ *  riding is a standing request to be kept at the bottom. Everyone else gets a
+ *  landing that brings the turn they acted on as far up the viewport as the
+ *  transcript can reach. That landing is anchored on an ELEMENT, never computed
+ *  from `scrollHeight`, because the transcript grows between the submit and the
+ *  landing. See `landOnOwnTurn`.
  *
- *  It is NOT a blind jump to the bottom, and splits TWO ways:
+ *  It takes a POSITION STAMP before doing anything. The two deferred submits
+ *  move nobody for a frame or more, and the reader's flick in that window must
+ *  still cancel them (see `holdPosition`).
  *
- *   - **Already riding the live edge**: glide to the live edge. Riding it is a
- *     STANDING request to be kept at the bottom, so a submit made while it is
- *     armed asks for the bottom and not for a look at the turn they acted on.
- *   - **Everyone else**: glide so the turn they acted on comes as far up the
- *     viewport as the transcript can reach, which is its TOP on the landing line
- *     when there is a screenful under it and simply "the whole turn on screen"
- *     when there is not. Anchored on an ELEMENT, never computed from
- *     `scrollHeight`: the
- *     transcript grows between the submit and the landing, and a `scrollHeight`
- *     target then lands PAST the turn and hides the very thing they acted on.
- *     See `landOnOwnTurn`.
- *
- *  TWO, not four. It shipped with two more branches that declined to move
- *  anybody, and both were the same mistake: they asked a question about the
- *  transcript AS IT STANDS in order to predict where a turn that has not
- *  rendered yet will sit.
- *
- *   - **At the live edge wrote nothing**, on the reasoning that the reader is
- *     already looking at the newest content. They are, and a beat later the
- *     submit APPENDS a turn whose status line is below the fold, so the reader
- *     who sent from the bottom (the ordinary case) was left on the top of their
- *     own message with nothing to take them down. Reported twice on 2026-08-10,
- *     as "does not land on the first response line" and "answering with custom
- *     text does not scroll at all".
- *   - **Nowhere to take anybody** (`hasSomewhereToLand`: scrollable, and holding
- *     at least one turn) wrote nothing for the same shape of reason, and got the
- *     brand-new thread wrong in the same way: it holds no `.chat-exchange` at
- *     submit time, and its first turn's status line can still land below the fold
- *     on a short viewport.
- *
- *  What both were reaching for survives as ONE test, in the right place and
- *  against the right thing: `landOnOwnTurn` writes nothing when its target is at
- *  or behind the current position. That is physics rather than policy, since the
- *  turn is already at or above the landing line and there is nowhere to go, and
- *  it subsumes both: a thread too short to scroll cannot produce a target ahead
- *  of the reader, and neither can a turn the reader is already looking at the top
- *  of. Asked per frame, against the real turn, after that turn exists.
- *
- *  The landing takes a POSITION STAMP before it does anything, because the two
- *  deferred submits move nobody for a frame or more and the reader's flick in
- *  that window must still cancel them (see `holdPosition`). It used to come free
- *  from the follow's disarm, which no longer fires for a submit that arms
- *  nothing.
- *
- *  A landing already PENDING is kept rather than replaced, which is what makes
- *  the composer's two calls for one send one submit: `PromptInput`'s `submit`
- *  and `store/actions/chat.ts`'s `addPendingMessage` both fire, in one
- *  synchronous task, and a second resolver built after the optimistic row
- *  rendered would wait for a message that will never come. */
+ *  A landing already PENDING is kept rather than replaced, which makes the
+ *  composer's two calls for one send one submit. Both fire in one synchronous
+ *  task, and a second resolver built after the optimistic row rendered would
+ *  wait for a message that will never come. */
 function followSubmit(resolveTurn: TurnResolver): void {
   // A submit CLAIMS the thread is live, whatever the last turn's status says
   // yet. That is what a submit IS: an act the agent is expected to respond to.
-  // The status cannot say so for a while, and the gap is not small: answering a
+  // The status cannot say so for a while, and the gap is not small. Answering a
   // card leaves the turn on `awaiting-answer`, which is not an ACTIVE status,
-  // until the engine's resumed status arrives over SSE a round trip later. A
-  // reader who scrolls away inside that window means "stop dragging me" exactly
-  // as much as one who scrolls away mid-reply, and reading it as idle browsing
-  // would keep their follow armed and haul them back the moment the reply
-  // resumed. A CLAIM rather than a fact, so it expires on its own when the
-  // response never comes: see `_submitLiveUntil`. `ChatExchange` supersedes it
-  // the instant the real status is known.
+  // until the engine's resumed status arrives over SSE. A reader who scrolls
+  // away inside that window means "stop dragging me" as much as one who scrolls
+  // away mid-reply. A CLAIM rather than a fact, so it expires on its own when
+  // the response never comes: see `_submitLiveUntil`. `ChatExchange` supersedes
+  // it the instant the real status is known.
   _submitLiveUntil = nowMs() + SUBMIT_LIVE_CLAIM_MS;
   const el = resolveTarget();
   if (!el) return;
   if (_followingBottom.value) {
-    // The one place an at-the-live-edge test is still legitimate, and the
-    // difference from the branch below is the whole reason: this branch's target
-    // is the live edge itself, which is exactly where the growth is about to
-    // take them anyway, so a rider already on it needs no write and gets no
-    // redundant tween (on iOS that would cancel a momentum scroll). The LANDING
-    // cannot ask the same question, because its target is a turn that does not
-    // exist yet and will render BELOW where the reader is standing.
+    // The one place an at-the-live-edge test is still legitimate. This branch's
+    // target IS the live edge, which is where the growth is about to take them
+    // anyway. So a rider already on it needs no write and gets no redundant
+    // tween, which on iOS would cancel a momentum scroll. The LANDING cannot ask
+    // the same question. Its target is a turn that does not exist yet, and that
+    // will render BELOW where the reader is standing.
     if (!isAtLiveEdge(el)) glideToLiveEdge(el);
     return;
   }
   // A landing already PENDING keeps the floor, unless it has LAPSED. The two
   // checks are the same rule from opposite sides: the growth branch expires it
   // when a round happens to run, and this expires it when one never does. A
-  // queued follow-up is exactly that case: it folds into a closed disclosure
-  // group, so it never becomes addressable, nothing else grows the transcript,
-  // and the stale pending landing sat on `_pendingLanding` forever. The reader's
-  // NEXT submit then returned on the line below without installing its own
-  // resolver, so it never landed. Found by the Codex reviewer, 2026-08-10.
+  // queued follow-up is that case. It folds into a closed disclosure group, so
+  // it never becomes addressable and nothing else grows the transcript. Without
+  // this, the reader's NEXT submit returns on the line below without installing
+  // its own resolver, and never lands.
   dropLapsedLanding();
   if (_pendingLanding) return;
   holdPosition(el);
-  // The turn, and nothing else. This used to wait for the turn's STATUS LINE as
-  // well, because that row was the target and the response panel can mount a
-  // commit or two after the row it belongs to, so a landing aimed while it was
-  // missing stopped one row short. The target is the turn's own TOP now, which is
-  // fixed the instant the turn renders and cannot be improved on by waiting, and
-  // the status line arrives into the viewport underneath it whenever it arrives.
+  // The turn, and nothing else. The target is the turn's own TOP, which is fixed
+  // the instant the turn renders and cannot be improved on by waiting. The
+  // status line arrives into the viewport underneath it whenever it arrives.
   const panel = resolveTurn(el);
   if (panel) { landOnOwnTurn(el, panel); return; }
   _pendingLanding = { resolveTurn, at: nowMs() };
@@ -1611,33 +1248,25 @@ export function followSentMessage(): void {
 }
 
 /** The reader submitted an answer to the question card `toolUseId`. Its turn is
- *  the `.initiator-panel` around that card, which is on screen already (it is
- *  what they just tapped), so this landing needs none of the send's deferral: it
- *  resolves now and glides.
+ *  the `.initiator-panel` around that card, which is on screen already, so this
+ *  landing needs none of the send's deferral.
  *
  *  Called by the two card-submitted answers: `QuestionCard`'s single-select
  *  option tap and `PromptInput`'s multi-select Submit. The THIRD way to answer,
- *  typing into the composer, is a send that the engine reroutes as a `FreeText`
- *  answer, so it arrives through `followSentMessage` and needs nothing here. */
+ *  typing into the composer, is a send the engine reroutes as a `FreeText`
+ *  answer, so it arrives through `followSentMessage`. */
 export function followAnsweredQuestion(toolUseId: string): void {
   followSubmit((el) => cardTurn(el, '.question-body', 'data-tool-use-id', toolUseId));
 }
 
-/** The reader decided the permission card `requestId` (Deny / Allow once / Allow
- *  for this thread / Always allow, on any of the three permission-shaped cards:
- *  the coding-agent tool permission, the command guard and the MCP tool consent,
- *  all of which decide through `PermissionCard`'s `usePermissionDecide` and so
- *  all inherit this from one call site).
+/** The reader decided the permission card `requestId`, on any of the three
+ *  permission-shaped cards: the coding-agent tool permission, the command guard
+ *  and the MCP tool consent. All three decide through `PermissionCard`'s
+ *  `usePermissionDecide`, so all three inherit this from one call site.
  *
- *  A submit like the others. It used to be "the one submit that ARMS NOTHING",
- *  on the reasoning that answering a gate the agent put in its own way is not
- *  producing content: it moved a rider to the live edge and everyone else zero
- *  pixels, so deciding a card resumed the agent below the fold with nothing on
- *  screen saying so. That distinction is gone, because from the reader's side
- *  all four submits are the same act, and this one now lands like the rest.
- *
- *  Its turn is the `.initiator-panel` around the card, which is on screen
- *  already, so like the answer it resolves now and glides. */
+ *  A submit like the others, because from the reader's side all four are the
+ *  same act. Its turn is the `.initiator-panel` around the card, which is on
+ *  screen already, so like the answer it resolves now and glides. */
 export function followResolvedPermission(requestId: string): void {
   followSubmit((el) => cardTurn(el, '.permission-body', 'data-request-id', requestId));
 }
@@ -1659,62 +1288,31 @@ export function followContinuedThread(): void {
 }
 
 /** Glide so the turn the reader acted on comes as far UP the viewport as the
- *  transcript can actually take it, marking every frame as a held scroll. `panel`
- *  is what the submit resolved: their optimistic message row for a send, the
- *  answered card's initiator panel for an answer, the decided card's for a
- *  permission, the whole continuation exchange for Continue. The thing landed is
- *  that panel's `.chat-exchange`, whose top is the panel's top in every one of
- *  those cases (a turn renders as `[initiator panel, response panel?]`, so the
- *  panel a submit resolves is the turn's first child) and which is where the
- *  landing line is declared.
+ *  transcript can take it, marking every frame as a held scroll. `panel` is what
+ *  the submit resolved; what is landed is that panel's `.chat-exchange`. Its top
+ *  is the panel's top in every case, and it declares the landing line.
  *
- *  UPWARD is the reason. A reader who submits is asking "did that go through, and
- *  what does it say", and both are answered by the screen below their message: the
- *  agent status line says the turn was taken, and the reply then streams into
- *  whatever is under it. The landing used to rest that STATUS LINE on the
- *  container's bottom edge instead, which answered the first question and spent
- *  the entire screen doing it.
+ *  UPWARD is the reason. A reader who submits asks "did that go through, and
+ *  what does it say". Both are answered by the screen BELOW their message. Not
+ *  the response panel's bottom, which grows with every token and would drag the
+ *  reader through an answer they have not read.
  *
- *  It is emphatically NOT the response panel's bottom, which would be the
- *  live-edge chase this landing exists instead of: the panel grows with every
- *  token, so anchoring there would drag the reader down through an answer they
- *  have not read. The turn's top is a fixed line ABOVE all of that growth, so it
- *  holds still while the reply arrives beneath it.
+ *  HOW FAR up is measured, which is the whole of what `targetOf` does. The block
+ *  above says why nothing is reserved under the newest turn. It also says why
+ *  the ask becomes SHOW the turn when the line is out of reach. The target is
+ *  re-read per frame, so content settling above the turn is tracked. Reduced
+ *  motion writes once, and a target at or behind the reader writes nothing.
  *
- *  HOW FAR up is decided by measuring, not by wishing, and that is the whole of
- *  what `targetOf` does. The landing LINE is reachable only for a turn with a
- *  screenful under it, and the newest turn does not have one: nothing is reserved
- *  below it (see "THE TRANSCRIPT RESERVES NOTHING UNDER ITS NEWEST TURN"). So the
- *  ask becomes the modest one, SHOW the turn, rather than asking for the line and
- *  letting the browser clamp. A clamp is a decision by accident: it drags the
- *  reader to the live edge for a turn that cannot reach the top anyway. Combined
- *  with the do-not-scroll-backwards guard, the modest ask also means a queued
- *  follow-up already on screen moves nobody, leaving the message they sent first
- *  where its own landing put it. A long reply's turn grows past a screenful as it
- *  streams and reaches the line on its own, with no reservation to help it.
- *
- *  The target is re-read per frame by `animateScroll`, so content settling above
- *  the turn during the glide is tracked rather than overshot. Reduced motion
- *  writes it once, as everywhere else in this module. A target at or behind the
- *  current position writes nothing: the turn is already at or above the line, and
- *  a submit has no business scrolling the reader backwards to prove it.
- *
- *  A turn that LEAVES the layout mid-glide (the reader opens another thread, a
- *  second queued follow-up reparents this one into its disclosure group) holds
- *  the tween on the last target it measured while the turn was still there, so
- *  the glide finishes where it was heading. Nothing else cancels a tween on a
- *  thread switch, and a detached node reports an all-zero rect, which would make
- *  the target the container's own negative offset and haul the newly-opened
- *  thread to its top. The floor is the same belt for a rect that is merely
- *  surprising. */
+ *  A turn that LEAVES the layout mid-glide holds the tween on its last measured
+ *  target, so the glide finishes where it was heading. A detached node reports
+ *  an all-zero rect, which would otherwise aim at a negative offset. */
 function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
   let lastTarget = -1;
-  // The turn, and the room to leave above it. Both are resolved ONCE: a turn
-  // does not become a different element while the glide runs (the panel inside
-  // it can, which is why an answered question card's landing holds the panel and
-  // not its body), and the clearance is a breakpoint-level constant, so re-asking
-  // either per frame would buy nothing and cost a `closest` plus a
-  // `getComputedStyle` on every one.
+  // The turn, and the room to leave above it. Both are resolved ONCE. A turn
+  // does not become a different element while the glide runs, and the clearance
+  // is a breakpoint-level constant. Re-asking per frame would cost a `closest`
+  // plus a `getComputedStyle` and buy nothing. The panel inside the turn CAN
+  // change, which is why a question card's landing holds the panel.
   const turn = (panel.closest?.(TURN_SELECTOR) as HTMLElement | null) ?? panel;
   const clearance = turnLandingClearancePx(turn);
   const targetOf = (c: HTMLElement) => {
@@ -1736,14 +1334,13 @@ function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
     // a long thread answers this way, and so does a reply that has streamed past
     // a screenful of its own.
     //
-    // Unreachable is the NEWEST turn, which is most submits, since the transcript
-    // reserves nothing below it. Asking for the line anyway would let the browser
-    // clamp, and a clamp is a decision by accident: it drags the reader to the
-    // live edge for a turn that cannot get there, taking them off whatever they
-    // were watching to gain nothing. So the ask becomes the modest one instead,
-    // show the turn, and the do-not-scroll-backwards guard below then does the
-    // rest: a queued message already on screen moves nobody at all, and the
-    // message they sent FIRST stays where its own landing put it.
+    // Unreachable is the NEWEST turn, which is most submits, since the
+    // transcript reserves nothing below it. Asking for the line anyway would let
+    // the browser clamp, and a clamp is a decision by accident: it drags the
+    // reader to the live edge for a turn that cannot get there. So the ask
+    // becomes the modest one, show the turn, and the do-not-scroll-backwards
+    // guard below does the rest. A queued message already on screen then moves
+    // nobody, and the message sent FIRST stays where its own landing put it.
     lastTarget = Math.max(0, line <= furthest + LANDING_REACH_SLACK_PX ? line : Math.min(line, reveal));
     return lastTarget;
   };
@@ -1761,27 +1358,27 @@ function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
   _heldAnimTarget = 'own-turn';
 }
 
-/** What one growth round owes the reader, which is at most one of two things: a
- *  submit is waiting for its own turn to render (land on it, once, on the status
- *  line under it), or the follow is CARRYING them to the live edge (write it).
- *  Never both, because a submit arms nothing and arming drops a pending landing
- *  (`armFollowOn`), and nothing at all for a reader who asked for neither.
+/** What one growth round owes the reader, which is at most ONE of two things. A
+ *  submit is waiting for its own turn to render, so land on it. Or the follow is
+ *  CARRYING them to the live edge, so write it. Never both, because a submit
+ *  arms nothing and arming drops a pending landing (`armFollowOn`). Nothing at
+ *  all for a reader who asked for neither.
  *
- *  Stands down while a navigation tween owns the scroll, including the landing
- *  glide itself: a tween re-reads its own target every frame, so a live-edge
- *  write beside it would drag the glide past the turn it is landing on.
+ *  Stands down while a navigation tween owns the scroll, the landing glide
+ *  included. A tween re-reads its own target every frame, so a live-edge write
+ *  beside it would drag the glide past the turn it is landing on.
  *
- *  And stands down on an IDLE thread even for an armed reader, which is the
- *  whole of `followIsCarrying`'s live half. Growth on an idle thread is the
- *  transcript finishing its own rendering, so there is nothing to be carried
- *  toward and the reader is browsing: they scrolled up to re-read a turn, or
- *  clicked something, and this line used to write them to the bottom for it on
- *  the next markdown reflow, decoded image or arriving card. The two halves of
- *  the follow disagreed about liveness until 2026-08-11, the disarm asking and
- *  this write not, so the reader kept the ride the scroll rule promised them and
- *  lost their position anyway. The SUBMIT's own claim is what keeps this write
- *  running through the gap before a fresh turn's status catches up. */
-function honourGrowth(el: HTMLElement): void {
+ *  TWO ARMS, and which one answers depends only on where the reader is. A reader
+ *  who has SCROLLED AWAY is carried only while the agent is live
+ *  (`followIsCarrying`). A reader ON the live edge is kept there either way, and
+ *  that arm is not this function's to state: growth is the third event reaching
+ *  `keepTheLiveEdge`, beside a box change and a platform scroll, so the caller
+ *  hands it in.
+ *
+ *  `keepEdge` is omitted by a caller with no pre-round reading of where the
+ *  reader was, which is `honourWake`. A wake has just declared the thread live,
+ *  so the arm above answers for a rider too. */
+function honourGrowth(el: HTMLElement, keepEdge?: () => boolean): void {
   if (_scrollAnimRaf !== null) return;
   if (_pendingLanding) {
     const panel = _pendingLanding.resolveTurn(el);
@@ -1790,42 +1387,37 @@ function honourGrowth(el: HTMLElement): void {
       landOnOwnTurn(el, panel);
       return;
     }
-    // The turn the submit is waiting for is not there yet: there is nothing to
-    // land on, and nowhere to jump meanwhile. Past the deadline it is not late,
-    // it is unaddressable, so the landing LAPSES and moves nobody (see
-    // `LANDING_DEADLINE_MS`).
+    // The turn the submit is waiting for is not there yet, so there is nothing
+    // to land on. Past the deadline it is unaddressable rather than late, so the
+    // landing LAPSES and moves nobody (see `LANDING_DEADLINE_MS`).
     dropLapsedLanding();
     return;
   }
-  if (followIsCarrying()) markHeldScroll(el, liveEdgeTop(el));
+  if (followIsCarrying()) {
+    markHeldScroll(el, liveEdgeTop(el));
+    return;
+  }
+  keepEdge?.();
 }
 
 /** rAF easeOutCubic scroll of the active container toward a target, shared by
- *  every transcript navigation — the up/down chevrons, ⌘↑/⌘↓ turn-nav, and the
- *  deep-link "scroll to element" (via smoothScrollToElement below).
+ *  every transcript navigation. ADR 0065 (docs/adr/) is the shape and why.
  *
- *  - `targetOf(el)` is re-read EVERY frame, so a moving target (the bottom of a
- *    streaming thread) is followed rather than chasing a stale position. The eased
- *    fraction is applied between the captured `start` and the LIVE target each
- *    frame (`start + (target - start) * eased`), so a target that grows mid-tween
- *    is tracked yet the curve still lands cleanly at t=1.
- *  - `start` is captured on the FIRST frame from the live scrollTop (after the
- *    render-all scroll-anchoring shift has settled); thereafter the position is a
- *    pure function of elapsed time, so we never READ scrollTop again (Safari lags
- *    scrollTop reads mid-animation, which janks), only write it. There is no
- *    yield-guard, so an explicit chevron tap ALWAYS reaches its target.
- *  - `duration` scales with the initial distance (clamped to [MIN, MAX]_MS), so a
- *    short hop and a long haul share the same deceleration SHAPE, just at different
- *    speeds. The tween ends precisely at the target on the t≥1 frame — no SNAP_PX
- *    cutoff and no end-jump. Then `onDone` runs: the down-chevron uses it to
- *    reconcile the chevron against where the tween actually landed.
- *  - scrollTop is written FRACTIONAL (no Math.round): on a 2x/3x display the
- *    sub-pixel position is what makes the slow final approach read as smooth
- *    instead of stepping integer CSS pixels.
- *  - `mark` is how each frame's write is recorded. It defaults to
- *    `markNavigationScroll`, which is right for a one-off navigation; the two
- *    held glides pass `markHeldScroll` so their own frames are not read as the
- *    reader taking over. */
+ *  - `targetOf(el)` is re-read EVERY frame. The eased fraction is applied
+ *    between the captured `start` and the LIVE target. A target that grows
+ *    mid-tween is therefore tracked, and the curve still lands cleanly at t=1.
+ *  - `start` is captured on the FIRST frame, after the render-all
+ *    scroll-anchoring shift has settled. Thereafter the position is a pure
+ *    function of elapsed time and `scrollTop` is never READ again, only written.
+ *    There is no yield guard, so an explicit chevron tap always reaches its
+ *    target.
+ *  - `duration` scales with the initial distance, clamped. The tween ends
+ *    precisely at the target on the t>=1 frame, then `onDone` runs.
+ *  - `scrollTop` is written FRACTIONAL, with no `Math.round`.
+ *  - `mark` records each frame's write. It defaults to `markNavigationScroll`,
+ *    which is right for a one-off navigation. The two held glides pass
+ *    `markHeldScroll`, so their own frames are not read as the reader taking
+ *    over. */
 function animateScroll(
   targetOf: (el: HTMLElement) => number,
   onDone?: () => void,
@@ -1843,10 +1435,10 @@ function animateScroll(
     if (!started) {
       started = true;
       start = cur.scrollTop;
-      // Back-date startTime by one nominal frame so the FIRST painted frame already
-      // has a frame's worth of eased progress — reacts instantly to the tap instead
-      // of spending a dead frame at t=0. It's a constant time offset, not a per-frame
-      // fraction, so the deceleration shape stays elapsed-time (frame-rate) based.
+      // Back-date startTime by one nominal frame, so the FIRST painted frame
+      // already has a frame's worth of eased progress rather than sitting at
+      // t=0. A constant time offset, not a per-frame fraction, so the
+      // deceleration shape stays elapsed-time based.
       startTime = now - SCROLL_FRAME_MS;
       const distance = Math.abs(targetOf(cur) - start);
       duration = Math.min(SCROLL_MAX_MS, Math.max(SCROLL_MIN_MS, distance / SCROLL_PX_PER_MS));
@@ -1865,22 +1457,18 @@ function animateScroll(
   _scrollAnimRaf = requestAnimationFrame(step);
 }
 
-/** Scroll the active container so `el`'s top lands at the container top, minus the
- *  element's CSS `scroll-margin-top` — the "navigation to element" motion for a
- *  notification / Changes deep-link.
+/** Scroll the active container so `el`'s top lands at the container top, minus
+ *  the element's CSS `scroll-margin-top`. This is the "navigation to element"
+ *  motion for a notification or Changes deep link.
  *
- *  Replaces the browser's native `el.scrollIntoView({ block: 'start', behavior:
- *  'smooth' })` with the shared animateScroll engine (see its doc), so the
- *  deep-link and the chevrons scroll identically. `scroll-margin-top` was already
- *  the deep-link's header/fade clearance under scrollIntoView (defined per
- *  breakpoint in chat/response.css); we read the resolved px and subtract it so
- *  the element lands in exactly the same place, just via our own tween.
+ *  It runs on the shared `animateScroll`, so the deep link and the chevrons
+ *  scroll identically (ADR 0065). `scroll-margin-top` is the deep link's header
+ *  and fade clearance, defined per breakpoint in chat/response.css. Reading the
+ *  resolved px and subtracting it lands the element in the same place.
  *
- *  The target is recomputed each frame (animateScroll re-reads `targetOf`), so an
- *  element still growing as markdown/images render — or the whole transcript
- *  re-anchoring after a render-all — is tracked, where native scrollIntoView fixed
- *  its target at call time. Reduced-motion jumps instantly (native smooth ignored
- *  the preference; the tween honours it, matching scrollToTop). */
+ *  The target is recomputed each frame. An element still growing as markdown or
+ *  images render is therefore tracked, and so is the whole transcript
+ *  re-anchoring after a render-all. Reduced motion jumps instantly. */
 function smoothScrollToElement(el: HTMLElement): void {
   const marginTop =
     typeof getComputedStyle === 'function'
@@ -1899,20 +1487,17 @@ function smoothScrollToElement(el: HTMLElement): void {
   animateScroll(targetOf);
 }
 
-/** Smoothly scroll the active chat container to the VERY top — the up-chevron's
- *  action. Two concerns:
+/** Smoothly scroll the active chat container to the VERY top: the up chevron's
+ *  action. Two things beyond the shared tween:
  *
- *  1. **Real motion, reliable on iOS.** animateScroll writes scrollTop directly
- *     per rAF frame instead of native smooth scroll, which iOS drops. Reduced-motion
- *     users get an instant jump (with one re-assert to defeat an iOS no-op / late
- *     RO settle) — no animation.
- *  2. **The chevron.** At the top we are definitively away from the bottom, so
- *     set the signal here rather than waiting for the first scroll event, which
- *     keeps the down-chevron on from the first frame of the glide.
+ *  1. **The chevron.** At the top the reader is definitively away from the
+ *     bottom, so the signal is set here rather than on the first scroll event.
+ *     That keeps the down chevron on from the first frame of the glide.
+ *  2. **Reduced motion** jumps, with one rAF re-assert to defeat an iOS no-op or
+ *     a late render-all ResizeObserver settle.
  *
- *  A manual top jump also supersedes any in-flight notification deep-link claim:
- *  the deep-link owns the viewport until it settles, and this is the user saying
- *  otherwise. */
+ *  A manual top jump also supersedes any in-flight deep-link claim. The link
+ *  owns the viewport until it settles, and this is the user saying otherwise. */
 export function scrollToTop() {
   clearPendingEventScroll();
   awayFromBottom.value = true;
@@ -1920,22 +1505,19 @@ export function scrollToTop() {
   const el = resolveTarget();
   if (!el) return;
 
-  // Going to the top ends the ride, and the press has to say so ITSELF: a
-  // scroll only speaks for the reader when a gesture is behind it, and a
-  // chevron tap lands on the button rather than on the transcript (see "Was
-  // this scroll the reader's own GESTURE?"). It used to come free from the
-  // position test, which read this write as a flick.
+  // Going to the top ends the ride, and the press has to say so ITSELF. A
+  // scroll only speaks for the reader when a gesture is behind it. A chevron
+  // tap lands on the button rather than on the transcript. See "Was this
+  // scroll the reader's own GESTURE?".
   //
-  // Only while the agent is LIVE, matching the scroll disarm: going back to
-  // re-read an idle thread is browsing, not a decision about how the next reply
-  // should behave, and the lit toggle says on screen that the ride survived.
+  // Only while the agent is LIVE, matching the scroll disarm. Going back to
+  // re-read an idle thread is browsing, and the lit toggle says on screen that
+  // the ride survived.
   //
   // After the target resolves, so a press with no transcript to move retires
   // nothing.
   if (threadIsLive()) stopFollowingBottom();
 
-  // Reduced motion: jump instantly, with one rAF re-assert to defeat an iOS no-op
-  // / a late render-all ResizeObserver settle.
   if (prefersReducedMotion()) {
     cancelScrollAnim();
     markNavigationScroll(el, 0);
@@ -1950,27 +1532,21 @@ export function scrollToTop() {
   animateScroll(() => 0);
 }
 
-/** Smoothly scroll the active chat container to the bottom — the down-chevron's
- *  action, and NOTHING more than that.
+/** Smoothly scroll the active chat container to the bottom: the down chevron's
+ *  action, and NOTHING more than that. It arms no standing follow, which is the
+ *  follow toggle's request alone (ADR 0064).
  *
- *  Eases to the bottom, re-reading the target every frame so a thread that keeps
- *  streaming during the glide is tracked and the tween lands on the TRUE grown
- *  bottom rather than on the bottom as it was when tapped.
+ *  Eases to the bottom, re-reading the target every frame. A thread that keeps
+ *  streaming during the glide is therefore tracked, and the tween lands on the
+ *  TRUE grown bottom.
  *
- *  It used to ARM the standing follow on landing, and that is gone: the chevron
- *  is a navigation like the up chevron and turn stepping, and riding the live
- *  edge is the follow toggle's request. Overloading the one button was tried and
- *  does not work, because go-to-bottom, arm and disarm is a three-step cycle
- *  with no state left over for a plain jump to the bottom (see "The standing
- *  request to ride the live edge").
- *
- *  Reduced motion skips straight to scrollToBottom()'s instant jump. */
+ *  Reduced motion skips straight to `scrollToBottom`'s instant jump. */
 export function scrollToBottomAnimated() {
   clearPendingEventScroll();
   const el = resolveTarget();
   if (!el || prefersReducedMotion()) { scrollToBottom(); return; }
-  // `liveEdgeTop` (the MAX scroll position), not scrollHeight, so the ease lands
-  // exactly at the bottom instead of clamping flat for the last clientHeight px.
+  // `liveEdgeTop` (the MAX scroll position), not `scrollHeight`, so the ease
+  // lands exactly at the bottom instead of clamping flat for the last screenful.
   animateScroll(
     liveEdgeTop,
     // The landing write may not move the container at all (the tween's last
@@ -1980,19 +1556,17 @@ export function scrollToBottomAnimated() {
   );
 }
 
-/** Set the standing follow, which is the FOLLOW TOGGLE's whole behaviour and the
- *  only way to arm one (`resumeFollowingBottom` aside, which replays a request
- *  recorded in this thread and can therefore only ever replay one of these).
+/** Set the standing follow. This is the FOLLOW TOGGLE's whole behaviour, and the
+ *  only way to arm one. `resumeFollowingBottom` aside, which replays a request
+ *  recorded in this thread and can only ever replay one of these.
  *
- *  ON glides to the live edge and arms, which is the whole of what the chevron
- *  used to do, so a reader anywhere in the transcript is one tap from following.
- *  OFF disarms and writes NO SCROLL: turning a mode off is not a request to be
- *  moved, and a reader who stops following almost always wants to stay where
- *  they are reading.
+ *  ON glides to the live edge and arms, so a reader anywhere in the transcript
+ *  is one tap from following. OFF disarms and writes NO SCROLL: turning a mode
+ *  off is not a request to be moved.
  *
  *  Turning it off is a CONVENIENCE rather than the mechanism. The reader's own
- *  scroll already retires the follow (see the disarm in `onScroll`) and the
- *  button follows it off, because both render this one signal. */
+ *  scroll already retires the follow, and the button follows it off, because
+ *  both render this one signal. */
 export function setFollowLiveEdge(on: boolean): void {
   // Remember the press first, and on BOTH edges: turning the mode off is as much
   // a standing choice as turning it on, and the off edge returns early below.
@@ -2007,16 +1581,12 @@ export function setFollowLiveEdge(on: boolean): void {
 }
 
 /** Jump the transcript to the bottom in one write: the reduced-motion form of
- *  the down chevron, and the compose view's chevron (which has no windowed
- *  render to glide through). Arms nothing, exactly as the animated form no
- *  longer does.
+ *  the down chevron, and the compose view's chevron, which has no windowed
+ *  render to glide through. Arms nothing, as the animated form does not.
  *
- *  An EXPLICIT gesture, and the only kind left, so it supersedes any in-flight
- *  notification deep-link claim: the deep-link owns the viewport until it
- *  settles, and this is the user saying otherwise. Nothing in the app calls this
- *  on the user's behalf any more, so there is no longer an `auto` variant that
- *  had to defer to the claim instead. A submit does not call it either: a submit
- *  lands on the turn it was made on (see `followSubmit`). */
+ *  Always an EXPLICIT gesture, so it supersedes any in-flight deep-link claim.
+ *  Nothing in the app calls it on the user's behalf, and a submit does not call
+ *  it either: a submit lands on the turn it was made on (see `followSubmit`). */
 export function scrollToBottom() {
   clearPendingEventScroll();
   // Cancel any in-flight navigation so a down-tap right after an up-tap isn't
@@ -2038,52 +1608,39 @@ function syncAwayFromBottom() {
   awayFromBottom.value = !isAtLiveEdge(el);
 }
 
-/** Scroll the chat exchange matching a CSS `selector` into view and briefly
- *  pulse-highlight it. Two public wrappers feed this: `scrollToEventAndPulse`
- *  targets by `data-event-id` (notification deep-links → a specific event) and
- *  `scrollToChangeAndPulse` targets by `data-change-id` (the Changes panel → the
- *  turn that produced a change, which isn't necessarily the thread's last turn).
- *
- *  The target may not be in the DOM yet (the thread is lazy-loading), so a
- *  MutationObserver retries until either the element appears or the deadline
- *  fires. Both layout copies (desktop + mobile) carry the same attributes, so
- *  we filter to the visible one before scrolling and pulsing — otherwise the
- *  pulse runs invisibly on the hidden copy. */
-/** How long a deep-link waits for its target to appear before giving up and
- *  recovering. Exported because it is the budget for waiting out ONE lazily
- *  loading thread, and a caller that has its own pre-navigation wait on the same
- *  thread (`showEventWhereItLives`, resolving the anchor before it focuses)
- *  must spend the same budget rather than a second literal that drifts. */
+/** How long a deep link waits for its target to appear before giving up. It is
+ *  the budget for waiting out ONE lazily loading thread. Exported so a caller
+ *  with its own pre-navigation wait on the same thread spends the same budget
+ *  rather than a second literal that drifts. `showEventWhereItLives` is that
+ *  caller, resolving the anchor before it focuses. */
 export const EVENT_RESOLVE_DEADLINE_MS = 4000;
-/** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve, as a
- *  fallback for browsers where `scrollend` is unsupported/unreliable (older iOS
- *  Safari). smoothScrollToElement's tween settles within SCROLL_MAX_MS; this
- *  generously covers it so competing scrolls keep deferring across the whole
- *  glide. Released earlier if `scrollend` fires first. */
+/** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve. A
+ *  fallback for browsers where `scrollend` is unsupported or unreliable, and
+ *  released earlier if `scrollend` fires first. `smoothScrollToElement`'s tween
+ *  settles within `SCROLL_MAX_MS`, and this covers it generously, so competing
+ *  scrolls keep deferring across the whole glide. */
 const SCROLL_SETTLE_FALLBACK_MS = 1000;
 
-/** The notification deep-link currently resolving a scroll, or null when none is
+/** The notification deep link currently resolving a scroll, or null when none is
  *  in flight. Identified by a fresh OBJECT per call, never by what it is
- *  scrolling to: two taps on the SAME notification inside the resolve window
- *  produce the same target, so a target-keyed claim let the FIRST call's
- *  deadline mistake the second call's claim for its own, release it, and run the
- *  give-up recovery over a navigation that was still live. Object identity
- *  cannot collide, so "is the claim still mine" is exact.
+ *  scrolling to. Two taps on the SAME notification inside the resolve window
+ *  produce the same target. A target-keyed claim therefore let the FIRST call's
+ *  deadline mistake the second call's claim for its own. Object identity cannot
+ *  collide, so "is the claim still mine" is exact.
  *
- *  Plain mutable variable (not a signal) like `_activeScrollElement`: it's read
- *  imperatively by `useScrollMemory`'s restore gate, which already re-runs on
- *  the key / paused changes that matter, so nothing needs to react to it.
+ *  A plain mutable variable rather than a signal, read imperatively.
  *
- *  What it still guards, now that no auto-scroll competes for the viewport:
+ *  What it guards:
  *   - `useScrollMemory.shouldRestore`, so focusing an UNfocused thread does not
- *     land on the saved position instead of the deep-linked event (its restore
- *     observers fire on the same lazily-loaded render the deep-link is waiting
- *     for, and would otherwise win by running last);
- *   - `useScrollMemory`'s no-save reset to the top, for the same reason;
- *   - the navigation focus marker's settle guard, so this deep-link's own smooth
+ *     land on the saved position instead of the deep-linked event. Its restore
+ *     observers fire on the same lazily-loaded render the link is waiting for,
+ *     and would otherwise win by running last.
+ *   - `useScrollMemory`'s no-save reset to the top, for the same reason.
+ *   - the navigation focus marker's settle guard, so this link's own smooth
  *     scroll cannot dismiss the highlight it just applied.
- *  It is held until the deadline (or, on a synchronous resolve, until the scroll
- *  settles) so it covers the whole landing, not just the call. */
+ *
+ *  Held until the deadline, or until the scroll settles on a synchronous
+ *  resolve, so it covers the whole landing rather than just the call. */
 let _pendingEventScrollClaim: object | null = null;
 
 /** True while a notification deep-link is waiting for its target event to
@@ -2092,19 +1649,18 @@ export function hasPendingEventScroll(): boolean {
   return _pendingEventScrollClaim !== null;
 }
 
-/** Subscribers notified when a deep-link TAKES the claim, and never when it
+/** Subscribers notified when a deep link TAKES the claim, and never when it
  *  releases one. Same shape and same asymmetry as `onFollowArmed`: the claim is
  *  the request, and a release is not a second request anyone needs to hear.
  *
  *  One consumer: `attachScrollMemory`, which retires a saved-position restore
- *  that was already armed when the claim arrived. Asking `hasPendingEventScroll`
- *  once at attach cannot answer for a claim taken LATER, and two orderings that
- *  reach exactly that are ordinary rather than exotic: a deep-link into the
- *  thread the reader is already in re-attaches nothing at all, and a thread
- *  whose events arrive while the tap is still resolving attaches before the
- *  claim. Nor can the restore simply re-ask, because the claim is released
- *  within a second of a synchronous landing while the restore stays armed for
- *  three: the ask has to be delivered when it is made. */
+ *  already armed when the claim arrived. Asking `hasPendingEventScroll` once at
+ *  attach cannot answer for a claim taken LATER, and two ordinary orderings
+ *  reach exactly that. A link into the thread the reader is already in
+ *  re-attaches nothing. A thread whose events arrive while the tap is resolving
+ *  attaches before the claim. Nor can the restore re-ask: the claim is released
+ *  within a second of a synchronous landing, while the restore stays armed for
+ *  three. */
 const _deepLinkClaimListeners = new Set<() => void>();
 
 /** Subscribe to the claim. Returns the unsubscribe. Fires on every claim,
@@ -2116,20 +1672,18 @@ export function onDeepLinkClaimed(listener: () => void): () => void {
   return () => { _deepLinkClaimListeners.delete(listener); };
 }
 
-/** Subscribers notified when a deep-link FINDS its target, which is the moment
- *  it stops being a link that might be dead. The other half of the pair above,
- *  and the two together are the whole of what a listener needs to tell a link
- *  that landed from one that never did.
+/** Subscribers notified when a deep link FINDS its target, the moment it stops
+ *  being a link that might be dead. The other half of the pair above. Together
+ *  they are what a listener needs to tell a link that landed from one that never
+ *  did.
  *
  *  One consumer: `attachScrollMemory`'s dead-link rescue, which stood down for
- *  the claim and would otherwise have to INFER the landing from the container
- *  having moved. That inference is wrong whenever the landing had nowhere to
- *  move, and the case is ordinary rather than exotic: arriving in a shorter
- *  thread clamps the shared container to its bottom, and a deep-link to that
- *  thread's last turn resolves to the same offset. Inferred, the rescue then
- *  reads a successful landing as a dead link and hauls the reader off the event
- *  they are looking at, seconds after they got there, which is the exact
- *  complaint this whole change exists to fix. */
+ *  the claim and would otherwise INFER the landing from the container having
+ *  moved. That inference is wrong whenever the landing had nowhere to move, and
+ *  the case is ordinary. Arriving in a shorter thread clamps the shared
+ *  container to its bottom, and a link to that thread's last turn resolves to
+ *  the same offset. The rescue would then read a successful landing as a dead
+ *  link, and haul the reader off the event they are looking at. */
 const _deepLinkResolvedListeners = new Set<() => void>();
 
 /** Subscribe to the resolve. Returns the unsubscribe. */
@@ -2142,13 +1696,12 @@ export function onDeepLinkResolved(listener: () => void): () => void {
  *  each new claim, so it always describes the live one.
  *
  *  The broadcast above cannot answer this, and the gap it leaves is the ORDINARY
- *  ordering rather than an edge case: for a tap into a thread the reader is not
- *  in, the target renders and resolves on the microtask checkpoint of the commit
- *  that rendered it, while Preact defers the effect that would subscribe past
- *  that checkpoint. The listener does not exist yet when the resolve fires, and
- *  `resolved` latches, so no later broadcast ever follows. A subscriber that
- *  arrives mid-flight has to be able to ASK what it missed, which is the mirror
- *  of why the claim itself is delivered rather than re-read.
+ *  ordering. Take a tap into a thread the reader is not in. The target renders
+ *  and resolves on the microtask checkpoint of the commit that rendered it,
+ *  while Preact defers the subscribing effect past that checkpoint. The listener
+ *  does not exist yet when the resolve fires, and `resolved` latches, so no
+ *  later broadcast follows. A subscriber arriving mid-flight has to be able to
+ *  ASK what it missed.
  *
  *  False whenever no claim is held, so it can never describe a link that is
  *  already over. */
@@ -2158,23 +1711,18 @@ export function deepLinkHasResolved(): boolean {
   return _pendingEventScrollClaim !== null && _pendingEventScrollResolved;
 }
 
-/* The deep-link focus marker (the "focus stick") is the shared navigation focus
- *  marker — see components/shared/focusMarker.ts. scrollToSelectorAndPulse applies
- *  it on resolve (below), passing `hasPendingEventScroll` as the settle guard so
- *  this deep-link's own smooth scroll can't self-clear it; clearPendingEventScroll
- *  clears it. */
-
 /** While true, the mobile hide-on-scroll header stays pinned fully visible (see
- *  useHideOnScroll.onScroll). The deep-link scroll lands the element at the
+ *  `useHideOnScroll.onScroll`). The deep-link scroll lands the element at the
  *  container top minus its `scroll-margin-top`, which adds the fixed app header
- *  and sticky thread-title row back as a STATIC value — only correct if the
- *  header's visible portion is deterministic. Without the pin the smooth scroll would
- *  half-hide the header mid-flight, leaving the landed event partly covered. The
- *  pin is held for a short window covering the smooth scroll, not the full ~4s
- *  deep-link claim, so normal hide-on-scroll resumes the moment the user reads on.
- *  Desktop ignores this — its thread-title header is a sibling above the scroll
- *  container, so the scroll (offset by the desktop scroll-margin-top) already
- *  lands cleanly there. */
+ *  and sticky thread-title row back as a STATIC value. That is only correct if
+ *  the header's visible portion is deterministic. Without the pin, the smooth
+ *  scroll half-hides the header mid-flight and the landed event is partly
+ *  covered.
+ *
+ *  Held for a short window covering the smooth scroll, not the full deep-link
+ *  claim, so normal hide-on-scroll resumes the moment the reader reads on.
+ *  Desktop ignores it, since its thread-title header is a sibling above the
+ *  scroll container. */
 let _headerPinnedForScroll = false;
 let _headerPinTimer: ReturnType<typeof setTimeout> | null = null;
 const HEADER_PIN_MS = 800;
@@ -2194,17 +1742,21 @@ function pinHeaderForScroll(): void {
   }, HEADER_PIN_MS);
 }
 
-/** `selector` resolves the SCROLL target (a `.chat-exchange`, or an addressable
- *  card inside one; both carry the landing scroll-margin-top, see
- *  chat/response.css). `pulseTarget`, when given, narrows the PULSE highlight
- *  to a descendant of that target so a sibling panel in the same exchange isn't
- *  highlighted too — a string is a plain descendant selector (an event deep-link
- *  scopes it to `.initiator-panel`, the event itself, not the agent response
- *  below it), while a function picks the descendant PER MATCHED TARGET (a change
- *  deep-link needs this: the change body sits in `.response-panel` on a proposing
- *  turn but in `.initiator-panel` on a resolution card — see
- *  `scrollToChangeAndPulse`). When the chosen descendant is absent the pulse
- *  falls back to the whole target via `?? target`. */
+/** Scroll the element matching `selector` into view and pulse-highlight it, for
+ *  the two deep-link wrappers below. The target may not be in the DOM yet (the
+ *  thread is lazy-loading), so a MutationObserver retries until it appears or
+ *  the deadline fires. Only a target with a box is taken.
+ *
+ *  `selector` resolves the SCROLL target: a `.chat-exchange`, or an addressable
+ *  card inside one. Both carry the landing `scroll-margin-top`, see
+ *  chat/response.css.
+ *
+ *  `pulseTarget`, when given, narrows the PULSE to a descendant of that target,
+ *  so a sibling panel in the same exchange is not highlighted too. A string is a
+ *  plain descendant selector. A function picks the descendant PER MATCHED
+ *  TARGET, which a change deep link needs: its body sits in `.response-panel` on
+ *  a proposing turn and in `.initiator-panel` on a resolution card. When the
+ *  chosen descendant is absent the pulse falls back to the whole target. */
 function scrollToSelectorAndPulse(
   selector: string,
   preferLast = false,
@@ -2222,10 +1774,10 @@ function scrollToSelectorAndPulse(
   const claim = {};
 
   // Claim the deep-link scroll so a competing scroll defers (see
-  // _pendingEventScrollClaim). The claim is held until the deadline below, and
-  // NOT released the instant the scroll lands: the same render that finally
-  // shows the event is also what wakes useScrollMemory's restore observers, and
-  // they would otherwise land the saved position over the deep-link's.
+  // `_pendingEventScrollClaim`). Held until the deadline below, and NOT released
+  // the instant the scroll lands. The same render that finally shows the event
+  // also wakes `useScrollMemory`'s restore observers, which would otherwise land
+  // the saved position over this one.
   _pendingEventScrollClaim = claim;
   _pendingEventScrollResolved = false;
   // Announce the claim to anything holding a positioning decision of its own,
@@ -2233,17 +1785,17 @@ function scrollToSelectorAndPulse(
   // `onDeepLinkClaimed`). Notified AFTER the slot is set, so a listener asking
   // `hasPendingEventScroll` sees this claim rather than the state before it.
   for (const listener of _deepLinkClaimListeners) listener();
-  // Force ThreadView to render the FULL exchange list so a windowed-out target
-  // can render for tryResolve/the MutationObserver to find. Stays true until the
-  // claim releases; ThreadView keeps the thread fully rendered afterward so the
-  // user isn't snapped back to the windowed tail mid-read.
+  // Force ThreadView to render the FULL exchange list, so a windowed-out target
+  // can render for `tryResolve` and the MutationObserver to find. It stays true
+  // until the claim releases. ThreadView keeps the thread fully rendered
+  // afterwards, so the reader is not snapped back to the windowed tail mid-read.
   deepLinkRenderAll.value = true;
 
-  // Release this call's claim, but only if it's still ours. A second deep-link
-  // started mid-flight has overwritten the slot with its own claim; its own
-  // release handles that one. Without the guard, this call's deadline would
-  // clear the newer claim, un-guarding the saved-scroll restore over a landing
-  // that is still live, and report a failure for a navigation that succeeded.
+  // Release this call's claim, but only if it is still ours. A second deep link
+  // started mid-flight has overwritten the slot, and its own release handles
+  // that one. Without the guard, this call's deadline would clear the newer
+  // claim and un-guard the saved-scroll restore over a live landing. It would
+  // also report a failure for a navigation that succeeded.
   const releaseClaim = () => {
     if (_pendingEventScrollClaim === claim) {
       _pendingEventScrollClaim = null;
@@ -2264,15 +1816,13 @@ function scrollToSelectorAndPulse(
   };
 
   // Hold the claim across the smooth scroll's settle, then release. Used by the
-  // SYNCHRONOUS resolve path (the already-focused thread, whose events are
-  // already in the DOM): releasing the claim the instant smoothScrollToElement is
-  // CALLED is wrong, because the tween lands up to SCROLL_MAX_MS later and a
+  // SYNCHRONOUS resolve path, the already-focused thread whose events are
+  // already in the DOM. Releasing the claim when `smoothScrollToElement` is
+  // CALLED is wrong: the tween lands up to `SCROLL_MAX_MS` later, and a
   // competing scroll in that window would override the landing. Release on the
-  // scroll container's `scrollend` (the authoritative
-  // "scroll finished" signal, which our per-frame scrollTop writes still fire when
-  // they stop) or, where that's unsupported, a fallback timer — whichever fires
-  // first. (The async path already holds the claim until its own deadline, which
-  // generously covers the same settle.)
+  // container's `scrollend`, which our per-frame writes still fire when they
+  // stop, or on a fallback timer where that is unsupported. The async path
+  // already holds the claim until its own deadline.
   const holdClaimUntilScrollSettles = () => {
     const container = resolveTarget();
     let settleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2295,17 +1845,17 @@ function scrollToSelectorAndPulse(
     for (const el of matches) {
       if (isElementVisible(el)) {
         target = el;
-        // An event id has one visible copy (dual-mount aside), so first wins.
-        // A change id can match BOTH the proposing CC turn (earlier) and its
-        // later Applied/Reverted resolution card — preferLast lands on that
-        // card, which is the turn the user means when reopening the change.
+        // An event id has one visible copy, so the first wins. A change id can
+        // match BOTH the proposing coding-agent turn and its later
+        // Applied/Reverted resolution card. `preferLast` lands on the card,
+        // which is the turn the user means when reopening the change.
         if (!preferLast) break;
       }
     }
     if (!target) return;
     resolved = true;
     // Stop watching the DOM, but keep the pending claim alive until the deadline
-    // so the post-resolve re-renders stay suppressed (see the claim comment).
+    // so the post-resolve re-renders stay suppressed.
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -2319,79 +1869,70 @@ function scrollToSelectorAndPulse(
     if (typeof document !== 'undefined' && document.dispatchEvent) {
       document.dispatchEvent(new Event('reveal-mobile-header'));
     }
-    // Going to a link on a LIVE thread ends the ride: the reader asked to be at
-    // THIS place, and the standing follow would carry them off it on the next
-    // token. Retired before the scroll below rather than after, so the landing's
-    // own frames are marked as a plain navigation and the reading position
-    // recorded for this thread is the offset the link landed on rather than the
-    // live edge.
+    // Going to a link ends the ride: the reader asked to be at THIS place, and
+    // the standing follow would carry them off it on the next token. Retired
+    // BEFORE the scroll below, so the landing's own frames are marked as a plain
+    // navigation. The reading position recorded for this thread is then the
+    // offset the link landed on.
     //
-    // TWO gates are in play here and only one of them is asked. Not gated on the
-    // CLAIM being ours, on the line above the scroll on purpose: the two describe
-    // one landing and must not disagree, and a superseded call still lands (the
-    // pin, the scroll and the pulse below are all ungated, unlike the resolve
-    // broadcast), so gating that way would leave a reader who was just moved
-    // still following. Gated on LIVE, which is a different question entirely and
-    // the same one the scroll disarm, the up chevron and turn stepping ask: on an
-    // idle thread the reader is browsing, so following a link costs them nothing
-    // and their next submit still takes them to the live edge. Nothing carries
-    // them off the event meanwhile, because the follow stands down on an idle
-    // thread too (see `followIsCarrying`); if the thread WAKES they are carried,
-    // which is what the lit toggle says will happen.
-    if (threadIsLive()) stopFollowingBottom();
+    // UNCONDITIONAL, and this is the one navigation that is. Not gated on the
+    // CLAIM being ours, because the two describe one landing and must not
+    // disagree. A superseded call still lands, since the pin, the scroll and the
+    // pulse below are all ungated. Gating this way would leave a reader who was
+    // just moved still following.
+    //
+    // Not gated on LIVE either, unlike the scroll disarm, the up chevron and
+    // turn stepping. Those three are browsing when the thread is quiet, so
+    // keeping the ride costs the reader nothing. A LINK names one event, and
+    // that ask is durable rather than a moment's position, so it must survive
+    // the thread waking. See ADR 0064 for the gate this replaced.
+    stopFollowingBottom();
     smoothScrollToElement(target);
-    // Record and announce the landing, AFTER the scroll above rather than
-    // before it. Two things read this, and the second is why the order matters:
-    // one wants to know the link is no longer a candidate for the dead-link
-    // rescue, and the other records WHERE it landed as the thread's reading
-    // position. Under reduced motion the line above IS the whole landing, one
-    // synchronous write, so announcing first would hand that recorder the
-    // position the reader was leaving instead of the one they arrived at. An
-    // animated landing has only scheduled its first frame by now, and its own
-    // frames correct the record as they run.
+    // Record and announce the landing AFTER the scroll above. Two things read
+    // this, and the second is why the order matters. One wants to know the link
+    // is no longer a candidate for the dead-link rescue. The other records WHERE
+    // it landed as the thread's reading position. Under reduced motion the line
+    // above IS the whole landing, so announcing first would hand that recorder
+    // the position the reader was leaving.
     //
     // Only while the claim is still OURS. A superseded call keeps observing
-    // until its own deadline, and letting its late resolve speak for the claim
-    // a newer link now holds is exactly the collision the claim is an object to
-    // prevent.
+    // until its own deadline, and letting its late resolve speak for a newer
+    // link's claim is the collision the claim is an object to prevent.
     if (_pendingEventScrollClaim === claim) {
       _pendingEventScrollResolved = true;
       for (const listener of _deepLinkResolvedListeners) listener();
     }
-    // Highlight only the subject panel, not a sibling panel in the same turn:
-    // resolve the requested descendant (string selector, or a per-target picker)
-    // and pulse it when present, else the whole target. (`?.` so the jsdom test
-    // fakes that lack querySelector fall back cleanly.)
+    // Highlight only the subject panel, never a sibling panel in the same turn.
+    // Resolve the requested descendant and pulse it when present, else the whole
+    // target. `?.` so jsdom test fakes lacking `querySelector` fall back.
     const pulseChild =
       typeof pulseTarget === 'string'
         ? (target.querySelector?.(pulseTarget) as HTMLElement | null)
         : pulseTarget?.(target) ?? null;
     const pulseEl = pulseTarget ? pulseChild ?? target : target;
-    // Apply the shared navigation focus marker: a sticky background highlight that
-    // stays until the user takes any action (and never dissolves before its hold has
-    // elapsed), then dissolves slowly. The settle guard defers the
-    // dismissal while THIS deep-link's own smooth scroll is still settling
-    // (hasPendingEventScroll), so the landing scroll can't self-clear the marker.
+    // Apply the shared navigation focus marker (components/shared/focusMarker):
+    // a sticky background highlight that stays until the user takes any action,
+    // never dissolving before its hold has elapsed. The settle guard defers the
+    // dismissal while this link's own smooth scroll is settling, so the landing
+    // scroll cannot self-clear the marker.
     applyNavFocus(pulseEl, { settleGuard: hasPendingEventScroll });
   };
 
   tryResolve();
   if (resolved) {
-    // Synchronous resolve — the thread's events were already in the DOM (it was
-    // already focused), so no async load follows. Do NOT release the claim
-    // synchronously: the deep-link scroll (smoothScrollToElement) is still
-    // settling, and a competing scroll would override the landing. Hold the
-    // claim until the scroll settles so everything keeps deferring across it.
+    // Synchronous resolve: the thread's events were already in the DOM, so no
+    // async load follows. Do NOT release the claim synchronously. The deep-link
+    // scroll is still settling, and a competing scroll would override the
+    // landing, so hold the claim until it settles.
     holdClaimUntilScrollSettles();
     return;
   }
 
-  // body, not .thread-content: Preact's positional diff can't preserve the
-  // loading-branch .thread-content across ThreadView's loading→loaded swap
-  // (one child of .thread-view becomes two), so a scoped observer strands on
-  // a detached node. Hot-path filter: re-query only when a mutation actually
-  // adds a node containing the target — without it, every streaming token
-  // would trigger a doc-wide querySelectorAll + isElementVisible walk.
+  // `body`, not `.thread-content`. Preact's positional diff cannot preserve the
+  // loading-branch `.thread-content` across ThreadView's loading to loaded swap,
+  // so a scoped observer strands on a detached node. The hot-path filter
+  // re-queries only when a mutation adds a node containing the target. Without
+  // it, every streaming token triggers a document-wide scan.
   observer = new MutationObserver((records) => {
     for (const record of records) {
       for (const node of record.addedNodes) {
@@ -2405,28 +1946,20 @@ function scrollToSelectorAndPulse(
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
-  // Deadline. Two outcomes reach it, and only one of them is a failure.
+  // Deadline. Two outcomes reach it, and only one is a failure.
   //
-  //  - The target DID render and `tryResolve` landed on it (the observer path).
-  //    The timer then exists purely to release the claim, which kept the
-  //    post-resolve re-renders suppressed. Nothing else to do.
-  //  - The target NEVER rendered: it isn't in this thread, it renders nothing at
-  //    all, or the thread was still loading when the window closed. That is a
-  //    dead deep-link, and it used to end here in silence, leaving the tap
-  //    looking broken with no feedback whatsoever. It now tells the user, via
-  //    the caller's `onUnresolved` (scrollState stays free of the `store`
-  //    import; see `parseNavigatedTurn`).
+  //  - The target DID render and `tryResolve` landed on it. The timer then
+  //    exists purely to release the claim.
+  //  - The target NEVER rendered: it is not in this thread, it renders nothing,
+  //    or the thread was still loading when the window closed. That is a dead
+  //    deep link, and the user is told through the caller's `onUnresolved`.
+  //    `scrollState` stays free of the `store` import, see `parseNavigatedTurn`.
   //
-  // It reports WITHOUT moving the transcript. The user asked to go to a place;
-  // the place does not exist, and the bottom is not it. (This used to scroll to
-  // the thread's most recent turn, guarded by a `watchUserAction` watcher so a
-  // reader who had scrolled away meanwhile was not yanked 4s later. Both the
-  // recovery scroll and the watcher it needed are gone: leaving the reader where
-  // they are is now the rule rather than the exception, so there is nothing left
-  // to stand down from.)
+  // It reports WITHOUT moving the transcript. The user asked to go to a place,
+  // the place does not exist, and the bottom is not it.
   //
-  // A deep-link superseded mid-flight (`wasOurs` false) reports nothing: the
-  // newer one owns the claim, the viewport and the outcome now.
+  // A deep link superseded mid-flight (`wasOurs` false) reports nothing. The
+  // newer one owns the claim, the viewport and the outcome.
   deadlineTimer = setTimeout(() => {
     const wasOurs = _pendingEventScrollClaim === claim;
     stopWatching();
@@ -2438,35 +1971,31 @@ function scrollToSelectorAndPulse(
 
 /** Shared options for the two deep-link entry points below. */
 export interface DeepLinkOptions {
-  /** Called when the deep-link's target never renders and the resolve deadline
+  /** Called when the deep link's target never renders and the resolve deadline
    *  expires: a dead link the user has to be told about. The MESSAGE is the
-   *  caller's, not this module's, because `scrollState` deliberately stays free
-   *  of the heavy `store` import (`showToast` lives there) so its lean importers
-   *  keep working, the same constraint `parseNavigatedTurn` documents.
+   *  caller's, because `scrollState` stays free of the heavy `store` import
+   *  where `showToast` lives. See `parseNavigatedTurn`.
    *
    *  The words are the WHOLE recovery: a dead link leaves the transcript exactly
    *  where it was. */
   onUnresolved?: () => void;
 }
 
-/** Land on the element carrying `data-event-id`: a notification deep-link
+/** Land on the element carrying `data-event-id`: a notification deep link
  *  scrolling to the exact event that raised it. Two shapes of match, and the
  *  pulse scope differs per match, so the scope is resolved as a function.
  *
- *   - **An exchange-start event** (`UserQuestionAsked`, `CodingAgentPermissionRequest`,
- *     `CredentialRequested`, `McpConsentRequested`, …) stamps the whole
- *     `.chat-exchange` (`ChatExchange`'s root). Narrow the pulse to its
- *     `.initiator-panel` (the event itself), so the agent response rendered
- *     below it in the same turn isn't highlighted too.
+ *   - **An exchange-start event** (`UserQuestionAsked`,
+ *     `CodingAgentPermissionRequest`, `CredentialRequested`, and so on) stamps
+ *     the whole `.chat-exchange`. Narrow the pulse to its `.initiator-panel`, so
+ *     the agent response in the same turn is not highlighted too.
  *   - **A step-level event** stamps the specific card that renders it, today the
- *     `ResponseFailed` failure card (`.exchange-error`). That element already IS
- *     the subject, so it must NOT be narrowed: there is no `.initiator-panel`
- *     inside it, and narrowing to a sibling panel would highlight the wrong
- *     thing (or, on a card that happened to contain one, an unrelated descendant).
+ *     `ResponseFailed` failure card. That element already IS the subject, so it
+ *     must NOT be narrowed. There is no `.initiator-panel` inside it, and
+ *     narrowing would highlight an unrelated descendant.
  *
- *  Discriminating on the match rather than relying on the `?? target` fallback
- *  keeps the intent explicit; the fallback still covers a degenerate exchange
- *  with no `.initiator-panel`.
+ *  Discriminating on the match keeps the intent explicit. The `?? target`
+ *  fallback still covers a degenerate exchange with no `.initiator-panel`.
  *
  *  `onUnresolved` is called when the event never renders inside the resolve
  *  deadline (see the deadline in `scrollToSelectorAndPulse`). */
@@ -2483,31 +2012,26 @@ export function scrollToEventAndPulse(eventId: string, opts?: DeepLinkOptions): 
   );
 }
 
-/** Land on the chat exchange carrying `data-change-id` — the Changes panel
- *  deep-linking a row to its change. `ChatExchange` stamps both the proposing CC
- *  turn (the `ChangeProposed` rides it as a non-rendered step) and any later
- *  Applied/Reverted resolution card with the same id; `preferLast` resolves to
- *  that resolution card when present, and to the proposing turn for a pending
- *  change (its only match) — so the user lands on the change wherever it sits.
+/** Land on the chat exchange carrying `data-change-id`: the Changes panel deep
+ *  linking a row to its change. `ChatExchange` stamps both the proposing
+ *  coding-agent turn and any later resolution card with the same id.
+ *  `preferLast` resolves to the resolution card when present, and to the
+ *  proposing turn for a pending change.
  *
  *  The pulse is scoped to the panel that HOLDS the change, so a sibling panel in
- *  the same turn isn't highlighted too — and which panel that is depends on the
- *  card type, so the scope is resolved per matched target:
- *   - proposing CC turn → `.response-panel` (where the `ChangeProposed` step
- *     lives), NOT the user message that started the turn;
- *   - resolution card (ChangeApplied/Discarded/Reverted/Failed) → `.initiator-panel`
- *     (which carries the change body + Diff/Revert actions), NOT any folded-in
- *     post-apply continuation work that renders in a `.response-panel`
- *     (`changePanelHasContinuation` — real thread 76b4ee76). A resolution card is
- *     recognised by its `initiator-panel-change-*` accent class.
- *  When the chosen panel is absent (a degenerate exchange missing it, or a test
- *  DOM fake) the pulse falls back to the whole target via the `?? target` in
- *  scrollToSelectorAndPulse.
+ *  the same turn is not highlighted. Which panel that is depends on the card
+ *  type, so the scope is resolved per matched target:
+ *   - proposing turn: `.response-panel`, where the `ChangeProposed` step lives,
+ *     NOT the user message that started the turn;
+ *   - resolution card: `.initiator-panel`, which carries the change body and the
+ *     Diff and Revert actions, NOT any folded-in post-apply continuation work
+ *     that renders in a `.response-panel` (`changePanelHasContinuation`).
+ *  A resolution card is recognised by its `initiator-panel-change-*` accent
+ *  class. When the chosen panel is absent the pulse falls back to the whole
+ *  target.
  *
- *  Takes the same `onUnresolved` as the event deep-link, and for the same
- *  reason: both run through one `scrollToSelectorAndPulse` deadline, so a change
- *  whose turn never renders gets the identical recovery (land on the newest turn,
- *  say so) with no second implementation to keep in step. */
+ *  Takes the same `onUnresolved` as the event deep link, and through the same
+ *  deadline, so both get the identical recovery with no second implementation. */
 const CHANGE_RESOLUTION_INITIATOR =
   '.initiator-panel-change-applied,.initiator-panel-change-discarded,.initiator-panel-change-reverted,.initiator-panel-change-failed';
 export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions): void {
@@ -2530,33 +2054,30 @@ export function clearPendingEventScroll(): void {
   _pendingEventScrollClaim = null;
   _pendingEventScrollResolved = false;
   deepLinkRenderAll.value = false;
-  // A plain focus / explicit scroll is deliberate engagement elsewhere — drop any
-  // persistent focus marker so it can't leak onto the next thread or linger.
+  // A plain focus or explicit scroll is deliberate engagement elsewhere, so drop
+  // any persistent focus marker rather than let it leak onto the next thread.
   clearNavFocus();
 }
 
 /* ── Turn-by-turn keyboard traversal ─────────────────────────────────────────
- *  The ⌘↑/⌘↓ shortcuts step the transcript one *turn* (a `.chat-exchange`) at a
- *  time — landing the previous/next turn at the top of the scroll container and
- *  marking it with the shared navigation focus marker (the same cue a deep-link
- *  landing uses). Pairs with the focusable `.thread-content` region: a jump also
- *  moves DOM focus into the container so the native Arrow/Page keys keep scrolling
- *  from there. */
+ *  The turn-step shortcuts move the transcript one *turn* at a time. They land
+ *  the previous or next `.chat-exchange` on the shared landing line and mark it
+ *  with the navigation focus marker. It pairs with the focusable
+ *  `.thread-content` region: a jump also moves DOM focus into the container, so
+ *  the native Arrow and Page keys keep scrolling from there. */
 const TURN_SELECTOR = '.chat-exchange';
-/** Small slack around the landing line so a re-press of the turn shortcut doesn't
- *  re-select the just-landed turn (whose top rests on the landing line) and subpixel
- *  rounding is absorbed. Small and fixed — NOT scaled by the clearance: the gap is
- *  folded into the reference position (scrollTop + gap in stepThreadTurn), so a
- *  larger clearance must not widen the "skip" band, or short adjacent turns become
- *  unreachable by stepping. */
+/** Small slack around the landing line, so a re-press does not re-select the
+ *  just-landed turn and subpixel rounding is absorbed. Small and FIXED, never
+ *  scaled by the clearance. The gap is folded into the reference position, as
+ *  `scrollTop + gap` in `stepThreadTurn`. A larger clearance must not widen the
+ *  skip band, or short adjacent turns become unreachable by stepping. */
 const TURN_NAV_THRESHOLD_SLACK_PX = 4;
 
-/** Pure pick of the turn to jump to. `tops` are each turn's top in the container's
- *  scroll coordinate space (ascending, DOM order); `scrollTop` is the current
- *  position. Forward (direction 1) → the first turn below `scrollTop + threshold`;
- *  backward (-1) → the last turn above `scrollTop - threshold`. Returns `null` when
- *  there's nowhere to go (already at the last/first turn). Exported for unit
- *  testing — the DOM wiring around it (below) is thin. */
+/** Pure pick of the turn to jump to. `tops` are each turn's top in the
+ *  container's scroll coordinate space, ascending in DOM order, and `scrollTop`
+ *  is the current position. Forward is the first turn below
+ *  `scrollTop + threshold`, backward the last turn above `scrollTop - threshold`.
+ *  Returns `null` when there is nowhere to go. Exported for unit testing. */
 export function pickTurnIndex(
   tops: number[], scrollTop: number, direction: 1 | -1, threshold: number,
 ): number | null {
@@ -2575,20 +2096,18 @@ export function pickTurnIndex(
 
 /** Pick the turn to move to, preferring a marker anchor over scroll position.
  *
- *  When `anchorIdx >= 0` — the nav focus marker sits on a listed turn, which means
- *  the user has NOT scrolled since the last turn-nav (any real scroll gesture fades
- *  the marker) — step by INDEX from it (`anchorIdx + direction`). This is what makes
- *  a cluster of turns sharing a clamped scroll position reachable: after collapsing
- *  the last turn, the collapsed turn and an appended "Change applied" card both sit
- *  in the last (no-scroll-room) viewport, where pure scroll-position stepping keys
- *  off a pinned `scrollTop` and can't distinguish them — so ⌘↓ re-selected the same
- *  turn (or returned null) and the change card was unreachable.
+ *  `anchorIdx >= 0` means the nav focus marker sits on a listed turn, so the
+ *  user has NOT scrolled since the last turn-nav: any real scroll gesture fades
+ *  the marker. Step by INDEX from it. That is what makes a cluster of turns
+ *  sharing a clamped scroll position reachable. Collapse the last turn, and it
+ *  sits with an appended "Change applied" card in the last viewport, where there
+ *  is no scroll room. Pure scroll-position stepping keys off a pinned
+ *  `scrollTop` there and cannot tell them apart.
  *
- *  With no anchor (`anchorIdx < 0` — no marker, or it's on a non-turn element) fall
- *  back to scroll-position stepping via `pickTurnIndex`, which handles the
- *  first-press-from-the-current-scroll case and the mid-turn "prev snaps to the
- *  current turn's top" read (both happen precisely when there is no marker). Returns
- *  null at the list end. Pure — exported for unit testing. */
+ *  With no anchor, fall back to scroll-position stepping via `pickTurnIndex`. It
+ *  handles the first press from the current scroll, and the mid-turn read where
+ *  "prev" snaps to the current turn's top. Both happen precisely when there is
+ *  no marker. Returns null at the list end. Pure, exported for unit testing. */
 export function pickTurnTarget(
   anchorIdx: number,
   tops: number[],
@@ -2604,101 +2123,90 @@ export function pickTurnTarget(
 }
 
 /** Scroll the visible transcript one turn in `direction` (-1 previous, 1 next),
- *  landing it at the top and marking it with the shared navigation focus marker.
- *  A deliberate jump, so — like `scrollToTop` — it supersedes any in-flight
- *  deep-link claim. `awayFromBottom` is reconciled against the ACTUAL landing
- *  target rather than assumed: a jump that lands at the bottom must hide the
- *  chevron, and the last turn's clamped target often can't move an already
- *  bottomed container, so no scroll event would arrive to do it. No-op when no
- *  transcript is visible (thread pane collapsed, or the hidden dual-mount copy)
- *  or there's no turn in `direction`. Desktop moves DOM focus into the
- *  (focusable) container so the native scroll keys follow the jump. */
+ *  landing it on the landing line and marking it with the navigation focus
+ *  marker. A deliberate jump, so like `scrollToTop` it supersedes any in-flight
+ *  deep-link claim.
+ *
+ *  `awayFromBottom` is reconciled against the ACTUAL landing target rather than
+ *  assumed. A jump that lands at the bottom must hide the chevron. The last
+ *  turn's clamped target often cannot move an already bottomed container, so no
+ *  scroll event would arrive to do it.
+ *
+ *  A no-op when no transcript has a box, or when there is no turn in
+ *  `direction`. Desktop moves DOM focus into the focusable container, so the
+ *  native scroll keys follow the jump. */
 export function stepThreadTurn(direction: 1 | -1): void {
   const el = resolveTarget();
   if (!el) return;
 
-  // Land focus in the transcript FIRST so continuous Arrow/Page scrolling follows
-  // — even when there's no turn to jump to in this direction (already at the
-  // last/first turn), pressing the shortcut still parks focus on the scroll region
-  // to keep reading. Desktop only (mobile navigates panes; a chord has no mobile
-  // path). preventScroll so the focus move doesn't fight the animation below.
+  // Land focus in the transcript FIRST, so continuous Arrow and Page scrolling
+  // follows. Even with no turn to jump to in this direction, pressing the
+  // shortcut parks focus on the scroll region to keep reading. Desktop only,
+  // since mobile navigates panes and a chord has no mobile path. `preventScroll`
+  // so the focus move does not fight the animation below.
   if (!isMobile()) el.focus({ preventScroll: true });
 
   const turns = Array.from(el.querySelectorAll<HTMLElement>(TURN_SELECTOR)).filter(isElementVisible);
   if (turns.length === 0) return;
-  // The shared landing line (.chat-exchange scroll-margin-top), the same one a
-  // deep link and a submit's landing come to rest on; all turns share the CSS
-  // rule, so read it off the first one.
+  // The shared landing line, the same one a deep link and a submit's landing
+  // rest on. All turns share the CSS rule, so read it off the first one.
   const gap = turnLandingClearancePx(turns[0]);
   const containerTop = el.getBoundingClientRect().top;
   const tops = turns.map((t) => t.getBoundingClientRect().top - containerTop + el.scrollTop);
-  // A landed turn's top rests on the landing line at `scrollTop + gap`, so "next"
-  // is the first turn whose top is below that line and "prev" the last one above it
-  // — i.e. compare tops against `scrollTop + gap`, which is exactly "this turn's
-  // landing scroll position is forward/backward of the current one". Fold the gap
-  // into the reference here (with only a small slack as the threshold) rather than
-  // widening the threshold by it — a large threshold would make the skip band
-  // ~2×gap and swallow short adjacent turns when stepping.
+  // A landed turn's top rests on the landing line at `scrollTop + gap`. So
+  // "next" is the first turn whose top is below that line, and "prev" the last
+  // one above it. The gap is folded into the reference here, with only a small
+  // slack as the threshold. Widening the threshold by it instead would double
+  // the skip band and swallow short adjacent turns when stepping.
   //
   // When the nav focus marker is on one of these turns, step by INDEX from it
-  // rather than by scroll position (see `pickTurnTarget`). A marker means the user
-  // hasn't scrolled since the last nav (a scroll gesture retires its ref), so index
-  // stepping is unambiguous — and it's what makes a cluster of turns sharing a
-  // clamped scroll position each reachable: after collapsing the last turn, the
-  // collapsed turn + an appended "Change applied" card sit together in the last
-  // (no-scroll-room) viewport, where pure scroll-position stepping keys off a
-  // pinned scrollTop and re-selects the same turn, so the change card was
-  // unreachable. `closest('.chat-exchange')` also anchors a deep-link marker that
-  // landed on an inner `.initiator-panel`; a marker outside the transcript (a
-  // settings / plugin landing) isn't in `turns` → -1 → the scroll-based fallback.
+  // rather than by scroll position (see `pickTurnTarget`).
+  // `closest('.chat-exchange')` also anchors a deep-link marker that landed on
+  // an inner `.initiator-panel`. A marker outside the transcript is not in
+  // `turns`, giving -1 and the scroll-based fallback.
   const markedTurn = navFocusElement()?.closest?.(TURN_SELECTOR) as HTMLElement | null;
   const anchorIdx = markedTurn ? turns.indexOf(markedTurn) : -1;
   const idx = pickTurnTarget(anchorIdx, tops, el.scrollTop + gap, direction, TURN_NAV_THRESHOLD_SLACK_PX);
-  if (idx === null) return; // at the end in this direction — focus moved, nothing to jump to
+  if (idx === null) return; // at the end in this direction; focus already moved
   const turn = turns[idx];
 
-  // We ARE jumping now. A deliberate jump, so — like scrollToTop — supersede any
-  // in-flight deep-link claim.
+  // We ARE jumping now, and a deliberate jump supersedes any in-flight deep-link
+  // claim, exactly as `scrollToTop` does.
   clearPendingEventScroll();
 
-  // Absolute target scrollTop that puts the turn's top `gap` px below the container
-  // top. Re-read each frame (via animateScroll) so a layout shift during streaming
-  // is tracked; the term is stable as scrollTop changes because the turn's viewport
-  // top moves by the same amount.
+  // Absolute target `scrollTop`, putting the turn's top `gap` px below the
+  // container top. Re-read each frame, so a layout shift during streaming is
+  // tracked. The term is stable as `scrollTop` changes, because the turn's
+  // viewport top moves by the same amount.
   const targetOf = (c: HTMLElement) =>
     typeof c.getBoundingClientRect === 'function'
       ? turn.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - gap
       : 0;
 
-  // Reconcile the chevron against the ACTUAL landing target instead of
-  // hardcoding "parked mid-thread". The last turn (and any turn near the end) has a
-  // landing target at/beyond the live edge, so the browser clamps the scroll to the
-  // bottom — and when we're ALREADY at the bottom the clamped write doesn't move the
-  // container, so no scroll event fires and onScroll never reconciles the chevron.
-  // Hardcoding awayFromBottom=true there left the down chevron stuck on ("appears
-  // the second time you click down arrow"). (2px slack mirrors isVisuallyAtBottom.)
+  // Reconcile the chevron against the ACTUAL landing target rather than
+  // hardcoding "parked mid-thread". Any turn near the end has a landing target
+  // at or beyond the live edge, so the browser clamps the scroll to the bottom.
+  // When the container is ALREADY at the bottom the clamped write moves nothing,
+  // so no scroll event fires and `onScroll` never reconciles the chevron. The
+  // 2px slack mirrors `isAtLiveEdge`.
   awayFromBottom.value = targetOf(el) < liveEdgeTop(el) - 2;
 
   // A deliberate jump AWAY from the live edge ends the ride, and it has to say
-  // so itself: a scroll only speaks for the reader when a gesture is behind it,
-  // and a keyboard chord is not one (see "Was this scroll the reader's own
-  // GESTURE?"). This used to come free from the position test, which read the
-  // jump's unstamped write as a flick.
+  // so itself. A scroll only speaks for the reader when a gesture is behind it,
+  // and a keyboard chord is not one. See "Was this scroll the reader's own
+  // GESTURE?".
   //
-  // Reuses the line above rather than asking again, so the chevron's state and
-  // the ride's cannot disagree: a step onto the LAST turn lands at the clamped
-  // live edge, which is where the ride was taking them anyway. And only while
-  // the agent is LIVE, matching the scroll disarm: stepping back through an
-  // idle thread is browsing, and the reader's next submit should still carry
-  // them.
+  // It reuses the line above rather than asking again, so the chevron's state
+  // and the ride's cannot disagree. A step onto the LAST turn lands at the
+  // clamped live edge, which is where the ride was taking them anyway. And only
+  // while the agent is LIVE, matching the scroll disarm.
   if (awayFromBottom.value && threadIsLive()) stopFollowingBottom();
 
-  // Mark the landed turn with the shared navigation focus marker (a background
-  // highlight that sticks until the user's next scroll gesture, and for its hold even
-  // then). clearPendingEventScroll
-  // above already cleared any prior marker via clearNavFocus, so this is a clean
-  // supersede; no settleGuard — the animateScroll below is programmatic (emits no
-  // wheel/touch/keydown), so it can't self-clear, and a real user scroll should.
+  // Mark the landed turn with the navigation focus marker. Any prior marker was
+  // already cleared by `clearPendingEventScroll` above, so this is a clean
+  // supersede. No settle guard: the `animateScroll` below is programmatic and
+  // emits no wheel, touch or keydown, so it cannot self-clear, and a real user
+  // scroll should.
   applyNavFocus(turn);
 
   if (prefersReducedMotion()) {
@@ -2709,21 +2217,21 @@ export function stepThreadTurn(direction: 1 | -1): void {
   animateScroll(targetOf);
 }
 
-/** Which collapse store a `.chat-exchange` toggle targets: `response` folds the
- *  response body (`collapsedExchanges`), `initiator` folds the initiator panel
- *  (`collapsedInitiators`) — the fallback for a response-less divider / change turn.
- *  Both stores key on `${threadId}:${userSeq}`. */
+/** Which collapse store a `.chat-exchange` toggle targets. `response` folds the
+ *  response body (`collapsedExchanges`); `initiator` folds the initiator panel
+ *  (`collapsedInitiators`), the fallback for a response-less divider or change
+ *  turn. Both stores key on `${threadId}:${userSeq}`. */
 export type TurnCollapseKind = 'response' | 'initiator';
 
 /** Pure decode of a navigated `.chat-exchange`'s collapse identity from its data
- *  attributes (`data-thread-id`, `data-user-seq`, `data-collapse-kind`). Returns the
- *  target thread id, exchange sequence, and which panel to toggle — or null when the
- *  attributes are missing / malformed / the turn is not collapsible. Exported and
- *  DOM-free for unit testing, mirroring `pickTurnIndex`. The store-touching
- *  orchestration that consumes this (`toggleNavigatedTurnCollapsed`) lives in
- *  `hooks/useKeyboardShortcuts.ts` — this module stays free of the heavy `store`
- *  import so lean importers (`promptFocus` → `scrollState`) don't drag in
- *  `store`'s module-load side effects (`basePath`'s DOM read). */
+ *  attributes. It returns the target thread id, exchange sequence, and which
+ *  panel to toggle. Null when the attributes are missing or malformed, or the
+ *  turn is not collapsible. Exported and DOM-free for unit testing.
+ *
+ *  The store-touching orchestration that consumes it,
+ *  `toggleNavigatedTurnCollapsed`, lives in `hooks/useKeyboardShortcuts.ts`.
+ *  THIS MODULE STAYS FREE OF THE HEAVY `store` IMPORT, so lean importers such as
+ *  `promptFocus` do not drag in `store`'s module-load side effects. */
 export function parseNavigatedTurn(
   threadId: string | null,
   userSeqAttr: string | null,
@@ -2731,8 +2239,8 @@ export function parseNavigatedTurn(
 ): { threadId: string; userSeq: number; kind: TurnCollapseKind } | null {
   if (!threadId) return null;
   if (kind !== 'response' && kind !== 'initiator') return null;
-  // Reject a missing / blank attribute explicitly: `Number(null)` and `Number('')`
-  // both coerce to 0 (a valid integer), which would let an unstamped turn parse.
+  // Reject a missing or blank attribute explicitly. `Number(null)` and
+  // `Number('')` both coerce to 0, which would let an unstamped turn parse.
   if (userSeqAttr === null || userSeqAttr.trim() === '') return null;
   const userSeq = Number(userSeqAttr);
   if (!Number.isInteger(userSeq)) return null;
@@ -2740,13 +2248,11 @@ export function parseNavigatedTurn(
 }
 
 /** True when the element with the given `data-event-id` is currently in the
- *  visible viewport on this device: the `.chat-exchange` for an exchange-start
- *  event, or the card that renders it for a step-level event (the
- *  `ResponseFailed` failure card). Both are stamped by `ChatExchange`, so the
- *  notification in-app matrix's "already looking at it" check works for either.
- *  Filters dual-mount copies via isElementVisible: the hidden layout's copy
- *  reports a 0×0 rect and would otherwise win the visibility check on the wrong
- *  layout. */
+ *  visible viewport on this device. That is the `.chat-exchange` for an
+ *  exchange-start event, or the card that renders it for a step-level event.
+ *  Both are stamped by `ChatExchange`, so the notification in-app matrix's
+ *  "already looking at it" check works for either. A copy with no box is
+ *  filtered out by `isElementOnScreen`. */
 export function isEventInViewport(eventId: string): boolean {
   if (!eventId || typeof document === 'undefined' || !document.querySelectorAll) return false;
   const matches = document.querySelectorAll<HTMLElement>(`[data-event-id="${CSS.escape(eventId)}"]`);
@@ -2757,25 +2263,22 @@ export function isEventInViewport(eventId: string): boolean {
 }
 
 /** True when `el` is actually on screen, not merely laid out. Two distinct
- *  checks, and both are load-bearing: `isElementVisible` rejects the hidden
- *  layout copy (0x0 rect) and anything inside a collapsed container, while the
- *  rect test rejects an element scrolled or translated out of view. The second
- *  is what a restored scroll position (`useScrollMemory`) needs, since a card
- *  far below the fold is perfectly "visible" by the first test alone.
+ *  checks, and both are load-bearing. `isElementVisible` rejects an element with
+ *  no box and anything inside a collapsed container. The rect test rejects an
+ *  element scrolled or translated out of view. That second one is what a
+ *  restored scroll position needs, since a card far below the fold passes the
+ *  first test.
  *
- *  BOTH axes are tested, and each catches a different layout. Vertically, the
- *  band is the ACTIVE SCROLL ELEMENT's when there is one rather than the
- *  window's, because the transcript is inset by the app header above and the
- *  prompt region below, so an element in either strip is inside
- *  `window.innerHeight` while being completely hidden. Horizontally, the mobile
- *  swipe layout keeps every pane mounted and merely translates the inactive
- *  ones aside, so an element in an off-screen pane has a full-size rect and
- *  passes every vertical test there is.
+ *  BOTH axes are tested, and each catches a different layout. Vertically the
+ *  band is the ACTIVE SCROLL ELEMENT's rather than the window's, because the
+ *  transcript is inset by the app header and the prompt region. An element in
+ *  either strip is inside `window.innerHeight` while being hidden. Horizontally,
+ *  the mobile swipe layout keeps every pane mounted and translates the inactive
+ *  ones aside. An element in an off-screen pane therefore has a full-size rect.
  *
- *  Shared by `isEventInViewport` (deep-link pulse, presence-pong
- *  `event_in_viewport`) and `choiceCardNav`, which must never take DOM focus on
- *  an off-screen choice: that would arm an Enter the user cannot see, and on a
- *  permission card an unseen grant. */
+ *  Shared by `isEventInViewport` and by `choiceCardNav`, which must never take
+ *  DOM focus on an off-screen choice. That would arm an Enter the user cannot
+ *  see, and on a permission card an unseen grant. */
 export function isElementOnScreen(el: HTMLElement): boolean {
   if (!isElementVisible(el)) return false;
   const scroller = getActiveScrollElement();
@@ -2792,23 +2295,23 @@ export function isElementOnScreen(el: HTMLElement): boolean {
     && r.right > bounds.left && r.left < bounds.right;
 }
 
-/** Build the scroll- and resize-event handlers for a single .thread-content
+/** Build the scroll- and resize-event handlers for a single `.thread-content`
  *  element, and wire the reader-gesture signal `onScroll` reads. The visibility
- *  gate at the top of each handler is required by the dual-mounting contract
- *  documented at the top of this file.
+ *  gate at the top of each handler is required by the contract at the top of
+ *  this file.
  *
- *  `detachGestures` is the caller's ONE teardown obligation, and it exists
- *  because the gesture listeners are the only thing here that touches the DOM:
- *  the caller attaches `onScroll`/`onResize` itself and removes them itself,
- *  but it never sees these. Call it wherever the `scroll` listener is removed. */
+ *  `detachGestures` is the caller's ONE teardown obligation, because the gesture
+ *  listeners are the only thing here that touches the DOM. The caller attaches
+ *  and removes `onScroll` and `onResize` itself, but never sees these. Call it
+ *  wherever the `scroll` listener is removed. */
 export function makeScrollObservers(el: HTMLElement) {
   const detachGestures = attachReaderGestures(el);
   function isAtTop() {
     return el.scrollTop <= 80;
   }
-  // Tighter "at the very top" check than isAtTop's 80px chevron window — the
-  // title fade should ease in as soon as content slides under the bar. 2px
-  // slack absorbs subpixel rounding / iOS overscroll bounce at the top.
+  // Tighter than `isAtTop`'s 80px chevron window: the title fade eases in as
+  // soon as content slides under the bar. The 2px slack absorbs subpixel
+  // rounding and the iOS overscroll bounce at the top.
   function isVisuallyAtTop() {
     return el.scrollTop <= 2;
   }
@@ -2822,41 +2325,52 @@ export function makeScrollObservers(el: HTMLElement) {
   /* ── Reflow anchoring: hold the reader still across a WIDTH change ─────────
    *  Resizing a pane changes the transcript's width, and every wrapped line
    *  re-wraps. The content ABOVE the viewport changes height, so the same
-   *  scrollTop shows a different part of the thread: narrowing the thread pane
+   *  `scrollTop` shows a different part of the thread. Narrowing the thread pane
    *  makes the transcript taller and carries the reader UP into older turns.
    *
    *  The browser will not do this for us. Chromium's scroll anchoring treats a
    *  width change on the scroll container as a suppression trigger, and WebKit
-   *  has never implemented scroll anchoring at all (WebKit #171099, the same
-   *  gap `withScrollAnchor` covers for DOM mutations).
+   *  has never implemented it at all. Same gap `withScrollAnchor` covers for DOM
+   *  mutations.
    *
-   *  The anchor has to describe the layout BEFORE the reflow, and a
-   *  ResizeObserver only ever runs after it, so both handlers keep a running
-   *  snapshot of it: which child the reader is parked on, and where that child's
-   *  top sat relative to the viewport. Two MEASURED positions, before and after,
-   *  are all the correction needs. That is what makes it immune to the browser
-   *  clamping scrollTop, which it does whenever a widening pane leaves the
-   *  transcript shorter than the reader's old offset: a correction derived from
-   *  a scrollTop delta would read that clamp as the reader having scrolled. */
+   *  The anchor must describe the layout BEFORE the reflow, and a ResizeObserver
+   *  only runs after it. So both handlers keep a running snapshot of which child
+   *  the reader is parked on, and where its top sat. Two MEASURED positions are
+   *  all the correction needs, which makes it immune to the browser clamping
+   *  `scrollTop`. A correction derived from a delta would read that clamp as the
+   *  reader having scrolled.
+   *
+   *  A reader measured ON THE LIVE EDGE is anchored to the edge instead of to a
+   *  child, and `anchorAtLiveEdge` is that half of the snapshot. */
   let lastWidth = el.clientWidth;
+  let lastHeight = el.clientHeight;
   let anchorChild: HTMLElement | null = null;
   let anchorRelTop = 0;
+  /** Was the reader at the live edge when the anchor was last taken? Starts
+   *  false rather than measured: a container with no box answers `isAtLiveEdge`
+   *  true (0 + 0 >= 0 - 2), and the first round must not act on that. */
+  let anchorAtLiveEdge = false;
 
   function viewportTop() {
     return el.getBoundingClientRect().top;
   }
 
-  /** Snapshot the child the reader is parked on: the last one whose top is at or
-   *  above the viewport top. Scanned from the END because the reader is normally
-   *  near the newest turn, so the loop usually stops on its first step. Children
-   *  with no box are skipped, since on desktop the mobile title row is
-   *  `display: none` and reports an all-zero rect that would otherwise read as
-   *  "far above".
+  /** Snapshot where the reader is parked, in the two forms the correction can
+   *  use. Whether they are ON THE LIVE EDGE, and which child they are parked on:
+   *  the last one whose top is at or above the viewport top, with the offset it
+   *  sat at. Scanned from the END, since the reader is normally near the newest
+   *  turn, so the loop usually stops on its first step. Children with no box are
+   *  skipped, because on desktop the mobile title row reports an all-zero rect
+   *  that would otherwise read as "far above".
    *
-   *  Cheap on the scroll path despite the rect reads: both callers run
-   *  `isElementVisible(el)` first, which already forces any pending style/layout
-   *  flush, so these reads hit a clean layout tree rather than triggering one. */
+   *  Both are taken together and read together. The ResizeObserver only sees the
+   *  geometry AFTER the change, and both questions are about before it.
+   *
+   *  Cheap on the scroll path despite the rect reads. Both callers run
+   *  `isElementVisible(el)` first, which already forces any pending layout
+   *  flush, so these reads hit a clean tree rather than triggering one. */
   function recordAnchor() {
+    anchorAtLiveEdge = isAtLiveEdge(el);
     anchorChild = null;
     const kids = el.children;
     if (!kids || typeof el.getBoundingClientRect !== 'function') return;
@@ -2876,17 +2390,19 @@ export function makeScrollObservers(el: HTMLElement) {
   }
 
   /** Put the reader back where the width change moved them. Runs inside the
-   *  ResizeObserver callback, i.e. after layout and before paint, so the
-   *  correction is never painted as a jump.
+   *  ResizeObserver callback, after layout and before paint, so the correction
+   *  is never painted as a jump.
    *
-   *  Every reader is held on their anchor, including one sitting at the very
-   *  bottom. This used to branch: a reader within the 80px stickiness window was
-   *  re-pinned to the bottom instead of anchored, on the reasoning that riding
-   *  the newest turn means "keep me on the newest turn" whatever the layout
-   *  does. That is a bottom-pin wearing anchor preservation's clothes, and it
-   *  fired on a reader who had deliberately scrolled 79px up. Holding the anchor
-   *  is the honest reading of "keep the reader on the same content", and it is
-   *  the same answer for everyone. */
+   *  EVERY reader who reaches it is held on their anchor, including one sitting
+   *  at the very bottom. Holding the anchor is the honest reading of "keep the
+   *  reader on the same content", and being AT the bottom does not change it: a
+   *  position is not a request.
+   *
+   *  The one reader who does NOT reach it is one who ASKED to be kept at the
+   *  bottom and was there when the box changed. Their anchor is the edge itself.
+   *  That branch is in `onResize` and stands in FRONT of this. It is the same
+   *  carve-out `withScrollAnchor` makes on the DOM side, and it is a request
+   *  term rather than a proximity one. */
   function restoreAfterReflow() {
     const child = anchorChild;
     if (!child || child.isConnected === false) return;
@@ -2894,142 +2410,170 @@ export function makeScrollObservers(el: HTMLElement) {
     if (shift === 0) return;
     el.scrollTop = el.scrollTop + shift;
     // The app holding the reader on the same content, not the reader taking
-    // over. The growth branch usually re-stamps a line later, but not when it
-    // stands down for a tween or a pending landing, which is exactly when a pane
-    // resize retired a follow nobody retired. See `carryHeldScroll`.
+    // over. The growth branch usually re-stamps a line later, but not while it
+    // stands down for a tween or a pending landing. See `carryHeldScroll`.
     carryHeldScroll(el);
   }
 
-  // Scroll events. Whoever moved the container (a gesture, a chevron, a restore,
-  // the reflow correction), the answer is the same: reconcile the three position
-  // signals against where it now sits, and re-take the reflow anchor. There is
-  // no longer anything to suppress, because nothing infers intent from a scroll.
+  /** THE FOLLOW'S PROMISE: one write and one rule, reaching the reader through
+   *  THREE events. Two of them move the reader without the transcript growing.
+   *  Those are the transcript's own BOX changing, and the PLATFORM scrolling the
+   *  container with no gesture behind it. GROWTH is the third, and arrives here
+   *  as `honourGrowth`'s `keepEdge`. Each caller adds its own event terms and
+   *  reads the return.
+   *
+   *  TWO terms here. ARMED, because a position is not a request. And AT THE LIVE
+   *  EDGE before the event, which is `anchorAtLiveEdge`, the snapshot
+   *  `recordAnchor` takes at the end of every round.
+   *
+   *  No LIVENESS term. The platform and the app's own layout move the reader
+   *  whether or not the agent is running. Liveness belongs to GROWTH, where it
+   *  means there is nothing to be carried toward.
+   *
+   *  It stands down for a TWEEN, already going somewhere the reader asked for
+   *  more recently, and for a deep-link CLAIM that has not landed. Under a
+   *  claim, `restoreAfterReflow` is the right answer instead. It cannot loop,
+   *  because `markHeldScroll` stamps the position read back AFTER the write, so
+   *  a browser clamp is recorded as ours. */
+  function keepTheLiveEdge(): boolean {
+    if (!_followingBottom.value || !anchorAtLiveEdge) return false;
+    if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
+    markHeldScroll(el, liveEdgeTop(el));
+    return true;
+  }
+
+  // Scroll events. Whoever moved the container, the answer is the same:
+  // reconcile the three position signals against where it now sits, and re-take
+  // the reflow anchor. Nothing infers intent from a scroll.
   //
-  // Two questions ARE asked of the scroll, and this is the only place a standing
-  // follow is retired or a landing cancelled from one: has the reader taken the
-  // container away from where our own last held write put it (see
-  // `markHeldScroll`), and was a reader GESTURE behind it (see "Was this scroll
-  // the reader's own GESTURE?"). The landing asks only the first, deliberately.
+  // Two questions ARE asked of it, and this is the only place a scroll retires a
+  // follow or cancels a landing. Has the reader taken the container away from
+  // where our last held write put it, and was a reader GESTURE behind it. Those
+  // two have THREE answers between them, and the third is `keepTheLiveEdge`: a
+  // scroll that moved an armed reader off the edge with no gesture is neither
+  // theirs to keep nor ours to ignore.
   //
-  // The FOLLOW takes FOUR terms. Off the live edge alone is not enough, because
-  // a shrink clamps the reader down and the app's own anchor correction moves
-  // them while holding them on the same content; moved alone is not enough
-  // either, because a tween mid-glide is our own. They are false for everything
-  // that changes content without moving the reader off the edge, which is why
-  // answering a question, granting a permission or expanding a turn all keep
-  // the follow.
+  // The FOLLOW takes FOUR terms, and ADR 0064 has the reasoning. Off the live
+  // edge alone is not enough: a shrink clamps the reader down, and the anchor
+  // correction moves them while holding them on the same content. Moved alone is
+  // not enough either, because a tween mid-glide is our own.
   //
-  // The two of them together were the whole test until 2026-08-11, on the
-  // premise that a container that moved away from our write had been moved by
-  // the reader. That premise covers CONTENT growth and nothing else, so the
-  // keyboard, an app resume and every other platform-driven scroll read as the
-  // reader and retired a follow nobody touched (see "Was this scroll the
-  // reader's own GESTURE?"). `readerGestureActive` is that missing term, ANDed
-  // rather than swapped in: a real scroll satisfies all of them by
-  // construction, so nothing that used to retire the follow stops doing so.
-  //
-  // A NAVIGATION is not a gesture and now retires the follow itself, which is
-  // what the up chevron, turn stepping and the deep link do (see
-  // `stopFollowingBottom`). Before the gesture term they came free from the
-  // position test, and that was always an accident: their write lands where we
-  // did not stamp for the same reason a flick does, not because the reader's
-  // hand was on the transcript.
-  //
-  // The third is whether the agent is LIVE (`_threadLive`), and it separates two
-  // acts that produce an identical scroll event. Scrolling away from a reply IN
-  // FLIGHT means "stop dragging me". Scrolling on an IDLE thread is browsing:
-  // nothing is moving, nothing is dragging anybody, and going back to re-read a
-  // turn before writing the next message is not a decision about how the next
-  // reply should behave. It silently was one until this term existed, and the
-  // reader paid for it at their next submit.
-  //
-  // It applies to a NAVIGATION as much as to a gesture, which is a real
-  // consequence rather than an oversight: the up chevron, ⌘↑ turn stepping and a
-  // deep-link landing all retire the follow only while the agent is live, so on
-  // an idle thread the reader can step back through turns, or follow a link to
-  // one, and still have their next submit take them to the live edge. The lit
-  // toggle is what makes that fair, since it says on screen that they are still
-  // riding.
-  //
-  // The deep link was the last exception to that, on the reasoning that a link
-  // is a request to be at ONE place and nothing may carry the reader off it. The
-  // second half of that is now true without retiring anything, because the
-  // follow does not WRITE on an idle thread either (`followIsCarrying`). Two
-  // halves of one rule: on an idle thread nothing takes the ride away and
-  // nothing acts on it.
-  //
-  // The LANDING takes only the moved term, and both differences are deliberate.
-  // A reader who flicks down to the live edge mid-glide has gone exactly where
-  // the landing is not taking them, and the tween would haul them back up on the
-  // next frame; the clamp the follow's edge term guards against cannot strand
-  // this one, because a glide re-writes and re-stamps the position every frame.
-  // And a landing is answering a submit made a moment ago, so whether the agent
-  // has got going yet says nothing about whether the reader wants it.
+  // The LANDING takes only the moved term, deliberately. A reader who flicks
+  // down to the live edge mid-glide has gone where the landing is not taking
+  // them. A landing answers a submit made a moment ago, so whether the agent has
+  // got going yet says nothing about whether the reader wants it.
   function onScroll() {
     if (!isElementVisible(el)) return;
-    syncNotAtTop();
-    syncScrolledFromTop();
+    // All three are questions about the scroll being HANDLED, so all three are
+    // read before anything below can write over the answer. The gesture once,
+    // not once per arm. The two arms are opposite answers to ONE question, and a
+    // second call could land the other side of the window's edge.
     const atEdge = isAtLiveEdge(el);
-    awayFromBottom.value = !atEdge;
     const tookOver = !isWhereWeHeldIt(el);
+    const gesture = readerGestureActive(el);
     if (_followingBottom.value) {
-      if (threadIsLive() && !atEdge && tookOver && readerGestureActive(el)) stopFollowingBottom();
+      if (threadIsLive() && !atEdge && tookOver && gesture) stopFollowingBottom();
+      // NOT A GESTURE IS NOT THE SAME AS THE PLATFORM, which is the fourth term.
+      // The app's own NAVIGATIONS are the third thing that moves the container:
+      // the up chevron, turn stepping, and `useScrollMemory` positioning a
+      // thread on open. Each writes through `markNavigationScroll` rather than
+      // `markHeldScroll`, so none is where we held the reader, and a chord is
+      // deliberately not a gesture either. On an IDLE thread those three KEEP
+      // the ride. Without this term the correction writes the reader back to the
+      // bottom on the navigation's own trailing scroll event.
+      //
+      // `isNavigationScroll` is the module's existing answer to exactly this
+      // question, window and all. It is asked HERE rather than inside
+      // `keepTheLiveEdge`, because only a scroll event can be attributed to a
+      // write. The box-change caller has none, and re-marks itself every growth
+      // round, so asking there would stand the branch down for our own writes.
+      else if (!atEdge && tookOver && !gesture && !isNavigationScroll(el)) keepTheLiveEdge();
     } else if (tookOver && landingInFlight()) {
       cancelLanding();
     }
+    // Reconciled AFTER the correction above, and re-measured rather than reusing
+    // `atEdge`. The chevron and the anchor then describe where this handler LEFT
+    // the reader, not where the platform put them. Same order as `onResize`.
+    syncNotAtTop();
+    syncScrolledFromTop();
+    awayFromBottom.value = !isAtLiveEdge(el);
     // The reader has moved, so the reflow anchor has to follow them.
     recordAnchor();
   }
-  // Resize events. A resize moves the reader for exactly two reasons, and both
-  // are things they asked for: they ASKED to ride the live edge, have not taken
-  // it back, and there is something live to ride, or they just SUBMITTED and the
-  // turn their landing is waiting for has finally rendered (see "The standing
-  // request to ride the live edge", and `followSubmit`). For everyone else it
-  // moves nobody, whatever grew and however far off the bottom it leaves them: a
-  // streaming reply, a decoded image, an expanded step, a growing composer all
-  // leave the transcript exactly where it is, and the handler's remaining job is
-  // to reconcile the signals so the chevrons describe the new geometry.
+  // Resize events. A resize moves the reader for exactly three reasons, and all
+  // three are things they asked for:
   //
-  // "Everyone else" includes an ARMED reader on an idle thread, which is the
-  // part that was missing until 2026-08-11: growth there is the transcript
-  // finishing its own rendering, not the agent producing anything, so a reader
-  // who scrolled up to re-read a turn was written back to the bottom by the next
-  // markdown reflow. See `followIsCarrying`.
+  //  - they ASKED to ride the live edge and are still ON it, so the app must not
+  //    slide the edge out from under them. `keepTheLiveEdge`, whether the BOX
+  //    changed or the CONTENT grew;
+  //  - they asked to ride, have not taken it back, and there is something live
+  //    to ride, from wherever they now are (`followIsCarrying`);
+  //  - they just SUBMITTED and the turn their landing waits for has rendered.
   //
-  // This is where the old force-pin lived, and the two rules that fought over
-  // it: a 'scroll'-mode branch that slammed `scrollTop = scrollHeight` on every
-  // resize inside a 500ms window, and a follow branch that re-pinned any reader
-  // inside the 80px stickiness window. Neither is back. The branch below infers
-  // nothing: it reads what the reader's own chevron tap or submit recorded.
+  // For everyone else it moves nobody, whatever grew and however far off the
+  // bottom it leaves them. A streaming reply, a decoded image, an expanded step
+  // and a growing composer all leave the transcript where it is. The handler's
+  // remaining job is to reconcile the signals against the new geometry.
+  //
+  // "Everyone else" includes an ARMED reader who has SCROLLED AWAY on an idle
+  // thread, for CONTENT GROWTH. The line is drawn at the reader's POSITION, not
+  // at the kind of resize. See `followIsCarrying`, and ADR 0064 for the pin this
+  // replaced. The branch below infers nothing: it reads what the reader's own
+  // chevron tap or submit recorded.
   function onResize() {
     if (!isElementVisible(el)) return;
-    // A WIDTH change re-wrapped the transcript, so undo the drift it caused
-    // before anything below reads the new geometry (see "Reflow anchoring").
-    // Height-only growth, the streaming case, needs no correction: the content
-    // above the reader is unchanged, so the same scrollTop still shows them the
-    // same thing, and the transcript simply grows below them.
+    // The transcript's OWN BOX changing is a different event from its content
+    // growing, and only the first moves the reader relative to what they were
+    // reading. Content growth needs no correction. The content above the reader
+    // is unchanged, so the same `scrollTop` shows them the same thing.
     const width = el.clientWidth;
-    if (width !== lastWidth) {
-      lastWidth = width;
+    const height = el.clientHeight;
+    const boxChanged = width !== lastWidth || height !== lastHeight;
+    // A WIDTH change re-wrapped the transcript, so the content above the reader
+    // changed height and the drift it caused has to be undone. A height-only
+    // change re-wraps nothing.
+    const reflowed = width !== lastWidth;
+    lastWidth = width;
+    lastHeight = height;
+    // Both corrections run before anything below reads the new geometry, and
+    // they are ALTERNATIVES rather than a sequence.
+    //
+    // A reader who ASKED to be kept at the bottom and WAS there keeps the live
+    // edge across the change. For them the edge REPLACES the child anchor rather
+    // than following it. The two say the same thing before the change and
+    // different things after it. Correcting first would be one write to the
+    // wrong place and a second to the right one.
+    //
+    // `keepTheLiveEdge` holds the terms that decide it and reports whether it
+    // wrote, which is all this branch needs. Read it for the terms and the
+    // stand-downs. Those stand-downs are why `restoreAfterReflow` is the
+    // fallthrough rather than an unconditional second write: under a deep link's
+    // claim the anchor IS the right answer.
+    //
+    // This caller's own term is the BOX. Content growth changes no dimension, so
+    // a streaming reply reaches the edge write through the growth branch.
+    if (!(boxChanged && keepTheLiveEdge()) && reflowed) {
       restoreAfterReflow();
     }
-    // The growth branch. Runs after the reflow correction, so it writes from the
-    // corrected position rather than fighting it, and before the signal
-    // reconciles below, so the chevron describes where it left the reader rather
-    // than where the growth alone would have.
-    honourGrowth(el);
+    // The growth branch. It runs after whichever correction above ran, so it
+    // writes from the corrected position. It runs before the signals reconcile
+    // below, so the chevron describes where it left the reader.
+    //
+    // It is handed `keepTheLiveEdge` for its on-the-edge arm, so growth is that
+    // rule's third caller rather than a second copy of it. Growth adds no term
+    // of its own: the event IS the term. Where the branch above already wrote
+    // the live edge, this repeats that exact target.
+    honourGrowth(el, keepTheLiveEdge);
     syncNotAtTop();
     syncScrolledFromTop();
     // One unconditional reconcile, both directions. Growth below the fold raises
-    // the chevron on the very next frame, which matters more than it used to:
-    // an unarmed reader at the live edge is left behind by the first token of a
-    // reply and the chevron is their only way back. A shrink that leaves them
-    // visually at the bottom again (an idle banner removed, a step collapsed)
-    // hides it, without waiting for a scroll event that a pure content change
-    // never fires.
+    // the chevron on the very next frame, and an unarmed reader at the live edge
+    // is left behind by the first token of a reply. A shrink that leaves them
+    // visually at the bottom again hides it. Neither waits for a scroll event,
+    // which a pure content change never fires.
     awayFromBottom.value = !isAtLiveEdge(el);
-    // Retake the snapshot last, once the layout above has settled: measuring it
-    // any earlier would describe a position the reader is no longer at.
+    // Retake the snapshot last, once the layout above has settled. Measuring it
+    // earlier would describe a position the reader is no longer at.
     recordAnchor();
   }
   return { onScroll, onResize, detachGestures };

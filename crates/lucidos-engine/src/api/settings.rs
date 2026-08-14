@@ -9,6 +9,7 @@ use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_fi
 use crate::engine::command_permission::{
     read_agent_allowed_commands_file, write_agent_allowed_commands_file,
 };
+use crate::llm::{supported_efforts, ProviderKind};
 
 /// Response/request body for both allowlist editors (`cc-allowed-tools` and
 /// `agent-allowed-commands`) — the raw file text, one pattern per line. The
@@ -481,6 +482,12 @@ fn valid_context_window(w: Option<i32>) -> bool {
 
 /// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
 /// filters to `enabled`; the Settings → Models manager shows all.
+///
+/// Each row carries the reasoning tiers its provider supports, derived here so
+/// the picker offers exactly what `RoutingProvider` will send. Derived per
+/// request rather than stored: it is a pure function of the row's provider and
+/// id, so a re-providered model is right immediately and a user adding a local
+/// model is never asked to declare tiers they cannot know.
 pub(super) async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsListResponse>, (StatusCode, String)> {
@@ -490,6 +497,13 @@ pub(super) async fn list_models(
             format!("Failed to list models: {}", e),
         )
     })?;
+    let models = models
+        .into_iter()
+        .map(|model| ModelInfo {
+            reasoning_efforts: supported_efforts(ProviderKind::parse(&model.provider), &model.id),
+            model,
+        })
+        .collect();
     Ok(Json(ModelsListResponse { models }))
 }
 

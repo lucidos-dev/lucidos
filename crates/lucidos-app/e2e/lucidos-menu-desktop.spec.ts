@@ -1,25 +1,19 @@
 /**
  * The Lucidos menu on DESKTOP, opened from the mark in the thread pane's header.
  *
- * This exists because of what the menu replaced. The `[Lucidos • workspace]`
- * label used to open the workspace switcher, an anchored popover that carried
- * the peer list, the Refresh glyph and the Restart confirm; retiring the
- * switcher left that label as the only opener the viewport had, and then the
- * label itself became the mark. The regression it invites is that desktop
- * silently loses the route to Refresh, Restart and Workspaces entirely. Mobile
- * would not notice: it reaches the same menu from its own marks.
+ * The regression it guards is desktop silently losing its only route to
+ * Refresh, Restart and Workspaces. Mobile would not notice, reaching the same
+ * menu from its own marks.
  *
- * Desktop's menu is deliberately SHORTER than mobile's. New thread, Search
- * everywhere and Setup interview are icons in this very header row, so repeating
- * them below would make the menu a second copy of the row it hangs from. What is
- * left is the pair desktop can reach nowhere else. Both halves are asserted:
- * every row the menu owes is present, and every row the row above already
- * carries is absent WITH its icon proven present, so a trim can never be the
- * reason an action became unreachable.
+ * Desktop's menu is deliberately SHORTER than mobile's: New thread, Search
+ * everywhere and Setup interview are icons in this header row already. Both
+ * halves are asserted, so a trim can never be why an action became unreachable.
+ * Every row the menu owes is present, and every row the header carries is
+ * absent WITH its icon proven present.
  *
- * The panel's other job is answering for the mark: when the connection light
- * recedes, the menu is where the state is spelled out, and the third test here
- * is the only check that a real drop reaches the real panel.
+ * The panel also answers for the mark. When the connection light recedes, the
+ * menu is where the state is spelled out. The third test here is the only check
+ * that a real drop reaches the real panel.
  *
  * Desktop-only by viewport: the mobile layout has no `.desktop-header` at all.
  */
@@ -65,62 +59,53 @@ test.describe('Lucidos menu from the desktop mark', () => {
     await toggle.click();
     await expect(menu).toBeVisible();
 
-    // The two unconditional rows. Refresh is the one the retired switcher owned,
-    // so it is the one most likely to go missing in a move like this.
+    // The two unconditional rows.
     for (const label of ['Workspaces', 'Refresh']) {
       await expect(menu.locator('.brand-menu-item', { hasText: label })).toHaveCount(1);
     }
 
     // ...and the three the row carries are NOT repeated here. The setup
-    // interview (labelled "Setup guide" on the row) is gated on a configured
-    // LLM provider, which is not a property of the workspace this suite boots,
-    // so its own control is not asserted above; the row must be absent either
-    // way, which is what makes it safe to check.
+    // interview (labelled "Setup guide" on the row) is gated on a configured LLM
+    // provider, so its own control is not asserted above. Its menu row must be
+    // absent either way, which is what makes this safe to check.
     for (const label of ['New thread', 'Search everywhere', 'Setup guide']) {
       await expect(menu.locator('.brand-menu-item', { hasText: label })).toHaveCount(0);
     }
 
-    // Workspaces names the workspace you are in, in all three of the shapes
-    // that row can take. THIS harness is the middle one, and knowing which is
-    // load-bearing: `scripts/lib/e2e.sh` runs the engine standalone and lets it
-    // serve `dist/` at `/` (there is no Vite dev server in an e2e run, whatever
-    // this comment used to say), so the page is a direct engine port. Its shell
-    // carries the gateway-port meta but base `/`, which means the picker is
-    // addressable absolutely while `/~/api/v1/control/*` would resolve to the
-    // engine and 404. So the row links out here; it becomes the in-app
-    // switcher only under `/<slug>/`, which this suite has no way to reach.
-    // The three-way derivation is left to `computeGatewayPickerHref`'s unit
-    // tests and the switcher's own body tests; this pins what must hold in
-    // EVERY shape, plus the link shape itself.
+    // Workspaces names the workspace you are in, in all three shapes that row
+    // can take. THIS harness is the middle one: `scripts/lib/e2e.sh` runs the
+    // engine standalone and serves `dist/` at `/`, so the page is a direct
+    // engine port. Its shell carries the gateway-port meta but base `/`, so the
+    // picker is addressable absolutely while `/~/api/v1/control/*` would resolve
+    // to the engine and 404. The row therefore links out here, becoming the
+    // in-app switcher only under `/<slug>/`, which this suite cannot reach.
+    // `computeGatewayPickerHref`'s unit tests own the three-way derivation; this
+    // pins what must hold in EVERY shape.
     const workspaces = menu.locator('.brand-menu-item', { hasText: 'Workspaces' });
     await expect(workspaces.locator('.brand-menu-value-name')).toHaveCount(1);
     await expect(workspaces.locator('.brand-menu-value-name')).not.toBeEmpty();
 
     // ...and it must be able to SPELL it. The panel is fixed-width, so the room
-    // the name gets is arithmetic: the row's glyph, the word "Workspaces", the
-    // gaps and the pill's own frame all come out of that width first, and what
-    // is left is rationed again by the pill's `max-width`. At 15rem the
-    // remainder held ~7 monospace characters, so a workspace called
-    // "development" rendered "develo…", which identifies nothing.
+    // the name gets is arithmetic: the glyph, the word "Workspaces", the gaps
+    // and the pill's frame take that width first, and the pill's `max-width`
+    // rations what is left. At 15rem the remainder held ~7 monospace
+    // characters, so "development" rendered "develo…".
     //
-    // The word is SPLICED IN rather than asserted on this suite's own workspace
+    // The word is SPLICED IN rather than read off this suite's own workspace
     // name: the property under test is the panel's width budget, not how long
-    // `e2e-test` happens to be, and renaming the workspace to prove it would
-    // couple a layout guard to the harness. Measured in the real font at the
-    // real root size, which is the half a static reading of the CSS cannot do.
+    // `e2e-test` happens to be. Measured in the real font at the real root size,
+    // which a static reading of the CSS cannot do.
     const spelled = await workspaces.locator('.brand-menu-value-name').evaluate((el: HTMLElement) => {
       const original = el.textContent;
       el.textContent = 'development';
-      // `clientWidth > 0` is not belt-and-braces: this span only HAS a box
-      // because the pill around it is `inline-flex`, and a bare inline box
-      // answers 0 to both metrics, so `scroll <= client` would read 0 <= 0 and
-      // pass while the name overflowed unclipped.
+      // `clientWidth > 0` is not belt-and-braces. This span only HAS a box
+      // because the pill around it is `inline-flex`. A bare inline box answers 0
+      // to both metrics, so `scroll <= client` would read 0 <= 0 and pass while
+      // the name overflowed unclipped.
       //
-      // A pixel of tolerance for the same reason the containment probe below
-      // takes one: both metrics are integers, so neither can express the
-      // sub-pixel rounding of a text run measured against a `calc`ed box. The
-      // budget leaves roughly two characters past this word, so a pixel cannot
-      // hide a truncation, which would be tens of pixels.
+      // A pixel of tolerance: both metrics are integers, so neither can express
+      // the sub-pixel rounding of a text run measured against a `calc`ed box. A
+      // truncation would be tens of pixels, so a pixel cannot hide one.
       const fits = el.clientWidth > 0 && el.scrollWidth - el.clientWidth <= 1;
       el.textContent = original;
       return fits;
@@ -130,8 +115,8 @@ test.describe('Lucidos menu from the desktop mark', () => {
     // The control plane is NOT reachable from this origin, so the row must not
     // offer the switcher: an expander here answers a tap with a 404 against
     // routes the engine does not serve. It links to the picker instead, which
-    // is also the menu's one <a> and therefore the one row that would otherwise
-    // wear the user agent's link underline.
+    // makes it the menu's one anchor and the one row a user agent would
+    // underline.
     await expect(workspaces).toHaveJSProperty('tagName', 'A');
     await expect(workspaces).toHaveAttribute('href', /\/~\/\?pick$/);
     await expect(workspaces.locator('.brand-menu-value-chevron')).toHaveCount(0);
@@ -142,8 +127,8 @@ test.describe('Lucidos menu from the desktop mark', () => {
     // pane, not on the window: a window-centred panel hangs over the content
     // pane and drifts further off the mark the narrower the split gets.
     // Measured against the header's own brand region, which spans exactly the
-    // pane the mark sits in (drawer edge to split divider), so the assertion
-    // holds with the thread drawer open as well as closed.
+    // pane the mark sits in. So the assertion holds with the thread drawer open
+    // as well as closed.
     const centres = await page.evaluate(() => {
       const mid = (el: Element): number => {
         const r = el.getBoundingClientRect();
@@ -173,20 +158,17 @@ test.describe('Lucidos menu from the desktop mark', () => {
   });
 
   test('says why the mark is dim, and stops saying it on reconnect', async ({ page }) => {
-    // The one check in this file that is not about the panel's contents but
-    // about the WIRING. Everything else the notice promises is pinned cheaply
-    // (`connection-notice.test.ts` over the pure row, `header-mark-geometry`
-    // over its dressing), and none of it proves that a real drop reaches the
-    // real panel.
+    // The one check in this file about the WIRING rather than the panel's
+    // contents. Everything else the notice promises is pinned cheaply:
+    // `connection-notice.test.ts` over the pure row, `header-mark-geometry` over
+    // its dressing. None of it proves a real drop reaches the real panel.
     //
-    // It runs in one project, which is the file's `-desktop` suffix doing its
-    // job (playwright.config.ts ignores those in both mobile projects) rather
-    // than anything this test asks for. Worth knowing here, because the cost is
-    // real and paying it three times would not be: the dot flips only after
-    // MAX_SUPPRESSED_FAILURES + 1 consecutive failed polls at 5s
-    // (store/actions/connection.ts, the tolerance that stops an iOS radio nap
-    // painting red), so this spends ~20s going down and ~10s coming back
-    // (MIN_RECONNECT_SUCCESSES) and cannot be hurried from outside.
+    // It runs in one project, the file's `-desktop` suffix keeping it out of
+    // both mobile ones (playwright.config.ts). The cost is why that matters: the
+    // dot flips only after MAX_SUPPRESSED_FAILURES + 1 consecutive failed polls
+    // at 5s (store/actions/connection.ts, the tolerance that stops an iOS radio
+    // nap painting red). So this spends ~20s going down and ~10s coming back,
+    // and cannot be hurried from outside.
     test.slow();
 
     await navigateToApp(page);
@@ -238,16 +220,14 @@ test.describe('Lucidos menu from the desktop mark', () => {
   });
 
   test('opening and closing the menu does not move the mark or the workspace name', async ({ page }) => {
-    // Reported against the packaged macOS build: clicking the mark "makes icon
-    // and ws name jump a little". Nothing about the menu is supposed to touch
-    // the row it hangs from, and both halves of the report move TOGETHER, which
-    // means their shared box re-laid out rather than the mark reacting on its
-    // own. So this pins the property directly.
+    // Nothing about the menu is supposed to touch the row it hangs from. The
+    // reported jump moved the mark and the workspace name TOGETHER, so their
+    // shared box re-laid out, not the mark alone.
     //
     // Run twice, the second time with what `titlebar_inset_script` stamps on
-    // that build: no CSS keys off Tauri itself, so the attribute plus the inset
-    // IS the packaged geometry (a 28px band above a correspondingly shorter
-    // header, with the leading controls raised into it).
+    // the packaged macOS build. No CSS keys off Tauri itself, so the attribute
+    // plus the inset IS that geometry: a 28px band above a shorter header, with
+    // the leading controls raised into it.
     await navigateToApp(page);
 
     const toggle = page.locator('.desktop-header [data-role="brand-menu-toggle"]');
@@ -317,20 +297,16 @@ test.describe('Lucidos menu from the desktop mark', () => {
     // in-flow child, the actions cluster. The brand label it centres is out of
     // flow and as tall as the taller of the chevrons and the mark's TAP TARGET.
     // Let the label grow past the region and it hangs out of a box whose
-    // `overflow-x: clip` beside `overflow-y: visible` the packaged macOS webview
-    // does not honour: there the clip behaves as a scroll container, so the
-    // overflow is not hidden but SCROLLABLE, and a click on the mark scrolls it
-    // away and back. That is the reported jump, and it takes the whole label
-    // with it, which is why the user sees the mark and both chevrons move
-    // together while the rest of the row stands still.
+    // `overflow-x: clip` beside `overflow-y: visible` the packaged webview does
+    // not honour. There the clip behaves as a scroll container. A click on the
+    // mark then scrolls the overflow away and back, taking the whole label with
+    // it.
     //
-    // Run at the shipped tap target and at a RETUNED one. Both matter: the
-    // shipped pair (2.25rem chevrons, 2.1rem mark) fits exactly, so a run at the
-    // default alone can never fail, and it is the retune that made this
-    // reproducible on one machine and nowhere else. `--header-mark-tap` is a
-    // style-remote tunable and the remote sets it by writing the property inline
-    // on <html> (see the header of styles/header-mark.css), so this is the real
-    // mechanism rather than a test-only hook.
+    // Run at the shipped tap target and at a RETUNED one. The shipped pair
+    // (2.25rem chevrons, 2.1rem mark) fits exactly, so a run at the default
+    // alone can never fail. `--header-mark-tap` is a style-remote tunable that
+    // the remote sets inline on <html> (see styles/header-mark.css), so this is
+    // the real mechanism, not a test-only hook.
     await navigateToApp(page);
 
     const toggle = page.locator('.desktop-header [data-role="brand-menu-toggle"]');

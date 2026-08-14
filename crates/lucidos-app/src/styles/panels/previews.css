@@ -108,6 +108,50 @@
     opacity: 1;
 }
 
+/* --- File preview chrome (the path row, and the column holding it) --- */
+
+/* Every file preview in the content pane is this column: the path row, then
+   whichever preview the locator picked (ContentPane.tsx).
+
+   `height: 100%` plus a `flex: 1` body reproduces the box the preview had as a
+   direct child of `.content-pane-body`. Both roots that land in it size
+   themselves against their parent (`.file-preview-inline` here and
+   `.repo-preview-split` in panels/content.css are each `height: 100%`), so
+   without the column each would be a whole path row TALLER than the pane and
+   would leave a second scrollbar around the one it already has. */
+.file-preview-frame {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.file-preview-frame-body {
+    flex: 1;
+    min-height: 0;
+}
+
+/* The one surface that shows the previewed file's WHOLE path (rationale for it
+   existing at all: FilePreviewPath.tsx). Structural chrome above a full-bleed
+   view, so it takes the content pane's own --space-lg gutter rather than the
+   preview's zero one. */
+.file-preview-path {
+    flex: 0 0 auto;
+    padding: var(--space-sm) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    /* A path carries no spaces, so ordinary wrapping finds no break opportunity
+       and one long segment would run out of the pane. `anywhere` breaks it
+       wherever it has to, which is the whole point of the row. */
+    overflow-wrap: anywhere;
+}
+
+.file-preview-path-name {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
 /* --- File preview inline (panel) --- */
 
 .file-preview-inline {
@@ -141,6 +185,7 @@
 
 .file-editor-toolbar {
     display: flex;
+    justify-content: flex-end;
     gap: 0.5rem;
     flex-shrink: 0;
 }
@@ -761,8 +806,18 @@
     word-break: break-word;
 }
 
+/* Holds EITHER the app's own manifest icon (user-authored, almost always an
+   emoji, which takes its size from the row's font) OR our `<AppsIcon/>` fallback
+   when the app declares none. The svg rule sizes only the latter. */
 .message-route-panel .route-app-icon {
     flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+}
+
+.message-route-panel .route-app-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
 }
 
 .message-route-panel .route-app-name {

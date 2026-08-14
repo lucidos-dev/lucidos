@@ -188,6 +188,11 @@ impl LucidosEngine {
         // degrade into a prose typed-reply menu. `forced` bounds it per response.
         let mut question_ask_failed_last_iter = false;
         let mut question_reask_forced = 0usize;
+        // Wake check: how many times this turn has been sent back for leaving
+        // todo work open with nothing that would re-open the thread. Bounded by
+        // `MAX_TODO_WAKE_NUDGE`, so a model that answers and still walks away
+        // finalizes normally.
+        let mut todo_wake_nudges_forced = 0usize;
         let mut cached_list_files: Option<String> = None;
         let mut modified_app_uis: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -848,6 +853,12 @@ impl LucidosEngine {
                 // Preserve the draft assistant text in history, append the
                 // coalesced injection as one user message, and continue so the
                 // agent answers the queued updates in this same turn.
+                // Whether the drafted answer is already in `messages` as
+                // assistant context. Read by the wake check below, which must
+                // not push it a second time: an injection group that drops
+                // every prompt as empty leaves `appended` false, so this block
+                // pushes the draft and then falls through instead of looping.
+                let mut draft_in_history = false;
                 let mut injected_prompts = Vec::new();
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
@@ -870,6 +881,7 @@ impl LucidosEngine {
                             role: "assistant".to_string(),
                             content: MessageContent::Text(answer),
                         });
+                        draft_in_history = true;
                     }
                     let appended = append_injected_prompts_to_messages(
                         &self.event_bus,
@@ -893,6 +905,77 @@ impl LucidosEngine {
                         }
                         continue;
                     }
+                }
+
+                // The WAKE CHECK. A turn about to end with open todo work and
+                // nothing to re-open the thread. Its closing paragraph very
+                // often promises to keep watching, with nothing behind it.
+                // Three prose guards already say so and have failed twice, so
+                // the engine asks once here instead. See ADR 0071 and
+                // `docs/plans/2026-08-13-a-turn-cannot-end-claiming-to-watch.md`.
+                //
+                // Position is load-bearing in three directions. AFTER the
+                // injection drain: a follow-up sent mid-turn re-opens the
+                // thread by itself, and nudging first would deny that. AFTER
+                // the re-ask guard, because a rejected question is a broken
+                // interaction that outranks a stale list. BEFORE the app
+                // refresh below, which is end-of-turn work a nudged turn has
+                // not reached.
+                //
+                // Two turns are skipped rather than nudged. One the user
+                // Stopped mid-call. The loop only checks the token at the top
+                // of a round, so a `continue` would spend the drafted answer to
+                // reach it. And one with no drafted prose: it makes no claim to
+                // correct, and the classifier below diagnoses it.
+                let wake_nudge = if cancel_token.is_cancelled() {
+                    None
+                } else {
+                    let (open, covered) = self.wake_check_facts(thread_id).await;
+                    should_nudge_unwatched_turn(open, covered, todo_wake_nudges_forced)
+                        .then(|| open.unwrap_or(0))
+                        // Lazily, so an ordinary turn does not pay `clean_response`
+                        // twice: this runs only once a nudge is otherwise due.
+                        .and_then(|open| {
+                            response
+                                .content
+                                .as_deref()
+                                .map(|c| self.clean_response(c))
+                                .filter(|c| !c.is_empty())
+                                .map(|draft| (open, draft))
+                        })
+                };
+                if let Some((open, draft)) = wake_nudge {
+                    todo_wake_nudges_forced += 1;
+                    // Same message handling as the re-ask path. The drafted
+                    // prose goes in as assistant context first, so the model
+                    // sees the claim in question, and so the alternation holds.
+                    // Unless the drain above already put it there.
+                    if !draft_in_history {
+                        messages.push(Message {
+                            role: "assistant".to_string(),
+                            content: MessageContent::Text(draft),
+                        });
+                    }
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(todo_wake_nudge_instruction(open)),
+                    });
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::LlmCallRetried {
+                                    reason: format!(
+                                        "{open} todo item(s) open and nothing would re-open this \
+                                         thread, asking before the turn ends"
+                                    ),
+                                },
+                                meta: crate::engine::thread_events::EventMeta::NONE,
+                            },
+                            "[AgenticLoop] LlmCallRetried (wake check)",
+                        )
+                        .await;
+                    continue;
                 }
 
                 // Refresh anything touched during the tool loop, once per app at
@@ -1386,8 +1469,8 @@ impl LucidosEngine {
                 // an unpaired `tool_use` is a provider 400 the moment anything
                 // else runs on the thread, and every mechanism that existed to
                 // keep one alive (detach-on-interruption, the attachment probe,
-                // two wake-anchor kinds, a restart guard) existed only to pay
-                // for it. A wake is now an ordinary new turn, so a subscribed
+                // two anchor kinds, a restart guard) existed only to pay for
+                // it. A delivery is now an ordinary new turn, so a subscribed
                 // thread is simply idle.
                 if tool_call.name == tn::AWAIT_EVENT {
                     let (result, success) = match self

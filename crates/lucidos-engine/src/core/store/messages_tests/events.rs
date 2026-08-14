@@ -48,9 +48,10 @@ fn events_include_thinking_step() {
     }
 }
 
-/// MemorySearched event creates a ResponseEvent::Step.
-#[test]
-fn events_include_memory_searched_step() {
+/// Build a one-turn session whose only pre-LLM step is a memory recall, under
+/// whichever raw `event_type` string the caller names. Shared by the canonical
+/// and legacy cases below so the two cannot drift apart.
+fn recall_turn_steps(event_type: &str, results: u64) -> Vec<(String, bool)> {
     let events = vec![
         make_event(
             "MessageReceived",
@@ -58,8 +59,8 @@ fn events_include_memory_searched_step() {
             0,
         ),
         make_event(
-            "MemorySearched",
-            json!({"results": 7, "queries": ["birthday", "date of birth"], "request_id": "s1"}),
+            event_type,
+            json!({"results": results, "queries": ["birthday", "date of birth"], "request_id": "s1"}),
             1,
         ),
         make_event(
@@ -79,15 +80,66 @@ fn events_include_memory_searched_step() {
         ),
     ];
     let msgs = build_session_messages(&events);
-    let assistant = &msgs[1];
-    let steps = step_events(&assistant.events);
+    step_events(&msgs[1].events)
+        .into_iter()
+        .map(|(desc, ok)| (desc.to_string(), ok))
+        .collect()
+}
+
+/// MemoryRecalled event creates a ResponseEvent::Step, labelled with the count.
+#[test]
+fn events_include_memory_recalled_step() {
+    let steps = recall_turn_steps("MemoryRecalled", 7);
     assert_eq!(
         steps.len(),
         2,
-        "Should have MemorySearched + Thinking steps"
+        "Should have MemoryRecalled + Thinking steps"
     );
-    assert_eq!(steps[0], ("Memory searched", true));
-    assert_eq!(steps[1], ("Requesting", true));
+    assert_eq!(steps[0], ("Recalled 7 memories".to_string(), true));
+    assert_eq!(steps[1], ("Requesting".to_string(), true));
+}
+
+/// The label is verb-first and never says "search": the `memory` tool's own
+/// step reads "Searching memory for ...", and the two used to be one word
+/// apart. Zero and one are their own phrasings rather than "Recalled 0
+/// memories" / "Recalled 1 memories".
+#[test]
+fn memory_recalled_label_covers_zero_one_and_many() {
+    assert_eq!(
+        recall_turn_steps("MemoryRecalled", 0)[0].0,
+        "No memories recalled"
+    );
+    assert_eq!(
+        recall_turn_steps("MemoryRecalled", 1)[0].0,
+        "Recalled 1 memory"
+    );
+    assert_eq!(
+        recall_turn_steps("MemoryRecalled", 12)[0].0,
+        "Recalled 12 memories"
+    );
+    for label in [
+        recall_turn_steps("MemoryRecalled", 0)[0].0.as_str(),
+        recall_turn_steps("MemoryRecalled", 4)[0].0.as_str(),
+    ] {
+        assert!(
+            !label.to_lowercase().contains("search"),
+            "recall label {label:?} must not mirror the memory tool's search step"
+        );
+    }
+}
+
+/// Rows persisted under the pre-rename `MemorySearched` string must produce the
+/// identical step. The alias on the variant cannot cover this path: these
+/// builders match the raw `event_type` column, not a deserialized variant.
+#[test]
+fn legacy_memory_searched_rows_render_as_a_recall_step() {
+    for results in [0, 1, 7] {
+        assert_eq!(
+            recall_turn_steps("MemorySearched", results),
+            recall_turn_steps("MemoryRecalled", results),
+            "a legacy MemorySearched row must render exactly like MemoryRecalled"
+        );
+    }
 }
 
 /// ToolResult populates detail on the preceding Step event.

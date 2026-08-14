@@ -60,7 +60,7 @@ describe('ChildCompletionRow', () => {
     vi.clearAllMocks();
   });
 
-  /** The callback shares ONE marker with the event wait, the event wake and the
+  /** The callback shares ONE marker with the event wait, the event delivery and the
    *  trigger fire: all four report that something happened outside this thread,
    *  and they used to say it in four dialects. This pins that it is the shared
    *  row rather than a card of its own again. */
@@ -116,7 +116,7 @@ describe('ChildCompletionRow', () => {
     expect(vnodeText(link)).toBe('Untitled thread');
   });
 
-  /** One fold, labelled by what it holds, the same as the wake's `Payload` and
+  /** One fold, labelled by what it holds, the same as the delivery's `Payload` and
    *  the trigger's `Prompt`. It was "Show summary", which is an instruction
    *  where the other two are nouns. */
   it('renders agent summary inside a collapsed <details> disclosure', () => {

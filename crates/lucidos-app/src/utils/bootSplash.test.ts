@@ -111,9 +111,8 @@ describe('bootSplash controller', () => {
 
   // The exit is choreographed (index.html): the status and the mark run their
   // own, SHORTER animations inside the veil's 0.65s one, and `animationend`
-  // bubbles. Acting on a child's event removed the splash at 57% veil opacity in
-  // a live probe, snapping the app in mid-fade. Only the splash's own fade ends
-  // the splash.
+  // bubbles. Acting on a child's event removes the splash mid-fade, so only the
+  // splash's own fade ends the splash.
   it('ignores an animationend bubbling up from a child of the splash', async () => {
     fake = installFakeSplash(true);
     const c = await freshController();
@@ -176,14 +175,14 @@ describe('bootSplash controller', () => {
     fake = installFakeSplash(true);
     const doc = (globalThis as any).document;
     // Boot script (index.html) paints the brand gradient on <html> to cover the
-    // iOS bottom safe-area strip; dismiss must revert it so no blue lingers
-    // behind the app's own safe-area inset — but only once the splash is gone.
+    // iOS bottom safe-area strip. Dismiss reverts it so no blue lingers behind
+    // the app's own safe-area inset, but only once the splash is gone.
     doc.documentElement.style.background =
       '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
     const c = await freshController();
     c.dismissBootSplash();
-    // Still painted through the `.boot-splash-leaving` fade — reverting now would
-    // flash the dark safe-area strip while the splash is still visible.
+    // Still painted through the `.boot-splash-leaving` fade: reverting now
+    // would flash the dark safe-area strip while the splash is visible.
     expect(doc.documentElement.style.background).not.toBe('');
     fake.fireAnimationEnd();
     // Reverted once the splash node is actually removed.
@@ -357,13 +356,12 @@ describe('index.html inline boot splash', () => {
 
   it('paints the brand gradient on both canvas layers so the iOS bottom safe-area strip is covered', () => {
     // A fixed `inset:0` .boot-splash does not reach the iOS standalone bottom
-    // safe-area strip, so the boot script must paint the brand gradient (base
-    // colour + fixed attachment) on <html> behind it. The body must carry the
-    // same paint: its light-theme inline background otherwise owns the uncovered
-    // strip and shows white despite the root paint.
-    // The <html> half lives in the shared boot script's host entry now (the
-    // shell's own piece of it, kept out of the contract every app iframe runs);
-    // the <body> half is still this document's.
+    // safe-area strip, so the boot script paints the brand gradient on <html>
+    // behind it. The body carries the same paint: its light-theme inline
+    // background otherwise owns the uncovered strip and shows white.
+    //
+    // The <html> half lives in the shared boot script's host entry, kept out of
+    // the contract every app iframe runs. The <body> half is this document's.
     expect(bootHostSrc).toMatch(
       /SPLASH_BACKGROUND\s*=\s*\n?\s*['"]#145eb9 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
     );
@@ -375,12 +373,11 @@ describe('index.html inline boot splash', () => {
 
   it('bases the canvas on the gradient colour AT the seam, not on its end stop', () => {
     // The base colour is the only thing iOS paints into the bottom strip, right
-    // up against the gradient. Pinning the exact value is the regression guard:
-    // #0a4ea8 (the gradient's 100% stop) shipped here and read as a darker band,
-    // because along the bottom edge the gradient has only travelled 0.62 (x=30%)
-    // to 0.84 (x=100%) of the way to it. Both figures are aspect-independent,
-    // since each radius is a percentage of its own axis, so one constant works
-    // on every device. #145eb9 is the gradient at progress 0.70.
+    // up against the gradient, so a value off the seam reads as a band. Along
+    // the bottom edge the gradient has travelled 0.62 (x=30%) to 0.84 (x=100%)
+    // of the way to its end stop. Both figures are aspect-independent, since
+    // each radius is a percentage of its own axis, so one constant works on
+    // every device. #145eb9 is the gradient at progress 0.70.
     const BASE = '#145eb9';
     const END_STOP = '#0a4ea8';
     const stops = ['#2d83e0', END_STOP];
@@ -678,11 +675,10 @@ describe('index.html inline boot splash', () => {
   });
 
   it('pins the splash geometry in px so it cannot ride the UI scale', () => {
-    // This document's <html> font-size is var(--user-ui-scale) (base.css, and
-    // 112.5% by default on mobile.css), so ANY rem length here resolves to a
-    // different pixel size than the same value on the gateway splash, which is
-    // an isolated document at the browser default. That is what made the mark
-    // grow and the status slide down at the cold-boot to workspace seam.
+    // This document's <html> font-size is var(--user-ui-scale). The gateway
+    // splash is an isolated document at the browser default. So ANY rem length
+    // here resolves differently across that seam, growing the mark and sliding
+    // the status as the user crosses it.
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*min\(46vmin,\s*240px\)/);
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*min\(46vmin,\s*240px\)/);
     expect(html).toMatch(/\.boot-splash\s*\{[^}]*gap:\s*24px/);
@@ -704,14 +700,12 @@ describe('index.html inline boot splash', () => {
   });
 
   // The gateway splash carries this stylesheet and NOTHING else: it renders
-  // when no engine is reachable, so it cannot link the bundle css the app shell
-  // gets. Any type property the shell sets from `body` and this block does not
-  // therefore differs BETWEEN the two surfaces, on a seam the user crosses
-  // mid-boot. Smoothing is the one that shipped that way: the gateway status
-  // rendered at the macOS default (subpixel-antialiased, visibly heavier) and
-  // the app document's grayscale, so the line changed weight on the same frame
-  // its text changed. Read the shell's own rule rather than restating its
-  // values, so editing base.css cannot silently reopen it.
+  // when no engine is reachable, so it cannot link the bundle css. A type
+  // property the shell sets from `body` and this block does not therefore
+  // differs between the two surfaces. That seam is one the user crosses
+  // mid-boot, and smoothing is the property that bites: the line changes
+  // weight on the same frame its text changes. Read the shell's own rule
+  // rather than restating its values, so editing base.css cannot reopen it.
   it('smooths the splash type exactly as the app shell does', () => {
     const baseCss = readFileSync(resolve(__dirname, '../styles/global/base.css'), 'utf-8');
     const shell = /^body \{([^}]*)\}/m.exec(baseCss)?.[1];
@@ -735,18 +729,17 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // Three inline scripts in this document derive the per-workspace key prefix by
-  // hand (the FOUC theme/font/scale reader, the quiet-cover flag, the boot
-  // watchdog's retry marker) because each runs before the app's storage override
-  // exists. They read keys the APP writes, so a copy that normalizes differently
-  // reads a key nobody wrote and fails silently. An absolute `<base href>` is the
-  // case that splits them: `basePath.ts` takes its pathname, a naive slash-strip
-  // does not. Count the guard instead of trusting three prose comments.
+  // Inline scripts in this document derive the per-workspace key prefix by
+  // hand, because each runs before the app's storage override exists. They read
+  // keys the APP writes, so a copy that normalizes differently reads a key
+  // nobody wrote and fails silently. An absolute `<base href>` is the case that
+  // splits them: `basePath.ts` takes its pathname, a naive slash-strip does
+  // not. Count the guard instead of trusting a prose comment.
   it('normalizes an absolute base href in every hand-rolled key derivation', () => {
-    // TWO, not three. The appearance boot script used to carry a third copy and
-    // now goes through the SDK's `_storage.ts`, which derives the slug once for
-    // the shell and every app iframe. These two remain because they run in this
-    // document before any module, for the picker and the boot splash.
+    // Two of them: the picker's and the boot splash's. Both run in this
+    // document before any module. The appearance boot script goes through the
+    // SDK's `_storage.ts`, which derives the slug once for the shell and every
+    // app iframe.
     const guards = html.match(/if\s*\(.*?\/\^https\?:\\\/\\\/\/i\.test\(/g) ?? [];
     expect(guards.length, 'one absolute-base guard per wsKey derivation').toBe(2);
     expect(html.match(/function wsKey\(/g)?.length).toBe(2);
@@ -1054,11 +1047,10 @@ describe('index.html inline boot splash', () => {
 
     // The one deep-link document that is NOT a continuation of a live session:
     // a tap on a stopped workspace, which the gateway lazy-starts while serving
-    // its own boot splash on this exact url (query intact, meta-refreshed). By
-    // the time this document loads the user has watched a fully built mark for
-    // seconds, and the handover script kept it standing. Quieting it there would
-    // `display: none` that mark and snap the gradient flat in one frame, the
-    // exact seam jump the handover was built to prevent.
+    // its own boot splash on this exact url. By the time this document loads
+    // the user has watched a fully built mark for seconds, and the handover
+    // script kept it standing. Quieting it there would `display: none` that
+    // mark and snap the gradient flat in one frame.
     it('stands down when the gateway handed over a mark that is already standing', () => {
       // Both triggers lose to the handover: a refresh during an engine restart
       // crosses the same gateway splash as a tap on a stopped workspace does.
@@ -1148,27 +1140,22 @@ describe('index.html inline boot splash', () => {
   });
 
   it('plays the mark reveal in the final doc but hides the mark in the picker', () => {
-    // The whole-mark reveal animation exists and is applied to the mark — the
-    // per-tile reveal (bs-tile / boot-tile-in) was dropped because iOS WebKit
-    // doesn't GPU-composite SVG sub-element transforms, so it janked at boot
-    // (see the index.html boot-splash comment). The mark builds up once…
+    // One whole-mark reveal, applied to the mark. A per-tile reveal is not an
+    // option: iOS WebKit does not GPU-composite SVG sub-element transforms, so
+    // it janks at boot.
     expect(html).toContain('@keyframes boot-mark-reveal');
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-reveal/);
-    // …and the picker (boot-splash-reload) hides the mark so the reveal happens
-    // only in the workspace document, set by the inline base-href check in the
-    // body script that adds the class. (The FOUC script detects the picker too,
-    // for its theme fallback, but off the NORMALIZED base path rather than the
-    // raw attribute; see the absolute-base-href test above.)
+    // The picker (boot-splash-reload) hides the mark, so the reveal happens
+    // only in the workspace document. The class comes from the inline
+    // base-href check in the body script.
     expect(html).toMatch(/\.boot-splash-reload\s+\.boot-splash-mark\s*\{[^}]*visibility:\s*hidden/);
     expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 
-  // THE EXIT IS TWO BEATS: the brand (status, then mark) leaves the stage while
-  // the gradient veil is still opaque, and only the veil is left dissolving over
-  // the app. A single uniform fade is what made the hand-off read as unsmooth:
-  // a 240px white mark and a line of status text ghosting over the app's own
-  // content for most of the fade, worst at the low opacities where the UI
-  // underneath is readable.
+  // THE EXIT IS TWO BEATS. The brand (status, then mark) leaves the stage while
+  // the gradient veil is still opaque, and only the veil is left dissolving
+  // over the app. A single uniform fade reads as unsmooth: the mark and the
+  // status ghost over the app's own content for most of the fade.
   describe('leaving choreography', () => {
     it('lets the status and the mark leave inside the veil fade', () => {
       const veil = /\.boot-splash-leaving\s*\{[^}]*animation:\s*boot-splash-out\s+([\d.]+)s/.exec(html);
@@ -1185,14 +1172,13 @@ describe('index.html inline boot splash', () => {
       expect(parseFloat(status![1]) * 1000).toBeLessThan(veilMs);
     });
 
-    // The exit is APPENDED to the mark's animation list, and the entries ahead of
-    // it are restated verbatim, so the reveal keeps its start time (an animation
-    // is matched by name and position) and the exit's implicit `from` composites
-    // over the breathe. Declaring the shorthand with the exit alone would drop
-    // the breathe and start from the base opacity 1, jumping the mark up to 16%
-    // brighter on whichever frame dismissal lands in. The two states carry two
-    // different lists: a formed mark (the gateway handover) never played a
-    // reveal, and putting one back into its list would rebuild it mid-exit.
+    // The exit is APPENDED to the mark's animation list, with the entries ahead
+    // of it restated verbatim. An animation is matched by name and position, so
+    // the reveal keeps its start time and the exit's implicit `from` composites
+    // over the breathe. Declaring the shorthand with the exit alone drops the
+    // breathe and starts from opacity 1, jumping the mark brighter on whichever
+    // frame dismissal lands in. The two states carry different lists: a formed
+    // mark never played a reveal, and putting one back rebuilds it mid-exit.
     it('appends the exit to each mark state list instead of replacing it', () => {
       const leaving = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{([^}]*)\}/.exec(html)?.[1];
       expect(leaving).toBeTruthy();

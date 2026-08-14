@@ -133,7 +133,7 @@ impl LucidosEngine {
 
     /// Stamp `actor` on `meta` when an aborted-by-the-host terminal fires and no
     /// actor has been set already. Lets the AbortPanel attribute the abort:
-    /// '⚙ System' for a process-killed one, the device for a user-initiated
+    /// 'System' for a process-killed one, the device for a user-initiated
     /// *Switch to new version*, and neither for engine-deliberate work like a
     /// hardening retrigger, which sets its own actor upstream.
     ///
@@ -312,7 +312,7 @@ impl LucidosEngine {
         // what lets a session registered after `shutdown_agent_sessions` took
         // its flag pass still read "Paused by restart" and still auto-resume. No
         // stashed actor (a bare stop.sh, an external SIGUSR1) falls back to
-        // System, and the AbortPanel reads ⚙ System. User-driven Canceled
+        // System, and the AbortPanel reads System. User-driven Canceled
         // inherits the existing meta.
         let mut emit_meta = meta.clone();
         Self::stamp_host_actor_if_aborted(

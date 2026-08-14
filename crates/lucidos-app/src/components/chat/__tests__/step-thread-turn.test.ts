@@ -12,6 +12,7 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
 
 import {
   stepThreadTurn,
+  makeScrollObservers,
   setActiveScrollElement,
   awayFromBottom,
   followingLiveEdge,
@@ -212,6 +213,30 @@ describe('stepThreadTurn and the standing follow', () => {
     stepThreadTurn(-1);
 
     expect(awayFromBottom.value).toBe(true);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('and LEAVES the reader on the turn once the step\'s own scroll event lands', () => {
+    // Keeping the ride is only half of what an idle step promises: the reader
+    // has to still be ON the turn afterwards. The case above asserts the flag
+    // and attaches no observers, so it never delivers the scroll event a
+    // `scrollTop` write fires a frame later, and that event is where the
+    // platform-scroll correction runs. A step is unstamped (it writes through
+    // `markNavigationScroll`, not `markHeldScroll`) and a chord is deliberately
+    // not a gesture, so the correction read it as the platform and wrote the
+    // reader straight back to the bottom: ⌘↑ landed and undid itself, toggle
+    // still lit. Caught by /harden on 2026-08-13, before it shipped.
+    const el = ridingLongThread();
+    const { onScroll } = makeScrollObservers(el);
+    onScroll();                 // the arm's own event, recording them on the edge
+    setThreadLive(false);
+
+    stepThreadTurn(-1);
+    const landed = el.scrollTop;
+    expect(landed).toBeLessThan(1500);
+    onScroll();                 // the step's trailing scroll event
+
+    expect(el.scrollTop).toBe(landed);
     expect(followingLiveEdge.value).toBe(true);
   });
 });

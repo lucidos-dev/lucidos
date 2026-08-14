@@ -30,12 +30,11 @@ use crate::engine::agent_session::resume::{
 };
 use crate::engine::agent_session::spawn::spawn_or_resume;
 
-/// Decrement the paired-tool counter, flooring at 0. An unpaired decrement
-/// going negative would permanently disarm the hang watchdog —
-/// `watchdog_gate` reads `tools_in_flight > 0` and would never gate-skip
-/// again — so every decrement site (the ToolResult arm and the
-/// permission-bridge waiter task) shares this one contract. `Relaxed`
-/// matches the increments: the only reader tolerates one-tick staleness.
+/// Decrement the paired-tool counter, flooring at 0. An unpaired decrement going
+/// negative would permanently disarm the hang watchdog, since `watchdog_gate`
+/// reads `tools_in_flight > 0` and would never gate-skip again. So every
+/// decrement site shares this one contract. `Relaxed` matches the increments:
+/// the only reader tolerates one-tick staleness.
 fn release_tool_slot(tools_in_flight: &std::sync::atomic::AtomicI32) {
     let prev = tools_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if prev <= 0 {
@@ -46,35 +45,31 @@ fn release_tool_slot(tools_in_flight: &std::sync::atomic::AtomicI32) {
 /// Is a `Result` whose turn streamed no assistant text carrying the agent's own
 /// prose, worth emitting as `CodingAgentTextStreamed`?
 ///
-/// Yes for the case that branch exists for: a slash command (`/model`) answers
-/// through `result.result` with no preceding Message. No when the text IS the
-/// turn's failure reason, because that string is about to be emitted as
-/// `ResponseFailed` and the transcript renders it in the failure card. Printing
-/// it as a paragraph too states one failure twice.
+/// Yes for the case that branch exists for: a slash command answers through
+/// `result.result` with no preceding Message. No when the text IS the turn's
+/// failure reason. That string is about to be emitted as `ResponseFailed`, and
+/// the failure card renders it. Printing it as a paragraph too states one
+/// failure twice.
 ///
 /// Deliberately an equality check rather than an `API Error` prefix test: it can
-/// only ever drop text the card is already showing verbatim, so no shape of
-/// genuine model prose is at risk. A failure whose reason was derived from
-/// somewhere else (CC's `errors[]`, a subtype label) leaves the text alone and
-/// falls through to the frontend's own echo drop.
+/// only ever drop text the card is already showing verbatim, so no genuine model
+/// prose is at risk. A failure whose reason came from elsewhere leaves the text
+/// alone and falls through to the frontend's own echo drop.
 fn result_text_is_own_prose(text: &str, cc_error: Option<&str>) -> bool {
     let text = text.trim();
     !text.is_empty() && cc_error.map(str::trim) != Some(text)
 }
 
 /// The coding-agent driver dropped its input receiver before the engine could
-/// send the first prompt — which only happens when the driver task already
-/// wound down (the agent process failed to start, exited immediately, or its
-/// handshake failed). In every such path the driver flushes its REAL cause onto
-/// `events_rx` first — a `Result { error }` (Codex spawn / handshake failure, a
-/// CC `error_during_execution` line) or, when the process simply died, an
-/// `Exited { killed_by_signal }`. Recover it so the thread surfaces an
-/// actionable reason instead of the old bare "input channel closed", which
-/// named neither what failed nor why.
+/// send the first prompt. That happens only when the driver task already wound
+/// down: the agent process failed to start, exited immediately, or its handshake
+/// failed. In every such path the driver flushes its REAL cause onto `events_rx`
+/// first, as a `Result { error }` or an `Exited { killed_by_signal }`. Recover
+/// it, so the thread surfaces an actionable reason.
 ///
-/// Non-blocking on purpose: by the time the receiver-drop is observed the driver
-/// has returned, so every event it will ever emit is already buffered in the
-/// unbounded channel — `try_recv` drains the full tail without awaiting.
+/// Non-blocking on purpose. By the time the receiver-drop is observed the driver
+/// has returned, so every event it will ever emit is already buffered.
+/// `try_recv` drains the tail without awaiting.
 fn drain_startup_failure_reason(
     events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
 ) -> Option<String> {
@@ -82,7 +77,7 @@ fn drain_startup_failure_reason(
     let mut killed_by_signal = false;
     while let Ok(ev) = events_rx.try_recv() {
         match ev {
-            // Last non-empty error wins — the driver emits the specific cause
+            // Last non-empty error wins: the driver emits the specific cause
             // before the terminal Exited.
             AgentEvent::Result { error: Some(e), .. } if !e.trim().is_empty() => {
                 reason = Some(e);
@@ -103,18 +98,16 @@ fn drain_startup_failure_reason(
 /// resolved and the spawn isn't an app spawn.
 ///
 /// `dev_root` comes from [`main_worktree`], which falls back to the process cwd
-/// when there is no source checkout — on a packaged install that is the
+/// when there is no source checkout. On a packaged install that is the
 /// **workspace** directory, itself a git repo. Returning it there would branch
-/// the user's workspace git and label it platform source: exactly the silent
-/// mis-rooting that let a packaged install report "Claude Code session started"
-/// for a request to change Lucidos itself.
+/// the user's workspace git and label it platform source.
 ///
-/// So the fallback survives only for its real case — a dev build whose registry
-/// row hasn't been written yet (very early startup) — and is a hard refusal
-/// otherwise. Backstops every caller; the `run_coding_agent` tool refuses the
-/// same case earlier so the model sees it in-turn.
+/// So the fallback survives only for its real case, a dev build whose registry
+/// row has not been written yet. Everything else is a hard refusal. It backstops
+/// every caller; the `run_coding_agent` tool refuses the same case earlier, so
+/// the model sees it in-turn.
 ///
-/// Pure over `has_lucidos_source` so both branches are testable without a
+/// Pure over `has_lucidos_source`, so both branches are testable without a
 /// packaged binary. See `docs/plans/2026-07-29-no-lucidos-source-agent-context.md`.
 fn unregistered_lucidos_root(
     dev_root: PathBuf,
@@ -128,11 +121,10 @@ fn unregistered_lucidos_root(
 
 impl LucidosEngine {
     /// Flush any reasoning accumulated in `buf` past `last_len` as a
-    /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent (emits only
-    /// the new tail; no-op when nothing new). Coalesces CC's per-token
-    /// `thinking_delta`s — and Codex's reasoning deltas — into a handful of rows
-    /// per turn, mirroring the assistant-text flush path. The buffer is sliced on
-    /// a char boundary so multi-byte reasoning never panics.
+    /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent: it emits
+    /// only the new tail. Coalesces per-token reasoning deltas into a handful of
+    /// rows per turn, mirroring the assistant-text flush path. The buffer is
+    /// sliced on a char boundary, so multi-byte reasoning never panics.
     async fn flush_coding_agent_thought(
         &self,
         thread_id: Uuid,
@@ -164,9 +156,8 @@ impl LucidosEngine {
         *last_len = buf.len();
     }
 
-    // Bridges every per-session input (thread / user msg / images / origin /
-    // cancel / recovery / repo / prompt / resume / CC model+effort + worktree)
-    // to the agent runtime; a builder would just shuffle the same fields.
+    // Bridges every per-session input to the agent runtime; a builder would
+    // just shuffle the same fields.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_direct_agent(
         &self,
@@ -186,11 +177,10 @@ impl LucidosEngine {
         cc_reasoning_effort: Option<String>,
         // CWD for `--resume`. See the `UserQuestionAsked.worktree_path` doc.
         resume_worktree_path: Option<PathBuf>,
-        // Backend requested by the caller (chat API / spawn tool). Only
-        // honored for a thread's FIRST session — afterwards the stored
-        // `thread_summaries.coding_agent` wins so a thread can never flip
-        // backends mid-conversation (the new backend has no session to
-        // resume and would silently lose all context).
+        // Backend requested by the caller. Only honored for a thread's FIRST
+        // session; afterwards the stored `thread_summaries.coding_agent` wins,
+        // so a thread can never flip backends mid-conversation. The new backend
+        // would have no session to resume and would lose all context.
         requested_coding_agent: Option<CodingAgent>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         let cc_start = std::time::Instant::now();
@@ -230,13 +220,12 @@ impl LucidosEngine {
             )
             .await;
 
-        // Pre-spawn app-coding-agent-thread detection: `spawn_agent_thread`
-        // stashes the app id here when the LLM picks `folder=data/apps/<id>`;
-        // pop it once so the worktree dispatcher routes to sparse-checkout
-        // and the system-prompt selector picks the app variant. Falls back
-        // to thread_summaries on resume, so a follow-up message on an
-        // existing app thread still routes correctly after the pending
-        // stash was cleared by the initial spawn.
+        // Pre-spawn app-coding-agent-thread detection. `spawn_agent_thread`
+        // stashes the app id here when the LLM picks an app folder. Pop it once,
+        // so the worktree dispatcher routes to sparse-checkout and the
+        // system-prompt selector picks the app variant. Falls back to
+        // `thread_summaries` on resume, so a follow-up on an existing app thread
+        // still routes correctly.
         let app_spawn_id: Option<String> = {
             let mut guard = self
                 .pending_app_spawn
@@ -247,11 +236,8 @@ impl LucidosEngine {
         let app_spawn_id = if app_spawn_id.is_some() {
             app_spawn_id
         } else {
-            // Resume path — read from thread_summaries. Require kind == 'app';
-            // when folder is missing (early row, projection lag, partial
-            // replay) fall back to the worktree path on disk so a follow-up
-            // turn still routes through the sparse-checkout dispatch instead
-            // of silently re-spawning as a Lucidos-source thread.
+            // Resume path: read from `thread_summaries` and require kind 'app'.
+            // A NULL folder is refused below rather than reconstructed.
             match sqlx::query_as::<_, (Option<String>, Option<String>)>(
                 "SELECT coding_agent_kind, coding_agent_folder FROM thread_summaries WHERE thread_id = $1",
             )
@@ -266,11 +252,9 @@ impl LucidosEngine {
                             .and_then(|s| s.to_str())
                             .map(str::to_string)
                     } else {
-                        // Folder is NULL but kind is 'app'. Probe disk for
-                        // the worktree's `data/apps/<id>/` so we can recover
-                        // the app id. Worst case (no worktree on disk yet),
-                        // return a placeholder so the dispatcher errors
-                        // cleanly instead of silently using the wrong path.
+                        // Folder is NULL but kind is 'app'. Reconstructing the
+                        // id from disk would race the projection, so refuse and
+                        // let the caller retry once the row settles.
                         log!(
                             "[AgentSession] thread {} has coding_agent_kind='app' but NULL folder — \
                              folder reconstruction would race the projection; refusing to spawn",
@@ -290,9 +274,9 @@ impl LucidosEngine {
         let is_app_spawn = app_spawn_id.is_some();
 
         // Mutable so the interrupt arm can stamp `meta.actor` with the device
-        // that clicked Cancel — the terminal `ResponseCanceled` then carries it
-        // for the Initiator popover's Device row. Cleared at the next turn
-        // boundary so a resumed session doesn't inherit a stale actor.
+        // that clicked Cancel. The terminal `ResponseCanceled` then carries it
+        // for the Initiator popover. Cleared at the next turn boundary, so a
+        // resumed session does not inherit a stale actor.
         let mut meta = crate::engine::thread_events::EventMeta {
             request_event_id: Some(origin_id),
             channel: Some(EventChannel::ClaudeCode),
@@ -300,30 +284,28 @@ impl LucidosEngine {
         };
 
         // Check if already running for this thread (single lock to avoid TOCTOU).
-        // Skip for recovery sessions — the old session stays in agent_sessions
-        // during the handoff so the thread remains in the "active" set. This session
-        // will replace it via insert().
+        // Skip for recovery sessions: the old session stays in `agent_sessions`
+        // during the handoff, so the thread remains in the active set, and this
+        // session replaces it via `insert`.
         let mut had_dead_session = false;
         if recovery_worktree.is_none() {
             let guard = self.agent_sessions.lock().await;
             if let Some(session) = guard.get(&thread_id) {
                 // `is_live`, not `!process_exited`: a run future that was
-                // dropped instead of completed leaves the entry behind with
-                // that flag still false. Refusing the resume on a phantom is
-                // what wedged thread 293f96d5 on 2026-07-28 — every follow-up
-                // came back "A coding agent is already running for this
-                // thread" with no subprocess anywhere on the box.
+                // dropped instead of completed leaves the entry behind with that
+                // flag still false. Refusing the resume on a phantom wedges the
+                // thread, answering every follow-up "a coding agent is already
+                // running" with no subprocess anywhere.
                 if session.is_live() {
                     if session.is_waiting {
-                        // Session is idle — route follow-up via msg_tx. The caller
-                        // already emitted MessageReceived with the frontend UUID.
+                        // Session is idle, so route the follow-up via `msg_tx`.
+                        // The caller already emitted `MessageReceived`.
                         log!("[AgentSession] Session already running and idle — routing follow-up via msg_tx");
                         let images = user_images.map(|imgs| imgs.to_vec());
-                        // No counter to bump here: the message becomes visible to the
-                        // idle decision the moment it is in the channel (that decision
-                        // reads `msg_rx` under this same lock), and the run loop counts
-                        // it against `inputs_awaiting_result` when it forwards it to the
-                        // driver. Nothing to roll back on a failed send either.
+                        // No counter to bump here. The idle decision reads
+                        // `msg_rx` under this same lock, so the message is
+                        // visible the moment it is in the channel. The run loop
+                        // counts it when it forwards it to the driver.
                         if session
                             .msg_tx
                             .send(AgentUserInput {
@@ -382,11 +364,11 @@ impl LucidosEngine {
             spawns.insert(thread_id, std::time::Instant::now());
         }
 
-        // The thread's pinned account — the config dir of its FIRST session.
-        // Computed once here and injected on EVERY spawn below (see
-        // `inject_config_dir`) so a live `CLAUDE_CONFIG_DIR` toggle can never move
-        // an existing thread to another provider; it also scopes the auto-detected
-        // resume session id to this account.
+        // The thread's pinned account: the config dir of its FIRST session.
+        // Computed once here and injected on EVERY spawn below, so a live
+        // `CLAUDE_CONFIG_DIR` toggle can never move an existing thread to
+        // another provider. It also scopes the auto-detected resume session id
+        // to this account.
         let pinned_config_dir =
             crate::engine::agent_session::lookup_pinned_cc_config_dir(self.pool(), thread_id).await;
         let (resume_session_id, resume_branch) =
@@ -457,9 +439,8 @@ impl LucidosEngine {
 
         let (repo_id, repo_root, is_external_repo, external_repo_name, repo_name) = if is_app_spawn
         {
-            // App coding-agent thread: the worktree's git root is the
-            // workspace itself, not any registered repo. Skip the repo
-            // lookup entirely — apps aren't in the repo registry.
+            // App coding-agent thread: the worktree's git root is the workspace
+            // itself, and apps are not in the repo registry.
             (None, self.workspace_path.clone(), false, None, None)
         } else if let Some(repo) = repo {
             let path = PathBuf::from(&repo.path);
@@ -477,7 +458,7 @@ impl LucidosEngine {
                 Some(repo_name),
             )
         } else {
-            // No repo resolved and not an app spawn — i.e. "edit Lucidos
+            // No repo resolved and not an app spawn, so this is "edit Lucidos
             // itself". Only legitimate when a source checkout exists.
             (
                 None,
@@ -528,13 +509,12 @@ impl LucidosEngine {
             .await?;
 
         // Anchor for idle-time branch adoption: where this session's worktree
-        // sat BEFORE the agent ran. `last_idle_sha` (the previous idle's HEAD)
-        // is the stronger anchor because it already contains the thread's
-        // commits, but it is `None` on a first turn, which is exactly the
-        // single-turn session that renames its own branch and can never
-        // recover. Reading HEAD here costs one `rev-parse` per session and
-        // gives that case an anchor; `try_adopt_branch_at_idle` carries the
-        // second gate that makes the weaker anchor safe.
+        // sat BEFORE the agent ran. The previous idle's HEAD is the stronger
+        // anchor, because it already contains the thread's commits. But it is
+        // `None` on a first turn, which is exactly the single-turn session that
+        // renames its own branch and can never recover. Reading HEAD here costs
+        // one `rev-parse` and gives that case an anchor.
+        // `try_adopt_branch_at_idle` carries the gate that makes it safe.
         let adoption_anchor_sha = match worktree_path.as_deref() {
             Some(wt) => crate::engine::agent_session::external_edits::git_head_sha(wt)
                 .await
@@ -614,15 +594,15 @@ impl LucidosEngine {
             .or(prev_effort)
             .or(event_effort)
             .or_else(|| {
-                // The Claude Code settings files are a CC-only fallback —
-                // their effort vocabulary must not leak into other backends.
+                // The Claude Code settings files are a CC-only fallback: their
+                // effort vocabulary must not leak into other backends.
                 (coding_agent == CodingAgent::ClaudeCode)
                     .then(crate::runtime::claude_code::read_cc_default_effort)
                     .flatten()
             });
 
-        // Acquire startup semaphore — limits concurrent CC process initializations.
-        // Hold the permit until Init event is received (process is initialized and mostly idle).
+        // The startup semaphore limits concurrent process initializations. Hold
+        // the permit until Init, when the process is up and mostly idle.
         let startup_permit = self
             .cc_startup_semaphore
             .clone()
@@ -655,27 +635,23 @@ impl LucidosEngine {
         // A CC session's transcript lives at
         // `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the thread is PINNED
         // to the account of its FIRST session (`pinned_config_dir`, resolved above).
-        //   * `inject_config_dir` — the engine-owned override, injected on EVERY
-        //     spawn of an existing thread (resume, fresh, Tier-3 merge,
-        //     post-stale-resume retry, recovery). This is what guarantees a thread
-        //     never switches provider after turn 1: a live `CLAUDE_CONFIG_DIR`
-        //     toggle change is ignored for any thread that already has a pin.
-        //     `None` ONLY for the truly-first turn (no pin yet) — that spawn reads
-        //     the live env and thereby establishes the pin. Injecting on resume
-        //     also keeps `--resume` pointed at the dir CC wrote the transcript to
-        //     (the dev/bf997e21 "No conversation found" fix).
-        //   * `effective_config_dir` — the dir CC ACTUALLY runs under this spawn
-        //     (the injected pin, else the user's live value on turn 1, else CC's
-        //     default `$HOME/.claude`). Recorded at Init so the pin persists —
-        //     including the unset→set case (turn 1 on the default, user later set a
-        //     dir): the recorded default is re-injected on every later spawn.
+        //   * `inject_config_dir` is the engine-owned override, injected on EVERY
+        //     spawn of an existing thread. That is what guarantees a thread never
+        //     switches provider after turn 1: a live `CLAUDE_CONFIG_DIR` toggle is
+        //     ignored for any thread that already has a pin. It is `None` only for
+        //     the truly-first turn, which reads the live env and sets the pin.
+        //     Injecting on resume also keeps `--resume` pointed at the dir CC
+        //     wrote the transcript to.
+        //   * `effective_config_dir` is the dir CC ACTUALLY runs under this spawn:
+        //     the injected pin, else the user's live value on turn 1, else CC's
+        //     default. Recorded at Init so the pin persists, including the case
+        //     where turn 1 ran on the default and the user set a dir later.
         let inject_config_dir = pinned_config_dir.clone();
         let effective_config_dir = inject_config_dir.clone().or_else(|| {
-            // Match CC's actual precedence for a fresh session so the recorded dir
-            // never diverges from where CC writes the transcript: the user-managed
-            // env var (DB table — `apply_lucidos_env` sets it over the inherited
-            // env) wins, then the engine's own inherited process env (a shell that
-            // exported CLAUDE_CONFIG_DIR without a DB row), then CC's default.
+            // Match CC's precedence for a fresh session, so the recorded dir
+            // never diverges from where CC writes the transcript. The
+            // user-managed env var wins, then the engine's own inherited process
+            // env, then CC's default.
             user_env_vars
                 .iter()
                 .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
@@ -687,10 +663,10 @@ impl LucidosEngine {
                 })
                 .or_else(default_claude_config_dir)
         });
-        // User-configured agent binary path (Settings → Coding Agents).
-        // Resolved here — the spawn orchestration has the pool — and validated
-        // inside the runtime's spawn, which fails loud naming the setting on a
-        // path that doesn't resolve (never a silent fallback to probing).
+        // User-configured agent binary path. Resolved here, where the spawn
+        // orchestration has the pool, and validated inside the runtime's spawn.
+        // An unresolvable path fails loud and names the setting, rather than
+        // falling back to probing.
         let binary_override_key = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
             crate::runtime::CodingAgent::Codex => crate::core::PREF_CODING_AGENT_CODEX_PATH,
@@ -742,11 +718,10 @@ impl LucidosEngine {
         {
             Ok(r) => r,
             Err(e) => {
-                // Remove ONLY what this attempt created. The old shape ran
-                // both git calls unconditionally under `let _ =` — a failed
-                // RESUME force-removed the pre-existing worktree and
-                // force-deleted the branch holding the thread's committed
-                // work, silently.
+                // Remove ONLY what this attempt created. Running both git calls
+                // unconditionally lets a failed RESUME force-remove the
+                // pre-existing worktree and delete the branch holding the
+                // thread's committed work.
                 crate::engine::git_ops::cleanup_failed_spawn(
                     &repo_root,
                     worktree_path.as_deref(),
@@ -770,17 +745,16 @@ impl LucidosEngine {
             control_tx: agent_control_tx,
             kind: _,
             // In-band approval requests (Codex app-server). `None` for CC and
-            // the Codex exec escape hatch — the matching select arm below then
+            // the Codex exec escape hatch, where the matching select arm below
             // pends forever. Mutable so a closed channel can disable the arm.
             permission_rx: mut agent_permission_rx,
         } = runtime;
 
-        // Skip empty messages (warm-up resumes) to avoid triggering unwanted LLM output.
-        // AskUserQuestion answers are sent as plain user messages, not `tool_result`
-        // blocks: `claude --print --resume` of an unfinished tool_use auto-injects
-        // synthetic `Continue from where you left off.` / `No response requested.`
-        // BEFORE processing stdin, orphaning any `tool_result` we'd send for the
-        // original tool_use_id and making the LLM re-ask the same question.
+        // Skip empty messages (warm-up resumes) to avoid unwanted LLM output.
+        // AskUserQuestion answers are sent as plain user messages, never
+        // `tool_result` blocks. Resuming an unfinished tool_use auto-injects a
+        // synthetic pair BEFORE processing stdin. That would orphan any
+        // `tool_result` we sent, and the LLM would re-ask the same question.
         let has_user_images = user_images.is_some_and(|imgs| !imgs.is_empty());
         let has_content = !user_message.is_empty() || has_user_images;
         if has_content {
@@ -834,9 +808,9 @@ impl LucidosEngine {
                     branch_created,
                 )
                 .await;
-                // The driver already wound down (its input receiver is gone),
-                // so recover the real cause it flushed onto events_rx rather
-                // than reporting a bare "channel closed" that hides what failed.
+                // The driver already wound down, so recover the real cause it
+                // flushed onto `events_rx`. A bare "channel closed" hides what
+                // actually failed.
                 let cause = drain_startup_failure_reason(&mut events_rx);
                 return Err(match cause {
                     Some(c) => format!(
@@ -914,7 +888,7 @@ impl LucidosEngine {
                 tools_in_flight: tools_in_flight_shared.clone(),
                 coding_agent,
                 // Clone so the external watchdog can cancel from outside this
-                // loop — the in-loop paths use the original `agent_cancel`.
+                // loop; the in-loop paths use the original `agent_cancel`.
                 agent_cancel: agent_cancel.clone(),
             };
             sessions.insert(thread_id, session);
@@ -923,10 +897,8 @@ impl LucidosEngine {
         // From here on the entry is owned by this run. The guard is the
         // cancellation backstop: every *completion* path removes the entry
         // itself, but a dropped future runs none of them and would leave a
-        // phantom that wedges the thread (see `entry_guard`). Declared after
-        // `msg_rx` so it drops first — irrelevant for correctness (identity is
-        // the channel, not liveness) but it keeps the reap ordered ahead of the
-        // channel close.
+        // phantom that wedges the thread. Declared after `msg_rx` so it drops
+        // first, which keeps the reap ordered ahead of the channel close.
         let _entry_guard = super::entry_guard::SessionEntryGuard::new(
             self.agent_sessions.clone(),
             thread_id,
@@ -989,23 +961,17 @@ impl LucidosEngine {
         }
 
         // Seed `coding_agent_has_diff` from the actual worktree state. The
-        // projection's per-event handlers maintain this column for live
-        // updates (ChangeProposed/Applied/Discarded/Archived) but cannot fill
-        // in the gap between session start and the first new commit — a CC
-        // thread resumed after engine restart would show no Diff button until
-        // its next commit, even when commits already exist on the branch.
-        // Outside the projection tx by design: `git diff` inside a
-        // Postgres tx is the wrong shape. The helper logs and continues on
-        // failure — bootstrap must not block on git or the projection write.
-        // It writes the same git-truth the Diff button computes
-        // (`branch_changed_files`), so the button's visibility and its rendered
-        // diff stay in lockstep; the recovery sweep / next commit hook also
-        // reconcile it.
+        // projection's per-event handlers keep this column live, but cannot fill
+        // the gap between session start and the first new commit. A thread
+        // resumed after an engine restart would show no Diff button until its
+        // next commit, even with commits already on the branch.
         //
-        // Seeds for both initial-start (SessionStarted, via the chat HTTP
-        // handler → `run_direct_agent`) and resume (ContinuationStarted, via
-        // `SpawnConsumer::Continue` → `run_direct_agent`) — both paths land
-        // here.
+        // Outside the projection transaction by design: `git diff` inside a
+        // Postgres transaction is the wrong shape. The helper logs and continues
+        // on failure, because bootstrap must not block on git. It writes the
+        // same git truth the Diff button computes, so the button's visibility
+        // and its rendered diff stay in lockstep. Both the initial start and the
+        // resume path land here.
         crate::engine::session_seed::seed_coding_agent_has_diff(
             self.pool(),
             thread_id,
@@ -1027,9 +993,9 @@ impl LucidosEngine {
                         reasoning_effort: cc_reasoning_effort.clone(),
                         permission_mode: None,
                         coding_agent,
-                        // Fires before CC's Init — the session id isn't known
+                        // Fires before CC's Init, so the session id is not known
                         // yet. The Init handler emits a second SettingsChanged
-                        // carrying it AND the config dir (see below).
+                        // carrying it and the config dir.
                         cc_session_id: None,
                         claude_config_dir: None,
                     },
@@ -1046,45 +1012,39 @@ impl LucidosEngine {
         }
 
         let mut result_texts: Vec<String> = Vec::new();
-        // Count tool calls seen before the first `Result`. Feeds the
-        // stale-resume heuristic (`is_stale_resume_signal`): a resumed turn that
-        // made ANY tool call is alive and working — even when it produced no
-        // assistant text (terse models like Fable). The stale check only fires
-        // on the first Result (`result_texts.is_empty()`), so a session-scoped
-        // counter is exactly "tool calls before the first Result." Prevents the
-        // 2026-07-02 false stale-resume → duplicate-process bug.
+        // Count tool calls seen before the first `Result`. Feeds
+        // `is_stale_resume_signal`: a resumed turn that made ANY tool call is
+        // alive and working, even with no assistant text from a terse model. The
+        // stale check only fires on the first Result, so a session-scoped
+        // counter is exactly "tool calls before the first Result".
         let mut tool_calls_seen: u32 = 0;
-        // Count backend->model API calls seen before the first `Result`, read as
-        // `no_api_call_this_turn` by `is_resume_settle_result`. A `Usage` event is
-        // emitted per real API call and ONLY for one, which takes two guards in
-        // the parser: it drops all-zero usage frames, and a backend's
-        // `<synthetic>` message (the injected `Continue from where you left off.`
-        // / `No response requested.` pair, a drained task-notification) carries
-        // exactly that; and it reports a CC assistant message once, on its
-        // `message.id`, because CC splits one message into a frame per content
-        // block and repeats the same usage on each. So zero here is
-        // positive proof no model call happened, which is what separates "this
-        // Result closes the backend's own resume-settle turn" from "the model was
-        // asked our prompt and answered with nothing". Those two shapes are
-        // otherwise identical, and skipping the second would strand the turn until
-        // the inactivity watchdog fired. Session-scoped for the same reason
-        // `tool_calls_seen` is: the settle skip only fires on the first Result.
+        // Count backend-to-model API calls seen before the first `Result`, read
+        // as `no_api_call_this_turn` by `is_resume_settle_result`. A `Usage`
+        // event is emitted per real API call and ONLY for one, which takes two
+        // guards in the parser. It drops all-zero usage frames, which is what a
+        // synthetic message carries. And it reports a CC assistant message once
+        // on its `message.id`, because CC repeats the same usage per content
+        // block.
+        //
+        // So zero here is positive proof no model call happened. That separates
+        // "this Result closes the backend's own resume-settle turn" from "the
+        // model was asked our prompt and answered with nothing". The two shapes
+        // are otherwise identical, and skipping the second would strand the turn
+        // until the inactivity watchdog fired.
         let mut api_calls_seen: u32 = 0;
-        // The session id the backend reported at `Init` — i.e. the conversation
-        // it ACTUALLY attached to. Compared against `resume_session_id` to prove
-        // a `--resume` landed on the live conversation, which vetoes the
-        // empty-echo stale-resume heuristic outright (see `StaleResumeInputs::
-        // resume_attach_confirmed`). This is the structured signal the heuristic's
-        // temporary-measures row asks for; without it a healthy resume that says
-        // nothing is indistinguishable from a dead one.
+        // The session id the backend reported at `Init`, meaning the
+        // conversation it ACTUALLY attached to. Compared against
+        // `resume_session_id` to prove a `--resume` landed on the live
+        // conversation, which vetoes the empty-echo stale-resume heuristic
+        // outright. Without it, a healthy resume that says nothing is
+        // indistinguishable from a dead one.
         let mut init_session_id: Option<String> = None;
         let mut claude_text_buf = String::new();
         let mut last_text_persisted_len: usize = 0;
-        // Reasoning/thinking stream buffer (coalesced like the text buffer above).
-        // CC's `thinking_delta`s arrive per-token, so we flush on a paragraph
-        // boundary OR once `THOUGHT_FLUSH_THRESHOLD` chars accumulate — the latter
-        // bounds latency so a long unbroken reasoning paragraph still streams live
-        // (the frozen-"Working" bug) instead of landing only at turn end.
+        // Reasoning stream buffer, coalesced like the text buffer above. Deltas
+        // arrive per-token, so flush on a paragraph boundary or once
+        // `THOUGHT_FLUSH_THRESHOLD` chars accumulate. The threshold bounds
+        // latency, so a long unbroken paragraph still streams live.
         let mut claude_thought_buf = String::new();
         let mut last_thought_persisted_len: usize = 0;
         const THOUGHT_FLUSH_THRESHOLD: usize = 240;
@@ -1095,64 +1055,56 @@ impl LucidosEngine {
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
         let mut user_hit_stop = false;
         // interrupt_is_redirect: set alongside user_hit_stop when the interrupt
-        // came from a Codex mid-turn follow-up redirect (drained from the session
-        // by `arm_followup_redirect`), so the Result classifies as
-        // CancelCause::SupersededByFollowup (neutral render) instead of UserStop.
-        // Cleared at the turn boundary in lockstep with user_hit_stop.
+        // came from a Codex mid-turn follow-up redirect, so the Result renders
+        // neutrally instead of as a user Stop. Cleared at the turn boundary in
+        // lockstep with user_hit_stop.
         let mut interrupt_is_redirect = false;
         // last_emitted_idle: true iff the most recent in-loop event was
         // CodingAgentIdled. The post-loop relies on this flag to decide whether to
         // synthesize an idle event before SessionEnded.
         let mut last_emitted_idle = false;
-        // Paired ToolCalled / ToolResult counter. Watchdog disarms while
-        // > 0 — tool execution (Bash, Read, AskUserQuestion, TaskOutput,
-        // agent sub-tasks) is legitimate silence, not a hang. CC may batch
-        // multiple calls per turn, so a counter (not a bool) is the right
-        // shape. Mirrored on `AgentSession` so the external watchdog sees
-        // the same atomic from outside this `select!`.
+        // Paired ToolCalled / ToolResult counter. The watchdog disarms while it
+        // is above zero, because tool execution is legitimate silence, not a
+        // hang. CC may batch several calls per turn, so a counter rather than a
+        // bool is the right shape. Mirrored on `AgentSession` so the external
+        // watchdog sees the same atomic from outside this `select!`.
         let tools_in_flight = tools_in_flight_shared;
         // last_terminal_kind: terminal emitted by the most recently completed
-        // turn. Drives `should_auto_commit_on_cleanup` so we only commit (and
-        // therefore fire the per-commit hook → ChangeProposed) when the last
-        // turn ended Generated. Safety-net abort, Failed, Canceled, Aborted
-        // all leave this None or non-Generated → no auto-commit, no spurious
-        // Apply card. Reset on each new turn alongside `emitted_terminal_event`.
+        // turn. Drives `should_auto_commit_on_cleanup`, so the cleanup commits
+        // only when the last turn ended Generated. Every other terminal leaves
+        // this None or non-Generated, which means no auto-commit and no spurious
+        // Apply card. Reset per turn alongside `emitted_terminal_event`.
         let mut last_terminal_kind: Option<TerminalKind> = None;
         // Set by the watchdog tick below; consumed by the safety net to
         // pick ContinuationRequested auto-resume vs ResponseAborted. Not derived
         // from `agent_cancel.is_cancelled()` because the stale-resume and
         // question-cancel paths also cancel the token for non-hang reasons.
         let mut watchdog_fired = false;
-        // Set from `AgentEvent::Exited { killed_by_signal }` — true when the CC
-        // child died from a signal the engine did NOT initiate (the exit=143
-        // stray-SIGTERM bug). Consumed by the safety net to auto-resume.
+        // True when the CC child died from a signal the engine did NOT initiate
+        // (the exit=143 stray SIGTERM). The safety net reads it to auto-resume.
         let mut killed_by_signal = false;
         // True when the `msg_rx` arm forwarded an input and the agent has not yet
-        // produced output that provably post-dates it. `events_rx` and `msg_rx` are
-        // separate channels with no causal ordering, so `select!` can hand us a
-        // `Result` the agent produced BEFORE that input reached it, and
-        // `settle_inputs_awaiting_result` needs the difference: a Result that
-        // predates a forward cannot have answered it, and settling it away would
-        // terminate the subprocess with the user's message still inside.
+        // produced output that provably post-dates it. The two channels have no
+        // causal ordering, so `select!` can hand us a `Result` the agent produced
+        // BEFORE that input reached it. A Result that predates a forward cannot
+        // have answered it, and settling it away would terminate the subprocess
+        // with the user's message still inside.
         //
-        // "Provably post-dates" is why this needs the companion counter below rather
-        // than clearing on the next event. Events the driver had ALREADY queued when
-        // we forwarded say nothing about what the agent did afterwards, and the run
-        // loop routinely leaves several queued while it awaits an emit. Clearing on
-        // those would read a Result that was sitting in the channel the whole time as
-        // proof the agent had accepted an input it has not seen.
+        // "Provably post-dates" is why this needs the companion counter below.
+        // Events the driver had ALREADY queued prove nothing about what came
+        // after, and the loop routinely leaves several queued while it awaits an
+        // emit.
         let mut forwarded_input_unconfirmed = false;
         // How many events were already waiting in `events_rx` at the moment of that
         // forward. Each is skipped before any event is allowed to confirm it.
         let mut agent_events_queued_at_forward = 0usize;
 
-        // Bounded Esc fallback. A real Cancel (Stop) forwards CC's native
-        // interrupt (Esc) and waits for CC to wind down and emit a `Result`. If
-        // CC doesn't honor it within this window — a hung socket, or a control
-        // request ignored while a long tool runs (the watchdog skips while a
-        // tool is in flight, so it won't catch this) — escalate to the hard stop
-        // so Cancel is always responsive. Armed when the interrupt is forwarded;
-        // cleared once CC's terminal `Result` lands.
+        // Bounded Esc fallback. A real Cancel forwards CC's native interrupt and
+        // waits for CC to wind down and emit a `Result`. If CC does not honor it
+        // within this window, escalate to the hard stop so Cancel is always
+        // responsive. The watchdog skips while a tool is in flight, so it cannot
+        // catch a control request ignored during a long tool. Armed when the
+        // interrupt is forwarded, cleared once the terminal `Result` lands.
         let mut interrupt_escalate_at: Option<tokio::time::Instant> = None;
         const INTERRUPT_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -1163,7 +1115,7 @@ impl LucidosEngine {
             tokio::select! {
                 event_opt = events_rx.recv() => {
                     let Some(ev) = event_opt else {
-                        // Driver task exited without sending Exited (defensive — should not happen).
+                        // Driver task exited without sending Exited (defensive).
                         log!(
                             "[AgentSession] events_rx closed without AgentEvent::Exited for thread {}",
                             thread_id
@@ -1171,17 +1123,16 @@ impl LucidosEngine {
                         break;
                     };
                     // Advance the forward-confirmation state for this event. Done
-                    // here rather than in the Result arm because a tool call or a
-                    // token of text confirms a forward just as well as a Result
-                    // does. The rules and their cost live in the helper.
+                    // here rather than in the Result arm, because a tool call or
+                    // a token of text confirms a forward just as well.
                     let result_may_predate_a_forward = agent_event_may_predate_forward(
                         &mut forwarded_input_unconfirmed,
                         &mut agent_events_queued_at_forward,
                     );
                     if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
                         killed_by_signal = ev_killed_by_signal;
-                        // Final flush of any pending reasoning (process exited
-                        // mid-think — surface what it reasoned before dying).
+                        // Final flush of any pending reasoning: surface what the
+                        // process reasoned before it died.
                         self.flush_coding_agent_thought(
                             thread_id,
                             &claude_thought_buf,
@@ -1202,21 +1153,19 @@ impl LucidosEngine {
                             }
                         }
                         if is_waiting {
-                            // CC process exited after producing a Result — session is idle.
-                            // Don't hold the ThreadGuard waiting for follow-ups. Instead,
-                            // auto-commit (only when the last turn ended Generated, per
-                            // `should_auto_commit_on_cleanup`), remove from sessions map,
-                            // and return. The worktree and branch persist on disk so
-                            // follow-ups can reuse them via a new run_direct_agent call.
-                            // This makes engine shutdown instant (no idle loop to cancel).
+                            // The process exited after producing a Result, so the
+                            // session is idle. Do not hold the ThreadGuard for
+                            // follow-ups: auto-commit, drop the sessions entry
+                            // and return. The worktree and branch persist on
+                            // disk, so a follow-up reuses them, and engine
+                            // shutdown has no idle loop to cancel.
                             log!("[AgentSession] CC process exited while idle — releasing thread {}", thread_id);
 
-                            // Half-assed work (Failed / Canceled / Aborted / safety-net)
-                            // skips the auto-commit so the post-commit hook doesn't fire
-                            // a spurious ChangeProposed for partial work. should_discard
-                            // is always false here (no user Discard click without breaking
-                            // out via the stop arm); pass false to keep the gate purely
-                            // about terminal kind.
+                            // Partial work skips the auto-commit, so the
+                            // post-commit hook cannot fire a spurious
+                            // `ChangeProposed`. `should_discard` is always false
+                            // here, since a user Discard breaks out via the stop
+                            // arm, so the gate stays purely about terminal kind.
                             if let Some(ref wt) = worktree_path {
                                 if should_auto_commit_on_cleanup(false, &last_terminal_kind) {
                                     auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed on idle exit)").await;
@@ -1250,18 +1199,16 @@ impl LucidosEngine {
                             let orphans = lost_followups_to_orphans(drain_lost_followups(&mut msg_rx));
 
                             // A turn the backend ended on a transient upstream
-                            // `API Error` resumes itself instead of leaving a red dot
-                            // nobody is watching. This arm is the site that matters:
-                            // a reported drop always arrives as a real Result, so the
-                            // turn idles and returns HERE, never reaching the post-loop
-                            // `finalize_direct_agent` where the recovery originally
-                            // (and only) lived. See the helper's doc comment.
+                            // `API Error` resumes itself, rather than leaving a
+                            // red dot nobody is watching. This arm is the site
+                            // that matters: a reported drop arrives as a real
+                            // Result, so the turn idles and returns HERE and
+                            // never reaches the post-loop finalize.
                             //
-                            // Position is load-bearing: after the Result arm emitted
-                            // this turn's `CodingAgentIdled`, after the subprocess is
-                            // gone and the session dropped from `agent_sessions` just
-                            // above, and after the follow-up drain, whose result
-                            // decides whether anything else is already coming.
+                            // Position is load-bearing. It runs after this turn's
+                            // idle, after the session was dropped just above, and
+                            // after the follow-up drain, which decides whether
+                            // anything else is coming.
                             self.maybe_auto_resume_after_api_error(
                                 thread_id,
                                 &last_terminal_kind,
@@ -1289,15 +1236,14 @@ impl LucidosEngine {
                         );
                         break;
                     }
-                    // Stamp liveness — used by apply_now's timeout. Also drain the
-                    // question-answer resume signal in the SAME lock: a live
-                    // subprocess woken by an answered AskUserQuestion continues its
-                    // turn via the PreToolUse hook, never touching `msg_tx`, so the
-                    // run loop never hit `reset_per_turn_flags` (the only place
-                    // `emitted_terminal_event` clears). If the turn was
-                    // terminal-armed, re-arm emission below so CC's first
-                    // post-answer event is processed instead of dropped as a
-                    // "post-terminal straggler" (see `question_resume_pending`).
+                    // Stamp liveness for apply_now's timeout. Also drain the
+                    // question-answer resume signal in the SAME lock. A live
+                    // subprocess woken by an answered question resumes through
+                    // the PreToolUse hook and never touches `msg_tx`, so the run
+                    // loop never reached `reset_per_turn_flags`. On a
+                    // terminal-armed turn, re-arm emission below, so the first
+                    // post-answer event is processed rather than dropped as a
+                    // straggler.
                     let resume_after_answer = {
                         let mut guard = self.agent_sessions.lock().await;
                         if let Some(s) = guard.get_mut(&thread_id) {
@@ -1332,20 +1278,20 @@ impl LucidosEngine {
                         AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills } => {
                             log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
                             // Record what the backend actually attached to before
-                            // anything else — the stale-resume veto reads it.
+                            // anything else: the stale-resume veto reads it.
                             init_session_id = Some(cc_sid.clone());
                             // Enable --resume for follow-ups and engine restart
                             let cache_update = {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) {
                                     s.cc_session_id = Some(cc_sid.clone());
-                                    // Always update from Init — CC reports the actual
-                                    // full model ID (e.g. "claude-opus-4-6"), which is
-                                    // authoritative over any alias the user selected.
+                                    // Always update from Init: CC reports the full
+                                    // model id, which is authoritative over any
+                                    // alias the user selected.
                                     if let Some(ref m) = init_model {
-                                        // Reconcile against the originally-supplied alias so the
-                                        // [1m] suffix survives — CC strips it when echoing the
-                                        // model id, and context_window_for keys on it for 1M.
+                                        // Reconcile against the supplied alias so
+                                        // the [1m] suffix survives. CC strips it,
+                                        // and `context_window_for` keys on it.
                                         let norm = crate::runtime::claude_code::reconcile_cc_model(
                                             cc_model.as_deref(),
                                             m,
@@ -1368,16 +1314,14 @@ impl LucidosEngine {
                                 let repo_key = repo_root.to_string_lossy().to_string();
                                 self.upsert_cc_commands_cache(repo_key, info).await;
                             }
-                            // Persist the CC session id (and authoritative model) the
-                            // instant CC reports them at Init. Emitted unconditionally
-                            // — even when the model is unchanged — so the session id is
-                            // durable in the event store *before* the first
-                            // CodingAgentIdled. A mid-turn engine restart can then still
-                            // `--resume` the conversation: the resume/recovery lookups
-                            // read `cc_session_id` from this event as well as from
-                            // CodingAgentIdled. Without it, a long turn interrupted before
-                            // its first idle loses the id entirely and falls back to a
-                            // fresh session with only a reconstructed summary.
+                            // Persist the session id and authoritative model the
+                            // instant CC reports them at Init. Emitted even when
+                            // the model is unchanged, so the session id is
+                            // durable *before* the first `CodingAgentIdled`. A
+                            // mid-turn restart can then still `--resume`, because
+                            // the recovery lookups read `cc_session_id` from this
+                            // event too. Without it, a long turn interrupted
+                            // before its first idle loses the id entirely.
                             if let Err(e) = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentSettingsChanged {
@@ -1386,18 +1330,16 @@ impl LucidosEngine {
                                     permission_mode: None,
                                     coding_agent,
                                     cc_session_id: Some(cc_sid.clone()),
-                                    // Pin the session↔config-dir pairing at Init:
-                                    // the dir this session was created under is what
-                                    // a later resume must re-inject to find its
-                                    // transcript. See `effective_config_dir` above
-                                    // and `lookup_pinned_cc_config_dir`.
+                                    // Pin the session-to-config-dir pairing at
+                                    // Init. A later resume must re-inject this
+                                    // dir to find the transcript.
                                     claude_config_dir: effective_config_dir.clone(),
                                 },
                                 meta: meta.clone(),
                             }).await {
                                 log!("[AgentSession] Failed to persist Init CodingAgentSettingsChanged for {}: {}", thread_id, e);
                             }
-                            // Release startup semaphore — CC process is initialized and mostly idle now.
+                            // The process is initialized and mostly idle now.
                             if let Some(permit) = startup_permit.take() {
                                 drop(permit);
                                 log!("[AgentSession] [TIMING] Startup semaphore released: {:?}", cc_start.elapsed());
@@ -1414,17 +1356,12 @@ impl LucidosEngine {
                                 }
                             }
                         }
-                        // Straggler guard: the agent runtime sometimes delivers a
-                        // trailing Message AFTER this turn's terminal event (e.g. a
-                        // final "Understood." arriving on `events_rx` once the
-                        // `Result` arm already emitted ResponseGenerated +
-                        // CodingAgentIdled). Emitting it as CodingAgentTextStreamed
-                        // would re-flip the projection to status='running' (the
-                        // activity-event arm in `event_bus_projection_thread.rs`
-                        // bumps running), stranding an already-idled thread as
-                        // "running" forever — the "thread reports running when it's
-                        // not" bug. Drop it; a real follow-up turn re-arms emission
-                        // via `reset_per_turn_flags` when its prompt lands on msg_rx.
+                        // Straggler guard: the runtime sometimes delivers a
+                        // trailing Message AFTER this turn's terminal event.
+                        // Emitting it as `CodingAgentTextStreamed` would re-flip
+                        // the projection to `running` and strand an already-idled
+                        // thread there forever. Drop it. A real follow-up turn
+                        // re-arms emission through `reset_per_turn_flags`.
                         AgentEvent::Message { text, .. } if emitted_terminal_event => {
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler text ({} chars) for thread {} — would resurrect 'running' on an idled thread",
@@ -1433,15 +1370,13 @@ impl LucidosEngine {
                             );
                         }
                         AgentEvent::Message { text, .. } => {
-                            // CC resumed after waiting — clear waiting state
                             if is_waiting {
                                 is_waiting = false;
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
-                            // Reasoning precedes the answer — flush any pending
-                            // thought so the "Thinking" step resolves before the
-                            // text it was reasoning toward.
+                            // Reasoning precedes the answer, so flush any pending
+                            // thought and let the "Thinking" step resolve first.
                             self.flush_coding_agent_thought(
                                 thread_id,
                                 &claude_thought_buf,
@@ -1464,25 +1399,23 @@ impl LucidosEngine {
                                 }
                             }
                         }
-                        // Reasoning/thinking stream. Same post-terminal straggler
-                        // guard as Message/ToolUse: CodingAgentThoughtStreamed is
-                        // per-token-streaming, and its projection arm bumps
-                        // status='running', so a thought arriving after the turn's
-                        // terminal event would resurrect an idled thread. Drop it.
+                        // Reasoning stream, with the same straggler guard as
+                        // Message and ToolUse. Its projection arm bumps
+                        // `running`, so a thought arriving after the turn's
+                        // terminal event would resurrect an idled thread.
                         AgentEvent::Thought { .. } if emitted_terminal_event => {}
                         AgentEvent::Thought { text } => {
-                            // A thought is the first sign of life on a resumed turn —
-                            // clear waiting state like Message/ToolUse do.
+                            // A thought is the first sign of life on a resumed
+                            // turn, so clear the waiting state.
                             if is_waiting {
                                 is_waiting = false;
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
                             claude_thought_buf.push_str(&text);
-                            // Flush on a paragraph boundary OR once enough has piled
-                            // up — the threshold bounds latency so a long unbroken
-                            // reasoning paragraph still streams live instead of
-                            // landing only at turn end (the frozen-"Working" bug).
+                            // Flush on a paragraph boundary or once enough has
+                            // piled up, so a long unbroken paragraph still
+                            // streams live instead of landing at turn end.
                             if should_flush(&claude_thought_buf)
                                 || claude_thought_buf.len() - last_thought_persisted_len
                                     >= THOUGHT_FLUSH_THRESHOLD
@@ -1497,11 +1430,9 @@ impl LucidosEngine {
                                 .await;
                             }
                         }
-                        // Straggler guard (see the Message arm above): a tool call
-                        // arriving after the turn's terminal event would resurrect
-                        // status='running' on an idled thread. Drop it without
-                        // touching the in-flight counter — a post-terminal turn has
-                        // no live watchdog to disarm.
+                        // Straggler guard, as in the Message arm above. Drop it
+                        // without touching the in-flight counter, because a
+                        // post-terminal turn has no live watchdog to disarm.
                         AgentEvent::ToolUse { .. } if emitted_terminal_event => {
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler tool call for thread {} — would resurrect 'running' on an idled thread",
@@ -1509,14 +1440,13 @@ impl LucidosEngine {
                             );
                         }
                         AgentEvent::ToolUse { name, input, id } => {
-                            // CC resumed after waiting — clear waiting state
                             if is_waiting {
                                 is_waiting = false;
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
                             }
                             // Interleaved-thinking turns reason right up to a tool
-                            // call — flush any pending thought before the tool step.
+                            // call, so flush before the tool step.
                             self.flush_coding_agent_thought(
                                 thread_id,
                                 &claude_thought_buf,
@@ -1539,48 +1469,38 @@ impl LucidosEngine {
                             if !claude_text_buf.is_empty() {
                                 claude_text_buf.push_str("\n\n");
                             }
-                            // Disarm the watchdog while ANY tool runs — including
-                            // AskUserQuestion. The user might take ten minutes to
-                            // pick an answer, and we must not euthanize the session
-                            // for that. The matching ToolResult arm decrements.
-                            // `Relaxed` is fine — the only reader (the watchdog
-                            // tick) tolerates a one-tick staleness, and the in-
-                            // loop watchdog inside this same `select!` observes
-                            // the value monotonically anyway.
+                            // Disarm the watchdog while ANY tool runs, including
+                            // AskUserQuestion: the user may take ten minutes to
+                            // answer, and the session must survive that. The
+                            // matching ToolResult arm decrements. `Relaxed` is
+                            // fine, since the only reader tolerates one-tick
+                            // staleness.
                             tools_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // A tool call this turn proves the session is alive —
-                            // even a terse model that emits no text. Gates the
-                            // stale-resume heuristic below so a working Fable
-                            // resume is never misread as a dead session.
+                            // A tool call this turn proves the session is alive,
+                            // even for a terse model that emits no text. Gates
+                            // the stale-resume heuristic below.
                             tool_calls_seen = tool_calls_seen.saturating_add(1);
                             if crate::runtime::is_user_question_tool(&name) {
-                                // Question flow: the agent subprocess blocks until the user
-                                // answers and the engine renders the card from the
-                                // `UserQuestionAsked` the internal endpoint emits. CC routes
-                                // here via its PreToolUse hook (`crate::engine::cc_settings` +
-                                // `api/internal.rs::ask_user_question`) or via the MCP tool its
-                                // permission server also exposes; Codex via that same MCP tool
-                                // under its own mount name, hitting the same endpoint. All three
-                                // names live in `runtime::is_user_question_tool`. run_session has
-                                // nothing to do with this `tool_use` event: no emit (a tool-call
-                                // step would double-surface the question), no kill (the
-                                // subprocess keeps running), no session removal.
+                                // Question flow: the subprocess blocks until the
+                                // user answers, and the engine renders the card
+                                // from the `UserQuestionAsked` the internal
+                                // endpoint emits. Every route into that endpoint
+                                // is named by `runtime::is_user_question_tool`.
+                                // `run_session` has nothing to do here: no emit,
+                                // which would double-surface the question, no
+                                // kill, and no session removal.
                             } else {
-                                // Safety net: env-side fix (`pg_env_vars` injected
-                                // into the Claude Code subprocess env) keeps the password
-                                // out of `psql` argv in the common case, but a
-                                // hardcoded URI in a Bash command or Python script
-                                // can still slip through. Walk every string in
-                                // `args` and mask `postgres(ql)://user:pass@…`
-                                // before the event reaches the store / SSE stream.
+                                // Safety net. The injected `pg_env_vars` keep the
+                                // password out of `psql` argv in the common case.
+                                // A hardcoded URI in a Bash command can still
+                                // slip through, so mask every string in `args`
+                                // before the event reaches the store.
                                 //
                                 // BEFORE the description, not after: the step row
-                                // renders the description exactly as it renders the
-                                // args, so both have to be built from the redacted
-                                // copy. Describing first left the password in
-                                // cleartext on `description` while `args` was clean.
-                                // `agentic_loop::run` orders it the same way and
-                                // carries the same note.
+                                // renders the description exactly as it renders
+                                // the args, so both must be built from the
+                                // redacted copy. `agentic_loop::run` orders it
+                                // the same way.
                                 let mut input = input;
                                 crate::core::redact_postgres_secrets_in_json(&mut input);
                                 let description = crate::core::describe_cc_tool(&name, &input);
@@ -1597,12 +1517,11 @@ impl LucidosEngine {
                                 }, "[AgentSession] CodingAgentToolCalled").await;
                             }
                         }
-                        // Straggler guard (see the Message arm above): a tool result
-                        // arriving after the turn's terminal event would resurrect
-                        // status='running' on an idled thread. Still release the
-                        // in-flight slot in case a pre-terminal ToolUse incremented
-                        // it (release_tool_slot floors at 0, so an unpaired result is
-                        // a no-op), then drop the event without emitting.
+                        // Straggler guard, as in the Message arm above. Still
+                        // release the in-flight slot in case a pre-terminal
+                        // ToolUse incremented it, then drop the event without
+                        // emitting. `release_tool_slot` floors at 0, so an
+                        // unpaired result is a no-op.
                         AgentEvent::ToolResult { .. } if emitted_terminal_event => {
                             release_tool_slot(&tools_in_flight);
                             log!(
@@ -1613,9 +1532,8 @@ impl LucidosEngine {
                         AgentEvent::ToolResult { output, status: _, id } => {
                             let summary: String = output.chars().take(200).collect();
                             // Re-arm the watchdog if this was the last in-flight
-                            // tool. Floored at 0 so an unpaired ToolResult (CC
-                            // oddity / replay) can't underflow — see
-                            // `release_tool_slot`.
+                            // tool. Floored at 0 so an unpaired ToolResult cannot
+                            // underflow (see `release_tool_slot`).
                             release_tool_slot(&tools_in_flight);
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
@@ -1639,12 +1557,11 @@ impl LucidosEngine {
                             // (the parser drops all-zero ones), so this is the
                             // proof-of-model-call the resume-settle skip reads.
                             api_calls_seen = api_calls_seen.saturating_add(1);
-                            // Sections stay empty — CC doesn't expose its
-                            // system prompt or tool schemas via stream-json.
-                            // CC strips the [1m] suffix on the per-message
-                            // model echo too, so reconcile against
-                            // normalized_model (which the Init handler keeps
-                            // suffix-correct) before measuring the window.
+                            // Sections stay empty, because CC does not expose
+                            // its system prompt or tool schemas. CC strips the
+                            // [1m] suffix on the per-message model echo too, so
+                            // reconcile against `normalized_model` before
+                            // measuring the window.
                             let snapshot_model = cc_msg_model
                                 .as_deref()
                                 .map(|m| crate::runtime::claude_code::reconcile_cc_model(
@@ -1656,12 +1573,12 @@ impl LucidosEngine {
                             let context_window = self.context_window_for(&snapshot_model);
                             // Anthropic reports `input_tokens` as the
                             // uncached portion only. `ApiUsage.input_tokens`
-                            // stores the TOTAL prompt size — same convention
-                            // as `vertex.rs:678` — so the budget bar shows
-                            // real context use and the modal's cache-miss
-                            // formula (`input - read - write`) recovers
-                            // the uncached count. `saturating_add` defends
-                            // against a pathologically large stream.
+                            // stores the TOTAL prompt size, the same
+                            // convention `vertex.rs` uses. So the budget bar
+                            // shows real context use, and the modal's
+                            // cache-miss formula recovers the uncached
+                            // count. `saturating_add` defends against a
+                            // pathologically large stream.
                             let total_input = input_tokens
                                 .saturating_add(cache_read_tokens)
                                 .saturating_add(cache_creation_tokens);
@@ -1695,20 +1612,19 @@ impl LucidosEngine {
                         }
                         // Liveness-only ping from a streaming delta. The
                         // top-of-loop heartbeat bump already recorded that the
-                        // subprocess is alive — which is precisely what stops the
-                        // watchdog from euthanizing a long single step (extended
-                        // thinking, a large generation) that streams for longer
-                        // than WATCHDOG_INACTIVITY_LIMIT_MS without finishing a
-                        // step. Nothing to persist: the complete text / tool call
-                        // arrives separately as Message / ToolUse.
+                        // subprocess is alive. That is what stops the watchdog
+                        // from killing a long single step that streams past
+                        // `WATCHDOG_INACTIVITY_LIMIT_MS` without finishing.
+                        // Nothing to persist: the complete text or tool call
+                        // arrives separately.
                         AgentEvent::StreamActivity => {}
                         AgentEvent::Exited { .. } => unreachable!("Exited handled above"),
                         AgentEvent::Result { text, error: cc_error, .. } => {
                                         let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
                                         log!("[AgentSession] Result event received — entering waiting state{}", err_suffix);
-                                        // Final flush of any pending reasoning (a turn
-                                        // that reasoned then ended without text/tools,
-                                        // or the tail below the coalescing threshold).
+                                        // Final flush of any pending reasoning: a
+                                        // turn that reasoned then ended without
+                                        // text, or the tail below the threshold.
                                         self.flush_coding_agent_thought(
                                             thread_id,
                                             &claude_thought_buf,
@@ -1719,12 +1635,12 @@ impl LucidosEngine {
                                         .await;
                                         // Final flush of any pending text
                                         if !claude_text_buf.is_empty() {
-                                            // The Result.text may contain text beyond what was
-                                            // streamed via Message events (CC sometimes bundles
-                                            // trailing text into the Result without a preceding
-                                            // Message). Append the extra to the buffer so the
-                                            // frontend sees the complete text before entering waiting.
-                                            // Mirrors the same logic in build_session_messages.
+                                            // `Result.text` may carry text beyond
+                                            // what the Message events streamed.
+                                            // Append the extra, so the frontend
+                                            // sees the complete text before the
+                                            // session goes to waiting. Mirrors
+                                            // `build_session_messages`.
                                             let buf_trimmed = claude_text_buf.trim();
                                             let result_trimmed = text.trim();
                                             if !result_trimmed.is_empty()
@@ -1746,10 +1662,9 @@ impl LucidosEngine {
                                                 }, "[AgentSession] CodingAgentTextStreamed (Result flush)").await;
                                             }
                                         } else if result_text_is_own_prose(&text, cc_error.as_deref()) {
-                                            // Slash commands (e.g. /model) produce a Result
-                                            // without any preceding Message events. Emit the
-                                            // result text as CodingAgentTextStreamed so the
-                                            // frontend displays it.
+                                            // A slash command produces a Result
+                                            // with no preceding Message events,
+                                            // so emit its text for the frontend.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent },
@@ -1761,34 +1676,30 @@ impl LucidosEngine {
                                         // would mis-flag /model output as empty.
                                         let result_text_empty = text.trim().is_empty();
                                         let buffered_text_empty = claude_text_buf.trim().is_empty();
-                                        // Detect stale resume: CC returned empty Result immediately
-                                        // after resume. The session was expired and produced no output.
-                                        // Abort without emitting ResponseGenerated/CodingAgentIdled so
-                                        // the caller can retry with a fresh session.
+                                        // Detect a stale resume: the backend
+                                        // returned an empty Result right after
+                                        // resuming an expired session. Abort with
+                                        // no terminal and no idle, so the caller
+                                        // can retry against a fresh session.
                                         //
-                                        // Two independent signals, both meaning "the id we --resume'd is
-                                        // gone": the empty-echo heuristic (`is_stale_resume_signal`,
-                                        // gated on !cc_error so a transient 5xx never deletes user work),
-                                        // AND CC's EXPLICIT "No conversation found with session ID" error.
-                                        // The explicit error arrives AS a cc_error, so it bypasses the
-                                        // heuristic's gate — but it's deterministic (re-resuming can never
-                                        // succeed), so it's the one whitelisted error string that still
-                                        // recovers. Both take the same path: shadow the dead sid via
-                                        // SessionEnded(StaleResume), remove the worktree, keep the branch,
-                                        // return STALE_RESUME_ERROR so the caller retries fresh (chat →
-                                        // process_cc.rs; merge/apply → the Tier-2 Err arm falls through to
-                                        // a fresh Tier-3 merge session). Root cause: dev/bf997e21, a
-                                        // mid-flight CLAUDE_CONFIG_DIR switch relocated CC's transcript
-                                        // store.
+                                        // Two independent signals both mean "the
+                                        // id we resumed is gone": the empty-echo
+                                        // heuristic, and CC's explicit
+                                        // session-not-found error. The explicit
+                                        // one arrives as a `cc_error` and so
+                                        // bypasses the heuristic's gate, but it
+                                        // is deterministic, which is why it is
+                                        // whitelisted. Both take the same path:
+                                        // shadow the dead id, keep the branch,
+                                        // and return `STALE_RESUME_ERROR`.
                                         let explicit_session_not_found = resume_session_id.is_some()
                                             && is_definitive_session_not_found(cc_error.as_deref());
-                                        // Did the backend attach to the conversation we
-                                        // asked for? Its Init echoes the id it actually
-                                        // opened, and a FAILED resume yields a different
-                                        // one — so a match is structural proof of life
-                                        // and vetoes the output-shape heuristic. Compared
-                                        // only when we requested a resume; a fresh spawn
-                                        // has nothing to match against.
+                                        // Did the backend attach to the
+                                        // conversation we asked for? Its Init
+                                        // echoes the id it actually opened, and a
+                                        // FAILED resume yields a different one.
+                                        // So a match is structural proof of life
+                                        // and vetoes the output-shape heuristic.
                                         let stale_inputs = StaleResumeInputs {
                                             has_resume_session: resume_session_id.is_some(),
                                             resume_attach_confirmed: resume_session_id.is_some()
@@ -1801,17 +1712,15 @@ impl LucidosEngine {
                                             user_message_present: !user_message.is_empty(),
                                             cc_error: cc_error.is_some(),
                                         };
-                                        // The turn's SHAPE said "stale", the confirmed
-                                        // attach overruled it, and no API call was made:
-                                        // this Result closes the backend's own
-                                        // resume-settle turn (an orphaned tool_use being
-                                        // closed out, a queued task-notification being
-                                        // drained), not ours. Our prompt may not even be
-                                        // dequeued yet, so ending the turn here reports a
-                                        // failure that did not happen AND kills the
-                                        // subprocess mid-answer (the 2026-08-05 swallowed
-                                        // follow-up). Skip it and keep reading; the real
-                                        // Result is still coming.
+                                        // The turn's SHAPE said "stale", the
+                                        // confirmed attach overruled it, and no
+                                        // API call was made. So this Result
+                                        // closes the backend's own resume-settle
+                                        // turn, not ours. Our prompt may not even
+                                        // be dequeued yet. Ending the turn here
+                                        // would report a failure that did not
+                                        // happen and kill the subprocess
+                                        // mid-answer. Skip it and keep reading.
                                         if is_resume_settle_result(stale_inputs, api_calls_seen == 0) {
                                             log!(
                                                 "[AgentSession] thread {} resumed sid={} and the backend confirmed the attach, but this Result carries no text, no tool call and no error: it closes the resume-settle turn, not ours. Skipping it and waiting for the real Result.",
@@ -1824,16 +1733,15 @@ impl LucidosEngine {
                                             result_texts.push(text.clone());
                                             continue 'event_loop;
                                         }
-                                        // Same empty shape, same confirmed attach, but the
-                                        // backend DID call the model, so whatever came back
-                                        // is an answer to our prompt however empty. It
-                                        // classifies below (an empty one lands
-                                        // `EMPTY_RESPONSE_ERROR`). Logged because it is the
-                                        // one shape a wrong skip here would strand at
-                                        // `running` until the watchdog: if a spurious
-                                        // empty-response failure is ever reported, this
-                                        // line is what says the settle skip considered the
-                                        // turn and the API call is what ruled it out.
+                                        // Same empty shape and same confirmed
+                                        // attach, but the backend DID call the
+                                        // model, so what came back answers our
+                                        // prompt however empty. It classifies
+                                        // below. Logged because a wrong skip here
+                                        // strands the turn at `running`. This
+                                        // line says the settle skip considered
+                                        // the turn, and the API call ruled it
+                                        // out.
                                         if api_calls_seen > 0
                                             && is_resume_settle_result(stale_inputs, true)
                                         {
@@ -1858,10 +1766,9 @@ impl LucidosEngine {
                                                 }
                                                 guard.remove(&thread_id);
                                             }
-                                            // Shadow the stale CodingAgentIdled so
-                                            // `resolve_resume_context` won't reuse the dead
-                                            // sid on the retry (or after a restart). See
-                                            // SessionEndReason::StaleResume.
+                                            // Shadow the stale `CodingAgentIdled`,
+                                            // so `resolve_resume_context` cannot
+                                            // reuse the dead id on the retry.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: crate::engine::thread_events::ThreadEvent::SessionEnded {
@@ -1869,20 +1776,18 @@ impl LucidosEngine {
                                                 },
                                                 meta: meta.clone(),
                                             }, "[AgentSession] SessionEnded (stale resume)").await;
-                                            // NEVER CREATE A DUPLICATE: await the old process
-                                            // group's full teardown before signalling the retry.
-                                            // `agent_cancel.cancel()` drives the driver_task's
-                                            // `graceful_kill_child_process_group` (SIGTERM →
-                                            // GROUP_TEARDOWN_GRACE → SIGKILL → reap); the driver
-                                            // drops `events_tx` only AFTER that completes, so
-                                            // draining `events_rx` to a closed channel is a precise
-                                            // await of "the old CC process group is dead." Without
-                                            // it the fresh retry (`run_direct_agent`) could spawn
-                                            // while the wedged old process is still alive on the
-                                            // SHARED deterministic worktree — the 2026-07-02
-                                            // double-process (2x quota) bug. Bounded so a stuck
-                                            // teardown can't wedge the loop (grace is 3s; 15s is
-                                            // generous headroom).
+                                            // NEVER CREATE A DUPLICATE: await the
+                                            // old process group's full teardown
+                                            // before signalling the retry. The
+                                            // driver drops `events_tx` only after
+                                            // the kill completes. So draining
+                                            // `events_rx` to a closed channel is
+                                            // a precise await of "the old process
+                                            // group is dead". Without it the
+                                            // retry can spawn while the wedged
+                                            // old process still holds the SHARED
+                                            // worktree. Bounded, so a stuck
+                                            // teardown cannot wedge the loop.
                                             let teardown_deadline = tokio::time::Instant::now()
                                                 + std::time::Duration::from_secs(15);
                                             loop {
@@ -1892,9 +1797,9 @@ impl LucidosEngine {
                                                 )
                                                 .await
                                                 {
-                                                    // Trailing events from the dying process — drop them.
+                                                    // Trailing events from the dying process: drop them.
                                                     Ok(Some(_)) => continue,
-                                                    // Channel closed → the old process group is dead.
+                                                    // A closed channel means the old group is dead.
                                                     Ok(None) => break,
                                                     Err(_) => {
                                                         log!("[AgentSession] stale-resume teardown wait timed out for thread {} — proceeding with retry (old process may briefly linger)", thread_id);
@@ -1902,31 +1807,29 @@ impl LucidosEngine {
                                                     }
                                                 }
                                             }
-                                            // NEVER DELETE A POSSIBLY-USEFUL WORKTREE. The
-                                            // deterministic `thread-<id>` worktree is SHARED per
-                                            // thread and holds the user's warm working copy; we do
-                                            // NOT remove it here. The retry (`run_direct_agent` with
-                                            // `resume_session_id: None`) REUSES the existing worktree
-                                            // — `spawn_context` runs `worktree_add` only when the dir
-                                            // is absent, and `clear_stranded_worktree_dir` handles a
-                                            // genuinely-broken one. The branch is the thread's
-                                            // durable anchor and is kept regardless. The background
-                                            // WorktreeCleanup worker is the SOLE deleter of a valid
-                                            // worktree (gated on is_active, dirty, unmerged commits,
-                                            // retention). The old inline `git worktree remove
-                                            // --force` here deleted a live worktree out from under a
-                                            // concurrent process and needlessly wiped node_modules —
-                                            // removed 2026-07-02.
+                                            // NEVER DELETE A POSSIBLY-USEFUL
+                                            // WORKTREE. The deterministic
+                                            // `thread-<id>` worktree is SHARED
+                                            // per thread and holds the user's
+                                            // warm working copy. The retry reuses
+                                            // it: `spawn_context` runs
+                                            // `worktree_add` only when the dir is
+                                            // absent. The branch is the thread's
+                                            // durable anchor and is kept
+                                            // regardless, and the cleanup worker
+                                            // is the sole deleter of a valid
+                                            // worktree (ADR 0035).
                                             return Err(STALE_RESUME_ERROR.into());
                                         }
 
                                         result_texts.push(text.clone());
-                                        // Single read of shutting_down — both the terminal-event
-                                        // and the skip-idle decisions must agree on its value.
-                                        // Widened through `session_is_shutting_down`: the
-                                        // per-session flag alone misses a session that
-                                        // registered after the teardown's snapshot, which
-                                        // would classify an engine restart as a user Stop.
+                                        // Single read of `shutting_down`, so the
+                                        // terminal-event and skip-idle decisions
+                                        // agree. Widened through
+                                        // `session_is_shutting_down`: the
+                                        // per-session flag alone misses a session
+                                        // registered after the teardown snapshot,
+                                        // which would read a restart as a Stop.
                                         let is_shutdown = self.session_is_shutting_down(
                                             shutting_down
                                                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1939,19 +1842,20 @@ impl LucidosEngine {
                                             cc_error,
                                             buffered_text_empty && result_text_empty,
                                         );
-                                        // Capture before the `if let Some(kind)` below moves out —
-                                        // `may_touch_change_state_at_idle` and the post-loop cleanup
-                                        // both read this to refuse half-assed work.
+                                        // Capture before the `if let` below moves
+                                        // it out. The idle gate and the post-loop
+                                        // cleanup both read it to refuse partial
+                                        // work.
                                         last_terminal_kind = terminal_kind.clone();
                                         if let Some(kind) = terminal_kind {
-                                            // A Result is a turn boundary — both
+                                            // A Result is a turn boundary, so both
                                             // the user-stop latch and the cancel
-                                            // actor on `meta` must clear here so an
+                                            // actor on `meta` must clear here. An
                                             // interrupt kept alive by inflight
-                                            // follow-ups can't relabel the
-                                            // follow-ups' successful completion as a
-                                            // second Canceled, and a resumed turn
-                                            // doesn't inherit the cancelling device.
+                                            // follow-ups would otherwise relabel
+                                            // their success as a second Canceled,
+                                            // and a resumed turn would inherit the
+                                            // cancelling device.
                                             let clears = terminal_clears_user_hit_stop(&kind);
                                             if clears {
                                                 user_hit_stop = false;
@@ -1977,29 +1881,33 @@ impl LucidosEngine {
                                             }
                                         }
                                         emitted_terminal_event = true;
-                                        // CC honored the interrupt (a Result landed) — disarm the
-                                        // bounded Esc fallback so it can't escalate to a hard stop.
+                                        // A Result landed, so CC honored the
+                                        // interrupt. Disarm the bounded Esc
+                                        // fallback before it escalates.
                                         interrupt_escalate_at = None;
                                         claude_text_buf.clear();
                                         last_text_persisted_len = 0;
                                         claude_thought_buf.clear();
                                         last_thought_persisted_len = 0;
-                                        // Auto-commit any dirty files before checking for changes.
-                                        // CC may create/edit files via Bash without committing. Without
-                                        // this, the three-dot diff below sees no committed changes and
-                                        // wt_has_changes is false, preventing ChangeProposed from firing.
+                                        // Auto-commit dirty files before checking
+                                        // for changes. The agent may edit files
+                                        // through Bash without committing, and
+                                        // the three-dot diff below would then see
+                                        // nothing and never propose a change.
                                         if let Some(ref wt) = worktree_path {
                                             auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
                                         }
-                                        // Resolve the branch and probe the diff ONCE, together, in
-                                        // `idle_change_state`. Both halves used to be inline and wrong:
-                                        // the branch came from the spawn-time `branch_name` (stale the
-                                        // moment a repo skill runs `git branch -m`), and the diff was
-                                        // probed three separate times through the swallowing
-                                        // `branch_changed_files` wrapper, so one git failure reached
-                                        // three consumers as "there is no diff". This site WRITES its
-                                        // answer somewhere durable, so it gets git truth or an explicit
-                                        // unknown, never a silent no.
+                                        // Resolve the branch and probe the diff
+                                        // ONCE, together, in
+                                        // `idle_change_state`. The spawn-time
+                                        // `branch_name` goes stale as soon as a
+                                        // repo skill renames the branch. A
+                                        // repeated probe also lets one git
+                                        // failure reach several consumers as
+                                        // "there is no diff". This site WRITES
+                                        // its answer somewhere durable, so it
+                                        // gets git truth or an explicit unknown,
+                                        // never a silent no.
                                         let (wt_has_changes, wt_requires_restart, changed_files) = if conflict_change.is_some() {
                                             (true, false, None) // Conflict resolution always has work
                                         } else {
@@ -2027,11 +1935,12 @@ impl LucidosEngine {
                                                 s.is_waiting = true;
                                                 s.has_changes = wt_has_changes;
                                                 s.requires_restart = wt_requires_restart;
-                                                // Keep ONE branch name per session. An adoption above
-                                                // moved the run loop onto the worktree's real branch;
-                                                // without this write-back `apply_now` and the stop /
-                                                // discard paths would keep acting on the stale name,
-                                                // which is the same drift that produced this bug.
+                                                // Keep ONE branch name per session. An
+                                                // adoption above moved the run loop onto
+                                                // the worktree's real branch. Without this
+                                                // write-back, `apply_now` and the stop and
+                                                // discard paths keep acting on the stale
+                                                // name.
                                                 s.branch_name = Some(branch_name.clone());
                                                 // Notify anyone waiting for idle (e.g. send_and_wait,
                                                 // apply_now conflict resolution). Without this,
@@ -2041,14 +1950,13 @@ impl LucidosEngine {
                                             }
                                         }
                                         // `bg_bash_running` reflects the chat-agent's
-                                        // `run_bash_background` tool (`BackgroundBashRegistry`).
-                                        // It no longer gates the propose decision — it only keeps
-                                        // CC alive at idle (via `terminate_decision` below) so
-                                        // `spawn_bash_completion_watcher` can push a resume prompt
-                                        // when the bash finishes. It's also recorded on the
-                                        // `CodingAgentIdled` payload as `bg_bash_pending` for the
-                                        // event history (no longer projected or gated — see the
-                                        // field doc on `ThreadEvent::CodingAgentIdled`).
+                                        // `run_bash_background` tool. It does not gate
+                                        // the propose decision. It only keeps the
+                                        // subprocess alive at idle, so
+                                        // `spawn_bash_completion_watcher` can push a
+                                        // resume prompt when the bash finishes. It is
+                                        // also recorded on the `CodingAgentIdled` payload
+                                        // for the event history.
                                         let bg_bash_running = self
                                             .bash_background
                                             .has_running_for_thread(thread_id)
@@ -2078,16 +1986,15 @@ impl LucidosEngine {
                                         // shows immediately (propose_change deduplicates). When
                                         // CC skipped /harden, hardened=false propagates to the
                                         // change record and Apply runs hardening at click time.
-                                        // Background bash deliberately does NOT gate this — see
-                                        // `may_touch_change_state_at_idle` for the rationale and
-                                        // the shutdown / external-repo / conflict-session guards.
+                                        // Background bash deliberately does NOT gate
+                                        // this. See `may_touch_change_state_at_idle`
+                                        // for that and for the other guards.
                                         //
-                                        // Gated on `may_touch_change_state_at_idle` (the propose
-                                        // gate WITHOUT its `wt_has_changes` term) so the
-                                        // empty-diff arm below is reachable: a branch whose diff
-                                        // cancelled out still has a pending row to reconcile, and
-                                        // gating the whole block on `wt_has_changes` left that row
-                                        // claiming files the branch no longer had.
+                                        // The gate deliberately omits a `wt_has_changes`
+                                        // term, so the empty-diff arm below is reachable.
+                                        // A branch whose diff cancelled out still has a
+                                        // pending row to reconcile, which would otherwise
+                                        // keep claiming files the branch no longer has.
                                         if may_touch_change_state_at_idle(
                                             is_external_repo,
                                             is_shutdown,
@@ -2108,13 +2015,13 @@ impl LucidosEngine {
                                                     );
                                                 }
                                                 Some([]) => {
-                                                    // No committed diff against the base (nothing was
-                                                    // done, or a commit + revert cancelled out). Never
-                                                    // auto-discard an existing pending row (the user
-                                                    // resolves it from Review), but DO re-sync it to
-                                                    // zero files so the card stops advertising work the
-                                                    // branch no longer carries. No pending row → nothing
-                                                    // to reconcile and nothing to propose.
+                                                    // No committed diff against the base.
+                                                    // Never auto-discard an existing
+                                                    // pending row, because the user
+                                                    // resolves it from Review. Do re-sync
+                                                    // it to zero files, so the card stops
+                                                    // advertising work the branch no
+                                                    // longer carries.
                                                     self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
                                                 }
                                                 Some(changed_files) => {
@@ -2171,47 +2078,36 @@ impl LucidosEngine {
                                                 break 'event_loop;
                                             }
                                             IdleAction::ExitSubprocess => {
-                                                // Hold the `agent_sessions` lock across the whole
-                                                // read-decide-act so the chat fast-path's
-                                                // check-and-send (`chat::process`, which takes the
-                                                // SAME lock) is mutually exclusive with this
-                                                // terminate decision. Without that serialization a
-                                                // follow-up could `msg_tx.send` into a subprocess
-                                                // this arm is about to cancel, which is the
-                                                // idle-termination race that silently drops the
-                                                // follow-up (the subprocess dies before producing a
-                                                // Result; see docs/plans/2026-06-27-cc-idle-
-                                                // termination-followup-race.md). The lock is also
-                                                // what makes `msg_rx.len()` below an exact answer
-                                                // rather than a sample. No `.await` runs inside this
-                                                // section other than the lock acquire, and every
-                                                // operation (settle / decide / field set / notify /
-                                                // cancel / log) is sync, so holding the lock cannot
-                                                // deadlock.
+                                                // Hold the `agent_sessions` lock across the
+                                                // whole read-decide-act, so the chat
+                                                // fast-path's check-and-send takes the same
+                                                // lock and cannot interleave. Otherwise a
+                                                // follow-up could `msg_tx.send` into a
+                                                // subprocess this arm is about to cancel,
+                                                // and the message is silently dropped. The
+                                                // lock is also what makes `msg_rx.len()`
+                                                // below exact rather than a sample. Only
+                                                // the lock acquire awaits, and everything
+                                                // inside is sync, so this cannot deadlock.
                                                 let mut sessions = self.agent_sessions.lock().await;
-                                                // Read all three follow-up windows here, under the
-                                                // lock, because that is what makes them exact: the
-                                                // fast-path check-increment-send in `chat::process`
-                                                // takes the same lock, so a message that was sent is
-                                                // already in `msg_rx` by the time we look. The pure
-                                                // decision lives in `terminate_decision` so the
-                                                // precedence rules and the per-reason log line both
-                                                // read from one place (see `TerminateDecision`).
+                                                // Read all three follow-up windows here,
+                                                // under the lock, which is what makes them
+                                                // exact. A message that was sent is already
+                                                // in `msg_rx` by the time we look. The pure
+                                                // decision lives in `terminate_decision`.
                                                 //
-                                                // The settle is per backend and is the reason this is
-                                                // not a plain `swap(0)`: Claude Code answers every
-                                                // forwarded input with one Result, Codex answers one
-                                                // each. `result_may_predate_a_forward` is what keeps
-                                                // the Claude Code rule from eating an input this
-                                                // Result cannot have answered.
+                                                // The settle is per backend, which is why
+                                                // this is not a plain `swap(0)`.
+                                                // `result_may_predate_a_forward` keeps the
+                                                // Claude Code rule from eating an input
+                                                // this Result cannot have answered.
                                                 //
-                                                // The load-then-store is not an atomic
-                                                // read-modify-write and does not need to be. The only
-                                                // other writer is the `fetch_add` in the `msg_rx` arm
-                                                // below, which is another branch of THIS `select!` in
-                                                // this same task, so the two cannot interleave. The
-                                                // atomic exists to share the value with the session
-                                                // struct, not to arbitrate between writers.
+                                                // The load-then-store need not be atomic.
+                                                // The only other writer is the `fetch_add`
+                                                // in the `msg_rx` arm below, another branch
+                                                // of THIS `select!` in this same task. The
+                                                // atomic exists to share the value with the
+                                                // session struct, not to arbitrate writers.
                                                 let awaiting_result = settle_inputs_awaiting_result(
                                                     coding_agent,
                                                     inputs_awaiting_result
@@ -2246,14 +2142,14 @@ impl LucidosEngine {
                                                         log!("[AgentSession] Skipping subprocess termination for thread {} — background bash still running (auto-wake will resume CC on completion)", thread_id);
                                                     }
                                                     TerminateDecision::Terminate => {
-                                                        // Mark the session exited BEFORE cancelling
-                                                        // so a follow-up landing during the graceful-
-                                                        // shutdown window (process is alive until
-                                                        // `AgentEvent::Exited`, up to ~3s later) sees
-                                                        // `process_exited == true` and routes via the
-                                                        // slow `--resume` path instead of `msg_tx`
-                                                        // into the dying subprocess. Mirrors the
-                                                        // pre-exit mark in `completion.rs`.
+                                                        // Mark the session exited BEFORE
+                                                        // cancelling. The process stays alive
+                                                        // for the graceful-shutdown window. A
+                                                        // follow-up landing there must see
+                                                        // `process_exited` and route through
+                                                        // the slow `--resume` path rather than
+                                                        // `msg_tx` into a dying subprocess.
+                                                        // Mirrors the mark in `completion.rs`.
                                                         if let Some(s) = sessions.get_mut(&thread_id) {
                                                             s.process_exited = true;
                                                             s.idle_notify.notify_waiters();
@@ -2269,16 +2165,15 @@ impl LucidosEngine {
                                 }
                 }
 
-                // Codex app-server approval bridge. Each request spawns its
-                // own waiter task so this loop NEVER blocks on the user — a
-                // pending card must not stall event processing, interrupts,
-                // or the watchdog (run.rs is the engine's highest-traffic
-                // loop; keep this arm minimal).
+                // Codex app-server approval bridge. Each request spawns its own
+                // waiter task, so this loop NEVER blocks on the user. A pending
+                // card must not stall event processing, interrupts or the
+                // watchdog, so keep this arm minimal.
                 perm_req = async {
                     match agent_permission_rx.as_mut() {
                         Some(rx) => rx.recv().await,
-                        // No in-band permission channel (CC / codex exec) —
-                        // pend forever so the arm never fires.
+                        // No in-band permission channel, so pend forever and
+                        // let the arm never fire.
                         None => std::future::pending().await,
                     }
                 } => {
@@ -2287,24 +2182,21 @@ impl LucidosEngine {
                             let pool = self.pool.clone();
                             let bus = self.event_bus.clone();
                             let pending = self.pending_cc_permission.clone();
-                            // Unattended (trigger-rooted) sessions auto-resolve
-                            // the card from the inherited side-effect grant
-                            // instead of hanging — `prompt_coding_agent_permission`
-                            // needs the trigger registry + workspace root to
-                            // decide (see `cc_permission::resolve_attend_mode`).
+                            // An unattended session auto-resolves the card from
+                            // the inherited side-effect grant rather than
+                            // hanging, and that decision needs the trigger
+                            // registry and the workspace root.
                             let trigger_configs = self.trigger_configs.clone();
                             let workspace_path = self.workspace_path.clone();
-                            // A file write landing inside this session's own
-                            // worktree skips the card entirely. This local IS
-                            // what seeded `AgentSession.worktree_path`, so it
-                            // matches what the CC MCP path resolves via
-                            // `cc_permission::lookup_session_worktree` — and
-                            // reading it directly keeps this arm lock-free.
+                            // A file write inside this session's own worktree
+                            // skips the card entirely. This local IS what seeded
+                            // `AgentSession.worktree_path`, so it matches what
+                            // the MCP path resolves, and reading it here keeps
+                            // the arm lock-free.
                             let session_worktree = worktree_path.clone();
-                            // Disarm the watchdog while the card waits — the
-                            // approval may arrive BEFORE the item's ToolUse
-                            // (codex raises it pre-execution), so the paired
-                            // tool counter alone can't be relied on to cover
+                            // Disarm the watchdog while the card waits. The
+                            // approval may arrive BEFORE the item's ToolUse,
+                            // so the paired tool counter alone cannot cover
                             // the wait.
                             let tools = tools_in_flight.clone();
                             tokio::spawn(async move {
@@ -2329,16 +2221,14 @@ impl LucidosEngine {
                                         // and delivery; nothing to deliver to.
                                         let _ = respond.send(outcome.allowed);
                                     }
-                                    // Driver died (interrupt escalation, child
-                                    // crash) while the card was pending — the
-                                    // driver's JoinSet aborts its waiter task,
-                                    // dropping the oneshot receiver, which fires
-                                    // this arm. Abandoning the wait drops our
-                                    // broadcast receiver so the next prompt's
-                                    // gc_dead_entries sweep evicts the entry. The
-                                    // persisted card resolves via the same recovery
-                                    // paths CC uses (supersede-on-new-message,
-                                    // orphan sweep).
+                                    // The driver died while the card was pending.
+                                    // Its JoinSet aborts the waiter task, which
+                                    // drops the oneshot receiver and fires this
+                                    // arm. Abandoning the wait drops our
+                                    // broadcast receiver, so the next prompt's
+                                    // sweep evicts the entry. The persisted card
+                                    // resolves through the same recovery paths
+                                    // Claude Code uses.
                                     _ = respond.closed() => {
                                         log!(
                                             "[AgentSession] agent died with permission card pending for thread {} — abandoning waiter",
@@ -2350,8 +2240,8 @@ impl LucidosEngine {
                             });
                         }
                         None => {
-                            // Driver dropped its sender — disable the arm so a
-                            // closed channel doesn't re-resolve every loop tick.
+                            // The driver dropped its sender, so disable the arm.
+                            // A closed channel would re-resolve every tick.
                             agent_permission_rx = None;
                         }
                     }
@@ -2359,18 +2249,14 @@ impl LucidosEngine {
 
                 Some(user_input) = msg_rx.recv() => {
                     // The input just left the channel and is about to reach the
-                    // driver, so it moves from the "sent, not yet forwarded" window
-                    // (`msg_rx`) into the "forwarded, not yet answered" one. Counting
-                    // here rather than at each `msg_tx.send` is what keeps the two
-                    // windows disjoint, and it catches every sender, including the
-                    // ones that never touched the old send-site counter (`apply_now`'s
-                    // hardening prompt, the `run_bash_background` auto-wake,
-                    // `change_ops::propose`).
+                    // driver. It therefore moves from the "sent, not yet
+                    // forwarded" window into the "forwarded, not yet answered"
+                    // one. Counting here rather than at each `msg_tx.send` keeps
+                    // the two windows disjoint, and it catches every sender.
                     inputs_awaiting_result.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     // Arm the "this input may outrun the next Result" flag, and
-                    // record how many events the driver had already queued, since
-                    // those were produced before the agent could have seen this input
-                    // and must not be allowed to confirm it. See the declaration.
+                    // record how many events the driver had already queued. Those
+                    // predate the input and must not confirm it.
                     forwarded_input_unconfirmed = true;
                     agent_events_queued_at_forward = events_rx.len();
                     reset_per_turn_flags(
@@ -2420,7 +2306,7 @@ impl LucidosEngine {
                         log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
                     }
-                    // `WakeFromChild` suppresses our emit — see `AgentInputKind`
+                    // `ReentryFromEngine` suppresses our emit, see `AgentInputKind`
                     // docs; the parent's `ChildThreadCompleted` is the start.
                     if matches!(input_kind, crate::engine::AgentInputKind::User) {
                         self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
@@ -2481,10 +2367,9 @@ impl LucidosEngine {
                 }
 
                 _ = stop.notified() => {
-                    // Apply / Discard / Archive emit their own lifecycle terminator
-                    // (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`); only
-                    // a real `UserStop` (or no reason set — engine shutdown direct
-                    // notify) lets `ResponseCanceled` through.
+                    // Apply, Discard and Archive emit their own lifecycle
+                    // terminator. Only a real `UserStop`, or no reason at all,
+                    // lets `ResponseCanceled` through.
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     let suppress_user_terminal = matches!(
@@ -2585,14 +2470,13 @@ impl LucidosEngine {
 
                 _ = tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_TICK_INTERVAL_SECS)) => {
                     // Hung-subprocess watchdog. Any incoming event re-arms the
-                    // sleep via the surrounding select!, so only a fully silent
-                    // loop reaches here. On fire, the safety net at the bottom
-                    // of run_session reads `watchdog_fired` and emits
-                    // `ContinuationRequested{auto_recovery_after_hang}` instead of an
-                    // abort, so the spawn dispatcher boots a fresh `--resume`
-                    // without user intervention. Diagnostic line fires on any
-                    // non-NotStale gate past the threshold so post-mortems can
-                    // pin which gate held — the May-2026 incident lacked this.
+                    // sleep through the surrounding `select!`, so only a fully
+                    // silent loop reaches here. On fire, the safety net reads
+                    // `watchdog_fired` and emits a `ContinuationRequested`
+                    // instead of an abort. The dispatcher then boots a fresh
+                    // `--resume` with no user intervention. The diagnostic line
+                    // fires on any non-NotStale gate past the threshold, so a
+                    // post-mortem can pin which gate held.
                     let (last_ms, session_present) = {
                         let guard = self.agent_sessions.lock().await;
                         match guard.get(&thread_id) {
@@ -2637,16 +2521,14 @@ impl LucidosEngine {
                         let should_fire = match gate {
                             WatchdogGate::Fire => true,
                             WatchdogGate::FirePastCeiling(tif) => {
-                                // A tool has been "in flight" past the hung-tool
-                                // ceiling. Distinguish a genuinely hung tool
-                                // (thread still `running`) from a pending
-                                // question/permission card the user simply
-                                // hasn't answered yet — those flip the thread to
-                                // `waiting_for_user_answer` but are deliberately
+                                // A tool has been in flight past the hung-tool
+                                // ceiling. A genuinely hung tool leaves the
+                                // thread `running`. A pending question or
+                                // permission card flips it to
+                                // `waiting_for_user_answer`, yet is deliberately
                                 // counted in `tools_in_flight` to disarm the
-                                // normal watchdog. Only the former is
-                                // euthanizable; the user may take arbitrarily
-                                // long to answer.
+                                // normal watchdog. Only the first may be killed:
+                                // the user may take arbitrarily long to answer.
                                 let still_running =
                                     crate::engine::claude_code::thread_is_running(
                                         self.pool(),
@@ -2731,29 +2613,21 @@ pub(super) struct ResumeSpawnContext<'a> {
 /// message, optionally prefixed with up to three resume-time notes that
 /// reconcile what changed while the agent was idle:
 ///
-/// 1. **branch adoption**: the worktree was switched to a new branch holding
-///    the agent's work (`try_adopt_renegade_branch`),
-/// 2. **turn gap**: the user or the engine resolved one of the agent's changes
-///    (Apply / Discard / Revert / a failed Apply) or the cleanup worker
-///    reclaimed the worktree (`turn_gap::compute_turn_gap_note`),
-/// 3. **external edits**: the worktree changed under the agent
-///    (`external_edits::compute_external_edit_note`).
+/// 1. **branch adoption**: the worktree switched to a new branch holding the
+///    agent's work,
+/// 2. **turn gap**: the user or the engine resolved one of the agent's changes,
+///    or the cleanup worker reclaimed the worktree,
+/// 3. **external edits**: the worktree changed under the agent.
 ///
 /// The turn-gap note is computed FIRST because it decides whether the
-/// external-edit note is allowed to report a HEAD move as unexplained. An
-/// Apply, a Discard or a tier-2 worktree clean moves HEAD without anyone
-/// editing a file, and the edit detector cannot tell the difference: left to
-/// itself it reports "the user edited files in your worktree … HEAD moved (no
-/// log available)", blaming a hand edit for something the engine did. The
-/// turn-gap note states the real cause, so it passes `explains_worktree_reset`
-/// down and the edit note drops that one line (and only that line).
+/// external-edit note may report a HEAD move as unexplained. An Apply, a
+/// Discard or a tier-2 worktree clean moves HEAD without anyone editing a file,
+/// and the edit detector cannot tell the difference. The turn-gap note states
+/// the real cause, so it passes `explains_worktree_reset` down and the edit
+/// note drops that one line.
 ///
-/// The notes are folded into one block (joined by `\n`) and prepended to the
-/// message. An empty `user_message` (warm-up/continue-signal resume) is passed
-/// through untouched: notes only ride on a real turn so they can't trigger an
-/// otherwise-empty LLM call.
-///
-/// This single assembly point serves both Claude Code and Codex.
+/// An empty `user_message` passes through untouched: notes only ride on a real
+/// turn, so they cannot trigger an otherwise-empty LLM call.
 pub(super) async fn build_resume_prompt_text(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -2937,10 +2811,10 @@ mod result_text_prose_tests {
         assert!(result_text_is_own_prose("Set model to claude-opus-5", None));
     }
 
-    /// The duplicate. With CC's own banner no longer buffered as text, a turn
+    /// The duplicate. CC's own banner is no longer buffered as text. A turn
     /// whose only output was that banner reaches this branch with the failure
-    /// reason sitting in `result.result`, and emitting it would put the card's
-    /// sentence back in the response body.
+    /// reason in `result.result`. Emitting it puts the card's sentence back in
+    /// the response body.
     #[test]
     fn the_turns_failure_reason_is_not_prose() {
         let err = "API Error: Stream idle timeout - no chunks received";
@@ -2951,9 +2825,9 @@ mod result_text_prose_tests {
         );
     }
 
-    /// Equality, not an `API Error` prefix test. A failure whose reason was
-    /// derived elsewhere (CC's `errors[]`, a subtype label) leaves the text
-    /// alone rather than guessing, and the frontend's echo drop is the backstop.
+    /// Equality, not an `API Error` prefix test. A failure whose reason came
+    /// from elsewhere leaves the text alone rather than guessing, and the
+    /// frontend's echo drop is the backstop.
     #[test]
     fn text_the_card_will_not_show_verbatim_stays() {
         assert!(result_text_is_own_prose(

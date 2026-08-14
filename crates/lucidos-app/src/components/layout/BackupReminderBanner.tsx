@@ -1,25 +1,15 @@
 import type { Ref, VNode } from 'preact';
-import { useEffect, useRef } from 'preact/hooks';
+import { useRef } from 'preact/hooks';
 import { backupReminderVisible, dismissBackupReminder } from '../../store/actions/preferences';
 import { openBackupSettings } from '../../store/actions/menu';
 import { viewportIsMobile } from '../../utils/viewport';
-import { getRemPx } from '../../utils/dom';
 import { CloseIcon } from '../shared/icons';
+import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
 
-/** Which layout this instance belongs to. Both are mounted (the mobile one
- *  inside the fixed `.app-header`, the desktop one in the shell's flow), and each
- *  renders only under its own viewport, per the dual-render rule in
- *  `.claude/rules/frontend.md`. Rendering both would put two bars on screen and,
- *  worse, race two ResizeObservers to publish one CSS var. */
-export type BannerLayout = 'desktop' | 'mobile';
-
-/** The CSS custom property the desktop instance publishes its measured height
- *  into. `--app-header-bottom` adds it, so the toast stack, the drawer and the
- *  drawer backdrop all clear the banner instead of starting behind it. Mobile
- *  publishes nothing: its banner lives INSIDE the header element that
- *  `useHideOnScroll` already observes, so `--mobile-header-height` (and through
- *  it the mobile `--app-header-bottom` and every pane's `::before` spacer) grows
- *  on its own. */
+/** The CSS custom property this banner publishes its measured height into.
+ *  `--app-header-bottom` adds it, so the toast stack, the drawer and the drawer
+ *  backdrop all clear the banner instead of starting behind it. One property per
+ *  banner, never a shared one: see `useBannerHeightVar`. */
 export const BANNER_HEIGHT_VAR = '--app-banner-height';
 
 /** Whether THIS instance is the one that renders: it must belong to the mounted
@@ -30,16 +20,7 @@ export function shouldRenderBanner(opts: {
   mobileViewport: boolean;
   reminderVisible: boolean;
 }): boolean {
-  const mine = opts.layout === (opts.mobileViewport ? 'mobile' : 'desktop');
-  return mine && opts.reminderVisible;
-}
-
-/** The value for {@link BANNER_HEIGHT_VAR}, or null to clear the property.
- *  Published in rem (mirroring `updateTitleBarHeightVar` in `useHideOnScroll.ts`)
- *  so the reservation survives a UI-scale change. */
-export function bannerHeightValue(px: number | null, remSize: number): string | null {
-  if (px === null || px <= 0 || remSize <= 0) return null;
-  return `${px / remSize}rem`;
+  return bannerBelongsToLayout(opts.layout, opts.mobileViewport) && opts.reminderVisible;
 }
 
 /** Pure markup for the bar. Hook-free (the `backupHealthCard` idiom) so the
@@ -89,34 +70,7 @@ export function BackupReminderBanner({ layout }: { layout: BannerLayout }) {
     reminderVisible: backupReminderVisible(),
   });
 
-  // Desktop only: keep --app-banner-height in step with the rendered bar, which
-  // can wrap to a second line on a narrow split. Clearing on teardown is what
-  // stops a stale reservation from surviving a dismiss or a switch to mobile.
-  useEffect(() => {
-    if (layout !== 'desktop' || !show) return;
-    const el = ref.current;
-    if (!el) return;
-    const root = document.documentElement;
-    // getRemPx() is read at MEASURE time, not captured at mount. Changing the UI
-    // scale rewrites --user-ui-scale, which IS the root font size (base.css
-    // `html { font-size: var(--user-ui-scale, 100%) }`), so a captured value
-    // goes stale exactly when the bar's pixel height changes: the observer would
-    // then divide the new px by the old rem and reserve the wrong space,
-    // misplacing the toast stack and drawer until the banner remounted. Same
-    // reason refreshHeight() in useHideOnScroll.ts re-reads it every time.
-    const publish = (px: number | null) => {
-      const value = bannerHeightValue(px, getRemPx());
-      if (value === null) root.style.removeProperty(BANNER_HEIGHT_VAR);
-      else root.style.setProperty(BANNER_HEIGHT_VAR, value);
-    };
-    publish(el.getBoundingClientRect().height);
-    const observer = new ResizeObserver(() => publish(el.getBoundingClientRect().height));
-    observer.observe(el, { box: 'border-box' });
-    return () => {
-      observer.disconnect();
-      publish(null);
-    };
-  }, [layout, show]);
+  useBannerHeightVar(ref, { layout, cssVar: BANNER_HEIGHT_VAR, active: show });
 
   if (!show) return null;
 

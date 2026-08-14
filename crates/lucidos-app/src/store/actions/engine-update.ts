@@ -1,8 +1,8 @@
-import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { initiateEngineRestart } from './chat-changes';
-import { noteSwitchBuildId, wasSwitchDismissed } from '../../hooks/sw-update';
+import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
 import { syncBackgroundActivityToast } from './backgroundActivity';
 
 /** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
@@ -76,6 +76,145 @@ function groupedCommits(pending: EngineVersionStatus['pending_commits']): Pendin
   return pending && Array.isArray(pending.groups) ? pending : null;
 }
 
+/** The ONE writer of the pending pair: the badge's third state, and whether a
+ *  rebuild has been proved unable to resolve it.
+ *
+ *  Same argument as `setEngineBuilding` above. The poll decides "not pending" on
+ *  several paths (packaged, build failed, a switchable build landed, a build in
+ *  flight), and a wedged flag left standing after the state it describes has
+ *  gone would tint the badge and strip the Rebuild button for a workspace that
+ *  is merely building. One writer makes `pending === false` imply "not wedged"
+ *  by construction. */
+function setEngineVersionPending(pending: boolean, wedged = false): void {
+  engineVersionPending.value = pending;
+  engineRebuildWedged.value = pending && wedged;
+}
+
+/** Is the engine-version toast currently on screen?
+ *
+ *  Both shapes of it share `NEW_VERSION_TOAST_KEY`, deliberately: they are one
+ *  announcement about one thing, and sharing the key is what lets a pending
+ *  toast turn into the Switch toast in place when a build lands, rather than
+ *  popping out and a second one popping in. */
+function versionToastIsOpen(): boolean {
+  return toasts.value.some((t) => t.key === NEW_VERSION_TOAST_KEY);
+}
+
+/** Which shape the engine-version announcement takes, or `null` for nothing to
+ *  announce. One value rather than a pair of booleans, because `ready` and
+ *  `wedged` are mutually exclusive and a two-boolean encoding makes the
+ *  combination of them representable at every call site that has to avoid it. */
+type VersionAnnouncement = 'ready' | 'pending' | 'wedged';
+
+/** Draw the engine-version announcement in whichever of its three shapes fits.
+ *  Keyed, so this both CREATES the toast and updates one already on screen, and
+ *  re-running it on every poll neither stacks nor re-animates. The caller owns
+ *  the question of whether it is entitled to create.
+ *
+ *  The three differ in what the user can actually do, which is the only thing
+ *  worth distinguishing:
+ *
+ *  - **ready**: a built version is waiting, so offer the Switch, and a "Later"
+ *    that defers it.
+ *  - **pending**: new code exists with no version behind it, so offer the
+ *    Rebuild that produces one, and the same "Later".
+ *  - **wedged**: the same as pending except a rebuild has already been proved
+ *    futile. Offering the button anyway is the loop the user reported: it runs a
+ *    few-second no-op build and puts this toast straight back. So the button
+ *    goes, the tone rises to `warning`, and the copy names the one thing that
+ *    does resolve it. With nothing left to do but acknowledge, it takes the
+ *    `dismissable: false` + explicit OK shape the deferred-frontend hint below
+ *    already uses, rather than leaving a bare X as the only affordance. */
+function renderVersionToast(shape: VersionAnnouncement): void {
+  const later = {
+    label: 'Later',
+    onClick: () => { dismissToast(NEW_VERSION_TOAST_KEY); },
+  };
+  if (shape === 'ready') {
+    showToast('New version available.', 'info', {
+      key: NEW_VERSION_TOAST_KEY,
+      // "Later" defers the switch: same path as the X, remembering this on-disk
+      // build and hiding the toast while the reload badge stays lit.
+      secondaryAction: later,
+      action: {
+        label: 'Switch to new version',
+        onClick: () => { void initiateEngineRestart(); },
+      },
+    });
+    return;
+  }
+  if (shape === 'wedged') {
+    showToast(
+      'New engine version pending, and rebuilding cannot deliver it: a build for this commit ' +
+        'already succeeded without producing one. Relaunch the stack from your checkout.',
+      'warning',
+      {
+        key: NEW_VERSION_TOAST_KEY,
+        dismissable: false,
+        action: {
+          label: 'OK',
+          onClick: () => { dismissToast(NEW_VERSION_TOAST_KEY); },
+        },
+      },
+    );
+    return;
+  }
+  showToast('New engine version pending.', 'info', {
+    key: NEW_VERSION_TOAST_KEY,
+    secondaryAction: later,
+    action: {
+      label: 'Rebuild',
+      onClick: () => { void triggerRebuild(); },
+    },
+  });
+}
+
+/** The announced engine version id the last poll saw, so the badge tap below can
+ *  name the version it is asking to see again without re-reading the status. */
+let lastAnnouncedId: string | undefined;
+
+/** The version id the user re-opened from the badge, which is what buys the
+ *  toast an exemption from its own dismissal on later polls.
+ *
+ *  A flag rather than "the toast happens to be on screen", and the distinction
+ *  is load-bearing: the dismissal is a WORKSPACE-GLOBAL preference, deliberately,
+ *  so that putting the toast away on the phone puts it away on the laptop too.
+ *  Inferring the exemption from an open toast would keep it open on every device
+ *  that already had it up, which is the one thing a global dismissal exists to
+ *  prevent. Only a tap ON THIS DEVICE sets this.
+ *
+ *  Never cleared, and it does not need to be: it is only ever consulted together
+ *  with a matching announced id and an open toast, so dismissing the re-opened
+ *  toast retires it, and a genuinely newer version stops matching. */
+let reopenedVersionId: string | undefined;
+
+/** Forget which version was last announced and which was re-opened. Test seam
+ *  only, mirroring `resetBackgroundActivityToastForTest`: these two outlive any
+ *  signal a test resets, so without it one test's badge tap grants the next
+ *  test's toast an exemption it never asked for. */
+export function resetEngineVersionToastForTest(): void {
+  lastAnnouncedId = undefined;
+  reopenedVersionId = undefined;
+}
+
+/** Re-open the pending version toast on demand (the brand badge was tapped).
+ *
+ *  The badge's counterpart to the poll's create-or-update rule: the poll will
+ *  not resurrect a toast the user dismissed, so the badge is how they ask for it
+ *  back, which is what makes dismissing it safe in the first place. Reads the
+ *  signals rather than taking a status, because the badge that calls this is
+ *  rendered from those same signals and there is no fresher truth to be had
+ *  between polls.
+ *
+ *  Only the PENDING shape is re-openable. The ready state's badge is not
+ *  clickable at all: it falls through to the Lucidos menu, where the Restart row
+ *  carries the switch. */
+export function openEngineVersionToast(): void {
+  if (!engineVersionPending.value) return;
+  reopenedVersionId = lastAnnouncedId;
+  renderVersionToast(engineRebuildWedged.value ? 'wedged' : 'pending');
+}
+
 /** Poll the engine's version status and surface the unified "New version
  *  available → Switch to new version" flow (dev half). Packaged builds report
  *  `packaged: true` and never `update_available` — their new-version source is the
@@ -123,12 +262,17 @@ async function pollEngineVersion(): Promise<void> {
   // a dev-only affordance.
   if (status.packaged) {
     setEngineBuilding(false);
+    setEngineVersionPending(false);
     return;
   }
 
   if (status.build_state === 'failed') {
     engineVersionReady.value = false;
     setEngineBuilding(false);
+    // A failed build owns its own toast and its own Retry, so the pending
+    // surface stands down rather than putting a second badge and a second
+    // rebuild button on screen for the same stuck version.
+    setEngineVersionPending(false);
     // A new version exists in source but the last rebuild failed. Offer a manual
     // retry so the user isn't stuck (the engine self-heal driver also retries, up
     // to a per-HEAD cap). No auto-switch — the build must succeed first.
@@ -166,79 +310,80 @@ async function pollEngineVersion(): Promise<void> {
   // The `!== 'building'` term stays: the on-disk binary can already differ
   // mid-build (a prior build wrote it, or it is being rewritten right now), and
   // switching then respawns onto a half-written binary.
+  // Also the badge (`engineVersionReady`, read by the brand badge): readiness
+  // ALONE, the persistent "switch available" affordance that survives a dismiss.
+  // On ARRIVAL it appears with the Switch toast from this one check (INV-C
+  // arrival); the two decouple only on dismiss.
   const ready = status.update_available && status.build_state !== 'building';
-  // Badge (engineVersionReady, read by the brand badge) = readiness ALONE:
-  // the persistent "switch available" affordance that survives a dismiss (the
-  // user can still switch from the reload badge). On ARRIVAL it appears with the
-  // Switch toast from this one `ready` check (INV-C arrival); the two decouple
-  // only on dismiss.
-  const diskId = status.disk_build_id;
-  // Toast = ready AND not dismissed for THIS on-disk build (disk_build_id): the
-  // one-time announcement. A dismiss defers it (badge stays) until a genuinely
-  // newer build lands, mirroring the client refresh's per-served-build dismissal.
-  const toastAvailable = ready && !(diskId !== undefined && wasSwitchDismissed(diskId));
-  if (toastAvailable) {
-    // Keep the Switch toast present alongside the badge. Keyed → idempotent: a
-    // re-show updates in place, so re-running each poll neither stacks nor
-    // re-animates. Record the on-disk build so a dismiss pins the right id.
-    if (diskId !== undefined) noteSwitchBuildId(diskId);
-    showToast('New version available.', 'info', {
-      key: NEW_VERSION_TOAST_KEY,
-      // "Later" defers the switch: same path as the X — remembers this on-disk
-      // build and hides the toast, while the reload badge stays lit.
-      secondaryAction: {
-        label: 'Later',
-        onClick: () => { dismissToast(NEW_VERSION_TOAST_KEY); },
-      },
-      action: {
-        label: 'Switch to new version',
-        onClick: () => { void initiateEngineRestart(); },
-      },
-    });
-  } else if (status.source_behind_head && !status.update_available && status.build_state !== 'building' && !sharedBuilding) {
-    // A new engine version exists in source but no fresh binary is on disk yet
-    // AND nothing is building it (a mixed Apply's rebuild failed / never ran, and
-    // no co-located peer holds the shared build lock). The engine's self-heal
-    // driver retries automatically, but surface a manual escape so the Switch is
-    // never a dead-end. Two load-bearing guards:
-    //  - `!update_available`: after a SUCCESSFUL rebuild both `update_available`
-    //    (disk binary differs) AND `source_behind_head` (running engine's commit
-    //    still behind HEAD) are true — that state belongs to the ready→Switch
-    //    branch above (and its per-build dismissal), NOT here; without the guard a
-    //    dismissed Switch would re-nag as "Rebuild" every poll.
-    //  - `!sharedBuilding`: a co-located peer building the shared binary is NOT a
-    //    stuck state — its build WILL advance the binary → Switch. In the
-    //    multi-workspace case a lost-the-lock workspace has build_state 'idle' but
-    //    a build is in flight; showing "Rebuild" there is wrong (it'd just
-    //    SkippedLock again) and misleading. That case shows the spinner instead
-    //    (engineBuilding below); the pending toast is reserved for genuinely stuck.
-    // So this fires ONLY when no switchable binary exists and nothing is building.
-    // `!== 'building'` rather than `=== 'idle'` deliberately ('failed' already
-    // returned above via the build-failed toast, so this admits idle + ready): a
-    // rebuild that COMPLETED without producing anything newer leaves build_state
-    // 'ready' forever, and that is the most stuck state there is. Gating on 'idle'
-    // would answer it with silence — hiding both the pending version and this
-    // escape hatch (docs/plans/2026-07-26-downgrade-switch-toast-loop.md, INV-5b).
-    // Reuses NEW_VERSION_TOAST_KEY so it transitions in place to the Switch toast
-    // once a rebuild lands. Short-lived (self-heal / a peer build flips it) so no
-    // persistent "Later" (no on-disk build id to key a dismissal on anyway); the X
-    // just hides it and the next poll re-derives it.
-    showToast('New engine version pending.', 'info', {
-      key: NEW_VERSION_TOAST_KEY,
-      action: {
-        label: 'Rebuild',
-        onClick: () => { void triggerRebuild(); },
-      },
-    });
+
+  // A new engine version exists in source but no fresh binary is on disk yet
+  // AND nothing is building it (a mixed Apply's rebuild failed / never ran, and
+  // no co-located peer holds the shared build lock). Two load-bearing guards:
+  //  - `!update_available`: after a SUCCESSFUL rebuild both `update_available`
+  //    (disk binary differs) AND `source_behind_head` (running engine's commit
+  //    still behind HEAD) are true. That state belongs to the ready/Switch
+  //    surface and its per-build dismissal, NOT here. It is also what makes
+  //    `ready` and `pending` mutually exclusive by construction rather than by
+  //    the order of an if/else chain.
+  //  - `!sharedBuilding`: a co-located peer building the shared binary is NOT a
+  //    stuck state, since its build WILL advance the binary and surface the
+  //    Switch. In the multi-workspace case a lost-the-lock workspace has
+  //    build_state 'idle' but a build is in flight; showing "Rebuild" there is
+  //    wrong (it'd just SkippedLock again) and misleading. That case shows the
+  //    spinner instead (engineBuilding below); pending is for genuinely stuck.
+  // `!== 'building'` rather than `=== 'idle'` deliberately ('failed' already
+  // returned above via the build-failed toast, so this admits idle + ready): a
+  // rebuild that COMPLETED without producing anything newer leaves build_state
+  // 'ready' forever, and that is the most stuck state there is. Gating on 'idle'
+  // would answer it with silence, hiding both the pending version and its escape
+  // hatch (docs/plans/2026-07-26-downgrade-switch-toast-loop.md, INV-5b).
+  const pending =
+    status.source_behind_head === true &&
+    !status.update_available &&
+    status.build_state !== 'building' &&
+    !sharedBuilding;
+  // ...and the engine has PROVED that rebuilding cannot resolve it: a build for
+  // this HEAD already finished and produced nothing switchable. Never derived
+  // here from `build_state === 'ready'`, which looks like the same thing and
+  // isn't: a build that completed before newer commits landed would read as
+  // wedged when a rebuild would genuinely help, and only the engine knows which
+  // HEAD a finished build was built from.
+  const wedged = pending && status.rebuild_wedged === true;
+
+  // The identity of the version being announced, whichever shape it takes: the
+  // on-disk build when there is one to switch onto, the checkout's HEAD when the
+  // version exists only in source. Recorded whether or not the toast is on
+  // screen, so the badge can re-open a dismissed toast and a dismiss of THAT
+  // still pins the right id.
+  const announcedId = ready ? status.disk_build_id : pending ? status.head_commit : undefined;
+  if (announcedId !== undefined) noteAnnouncedEngineVersion(announcedId);
+  lastAnnouncedId = announcedId;
+  // Deferred for THIS version: the user dismissed it and nothing newer has
+  // arrived since. The badge stays lit either way; the dismissal defers only the
+  // toast, exactly as it does for the client refresh.
+  const deferred = announcedId !== undefined && wasEngineVersionDismissed(announcedId);
+  // ...unless the user asked for it back from the badge on THIS device and it is
+  // still up. Both terms are required: the id so a newer version is announced on
+  // its own merits, and the open check so dismissing the re-opened toast retires
+  // the exemption instead of making it permanent.
+  const reopened =
+    announcedId !== undefined && reopenedVersionId === announcedId && versionToastIsOpen();
+
+  const shape: VersionAnnouncement | null = ready ? 'ready' : pending ? (wedged ? 'wedged' : 'pending') : null;
+  if (shape !== null && (!deferred || reopened)) {
+    renderVersionToast(shape);
   } else {
-    // No toast offered (no build ready, none pending in source, or deferred for
-    // this on-disk build) → hide it. removeToast (not dismissToast) so this
-    // signal-driven hide isn't recorded as a user dismissal. This also clears a
-    // sticky toast once a NEW build starts (build_state 'building'), whose switch
-    // would respawn onto a binary that's mid-rewrite.
+    // Nothing to announce, or deferred and not re-opened here, so hide it.
+    // removeToast (not dismissToast) so this signal-driven hide isn't recorded
+    // as a user dismissal. This also clears the toast once a NEW build starts
+    // (build_state 'building'), whose switch would respawn onto a binary that's
+    // mid-rewrite, and it is what carries a dismissal made on ANOTHER device
+    // across to this one: the preference is workspace-global on purpose, so a
+    // poll that sees it must close a toast this device still has up.
     removeToast(NEW_VERSION_TOAST_KEY);
   }
   engineVersionReady.value = ready;
+  setEngineVersionPending(pending, wedged);
   // A background rebuild is in flight (Apply kicked it off) but not yet ready to
   // switch onto — drives the spinning-refresh brand badge. True for THIS engine's
   // own build (build_state === 'building') OR when a co-located peer is building

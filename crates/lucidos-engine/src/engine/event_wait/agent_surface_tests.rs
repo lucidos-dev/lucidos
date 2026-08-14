@@ -104,11 +104,11 @@ fn an_overdue_deadline_never_reads_as_negative() {
 /// believes it is watching and is not is the reported bug, so "none" has to say
 /// what that means rather than just being empty.
 #[test]
-fn an_empty_list_says_nothing_will_wake_the_thread() {
+fn an_empty_list_says_nothing_will_reopen_the_thread() {
     let text = render_event_wait_list(&[]);
     assert!(text.contains("no live subscriptions"), "{text}");
     assert!(
-        text.contains("Nothing will wake it"),
+        text.contains("Nothing will re-open it"),
         "the consequence, not just the count: {text}"
     );
     assert!(
@@ -140,7 +140,7 @@ fn the_list_names_each_subscription_its_reason_and_both_ages() {
         "{text}"
     );
     assert!(text.contains("armed 1m ago, times out in 1h 0m"), "{text}");
-    // "Each wakes it once, then is spent" is the fact a re-arm decision turns
+    // "Each re-opens it once, then is spent" is the fact a re-arm decision turns
     // on, and the reason a live list is not the same as a standing watch.
     assert!(text.contains("then is spent"), "{text}");
     // The read hands off to the cancel, including how to stop all of them.
@@ -243,7 +243,7 @@ fn an_on_stop_addresses_every_watch_for_that_event_whatever_it_filters() {
     // by one of its names ends the whole thing. Intended, and the sharpest
     // edge on this verb: a wait is one rendezvous with several triggers, spent
     // by the first match, not several watches sharing a row, so there is no
-    // `ReleasePublished` leg left to be woken by once the other is gone. The
+    // `ReleasePublished` leg left to deliver once the other is gone. The
     // alternative is replacing it with a subscription the caller never armed,
     // and nothing in this family mutates a wait (ADR 0059).
     assert!(among_several.watches("E2ELockReleased"));
@@ -386,7 +386,7 @@ fn stopping_by_event_type_never_claims_the_thread_is_watching_nothing() {
 
 /// **A partial stop is a failure.** An `all` stop is one emit per subscription,
 /// so one can fail while the rest land, and a failed one is re-armed and will
-/// still wake the thread. Reporting "nothing is subscribed any more" there is
+/// still re-open the thread. Reporting "nothing is subscribed any more" there is
 /// the exact lie this whole surface exists to stop the agent telling.
 #[test]
 fn a_partial_stop_is_refused_and_names_what_is_still_running() {

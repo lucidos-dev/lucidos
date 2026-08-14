@@ -69,27 +69,37 @@ impl AppManager {
 
     /// Stage a single app file and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/index.html").
+    ///
+    /// This handle's `Mutex` excludes only the other `AppManager` writes. Every
+    /// other writer of the same repo (`ArtifactManager`, the plugin helpers, a
+    /// coding agent's `git` CLI) races it, so the whole staging plus commit runs
+    /// inside `retry_while_repo_contended`. The repo guard is taken INSIDE the
+    /// closure so a retry re-stages onto a freshly reset index.
     pub fn commit(&self, app_path: &str, message: &str) -> Result<String, git2::Error> {
-        let repo = self.repo.lock().unwrap();
-        let mut index = repo.index()?;
-        super::reset_index_to_head(&repo, &mut index)?;
-        let repo_path = format!("data/apps/{}", app_path);
-        index.add_path(Path::new(&repo_path))?;
-        index.write()?;
-        super::commit_index(&repo, message)
+        super::retry_while_repo_contended(|| {
+            let repo = self.repo.lock().unwrap();
+            let mut index = repo.index()?;
+            super::reset_index_to_head(&repo, &mut index)?;
+            let repo_path = format!("data/apps/{}", app_path);
+            index.add_path(Path::new(&repo_path))?;
+            index.write()?;
+            super::commit_index(&repo, message)
+        })
     }
 
     /// Stage multiple app files and commit in one operation.
     pub fn commit_batch(&self, app_paths: &[String], message: &str) -> Result<String, git2::Error> {
-        let repo = self.repo.lock().unwrap();
-        let mut index = repo.index()?;
-        super::reset_index_to_head(&repo, &mut index)?;
-        for p in app_paths {
-            let repo_path = format!("data/apps/{}", p);
-            index.add_path(Path::new(&repo_path))?;
-        }
-        index.write()?;
-        super::commit_index(&repo, message)
+        super::retry_while_repo_contended(|| {
+            let repo = self.repo.lock().unwrap();
+            let mut index = repo.index()?;
+            super::reset_index_to_head(&repo, &mut index)?;
+            for p in app_paths {
+                let repo_path = format!("data/apps/{}", p);
+                index.add_path(Path::new(&repo_path))?;
+            }
+            index.write()?;
+            super::commit_index(&repo, message)
+        })
     }
 
     /// Load an App from its manifest.json on disk.
@@ -244,18 +254,22 @@ impl AppManager {
 
         std::fs::remove_dir_all(&app_dir)?;
 
-        // Scoped so the repo guard and the git2 index (neither of which is
-        // Send) are gone before the await below; otherwise this future stops
-        // being Send and axum refuses the handler.
-        let commit = {
+        // The closure keeps the repo guard and the git2 index (neither of which
+        // is Send) out of the await below; otherwise this future stops being
+        // Send and axum refuses the handler. The directory removal above stays
+        // outside it, so a retried attempt only re-stages an already-absent
+        // path onto the winner's head. Staging is tolerant and the commit goes
+        // through `commit_index_unless_unchanged`, because the writer that won
+        // the race may have committed this deletion already.
+        let commit = super::retry_while_repo_contended(|| {
             let repo = self.repo.lock().unwrap();
             let mut index = repo.index()?;
             super::reset_index_to_head(&repo, &mut index)?;
-            index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0)?;
+            let _ = index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0);
             index.write()?;
             let message = format!("Delete app: {}", app_id);
-            super::commit_index(&repo, &message)?
-        };
+            super::commit_index_unless_unchanged(&repo, &message)
+        })?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::AppDeleted {
@@ -448,13 +462,20 @@ impl AppManager {
         let full_path = self.apps_path.join(app_path);
         std::fs::remove_file(&full_path)?;
 
-        let repo = self.repo.lock().unwrap();
-        let mut index = repo.index()?;
-        super::reset_index_to_head(&repo, &mut index)?;
-        let repo_path = format!("data/apps/{}", app_path);
-        index.remove_path(Path::new(&repo_path))?;
-        index.write()?;
-        Ok(super::commit_index(&repo, message)?)
+        // The file removal above stays outside the retry closure, so a retried
+        // attempt only re-stages an already-absent path onto the winner's head.
+        // Staging is tolerant and the commit goes through
+        // `commit_index_unless_unchanged`, because the writer that won the race
+        // may have committed this deletion already.
+        Ok(super::retry_while_repo_contended(|| {
+            let repo = self.repo.lock().unwrap();
+            let mut index = repo.index()?;
+            super::reset_index_to_head(&repo, &mut index)?;
+            let repo_path = format!("data/apps/{}", app_path);
+            let _ = index.remove_path(Path::new(&repo_path));
+            index.write()?;
+            super::commit_index_unless_unchanged(&repo, message)
+        })?)
     }
 }
 

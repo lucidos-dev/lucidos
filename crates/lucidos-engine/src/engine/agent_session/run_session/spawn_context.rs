@@ -202,22 +202,21 @@ impl LucidosEngine {
                     repo_name.unwrap_or_else(|| BranchScope::LUCIDOS_REPO.to_string()),
                 ),
             };
+            // Kept alive past the resolution: the create below re-derives
+            // through it when a concurrent spawn takes the allocated name.
+            let fresh = FreshBranch {
+                repo_root,
+                agent: coding_agent,
+                scope,
+                thread_name: &thread_name,
+                thread_id,
+            };
             let BranchResolution {
                 branch_name,
                 reusing_branch,
                 resume_session_id: validated_sid,
-            } = resolve_branch_for_resume(
-                &FreshBranch {
-                    repo_root,
-                    agent: coding_agent,
-                    scope,
-                    thread_name: &thread_name,
-                    thread_id,
-                },
-                resume_session_id,
-                resume_branch.as_deref(),
-            )
-            .await;
+            } = resolve_branch_for_resume(&fresh, resume_session_id, resume_branch.as_deref())
+                .await;
             resume_session_id = validated_sid;
 
             // Caller-supplied worktree path wins over branch-based lookup —
@@ -315,7 +314,7 @@ impl LucidosEngine {
             //    the worktree disagrees." First spawns (no resume context)
             //    fall through to the override path because there's no
             //    expectation to violate.
-            let branch_name = if let Some(ref existing) = existing_worktree {
+            let mut branch_name = if let Some(ref existing) = existing_worktree {
                 if reusing_branch {
                     match crate::engine::agent_session::external_edits::verify_branch(
                         existing,
@@ -453,17 +452,28 @@ impl LucidosEngine {
                         }
                     }
                 } else {
-                    let wt_extra: Vec<&str> = if reusing_branch {
-                        vec![&branch_name]
-                    } else {
-                        let mut args = vec!["-b", &branch_name];
-                        if let Some(ref base_ref) = worktree_base_branch {
-                            args.push(base_ref);
+                    // Resuming gets one attempt: the branch is this thread's
+                    // own, so a failure is never a name race. A fresh branch
+                    // lets the create decide the name, retrying past a sibling
+                    // spawn that took the allocated one first.
+                    let created = if reusing_branch {
+                        match worktree_add(repo_root, &wt_path, &[branch_name.as_str()]).await {
+                            Ok(o) if o.status.success() => Ok(branch_name.clone()),
+                            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                            Err(e) => Err(e),
                         }
-                        args
+                    } else {
+                        fresh
+                            .create_worktree(
+                                &wt_path,
+                                worktree_base_branch.as_deref(),
+                                branch_name.clone(),
+                            )
+                            .await
                     };
-                    match worktree_add(repo_root, &wt_path, &wt_extra).await {
-                        Ok(o) if o.status.success() => {
+                    match created {
+                        Ok(name) => {
+                            branch_name = name;
                             if reusing_branch {
                                 log!(
                                     "[AgentSession] Resumed worktree at {} on existing branch {}",
@@ -482,17 +492,8 @@ impl LucidosEngine {
                                 );
                             }
                         }
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                            log!("[AgentSession] Failed to create worktree: {}", stderr);
-                            return Err(format!(
-                                "Failed to create git worktree for coding-agent isolation: {}",
-                                stderr
-                            )
-                            .into());
-                        }
                         Err(e) => {
-                            log!("[AgentSession] Failed to run git worktree: {}", e);
+                            log!("[AgentSession] Failed to create worktree: {}", e);
                             return Err(format!(
                                 "Failed to create git worktree for coding-agent isolation: {}",
                                 e

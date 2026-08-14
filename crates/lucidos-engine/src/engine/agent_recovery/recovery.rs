@@ -18,20 +18,11 @@ use uuid::Uuid;
 
 impl LucidosEngine {
     /// Gather branch metadata and propose a Change record. Callers must pass a
-    /// non-empty `changed_files` list (typically from `proposal_files_for_branch`)
-    /// so this never creates a phantom `changes` row with `file_count=0`.
+    /// non-empty `changed_files` list, so this never creates a phantom `changes`
+    /// row with `file_count=0`.
     ///
-    /// `origin` is forwarded to the emitted `ChangeProposed` event so the route
-    /// popover can render "Engine · Stale session cleanup" / "Engine · Orphan
-    /// recovery". Both engine-internal callers (stale-session + orphan) supply
-    /// the appropriate `MessageOrigin::Engine { reason }`.
-    ///
-    /// `incomplete` is derived from the prior turn's actual terminal event
-    /// via `last_turn_ended_cleanly` — a clean `ResponseGenerated` gets
-    /// `incomplete: false`, anything else (mid-turn crash, cancel, fail, or
-    /// no terminal at all) gets `incomplete: true`. Hardcoding `true` here
-    /// would mislabel work from a clean turn whose per-idle `propose_change`
-    /// simply never landed (e.g. the engine died between idle and proposal).
+    /// `origin` reaches the emitted `ChangeProposed`, so the route popover can
+    /// name which engine path proposed the change.
     async fn propose_branch_changes(
         &self,
         thread_id: Uuid,
@@ -50,11 +41,10 @@ impl LucidosEngine {
         let log_range = format!("{}..{}", base, branch_name);
         let description = describe_branch_changes(repo_root, &log_range, &fallback, None).await;
         let repo_root_str = repo_root.to_string_lossy();
-        // Marker survives worktree removal (keyed by repo_root + branch_name),
-        // so this lookup works even when the cleanup worker has already removed
-        // the worktree under us. Without this check, propose_change downgrades
-        // hardened=true → false and Apply re-runs `/harden` on already-hardened
-        // work.
+        // The marker is keyed by repo root plus branch name, so it survives the
+        // cleanup worker removing the worktree. Without this lookup,
+        // `propose_change` downgrades hardened to false and Apply re-runs
+        // `/harden` on already-hardened work.
         let hardened =
             branch_is_hardened(self.pool(), self.changes(), repo_root, branch_name).await;
         let incomplete = !last_turn_ended_cleanly(self.pool(), thread_id).await;
@@ -73,21 +63,18 @@ impl LucidosEngine {
         .await
     }
 
-    /// Handle ending a stale waiting Claude Code session (no live process) after engine restart.
-    /// Looks up the branch from SessionStarted events, proposes changes, and cleans up.
+    /// End a stale waiting Claude Code session (no live process) after an engine
+    /// restart.
     ///
-    /// `actor` identifies who initiated the operation. HTTP-driven entry points
-    /// (Apply Now, Cancel-with-apply, Archive) plumb the user's device through so
-    /// any resulting `ChangeApplied` / `ChangeApplyFailed` events stamp the
-    /// real actor instead of falling back to the "Lucidos Engine" chip.
-    /// Engine-internal restart-recovery callers pass `None`.
+    /// `actor` is who initiated it. HTTP entry points plumb the user's device
+    /// through, so any resulting change event stamps the real actor rather than
+    /// the "Lucidos Engine" chip. Engine-internal recovery callers pass `None`.
     pub(crate) async fn end_stale_waiting_session(
         self: &Arc<Self>,
         thread_id: Uuid,
         discard: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Look up branch name from SessionStarted event
         let branch: Option<String> = sqlx::query_scalar(
             "SELECT payload->>'branch' FROM events \
              WHERE event_type = 'SessionStarted' AND thread_id = $1 \
@@ -100,17 +87,15 @@ impl LucidosEngine {
         let branch_name = match branch {
             Some(b) if !b.is_empty() => b,
             None => {
-                // No SessionStarted event at all — this thread never had a Claude Code session.
-                // Return an error instead of emitting SessionEnded, which would pollute
-                // regular chat threads with CC-only events (causes spurious "Session ended
-                // automatically" banners in the UI).
+                // This thread never had a Claude Code session. Erroring beats
+                // emitting `SessionEnded`, which would pollute regular chat
+                // threads with coding-agent events.
                 return Err("No Claude Code session found for this thread".into());
             }
             Some(_) => {
-                // SessionStarted exists but branch is empty — stale Claude Code session with no branch.
-                // Phase 4: Mark the orphaned session as idle (turn boundary)
-                // rather than terminating it. The thread stays alive — the user
-                // can still send a follow-up that re-spawns CC via --resume.
+                // A session with no branch. Idle it at the turn boundary rather
+                // than terminating it: the thread stays alive, so a follow-up
+                // can re-spawn the agent through `--resume`.
                 let coding_agent = self.thread_coding_agent(thread_id).await;
                 self.event_bus
                     .emit_or_log(
@@ -146,19 +131,13 @@ impl LucidosEngine {
 
         let wt_path = find_worktree_for_branch(&repo_root, &branch_name).await;
 
-        // If worktree exists, commit uncommitted changes (unless discarding) and remove it.
-        //
-        // The removal is `--force`, so it discards whatever is still uncommitted.
-        // That is only safe once the rescue commit has actually LANDED, which is
-        // why this uses `commit_worktree_or_err` rather than the silent
-        // `auto_commit_worktree`: `git add` / `git commit` fail for perfectly
-        // ordinary reasons in a real repo (a non-zero pre-commit hook, a
-        // git-crypt filter on a locked repo, a `git status` that could not run),
-        // and swallowing that failure meant the very next line deleted the work
-        // the commit was supposed to save. On a failed rescue we keep the
-        // worktree: the branch is still proposed below, and the background
-        // WorktreeCleanup worker owns reclamation (ADR 0035), which weighs
-        // dirtiness before removing anything.
+        // The removal is `--force`, so it discards whatever is still
+        // uncommitted. That is safe only once the rescue commit has LANDED,
+        // which is why this uses `commit_worktree_or_err` rather than the silent
+        // `auto_commit_worktree`: `git add` and `git commit` fail for ordinary
+        // reasons in a real repo. On a failed rescue we keep the worktree. The
+        // branch is still proposed below, and the cleanup worker owns
+        // reclamation (ADR 0035).
         if let Some(ref wt) = wt_path {
             let mut rescued = true;
             if !discard {
@@ -174,8 +153,6 @@ impl LucidosEngine {
                     }
                 }
             }
-            // `rescued == false` leaves the tree in place; the cleanup worker
-            // reclaims it later, once its work is safe or genuinely absent.
             if rescued {
                 match wt.to_str() {
                     Some(wt_str) => {
@@ -202,17 +179,12 @@ impl LucidosEngine {
             }
         }
 
-        // `Some(files)` only when the branch has commits AND a non-empty net diff.
-        // Commits whose changes cancel out (commit + revert) get cleaned up like
-        // a no-op branch.
+        // `Some(files)` only when the branch has commits AND a non-empty net
+        // diff, so commits that cancel out read as a no-op branch.
         let proposal_files = proposal_files_for_branch(&repo_root, &branch_name).await;
 
         let mut proposed_change = false;
         if discard {
-            // User explicitly chose "Discard & End Session" on a thread with no
-            // live Claude Code subprocess. Plumb the user's actor through to the
-            // resulting ChangeDiscarded events so the chat chip reads "You"
-            // instead of falling back to the engine label.
             log!(
                 "[Recovery] Discarding stale session changes (branch {})",
                 branch_name
@@ -265,36 +237,20 @@ impl LucidosEngine {
                 }
             }
         } else {
-            // `proposal_files` is None: either the branch has no commits, or
-            // its commits cancel out (commit + revert).
-            //
-            // Discard intent (`discard=true`) is already handled by the
-            // `if discard` arm above — it emits ChangeDiscarded and deletes
-            // the branch unconditionally. The only callers that land here are
-            // `discard=false`: the Apply button (apply_now), Archive, and
-            // UserStop. For those, deleting the branch silently is a bug:
-            // when `proposal_files_for_branch` returns None for any reason
-            // we don't understand (transient git failure, empty net diff on
-            // commits that the user does care about, projection gaps), the
-            // user's two-commit branch gets `git branch -D`'d and the work
-            // is unrecoverable. Apply then fails with "No changes to apply
-            // — branch is already merged or has no commits", which is a lie
-            // the engine itself just constructed.
-            //
-            // Keep the branch. Orphaned empty branches are cheap (just a ref
-            // SHA); the worktree_cleanup periodic sweep GCs fully-merged
-            // branches, and engine startup recovery re-attaches any branch
-            // that still has work to be done.
+            // Keep the branch. An unexplained `None` (a transient git failure, a
+            // projection gap) would otherwise `git branch -D` work the user
+            // still wants, and that is unrecoverable. An orphaned empty branch
+            // is just a ref, and the cleanup sweep collects it once it is fully
+            // merged.
             log!(
                 "[Recovery] recovery: branch {} has no proposable diff — keeping branch (discard=false)",
                 branch_name
             );
         }
 
-        // Phase 4: SessionEnded is terminal-only. Emit `CodingAgentIdled` to
-        // mark the orphaned turn as ended without terminating the thread —
-        // ChangeProposed/ChangeDiscarded events emitted earlier already drive
-        // the panel state for change-bearing branches.
+        // `SessionEnded` is terminal-only, so mark the orphaned turn as ended
+        // with `CodingAgentIdled` instead. The change events emitted above
+        // already drive the panel state.
         let coding_agent = self.thread_coding_agent(thread_id).await;
         self.event_bus
             .emit_or_log(
@@ -307,19 +263,13 @@ impl LucidosEngine {
                         cc_session_id: None,
                         coding_agent,
                         reason: None,
-                        // The removal above is CONDITIONAL now (a rescue commit
-                        // that did not land keeps the worktree), so this path may
-                        // or may not still exist by the time the idle fires.
-                        // Recording it either way is wrong: a deleted path would
-                        // mislead the resolver into reusing it, and a retained
-                        // one belongs to a failed attempt nobody should resume
-                        // blind. Leave None and let the next spawn fall through
-                        // to the `git worktree list` lookup, which answers for
-                        // both cases, or to fresh deterministic path generation.
+                        // The removal above is conditional, so this path may or
+                        // may not still exist. Recording it either way misleads
+                        // the resolver, so leave it None and let the next spawn
+                        // look the worktree up itself.
                         worktree_path: None,
-                        // No worktree → no SHA to record. The next spawn will
-                        // skip external-edit detection until a real CC turn
-                        // populates the field on its own idle.
+                        // No worktree, so no SHA. External-edit detection stays
+                        // off until a real turn populates the field.
                         worktree_head_sha: None,
                         bg_bash_pending: false,
                     },
@@ -329,10 +279,9 @@ impl LucidosEngine {
             )
             .await;
 
-        // No auto-apply / auto-discard tail: any pending change on the branch
-        // is left for the user to resolve from Review. The Apply Now flow
-        // (`apply_now`) chains its own POST /changes/<id>/apply once the
-        // proposal lands via SSE, so we don't need to fuse propose+apply here.
+        // No auto-apply tail: a pending change is the user's to resolve from
+        // Review. Apply Now chains its own apply call once the proposal lands
+        // over SSE.
 
         self.broadcast_changes_updated().await;
 
@@ -375,9 +324,8 @@ impl LucidosEngine {
             ws_worktrees_prefix.push(std::path::MAIN_SEPARATOR);
         }
 
-        // Collect all repos to scan: Lucidos repo (no repo_id) + registered external repos.
-        // Deduplicate by canonical path so the same repo isn't scanned twice
-        // (e.g., Lucidos repo registered as both the built-in repo and an external repo).
+        // Deduplicate by canonical path, so a Lucidos repo that is also
+        // registered as an external repo is not scanned twice.
         let lucidos_canonical = lucidos_repo_root
             .canonicalize()
             .unwrap_or_else(|_| lucidos_repo_root.clone());
@@ -438,9 +386,8 @@ impl LucidosEngine {
                 } else if line.is_empty() {
                     if let (Some(ref wt), Some(ref br)) = (&worktree_path, &branch) {
                         if crate::engine::git_ops::is_coding_agent_branch(br) {
-                            // Fast path: worktrees outside this workspace's worktrees
-                            // dir cannot belong to us — skip without reading the marker.
-                            // Saves a stat+read per cross-workspace worktree, which
+                            // A worktree outside this workspace's worktrees dir
+                            // cannot be ours, so skip the marker read. That read
                             // dominates the scan in multi-workspace setups.
                             if wt.starts_with(&ws_worktrees_prefix) {
                                 let marker_path = PathBuf::from(wt).join(WORKTREE_WORKSPACE_MARKER);
@@ -483,9 +430,8 @@ impl LucidosEngine {
         // as 'idle' by branch_classification and must instead be resumed.
         let pool = self.pool();
         let proj = self.changes();
-        // Recovery sweep is best-effort — a DB error degrades to "nothing pending" so the
-        // startup classifier doesn't block boot. The error is logged so the sweep's
-        // partial behaviour is visible in the logs rather than silent.
+        // Best-effort: a DB error degrades to "nothing pending" rather than
+        // blocking boot, and is logged so the partial sweep is visible.
         let pending_changes_list = proj.list_pending().await.unwrap_or_else(|e| {
             log!(
                 "[Recovery] list_pending: {} — recovery proceeds without pending change context",
@@ -528,10 +474,8 @@ impl LucidosEngine {
             ).fetch_all(pool),
         );
 
-        // A failed classification query yields an empty set, which would silently
-        // misclassify every branch (e.g. re-recover already-completed sessions).
-        // Log on Err so the failure shows up in startup logs even if recovery
-        // proceeds with degraded data.
+        // An empty set from a failed query silently misclassifies every branch,
+        // so log the error even though recovery proceeds with degraded data.
         fn unwrap_logged<T: Default, E: std::fmt::Display>(label: &str, r: Result<T, E>) -> T {
             r.unwrap_or_else(|e| {
                 log!("[Recovery] {} query failed: {}", label, e);
@@ -588,35 +532,26 @@ impl LucidosEngine {
             idle_branches.len(),
             actively_running_branches.len());
 
-        // Phase 2: DB-based discovery for lost worktrees.
-        // The worktree scan above only finds branches with existing worktree
-        // directories and valid workspace markers. If a worktree directory was
-        // cleaned up (macOS temp cleanup, git prune, crash during setup) but the
-        // session was actively running, the branch is invisible to the scan.
-        // Detect these from the DB and create fresh worktrees so they enter the
-        // normal recovery pipeline.
-        // Owned set required because we push to `to_recover` in the loop below.
+        // DB-based discovery for lost worktrees. The scan above sees only
+        // branches whose worktree directory still exists, so a running session
+        // whose directory was cleaned up is invisible to it. Find those in the
+        // DB and create fresh worktrees, so they enter the normal pipeline.
+        // Owned set, because the loop below pushes to `to_recover`.
         let discovered_branches: std::collections::HashSet<String> =
             to_recover.iter().map(|(_, br, _, _)| br.clone()).collect();
 
-        // Helper: emit CodingAgentIdled to unstick a thread whose session
-        // can't be recovered (worktree gone, branch missing, git error). Phase
-        // 4 made SessionEnded terminal-only — the thread stays alive, and the
-        // user can re-spawn CC by sending a new message. Phase 5.3 stamps
-        // `reason: Some("engine_restart_interrupt")` so the UI can render a
-        // "continue?" affordance instead of treating the idle as natural.
+        // Unstick a thread whose session cannot be recovered (worktree gone,
+        // branch missing, git error). The thread stays alive, and the
+        // `engine_restart_interrupt` reason tells the UI to offer Continue
+        // rather than treat the idle as natural.
         let end_stuck_session = |engine: &Arc<Self>, thread_id: Uuid| {
             let bus = engine.event_bus.clone();
             let engine = engine.clone();
             async move {
-                // Same preserve rule as the `to_recover` loop below: a thread
-                // parked on an unanswered question is a stable checkpoint, and
-                // the `CodingAgentIdled` this closure emits is in the
-                // predicate's exclusion list — idling here would expire the
-                // card and defeat the guard. Even with the worktree/branch
-                // unrecoverable, answering still resumes via the
-                // no-live-subprocess `ContinuationRequested` → `--resume` path
-                // (which re-resolves or recreates the worktree).
+                // Same preserve rule as the loop below. The `CodingAgentIdled`
+                // this closure emits is park-ending, so idling here would expire
+                // a live question card. Answering still resumes, even with the
+                // worktree unrecoverable.
                 if thread_has_unanswered_question(engine.pool(), thread_id).await {
                     log!(
                         "[Recovery] Preserving stuck thread {} — parked on an unanswered question (no idle emitted)",
@@ -635,17 +570,11 @@ impl LucidosEngine {
                             cc_session_id: None,
                             coding_agent,
                             reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
-                            // No worktree to record — this path fires when
-                            // recovery cannot locate the worktree at all
-                            // (branch missing, git error). The thread stays
-                            // alive; the next spawn will resolve a path via
-                            // `git worktree list` fallback or new deterministic
-                            // path generation.
+                            // No worktree to record: this path fires when
+                            // recovery cannot locate one at all. The next spawn
+                            // resolves a path itself.
                             worktree_path: None,
-                            // Same reason as worktree_path — without a worktree
-                            // there's no SHA to snapshot. External-edit
-                            // detection skips the next spawn until a real CC
-                            // turn populates the field.
+                            // No worktree, so no SHA to snapshot.
                             worktree_head_sha: None,
                             bg_bash_pending: false,
                         },
@@ -661,20 +590,14 @@ impl LucidosEngine {
             if discovered_branches.contains(branch) {
                 continue;
             }
-            // `idle_branches` can still hold this branch even though we are
-            // iterating the running set: the classifier emits one row per
-            // THREAD, so two threads sharing a branch name can disagree. A
-            // disagreement is not a mandate to recreate a worktree.
+            // `idle_branches` can still hold this branch. The classifier emits
+            // one row per THREAD, so two threads sharing a branch name can
+            // disagree, and a disagreement is no mandate to recreate anything.
             //
-            // `already_recovered` is deliberately NOT consulted here, where the
-            // main loop below narrows it instead of dropping it. Every branch in
-            // this loop is classified `running`, and "the branch's newest
-            // ContinuationStarted was followed by a completion" can only be true
-            // of a running branch when a LATER turn opened after that completion.
-            // So here the set has no configuration in which it is right, only the
-            // one in which it silently drops a live turn whose worktree is also
-            // gone: the exact half-fix that would leave a lost worktree behaving
-            // differently from a surviving one.
+            // `already_recovered` is deliberately NOT consulted here. Every
+            // branch in this loop is classified `running`, so the set can only
+            // drop a live turn whose worktree is also gone. That would leave a
+            // lost worktree behaving differently from a surviving one.
             if idle_branches.contains(branch) {
                 continue;
             }
@@ -682,18 +605,10 @@ impl LucidosEngine {
             let mut found_repo: Option<(PathBuf, Option<String>)> = None;
             for (repo_root, repo_id) in &repos_to_scan {
                 // `or_unknown(false)`: an unanswered probe must not claim the
-                // branch lives in THIS repo, or the scan below would create a
-                // worktree against the wrong root, which is both wrong and
-                // unrecoverable. A `false` just moves on to the next repo.
-                //
-                // Note this is NOT a free direction: if every repo answers
-                // Unknown, the `None` arm below runs, and while its FIRST step
-                // (`recover_branch_ref_from_worktree`) is non-destructive, its
-                // last resort is `end_stuck_session`, which drops the session
-                // id and forces a fresh branch from main, discarding the
-                // conversation. `false` wins anyway because that chain puts a
-                // real recovery attempt in front of the destructive step,
-                // whereas a `true` goes straight to the wrong repo with none
+                // branch lives in THIS repo, or the scan below builds a worktree
+                // against the wrong root. Neither direction is free. A `false`
+                // puts a real recovery attempt in front of the destructive step,
+                // where a `true` goes straight to the wrong repo with none
                 // (`.claude/rules/rust.md`).
                 let branch_exists = crate::engine::git_ops::git_answer(
                     &["rev-parse", "--verify", &format!("refs/heads/{}", branch)],
@@ -718,24 +633,18 @@ impl LucidosEngine {
                         self.workspace_path(),
                         branch_to_thread.get(branch).copied(),
                     );
-                    // NEVER delete a valid worktree here. A deterministic
-                    // `thread-<short>` dir on disk is one of: (a) a valid live
-                    // worktree ON THIS BRANCH — REUSE it as-is (it holds the user's
-                    // checkout; a partial-setup leftover such as a missing marker is
-                    // repaired below, not nuked); (b) a valid live worktree on a
-                    // DIFFERENT branch — the shared per-thread path is occupied by
-                    // another branch of the same thread (e.g. a duplicate
-                    // stale-resume branch), so we must NOT reuse it (recovery mode
-                    // skips branch verification → we'd resume this branch against the
-                    // wrong checkout) and must NOT delete it (it holds the other
-                    // branch's work); skip and let the occupant recover on its own
-                    // pass; (c) a genuinely stranded/broken dir
-                    // (`.git/worktrees/<name>` admin gone → nothing recoverable) —
-                    // cleared by `clear_stranded_worktree_dir` so the add can
-                    // recreate it; or (d) absent — created by the add. The
-                    // background WorktreeCleanup worker is the SOLE deleter of a
-                    // valid worktree. This replaced an unconditional `remove_dir_all`
-                    // that nuked a live worktree out from under recovery — 2026-07-02.
+                    // NEVER delete a valid worktree here: reclamation belongs to
+                    // the cleanup worker alone (ADR 0035). A deterministic
+                    // `thread-<short>` dir on disk is one of four things:
+                    //
+                    // * a live worktree ON THIS BRANCH: reuse it as-is. A
+                    //   partial-setup leftover is repaired below, not deleted.
+                    // * a live worktree on a DIFFERENT branch: skip it. Reusing
+                    //   it resumes against the wrong checkout, and deleting it
+                    //   destroys the other branch's work.
+                    // * a stranded dir whose git admin is gone: cleared by
+                    //   `clear_stranded_worktree_dir` so the add can recreate it.
+                    // * absent: created by the add.
                     let is_live_worktree =
                         matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
                             && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
@@ -746,11 +655,9 @@ impl LucidosEngine {
                             == Some(branch.as_str());
 
                     if is_live_worktree && !on_our_branch {
-                        // Case (b): shared path occupied by a different branch's live
-                        // worktree. Reusing it would resume THIS branch on the wrong
-                        // checkout; deleting it would destroy the other branch's work.
-                        // Skip — the occupant is recovered on its own pass, and
-                        // duplicate branches for one thread are reconciled elsewhere.
+                        // The shared path is occupied by another branch's live
+                        // worktree, so skip it. The occupant recovers on its own
+                        // pass.
                         log!(
                             "[Recovery] Skipping lost branch {} — shared worktree {} is live on a different branch (not reused, not deleted)",
                             branch,
@@ -767,10 +674,9 @@ impl LucidosEngine {
                         );
                         true
                     } else {
-                        // Dir absent, or present-but-not-a-valid-worktree (stranded).
-                        // `clear_stranded_worktree_dir` removes the dir ONLY when
-                        // genuinely stranded (git admin gone); a valid worktree is
-                        // left untouched (and can't reach here — handled above).
+                        // Absent, or present but stranded.
+                        // `clear_stranded_worktree_dir` removes the dir only
+                        // when the git admin is gone.
                         crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path)
                             .await;
                         match worktree_add(&repo_root, &wt_path, &[branch]).await {
@@ -811,9 +717,8 @@ impl LucidosEngine {
                                 e
                             );
                         }
-                        // Add engine-injected paths to the worktree's git exclude
-                        // so external repos don't see them as untracked or
-                        // accidentally commit them.
+                        // Exclude engine-injected paths, so an external repo does
+                        // not see them as untracked and commit them.
                         add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
                         to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
                     } else if let Some(&thread_id) = branch_to_thread.get(branch) {
@@ -826,13 +731,12 @@ impl LucidosEngine {
                 }
                 None => {
                     if let Some(&thread_id) = branch_to_thread.get(branch) {
-                        // The branch ref vanished from every repo. Before giving up on
-                        // the session, try to recreate the branch from a surviving
-                        // worktree's HEAD so the recorded `cc_session_id` can still
-                        // `--resume` on the original branch (the thread-9e37697e
-                        // recovery-resilience goal). Ending the session — which drops
-                        // the session id and forces a fresh branch from main, discarding
-                        // the conversation — is the genuine last resort, not the first.
+                        // The branch ref vanished from every repo. Try to
+                        // recreate it from a surviving worktree's HEAD first, so
+                        // the recorded `cc_session_id` can still `--resume` on
+                        // the original branch. Ending the session drops that id
+                        // and forces a fresh branch from main, discarding the
+                        // conversation, so it is the last resort.
                         match recover_branch_ref_from_worktree(
                             self.workspace_path(),
                             thread_id,
@@ -846,8 +750,8 @@ impl LucidosEngine {
                                     branch,
                                     thread_id
                                 );
-                                // `marker_repo_id: None` — purely cosmetic in the resume
-                                // loop (it logs the id; repo selection uses `repo_root`).
+                                // `marker_repo_id` is only logged; repo selection
+                                // uses `repo_root`.
                                 to_recover.push((wt_path, branch.clone(), None, repo_root));
                             }
                             None => {
@@ -866,13 +770,10 @@ impl LucidosEngine {
         for (wt_path, branch_name, marker_repo_id, repo_root) in to_recover {
             if let Some(pending_change) = pending_by_branch.get(&branch_name) {
                 if actively_running_branches.contains(&branch_name) {
-                    // Session was actively running at shutdown — resume it. The
-                    // pending row was populated by per-commit emits during the
-                    // dying turn, so its description / files reflect half-
-                    // finished work the user never confirmed. Flip the row to
-                    // `incomplete: true` so the Apply UI requires explicit
-                    // confirmation; the resumed session's next clean idle
-                    // re-emits with `incomplete: false` and clears the flag.
+                    // The session was running at shutdown, so its pending row
+                    // describes half-finished work the user never confirmed.
+                    // Flip it to `incomplete` so Apply asks for confirmation.
+                    // The next clean idle clears the flag.
                     log!("[Recovery] Resuming active session with pending change for branch {} — marking change incomplete", branch_name);
                     if let Some(&tid) = branch_to_thread.get(&branch_name) {
                         mark_pending_change_incomplete(&self.event_bus, tid, pending_change).await;
@@ -885,13 +786,10 @@ impl LucidosEngine {
                     continue;
                 }
             }
-            // A completed prior recovery only settles the turn it recovered. The
-            // set is keyed by branch and asks a question about the newest
-            // `ContinuationStarted`, so on a thread that was auto-resumed once
-            // and then kept working it stays true forever, which is the same
-            // shape [`branch_awaits_recovery`] documents. A live classification
-            // therefore outranks it: an in-flight turn at boot has no live
-            // subprocess whoever recovered the last one.
+            // A completed prior recovery settles only the turn it recovered, and
+            // the set stays true forever once a thread has been resumed once. So
+            // a live classification outranks it: an in-flight turn at boot has no
+            // live subprocess, whoever recovered the last one.
             if !actively_running_branches.contains(&branch_name)
                 && already_recovered.contains(&branch_name)
             {
@@ -910,9 +808,6 @@ impl LucidosEngine {
                 );
                 continue;
             }
-            // Reuse the branch's originating thread; skip (don't fabricate)
-            // when none owns it. See `orphan_recovery_target` for why skipping
-            // beats the old phantom-thread path.
             let Some(thread_id) = orphan_recovery_target(&branch_to_thread, &branch_name) else {
                 log!(
                     "[Recovery] No originating thread for orphaned worktree {} (branch {}) — skipping; cleanup worker will reclaim",
@@ -927,13 +822,10 @@ impl LucidosEngine {
                 branch_name
             );
 
-            // Preserve a thread parked on an unanswered question: it's a stable
-            // checkpoint, not an interrupted turn. Leave it
-            // waiting_for_user_answer (no abort, no idle), worktree intact — the
-            // card stays answerable and answering resumes via
-            // ContinuationRequested → --resume. (Not added to recovering_threads:
-            // the catch-all settle only touches status='running', and the cleanup
-            // worker won't reclaim a non-terminal thread's worktree.)
+            // Preserve a thread parked on an unanswered question: a stable
+            // checkpoint, not an interrupted turn. No abort, no idle, worktree
+            // intact, so the card stays answerable. Deliberately not added to
+            // `recovering_threads`: the catch-all settle only touches `running`.
             if thread_has_unanswered_question(self.pool(), thread_id).await {
                 log!(
                     "[Recovery] Preserving thread {} — parked on an unanswered question (branch {})",
@@ -951,29 +843,20 @@ impl LucidosEngine {
                 continue;
             }
 
-            // Look up the prior cc_session_id so the synthetic CodingAgentIdled
-            // below carries it forward — when the user later clicks "continue",
-            // the spawn dispatcher's SpawnRequest::Continue handler resolves the
-            // same sid via `lookup_latest_cc_session_id` and passes it to
-            // `--resume`. The shared lookup reads it from both `CodingAgentIdled`
-            // and the `Init`-time `CodingAgentSettingsChanged`, so a turn
-            // interrupted before its first idle still resumes instead of falling
-            // back to a fresh session + reconstructed summary.
+            // Carry the prior session id onto the synthetic `CodingAgentIdled`,
+            // so a later Continue resumes it. The shared lookup also reads the
+            // `Init`-time `CodingAgentSettingsChanged`, so a turn interrupted
+            // before its first idle still resumes.
             let cc_session_id: Option<String> =
                 crate::engine::agent_session::lookup_latest_cc_session_id(self.pool(), thread_id)
                     .await;
 
             let is_external_repo = is_external_repo_path(&repo_root, &lucidos_repo_root);
-            // Phase 5.3: do NOT auto-spawn CC for mid-turn-crashed sessions.
-            // Surface the interruption as a synthetic CodingAgentIdled with
-            // `reason = engine_restart_interrupt` so the UI can render a
-            // "continue?" affordance. The user's click POSTs to
-            // /api/v1/threads/<id>/continue, which emits ContinuationRequested — the
-            // spawn dispatcher then re-enters CC via `--resume` against the
-            // recorded `cc_session_id`. The worktree stays on disk: the
-            // dispatcher resolves it on next spawn, and the cleanup worker's
-            // Tier 0 won't reclaim it until the thread reaches a terminal
-            // idle state with no pending change.
+            // Never auto-spawn the agent for a mid-turn crash. Surface the
+            // interruption as a synthetic `CodingAgentIdled` carrying
+            // `engine_restart_interrupt`, and let the user's Continue re-enter
+            // through `--resume`. The worktree stays on disk: Tier 0 of the
+            // cleanup worker leaves it until the thread reaches a terminal idle.
             log!("[Recovery] Surfacing interrupted Claude Code session for user-driven continue: {} (branch {}, thread {}{}, cc_session: {})",
                 wt_path.display(), branch_name, thread_id,
                 marker_repo_id.as_ref().map(|r| format!(", repo {}", r)).unwrap_or_default(),
@@ -991,11 +874,10 @@ impl LucidosEngine {
                 channel: Some(EventChannel::ClaudeCode),
                 ..crate::engine::thread_events::EventMeta::NONE
             };
-            // Emit the boundary `ResponseAborted` FIRST so the UI shows the
-            // "Response interrupted" panel above the synthetic Idled. The
-            // dispatcher classifies on `CodingAgentIdled.reason`, so order
-            // doesn't affect spawn decisions. Skipped when this turn already
-            // carries a boundary (see `boundary_abort_already_emitted`).
+            // Emit the boundary `ResponseAborted` FIRST, so the UI shows the
+            // "Response interrupted" panel above the synthetic idle. The
+            // dispatcher classifies on `CodingAgentIdled.reason`, so the order
+            // does not affect spawn decisions.
             if !boundary_abort_already_emitted(self.pool(), thread_id).await {
                 let originating_event_id =
                     crate::engine::agent_session::latest_originating_event_id(
@@ -1007,10 +889,8 @@ impl LucidosEngine {
                 let abort_meta = crate::engine::thread_events::EventMeta {
                     channel: Some(EventChannel::ClaudeCode),
                     request_event_id: originating_event_id,
-                    // The host system killed the previous CC turn (engine
-                    // crashed mid-turn / OS killed the process). The recovery
-                    // path is just marking it. Engine-deliberate work uses
-                    // `Engine{...}` instead.
+                    // The host killed the previous turn; recovery only marks it.
+                    // Engine-deliberate work uses `Engine { .. }` instead.
                     actor: Some(MessageOrigin::system()),
                     ..crate::engine::thread_events::EventMeta::NONE
                 };
@@ -1028,13 +908,12 @@ impl LucidosEngine {
                 .await;
             }
 
-            // Resume vs manual Continue, by cause. A user-initiated *Switch to new
-            // version* left a device-attributed teardown boundary → auto-resume
-            // (queued; `main.rs` emits `ContinuationRequested` once the spawn
-            // dispatcher is subscribed — recovery runs before it). A crash /
-            // involuntary death left no such boundary → surface the manual
-            // "Continue" affordance and do NOT auto-resume, so work that may have
-            // crashed the engine can't loop.
+            // Resume or manual Continue, by cause. A user switch left a
+            // device-attributed teardown boundary, so auto-resume it. The resume
+            // is queued: `main.rs` emits `ContinuationRequested` once the spawn
+            // dispatcher is subscribed, and recovery runs before it. A crash left
+            // no boundary, so offer Continue instead and never auto-resume: work
+            // that crashed the engine must not loop.
             if switch_was_user_initiated(self.pool(), thread_id).await {
                 self.enqueue_switch_resume(thread_id);
                 log!(
@@ -1056,10 +935,8 @@ impl LucidosEngine {
                                 coding_agent,
                                 reason: Some(ENGINE_RESTART_INTERRUPT_REASON.to_string()),
                                 worktree_path: Some(wt_path.to_string_lossy().into_owned()),
-                                // Snapshot the worktree's HEAD so the next spawn
-                                // can detect external edits the user made while
-                                // the engine was down. Best-effort — failures
-                                // (e.g. branch with zero commits) yield None.
+                                // Snapshot HEAD, so the next spawn can detect
+                                // edits made while the engine was down.
                                 worktree_head_sha:
                                     crate::engine::agent_session::external_edits_for_recovery_head_sha(&wt_path).await,
                                 bg_bash_pending: false,
@@ -1072,10 +949,8 @@ impl LucidosEngine {
             }
         }
 
-        // Catch-all (defense-in-depth): settle any coding-agent thread the
-        // projection still shows `running` that this pass neither resumed nor
-        // settled — the floor that would have caught thread-72120ca6. See
-        // `settle_orphaned_running_coding_agent_threads`.
+        // Catch-all: settle any coding-agent thread the projection still shows
+        // `running` that this pass neither resumed nor settled.
         settle_orphaned_running_coding_agent_threads(
             self.pool(),
             &self.event_bus,
@@ -1089,35 +964,15 @@ impl LucidosEngine {
 
 /// True when a discovered worktree's branch still owes the user a recovery: the
 /// turn on it was open when the engine died, or a change on it is still waiting
-/// to be applied. False means the branch is settled, so surfacing a "Continue?"
-/// affordance for it would be noise and the cleanup worker can have the disk.
+/// to be applied. False means the branch is settled, so the cleanup worker can
+/// have the disk.
 ///
-/// **Every input must be a fact about the branch's CURRENT turn.** That is the
-/// whole content of this function, and it is why it exists as a named predicate
-/// rather than an inline `&&`. `idle_branches` comes from
-/// [`BRANCH_CLASSIFICATION_SQL`], which reads the newest lifecycle event, and a
-/// pending change is by definition unresolved. A *historical* fact about the
-/// branch is not admissible here however settled it sounds, because a
-/// coding-agent thread keeps working on ONE branch across many turns: anything
-/// true of an earlier turn stays true forever and silently retires the thread.
-///
-/// It carried exactly such an input until 2026-08-09: `completed_change_branches`
-/// (`SELECT DISTINCT branch_name FROM changes WHERE status IN
-/// ('applied','discarded')`). Added 2026-04-01 against ghost recovery threads
-/// from a reset DB, it only ever changed the answer for a branch the classifier
-/// had already called `running`, since an applied-then-idle one is in
-/// `idle_branches` anyway and a branch with no originating thread is dropped by
-/// [`orphan_recovery_target`] a few lines below (the modern form of the same
-/// commit's `known_branches`, which was the real fix for ghosts). So its only
-/// live effect was on a mid-turn branch, where it was wrong. The cost, on a
-/// thread whose change had been applied hours earlier and which was mid-turn
-/// when the user hit *Switch to new version*: recovery logged "no in-flight
-/// signal" and skipped it, no resume was actuated, and
-/// [`settle_unresumed_switch_threads`] withdrew the promise. The user watched
-/// "Paused by restart" turn into "⚙ System / Response interrupted" over a
-/// `failed` thread, attributing their own restart to a crash. Permanently, too:
-/// a branch never leaves that set, so every later restart cost the same thread
-/// its auto-resume.
+/// **Every input must be a fact about the branch's CURRENT turn.** That is why
+/// this exists as a named predicate rather than an inline `&&`. `idle_branches`
+/// reads the newest lifecycle event, and a pending change is by definition
+/// unresolved. A *historical* fact is not admissible however settled it sounds.
+/// A coding-agent thread works one branch across many turns, so anything true of
+/// an earlier turn stays true forever and silently retires the thread.
 pub(crate) fn branch_awaits_recovery(
     branch: &str,
     idle_branches: &std::collections::HashSet<String>,
@@ -1131,27 +986,22 @@ pub(crate) fn branch_awaits_recovery(
 
 /// True when the thread's most recent `UserQuestionAsked` has no later answer,
 /// terminal, or agent progression: it is parked waiting for the user, and the
-/// card on screen is still live. Such a thread is a stable,
-/// resumable checkpoint: recovery must preserve it (no abort, no idle) across a
-/// restart so the card stays answerable; answering resumes via the existing
-/// no-live-subprocess `ContinuationRequested` → `--resume` path
-/// (`ensure_resume_after_answer`). Holds for both a user switch and a crash
-/// (SIGKILL emits nothing) — a pending question survives either way.
+/// card on screen is still live. Such a thread is a stable, resumable
+/// checkpoint, so recovery must preserve it across a restart with no abort and
+/// no idle. Answering resumes it through the no-live-subprocess
+/// `ContinuationRequested` path. A pending question survives a user switch and a
+/// crash alike.
 ///
-/// Shared predicate for BOTH sides of that invariant. The teardown emit
-/// (`emit_teardown_abort_unless_question_parked`) consults it to skip the
-/// boundary `ResponseAborted` — a question-parked session is still MID-TURN
-/// (subprocess alive, blocked in the AskUserQuestion hook), so the
-/// `is_in_flight()` filter cannot exclude it — and this recovery pass consults
-/// it to skip the abort/idle pair. One definition keeps "no boundary lands at
-/// teardown" and "recovery preserves" from drifting apart: a `ResponseAborted`
-/// in the exclusion list below flips this to false, so a teardown that emitted
-/// one would defeat the preserve guard on the very next boot.
+/// Shared predicate for BOTH sides of that invariant. The teardown emit consults
+/// it to skip the boundary `ResponseAborted`, because a question-parked session
+/// is still MID-TURN and the `is_in_flight()` filter cannot exclude it. This
+/// recovery pass consults it to skip the abort and idle pair. One definition
+/// keeps "no boundary lands at teardown" and "recovery preserves" from drifting
+/// apart: a `ResponseAborted` is park-ending, so a teardown that emitted one
+/// would defeat the guard on the very next boot.
 pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    // `$1` is bound as the thread id (text). One shared fragment (below) so this
-    // per-thread bool check and every set-based sweep filter key on the SAME
-    // "parked on an unanswered question" definition — the DRY anchor for the
-    // preserve guard across teardown + both recovery sweeps.
+    // `$1` is bound as the thread id (text). The shared fragment keeps this
+    // per-thread check and every set-based sweep on one definition.
     let sql = format!("SELECT {}", unanswered_question_exists_sql("$1"));
     sqlx::query_scalar::<_, bool>(&sql)
         .bind(thread_id.to_string())
@@ -1162,41 +1012,23 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
 
 /// True when an engine teardown must leave this thread exactly as it is because
 /// its session is parked on an unanswered `AskUserQuestion`. Thin wrapper over
-/// [`thread_has_unanswered_question`] so the two teardown sites cannot diverge
-/// on either half of the decision (the cause gate and the predicate), and so the
-/// skip is always logged.
+/// [`thread_has_unanswered_question`], so the two teardown sites cannot diverge
+/// and the skip is always logged. Callers still cancel the agent runtime, so no
+/// subprocess outlives the engine.
 ///
-/// A parked session is a stable checkpoint, not an interrupted turn: the card
-/// must stay answerable across the restart, and answering resumes it via
-/// `ContinuationRequested` then `--resume`. That requires the
-/// `UserQuestionAsked` to still be the thread's newest event when the next
-/// engine boots. Two teardown sites can break that, and both consult this:
+/// The card must stay answerable across the restart, which needs the
+/// `UserQuestionAsked` to still be the thread's newest event at the next boot.
+/// Two teardown sites would break that, and both consult this:
 ///
-/// * `shutdown_agent_sessions` would send the graceful `interrupt` (Claude
-///   Code's Esc), which cancels the pending `AskUserQuestion` and makes CC
-///   record a rejection the user never made as a `CodingAgentToolResult`.
-/// * the stop / chat-cancel arms of `run_session` would emit a terminal AND
-///   flush any buffered agent text (`kill_cc_and_flush` runs BEFORE the
-///   `external_terminal_emitted` dedup check, and that flag only covers sessions
-///   `abort_in_flight_for_restart` actually walked, not one inserted after that
-///   pass by a slow `--resume` racing the restart).
+/// * `shutdown_agent_sessions` sends the graceful interrupt, which cancels the
+///   question and records a rejection the user never made.
+/// * the stop and chat-cancel arms of `run_session` emit a terminal and flush
+///   buffered agent text.
 ///
-/// Every one of those events is park-ending, so any of them kills the card and
-/// strands the turn with no terminator: the 2026-08-01 "Working forever" report
-/// (`docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`).
-/// Callers still cancel the agent runtime, so the subprocess cannot outlive the
-/// engine.
-///
-/// Gated on `is_shutdown`, so outside a teardown this never fires: a user Stop /
-/// Apply / Discard / Archive with a question on screen is untouched, because
-/// those are deliberate user actions that DO end the turn and they cancel-stamp
-/// the card themselves. The gate is a *window*, not an actor test, and the
-/// `emit_stop_terminal` call site widens it through
-/// `LucidosEngine::session_is_shutting_down` to cover a session inserted after
-/// `shutdown_agent_sessions` took its flag pass. So a raw Stop that lands inside
-/// the teardown window IS swallowed too. That is deliberate: the engine is on
-/// its way out either way, and preserving the card costs the user nothing that
-/// the restart was not about to take anyway.
+/// Gated on `is_shutdown`, so a user Stop, Apply, Discard or Archive outside a
+/// teardown is untouched: each deliberately ends the turn and cancel-stamps the
+/// card itself. The gate is a *window*, not an actor test, so a raw Stop inside
+/// the teardown window is swallowed too.
 pub(crate) async fn preserve_question_park_at_shutdown(
     pool: &sqlx::PgPool,
     site: &'static str,
@@ -1217,31 +1049,21 @@ pub(crate) async fn preserve_question_park_at_shutdown(
 
 /// Canonical "thread is parked on an unanswered `AskUserQuestion`" predicate, as
 /// a correlated SQL `EXISTS(...)` body. `id_expr` is a SQL expression yielding
-/// the thread's `aggregate_id` (text): `"$1"` for the single-thread bool check
-/// ([`thread_has_unanswered_question`]), or a column reference such as
-/// `"pt.aggregate_id"` / `"e.thread_id::text"` for a set-based sweep filter.
+/// the thread's `aggregate_id` (text): `"$1"` for the single-thread bool check,
+/// or a column reference such as `"pt.aggregate_id"` for a set-based sweep.
 ///
 /// This is the SINGLE source of truth for the preserve guard. Every restart
-/// abort/cleanup path — the teardown boundary emit
-/// (`emit_teardown_abort_unless_question_parked`), the chat orphan sweep
-/// (`recover_orphaned_threads`), the orphan-tool-call sweep
-/// (`recover_orphan_tool_calls`), and the coding-agent recovery pass — resolves
-/// through this fragment, so "parked on a question ⇒ never aborted, card stays
-/// answerable" cannot drift between paths. A `ResponseAborted` (or any terminal)
-/// after the `UserQuestionAsked` flips it to false, so a path that wrongly
-/// emitted one would defeat every OTHER path's guard on the next boot — which is
-/// exactly why all of them must consult this one fragment.
+/// abort or cleanup path resolves through this fragment, so "parked on a
+/// question means never aborted" cannot drift between paths. A terminal after
+/// the `UserQuestionAsked` flips it to false. A path that wrongly emitted one
+/// would then defeat every OTHER path's guard on the next boot.
 ///
-/// "Parked" means the question is still the last thing that happened on the
-/// thread: no answer, no terminal, AND no agent progression. The progression
-/// half comes from [`ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`], the same
-/// constant the frontend mirrors to strike the card through, so "the card is
-/// dead" and "the thread is no longer preserved" cannot disagree. Before
-/// 2026-08-01 this list was terminals-only, and a `CodingAgentToolResult` from
-/// an Esc'd `AskUserQuestion` left a thread reported as preserved while its card
-/// was already unanswerable and its turn had no terminator, so recovery skipped
-/// it and it read "Working" forever (see
-/// `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`).
+/// "Parked" means the question is still the last thing that happened: no answer,
+/// no terminal, AND no agent progression. The progression half comes from
+/// [`crate::engine::thread_events::ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`],
+/// the constant the frontend
+/// mirrors to strike the card through. So "the card is dead" and "the thread is
+/// no longer preserved" cannot disagree.
 pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
     format!(
         "EXISTS ( \
@@ -1259,13 +1081,13 @@ pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
 }
 
 /// Park-ending events that are NOT in
-/// [`ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`], and why each is absent
-/// there. `UserQuestionAnswered` is the overtaken check's own pairing key (it
-/// looks the answer up by `tool_use_id` rather than by type). `ResponseGenerated`
-/// and `SessionEnded` are omitted from the shared constant because
-/// `UserQuestionAsked` is CC-only on the production path and CC turns end with
-/// `CodingAgentIdled`; the preserve guard still has to treat them as park-ending,
-/// because either one means the turn that owned the question is over.
+/// [`crate::engine::thread_events::ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`],
+/// and why each is absent
+/// there. `UserQuestionAnswered` is that check's own pairing key, looked up by
+/// `tool_use_id` rather than by type. `ResponseGenerated` and `SessionEnded` are
+/// absent because a coding-agent turn ends on `CodingAgentIdled`. The preserve
+/// guard must still treat them as park-ending: either one means the turn that
+/// owned the question is over.
 const PARK_ENDING_EXTRA_EVENT_TYPES: &[&str] =
     &["UserQuestionAnswered", "ResponseGenerated", "SessionEnded"];
 
@@ -1282,32 +1104,23 @@ static PARK_ENDING_EVENT_TYPES_SQL: std::sync::LazyLock<String> = std::sync::Laz
         .join(",")
 });
 
-/// True when the newest `ResponseAborted` (after the thread's last start-or-resume)
-/// is an **engine-shutdown teardown carrying a device actor** — the fingerprint of a
-/// user-initiated *Switch to new version* (the teardown boundary emit stamps the
-/// device that clicked switch onto in-flight threads). A crash (SIGKILL) emits no
-/// teardown boundary, so this is false → the thread keeps the manual "Continue"
-/// affordance and is NOT auto-resumed: work that may have crashed the engine can't
-/// loop.
+/// True when the newest `ResponseAborted` after the thread's last start is an
+/// **engine-shutdown teardown carrying a device actor**: the fingerprint of a
+/// user-initiated *Switch to new version*. A crash emits no teardown boundary,
+/// so this is false and the thread keeps the manual Continue affordance instead
+/// of auto-resuming (ADR 0045).
 ///
-/// **Both halves of the fingerprint are load-bearing.** The device actor alone is not
-/// enough: `AbortCause::StaleSettle` deliberately carries the actor of the user button
-/// that exposed a stuck row (Stop / Apply / Discard / Archive / Interrupt — see
-/// `claude_code::settle_stuck_running_thread`), so an actor-only predicate reads a user
-/// *Stop* as a *Switch* and auto-resumes work the user just abandoned. Only
-/// `EngineShutdown` is a teardown boundary; every other cause is either a crash-shaped
-/// terminal or a projection cleanup, and none of them should resume.
+/// **Both halves of the fingerprint are load-bearing.** The device actor alone
+/// is not enough: `AbortCause::StaleSettle` deliberately carries the actor of
+/// the user button that exposed a stuck row. An actor-only predicate would read
+/// a user *Stop* as a *Switch* and resume work the user just abandoned.
 ///
-/// The start set includes `ContinuationStarted` / `OrphanRecoveryStarted` — a
-/// prior auto-resume's start — so once a switch-abort has been consumed by a
-/// resume, it no longer counts. That is the loop-breaker: if the auto-resumed CC
-/// crashes the engine again *before* emitting any lifecycle event (so
-/// `already_recovered` doesn't yet cover it), the next boot sees the resume start
-/// as newer than the device abort → this returns false → manual Continue.
+/// The start set includes the resume starts, so once a switch abort has been
+/// consumed by a resume it stops counting. That is the loop-breaker: an
+/// auto-resume that crashes the engine again before emitting anything leaves the
+/// resume start newer than the abort, so the next boot offers manual Continue.
 ///
-/// Shared by the coding-agent resume gate (`recover_orphaned_worktrees`) and the
-/// chat/trigger one (`chat::recovery::switch_resume_candidates`) — the single
-/// definition of "was this a user switch", so the two can never drift.
+/// Shared with the chat resume gate, so the two definitions cannot drift.
 pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS ( \
@@ -1325,26 +1138,16 @@ pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uu
 /// True when a `ResponseAborted` already covers the thread's **current** turn, so
 /// the recovery pass must not emit a second boundary over the top of it.
 ///
-/// `/api/v1/restart` pre-emits a `ResponseAborted{actor: device}` for in-flight
-/// coding-agent threads BEFORE shutdown, so the post-restart timeline reads
-/// "Paused by restart". Emitting again here would double-render the AbortPanel and
-/// bury that device attribution under the system actor.
+/// `/api/v1/restart` pre-emits a `ResponseAborted { actor: device }` for
+/// in-flight coding-agent threads BEFORE shutdown, so the post-restart timeline
+/// reads "Paused by restart". Emitting again here would double-render the abort
+/// panel and bury that device attribution under the system actor.
 ///
-/// "Current turn" is the load-bearing half, and it is why this shares
-/// [`after_latest_thread_start_sql`] with the switch fingerprint instead of
+/// "Current turn" is the load-bearing half. It is why this shares
+/// [`after_latest_thread_start_sql`] with the switch fingerprint rather than
 /// spelling out a start set of its own. An abort older than the thread's newest
-/// start belongs to a turn that a later resume already superseded, so it says
-/// nothing about whether THIS turn was interrupted.
-///
-/// It did spell out its own list until 2026-08-06, and that list was missing both
-/// resume starts (`ContinuationStarted`, `OrphanRecoveryStarted`), which are
-/// precisely the ones that open a turn after an abort. The cost, on a nightly
-/// e2e coding-agent thread that had already been resumed once: the engine
-/// died, was switched back up (device abort), auto-resumed, then died again
-/// involuntarily. The retired switch abort still out-sequenced the message the
-/// stale list mistook for the turn's start, so of the four coding-agent threads
-/// that restart interrupted, the auto-resumed one was the only one to get no
-/// "Response interrupted" panel. Its timeline read as if it had never stopped.
+/// start belongs to a turn a later resume superseded. It says nothing about
+/// whether THIS turn was interrupted.
 pub(crate) async fn boundary_abort_already_emitted(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS ( \
@@ -1366,23 +1169,20 @@ pub(crate) async fn boundary_abort_already_emitted(pool: &sqlx::PgPool, thread_i
 /// equal the turn's own anchor.
 ///
 /// The extra clause is what makes the answer safe for a caller that will SKIP
-/// its own terminal on a `true`. The recovery pass can rely on the window
-/// alone, because a spurious `true` there costs it only a duplicate panel. An
-/// in-loop terminal is the turn's ONLY terminator, so a spurious `true` costs
-/// the turn its terminator entirely.
+/// its own terminal on a `true`. The recovery pass can rely on the window alone,
+/// because a spurious `true` costs it only a duplicate panel. An in-loop
+/// terminal is the turn's ONLY terminator, so there a spurious `true` costs the
+/// turn its terminator.
 ///
-/// The window alone is not enough for that, because it is turn-exact only for
-/// turns that carry one of [`THREAD_START_EVENTS_SQL`], and two ordinary shapes
-/// carry none: a parent woken by `ChildThreadCompleted` (the anchor is the CTC,
-/// which is in `CC_ORIGINATING_EVENT_TYPES` but not in the start set), and an
-/// `answered_after_idle` continuation (`continue_should_open_resume_exchange`
-/// deliberately withholds its `ContinuationStarted`). For those, a previous
-/// turn's abort is still inside the window forever, so the window alone would
-/// read a stale boundary as covering a live turn.
+/// The window alone is turn-exact only for turns carrying one of
+/// [`THREAD_START_EVENTS_SQL`], and two ordinary shapes carry none: a parent
+/// woken by `ChildThreadCompleted`, and an `answered_after_idle` continuation
+/// that deliberately withholds its `ContinuationStarted`. For those, a previous
+/// turn's abort stays inside the window forever.
 ///
-/// A `None` anchor cannot prove anything, so the caller treats it as "not
-/// covered" and emits. Same fail-open direction as the sibling: a duplicate
-/// boundary is cosmetic, a missing terminator is not.
+/// A `None` anchor proves nothing, so the caller treats it as "not covered" and
+/// emits. Same fail-open direction as the sibling: a duplicate boundary is
+/// cosmetic, a missing terminator is not.
 pub(crate) async fn boundary_abort_covers_turn(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -1421,28 +1221,23 @@ const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'OrphanRecoveryStarted'";
 
 /// SQL boolean: the event at `seq_expr` is newer than every
-/// [`THREAD_START_EVENTS_SQL`] event on the thread at `id_expr`, so it belongs to
-/// that thread's **current** turn rather than to one a later start superseded.
+/// [`THREAD_START_EVENTS_SQL`] event on the thread at `id_expr`, so it belongs
+/// to that thread's **current** turn.
 ///
-/// Every recovery read that asks "which turn does this `ResponseAborted` belong
+/// Every recovery read asking "which turn does this `ResponseAborted` belong
 /// to?" goes through here, because the interesting failures are two of them
-/// answering differently. The two questions:
+/// answering differently:
 ///
 /// * Is the *Switch to new version* fingerprint still live, or did a resume
 ///   already consume it? ([`switch_abort_unsuperseded_sql`], the loop-breaker.)
 /// * Does this turn still need an interruption boundary, or did the teardown
 ///   pre-emit already land one? ([`boundary_abort_already_emitted`].)
 ///
-/// The second carried its own hand-rolled copy of the list until 2026-08-06, one
-/// that had neither resume start in it, so a switch abort the first read had
-/// retired still counted for the second. See that function's doc for what a crash
-/// after an auto-resume then looked like.
-///
 /// `id_expr` yields the thread's `aggregate_id` (text): `"$1"` for a bound
-/// single-thread check, or a column reference such as `"e.aggregate_id"` for a
-/// set-based scan. `seq_expr` yields the event's sequence in the same scope. The
-/// subquery aliases its own `events` as `s`, so an unqualified `seq_expr` in an
-/// un-aliased outer query is never captured by it.
+/// single-thread check, or a column reference for a set-based scan. `seq_expr`
+/// yields the event's sequence in the same scope. The subquery aliases its own
+/// `events` as `s`, so an unqualified `seq_expr` in an un-aliased outer query is
+/// never captured by it.
 fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
     format!(
         "{seq} > COALESCE(( \
@@ -1475,54 +1270,37 @@ pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> St
 /// not mid-response when it died, so a restart must NOT re-open that turn with a
 /// "Response interrupted" boundary and a Continue button.
 ///
-/// This is the whole list of terminals a CC turn can end on, minus two deliberate
-/// absences. Both would break something if included:
+/// This is the whole list of terminals a coding-agent turn can end on, minus two
+/// deliberate absences:
 ///
-/// * **`ResponseAborted`** IS the interrupted boundary: it is what recovery
-///   itself emits, and an `EngineShutdown` one carrying a device actor is the
-///   *Switch to new version* fingerprint that [`switch_was_user_initiated`] keys
-///   on. Counting it as turn-ended would classify every switched-away session as
-///   idle and silently kill auto-resume.
+/// * **`ResponseAborted`** IS the interrupted boundary, and an `EngineShutdown`
+///   one carrying a device actor is the *Switch to new version* fingerprint
+///   [`switch_was_user_initiated`] keys on. Counting it as turn-ended would
+///   classify every switched-away session as idle and kill auto-resume.
 /// * **`SessionEnded`** is listed, but only for the reasons that really end a
 ///   turn. The mid-turn ones are subtracted separately by
 ///   [`SESSION_ENDED_MID_TURN_REASONS_SQL`].
-///
-/// The set was `CodingAgentIdled` + `ResponseGenerated` only until 2026-08-05,
-/// which meant a turn the user *canceled* (or one that ended `ResponseFailed`)
-/// left `SessionStarted` as the newest recognised lifecycle event forever. Every
-/// later engine restart then re-surfaced that dead turn as "System / Response
-/// interrupted" with a Continue button, hours after the timeline already showed
-/// "Canceled" and "Response canceled" for it.
 const TURN_ENDED_EVENT_TYPES_SQL: &str = "'CodingAgentIdled','ResponseGenerated',\
     'ResponseCanceled','ResponseFailed','SessionEnded'";
 
 /// [`crate::engine::thread_events::SessionEndReason`] values that do NOT end the
-/// turn. A `SessionEnded` carrying one is dropped from the lifecycle scan
-/// entirely, so the preceding `SessionStarted` becomes the newest lifecycle event
-/// again and the branch classifies `running`.
+/// turn. A `SessionEnded` carrying one is dropped from the lifecycle scan, so
+/// the preceding `SessionStarted` becomes the newest lifecycle event again and
+/// the branch classifies `running`.
 ///
-/// * `stale_resume` is transient by `SessionEndReason::is_transient`: CC answered
-///   a stale `--resume` with an empty Result, and the chat handler retries
-///   against a fresh session, so a new `SessionStarted` is imminent.
-/// * `shutdown` is the engine going away mid-turn: the `SessionEnded`-shaped twin
-///   of the `ResponseAborted { EngineShutdown }` boundary excluded above, and the
-///   turn it ends is precisely the one recovery must resume or offer Continue for.
-///   No production site emits it today (teardown goes through `stop_terminal_kind`,
-///   which yields `Aborted(EngineShutdown)`, and no workspace DB has ever held a
-///   `reason='shutdown'` row), but the variant is live in the enum and its meaning
-///   is unambiguous. The classifier states the rule rather than depending on a
-///   census of current emit sites: re-adding that emit must not silently cost
-///   *Switch to new version* its auto-resume.
+/// * `stale_resume` is transient: the agent answered a stale `--resume` with an
+///   empty Result, and the handler retries against a fresh session.
+/// * `shutdown` is the engine going away mid-turn, the `SessionEnded`-shaped
+///   twin of the `ResponseAborted { EngineShutdown }` boundary excluded above.
+///   No production site emits it today, but the variant is live in the enum.
+///   Re-adding that emit must not silently cost *Switch to new version* its
+///   auto-resume.
 ///
 /// Matched through `COALESCE(payload->>'reason','')`, and the `COALESCE` is
-/// load-bearing. `reason` is absent on the oldest rows (464 of them in one
-/// workspace DB), where `payload->>'reason'` is NULL, `NULL IN (...)` is NULL,
-/// and `NOT (TRUE AND NULL)` is NULL rather than TRUE, so a bare `IN` drops those
-/// rows from the scan instead of keeping them. They would then fall back to an
-/// older `SessionStarted` and classify `running`: the very bogus interrupt panel
-/// this whole change removes, just for the legacy cohort. A reason-less row
-/// deserializes as `LegacyNonTerminal`, which is terminal, so keeping it is also
-/// the semantically right answer.
+/// load-bearing. `reason` is absent on the oldest rows, where a bare `IN` yields
+/// NULL and drops them from the scan instead of keeping them. They would fall
+/// back to an older `SessionStarted` and classify `running`, which is the bogus
+/// interrupt panel this classifier exists to prevent.
 const SESSION_ENDED_MID_TURN_REASONS_SQL: &str = "'stale_resume','shutdown'";
 
 /// Events proving a new turn began after the last turn-ended event, so the
@@ -1531,17 +1309,16 @@ const TURN_PROGRESSION_EVENT_TYPES_SQL: &str = "'SessionStarted','CodingAgentUse
     'MessageReceived','CodingAgentPromptSent','CodingAgentToolCalled',\
     'CodingAgentTextStreamed','ContinuationStarted'";
 
-/// Classify every coding-agent branch as `running` (a turn was in flight when the
-/// engine died, so resume it or offer Continue) or `idle` (the turn ended; leave
-/// the worktree to the cleanup worker), one row per thread that ever emitted a
-/// `SessionStarted` with a branch.
+/// Classify every coding-agent branch as `running` or `idle`, one row per thread
+/// that ever emitted a `SessionStarted` with a branch. `running` means a turn was
+/// in flight when the engine died, so resume it or offer Continue. `idle` means
+/// the turn ended, so leave the worktree to the cleanup worker.
 ///
-/// A branch is `running` iff its newest lifecycle event is a `SessionStarted`, or
-/// a turn-progression event landed after its newest turn-ended event. Everything
-/// else is `idle`, including (since 2026-08-05) the previously unclassified
-/// `SessionEnded` case. "Unclassified" was not a third state anywhere: the caller
-/// computes `in_flight = !idle_branches.contains(branch)`, so any branch missing
-/// from both sets was treated as in-flight and got the same bogus interrupt panel.
+/// A branch is `running` iff its newest lifecycle event is a `SessionStarted`,
+/// or a turn-progression event landed after its newest turn-ended event.
+/// Everything else is `idle`. There is no third state: the caller computes
+/// `in_flight = !idle_branches.contains(branch)`, so a branch missing from both
+/// sets would be treated as in-flight.
 pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
@@ -1580,71 +1357,24 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
 
 /// Threads still holding an UNKEPT resume promise: a switch-teardown abort that
 /// is the thread's newest `ResponseAborted`, with no start event after it, on a
-/// thread the projection still shows `paused`.
+/// thread the projection still shows `paused`. ADR 0045 records why the engine
+/// discharges its own promise, and which paths leave one unkept.
 ///
-/// A *Switch to new version* promises a resume. Both halves of the boot honour
-/// it (`resume_pending_switches` for coding agents, `resume_pending_chat_switches`
-/// for chat / trigger), and the UI reads the same promise off the abort itself to
-/// withhold the Continue button (`abortPromisesAutoResume`, the TS mirror of
-/// [`SWITCH_TEARDOWN_ABORT_SQL`]). So a promise the boot cannot keep must be
-/// WITHDRAWN, or the thread sits paused with no way forward but a follow-up
-/// message. The paths that leave one unkept are all real: the chat per-boot
-/// resume cap, a `continue_chat` that errored, a `ContinuationRequested` that
-/// failed to persist, a candidate scan that failed, a coding-agent branch
-/// `recover_orphaned_worktrees` skipped, and an archived thread neither drain
-/// selects at all.
+/// Four clauses, each load-bearing:
 ///
-/// Three clauses, each load-bearing:
+/// * `t.status = 'paused'` scopes the sweep to threads still on the interruption.
+/// * `t.state = 'active'` is the compose lifecycle, NOT the archive curtain. A
+///   composing row is a draft and a discarded one a tombstone.
+/// * The abort is the thread's newest `ResponseAborted`, the idempotency guard:
+///   the withdrawal emits a `RecoveryAfterRestart` abort, so the thread stops
+///   matching on the next boot.
+/// * No newer [`THREAD_START_EVENTS_SQL`] event, the loop-breaker both resume
+///   gates use.
 ///
-/// * `t.status = 'paused'` scopes the sweep to threads still sitting on the
-///   interruption. A switch abort followed by an Apply / anything that settled
-///   the row is not waiting on anything. Note this is also what keeps the sweep
-///   quiet on the first boot after `paused` was introduced: no historical row
-///   carries the value, so it only ever fires for interruptions from here on.
-/// * The abort is the thread's newest `ResponseAborted`. This is the idempotency
-///   guard: the withdrawal below emits a `RecoveryAfterRestart` abort, which is
-///   not a switch abort, so the thread stops matching on the next boot. Without
-///   it the floor would re-fire forever, since nothing supersedes the original
-///   switch abort in the START-event sense.
-/// * No newer [`THREAD_START_EVENTS_SQL`] event, the same loop-breaker both
-///   resume gates use.
-///
-/// **Archived threads are deliberately INCLUDED**, unlike the resume drains and
-/// the orphan sweeps, which all exclude them. Those emit work or revive a turn,
-/// and the user dismissed the row. This does neither: it corrects a promise the
-/// engine made and could not keep, and the correction cannot resurrect anything
-/// (`display_section` keeps a `paused`, change-less thread in Archive, since
-/// `demands_surface` covers only running / active children / pending changes /
-/// attention descendants). Excluding them was a real dead end: no drain selects
-/// an archived thread, so its switch abort would stay the newest boundary
-/// forever, and unarchiving it would surface a paused thread whose Continue
-/// button no later boot could ever restore. `state = 'active'` still applies:
-/// that is the compose lifecycle, and a composing or discarded row is not a
-/// dismissed thread but a draft or a tombstone.
-///
-/// **The withdrawal inherits the switch abort's `request_event_id` AND its
-/// `actor`, which is why both are selected here.** Same reasoning for both: this
-/// boundary is a second statement about somebody else's teardown, so every field
-/// describing that teardown is read off the boundary being withdrawn rather than
-/// invented. The id keeps the two panels in one exchange instead of the
-/// withdrawal opening a stray one. The actor keeps them agreeing about who
-/// restarted the engine, which is the whole subject of both.
-///
-/// The actor half is not defensive: `SWITCH_TEARDOWN_ABORT_SQL` above selects
-/// **only** rows whose actor is a device, so every thread reaching the
-/// withdrawal was torn down by a human at a known device, and stamping
-/// `MessageOrigin::system()` on the result states the one thing the selection
-/// proves false. It did exactly that from 2026-08-05 to 2026-08-09, which is how
-/// the user's own *Switch to new version* came back as "⚙ System / Response
-/// interrupted": the fourth site of the hardcoded-`system()` bug that
-/// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`
-/// swept out of the three teardown emits two days after this one was written,
-/// and missed because this one lives on the boot path instead.
-///
-/// A boot cannot reach `LucidosEngine::teardown_actor` (that lives in the
-/// process that died), so the abort row is the only surviving record of who
-/// clicked, and inheriting it is the boot-side spelling of the same "one actor
-/// for the whole teardown" rule.
+/// **Archived threads are deliberately INCLUDED**, unlike the resume drains:
+/// this revives nothing, it corrects a promise the engine could not keep. The
+/// withdrawal inherits the abort's `request_event_id` AND its `actor`, the only
+/// surviving record of who clicked switch.
 fn unresumed_switch_threads_sql() -> String {
     format!(
         "SELECT e.aggregate_id::uuid AS thread_id, \
@@ -1668,34 +1398,26 @@ fn unresumed_switch_threads_sql() -> String {
     )
 }
 
-/// Withdraw every resume promise this boot did not keep, by emitting the
+/// Withdraw every resume promise this boot did not keep. It emits the
 /// crash-shaped `ResponseAborted { RecoveryAfterRestart }` boundary that
 /// `chat::recovery::recover_orphaned_threads` already uses for an interrupted
-/// turn nobody is resuming. The frontend's newest-abort scan then re-arms the
-/// Continue button on its own, because that boundary is not a switch abort.
+/// turn nobody is resuming. The frontend's newest-abort scan then re-arms
+/// Continue on its own, because that boundary is not a switch abort (ADR 0045).
 ///
 /// `resumed` is the union of what the two resume drains actuated, passed BY ID
 /// rather than re-derived from the events table. A coding-agent resume has only
-/// emitted `ContinuationRequested` by the time this runs, and that type is
-/// deliberately absent from [`THREAD_START_EVENTS_SQL`], so a query-only
-/// exclusion would re-abort a thread that is resuming perfectly well and hand
-/// the user a Continue button for a turn already back in flight.
+/// emitted `ContinuationRequested` by then, and that type is deliberately absent
+/// from [`THREAD_START_EVENTS_SQL`]. A query-only exclusion would therefore
+/// re-abort a thread that is resuming perfectly well.
 ///
-/// Best-effort, like every other boot sweep: a DB error degrades to "nothing to
+/// Best-effort, like every boot sweep: a DB error degrades to "nothing to
 /// withdraw" rather than blocking boot. Every withdrawal is logged by id, so the
 /// sweep can never read as "resumed everything" when it did not.
 ///
-/// Runs LAST in the boot sequence (`main.rs`, after both drains) for the obvious
-/// reason: it can only tell a broken promise from a kept one once every resume
-/// path has had its turn.
-///
-/// The boundary is crash-SHAPED, not crash-ATTRIBUTED. `RecoveryAfterRestart` is
-/// what re-arms Continue and keeps the thread `failed`
-/// (`AbortCause::status_sql`), and both are right: the turn is not coming back
-/// on its own. Who ended it is a separate axis, and on this path the answer is
-/// always a human at a device, carried over from the switch abort by
-/// [`unresumed_switch_threads_sql`]. See that function for what stamping
-/// `system` here cost.
+/// Runs LAST in the boot sequence, after both drains: only then can it tell a
+/// broken promise from a kept one. The boundary is crash-SHAPED, not
+/// crash-ATTRIBUTED. The actor is carried over from the switch abort by
+/// [`unresumed_switch_threads_sql`].
 pub(crate) async fn settle_unresumed_switch_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
@@ -1726,16 +1448,13 @@ pub(crate) async fn settle_unresumed_switch_threads(
              Withdrawing the resume promise so its Continue affordance returns",
             thread_id
         );
-        // Both fields describe the teardown this boundary is a second statement
-        // about, so both are inherited from the switch abort rather than
-        // invented. The id keeps the two panels in one exchange; the actor keeps
-        // them naming the same person.
+        // Both fields are inherited from the switch abort rather than invented.
+        // The id keeps the two panels in one exchange, and the actor keeps them
+        // naming the same person.
         //
-        // The actor fallback is genuinely unreachable, since the selection
-        // predicate matches only a device actor, so it can fire only if the row
-        // stopped round-tripping through `MessageOrigin`. Say so in the log
-        // rather than silently attributing the user's restart to the host: a
-        // `system` actor here is the shape of the bug this inheritance fixed.
+        // The fallback is unreachable, since the selection matches only a device
+        // actor. Log it rather than silently attributing the user's restart to
+        // the host.
         let actor = switch_actor
             .and_then(|v| match serde_json::from_value::<MessageOrigin>(v) {
                 Ok(origin) => Some(origin),
@@ -1751,9 +1470,8 @@ pub(crate) async fn settle_unresumed_switch_threads(
             })
             .unwrap_or_else(MessageOrigin::system);
         let meta = crate::engine::thread_events::EventMeta {
-            // `.ok()` is safe here: an unparseable value means the withdrawal
-            // opens its own exchange instead of joining, which costs grouping
-            // and nothing else, and the field is one the engine wrote itself.
+            // `.ok()` is safe: an unparseable value only costs grouping, and the
+            // engine wrote the field itself.
             request_event_id: request_event_id.as_deref().and_then(|s| s.parse().ok()),
             actor: Some(actor),
             ..crate::engine::thread_events::EventMeta::NONE
@@ -1774,22 +1492,19 @@ pub(crate) async fn settle_unresumed_switch_threads(
 }
 
 /// Settle any coding-agent thread still `running` in the projection that boot
-/// recovery neither resumed (in `recovering`) nor settled. After a restart
-/// there are NO live subprocesses, so a `running` coding-agent thread with no
-/// recovery is a permanent zombie — the in-memory watchdogs only scan live
-/// `agent_sessions` (empty at boot), so nothing else would ever clear it. This
-/// is the floor that would have caught thread-72120ca6: it stayed `running`
-/// across the restart because the skip paths in `recover_orphaned_worktrees`
-/// (`continue` on already-has-pending-change / no-in-flight-signal / duplicate /
-/// no-originating-thread) drop a worktree WITHOUT settling the projection.
+/// recovery neither resumed nor settled. After a restart there are NO live
+/// subprocesses, so such a thread is a permanent zombie: the in-memory watchdogs
+/// only scan live `agent_sessions`, which is empty at boot. The skip paths in
+/// `recover_orphaned_worktrees` that DROP a worktree leave the projection
+/// unsettled, and this is the floor under those. The question-park preserve is
+/// not one of them: it keeps the worktree and must stay unsettled.
 ///
-/// Scoped to coding-agent threads on purpose: chat orphans are settled by
+/// Scoped to coding-agent threads on purpose. Chat orphans are settled by
 /// `recover_orphaned_threads`, and a chat thread blocked on a child legitimately
-/// sits `running` pending parent-resume — settling it here would break that. A
-/// coding-agent thread, by contrast, exits its subprocess at every turn
-/// boundary, so at boot a `running` one has no live session.
-/// `settle_stuck_running_thread` re-checks `running` per thread (idempotent), so
-/// a thread settled by another path in the meantime is a no-op.
+/// sits `running` pending parent-resume. A coding-agent thread exits its
+/// subprocess at every turn boundary, so at boot a `running` one has no live
+/// session. `settle_stuck_running_thread` re-checks per thread, so a thread
+/// settled elsewhere in the meantime is a no-op.
 pub(crate) async fn settle_orphaned_running_coding_agent_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,

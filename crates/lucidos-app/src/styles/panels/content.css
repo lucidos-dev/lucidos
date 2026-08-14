@@ -92,10 +92,6 @@
     min-width: 0;
 }
 
-.notification-title .trigger-icon {
-    font-size: var(--font-size-lg);
-}
-
 .notification-summary {
     font-size: var(--font-size-xs);
     color: var(--text-secondary);

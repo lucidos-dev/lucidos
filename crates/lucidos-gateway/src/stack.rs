@@ -1,15 +1,12 @@
 //! One workspace stack = the spawned engine process + its health state.
 //!
-//! Engine bind depends on the build (ADR 0014 "Dev runtime topology"): **packaged**
-//! engines bind **loopback only** so the gateway is the sole network-facing
-//! surface (the engine defaults to loopback; `LUCIDOS_BIND_LOOPBACK=1` is also
-//! set as its `behind_gateway` signal); **dev** engines bind all interfaces on
-//! their own port (`LUCIDOS_BIND_ALL=1`) so the app is reachable directly there
-//! too (see `spawn_engine`'s `loopback` arg). Either way engines are spawned
-//! **detached** (`setsid`) so a
-//! gateway crash/restart doesn't take them down; a re-adopting gateway reconnects
-//! via the pidfile + a health probe (engine-statelessness). Supervision is
-//! health-probe based, so it works identically for spawned + re-adopted engines.
+//! Engine bind depends on the build, per ADR 0014's dev runtime topology. See
+//! [`spawn_engine`]'s `loopback` argument.
+//!
+//! Either way engines are spawned **detached**, so a gateway crash or restart
+//! does not take them down. A re-adopting gateway reconnects through the
+//! pidfile and a health probe. Supervision is health-probe based, so it works
+//! identically for spawned and re-adopted engines.
 
 use crate::postgres::PgHandle;
 use crate::registry::Workspace;
@@ -22,17 +19,15 @@ use std::time::{Duration, Instant};
 /// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
 /// coding-agent thread?
 ///
-/// A worktree is a throwaway checkout pinned to one commit. Anything long-lived
-/// that resolves into one (an engine/gateway binary, a served `dist/`) is frozen
-/// at that commit forever, which on 2026-07-26 made every frontend-only Apply
-/// silently serve a stale build. The bash side has the same predicate
-/// (`path_is_in_cc_worktree` in `scripts/lib/workspace.sh`) — keep the two in
-/// step; see `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`.
+/// A worktree is a throwaway checkout pinned to one commit, so anything
+/// long-lived that resolves into one is frozen at that commit forever. ADR 0021
+/// and `docs/plans/2026-07-26-worktree-pinned-stack-guard.md` hold the rest.
+/// Keep this in step with `path_is_in_cc_worktree` in `scripts/lib/workspace.sh`.
 ///
 /// A pure path test on purpose: it must stay correct for an ORPHANED worktree
 /// whose directory is already gone, which is exactly when it matters most.
-/// Matches on the `.lucidos/worktrees` component pair so a directory merely
-/// *named* `worktrees` (or a `~/worktrees/lucidos` checkout) is not caught.
+/// Matches on the `.lucidos/worktrees` component pair, so a directory merely
+/// *named* `worktrees` is not caught.
 pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
     let comps: Vec<_> = path
         .components()
@@ -43,13 +38,11 @@ pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
         .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
 }
 
-// NOTE: there is deliberately NO `LUCIDOS_ALLOW_WORKTREE_STACK` escape hatch in
-// this crate. The opt-out exists only for a session-scoped DIRECT engine (the
-// e2e harness, which calls `start_engine` and never starts a gateway). Every
-// path in the gateway is by definition the machine-global daemon — it outlives
-// the shell that launched it and propagates its env into every engine it spawns
-// — so honouring an inherited opt-out here would re-open exactly the 2026-07-26
-// hole the guards close. See ADR 0021 § "the opt-out stops at the gateway".
+// There is deliberately NO `LUCIDOS_ALLOW_WORKTREE_STACK` escape hatch in this
+// crate. The opt-out exists only for a session-scoped DIRECT engine. Every path
+// in the gateway is by definition the machine-global daemon, so honouring an
+// inherited opt-out here would re-open the hole the guards close. See ADR 0021
+// § "the opt-out stops at the gateway".
 
 /// Per-workspace health, surfaced on the control API and rendered in the picker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -77,11 +70,10 @@ pub struct StackRuntime {
     pub health: Health,
     /// Respawn attempts since the stack was last healthy. Caps auto-respawn.
     pub restart_attempts: u32,
-    /// Consecutive failed health probes since the stack was last healthy (or
-    /// last respawned). The supervisor requires several of these before culling
-    /// an alive-but-busy engine, so a transient load spike (a single slow probe)
-    /// never triggers a respawn — the root cause of the 2026-06-24 respawn
-    /// storm. Reset on a healthy probe and on respawn.
+    /// Consecutive failed health probes since the stack was last healthy or
+    /// respawned. The supervisor requires several before culling an
+    /// alive-but-busy engine, so a single slow probe never triggers a respawn.
+    /// Reset on a healthy probe and on respawn.
     pub health_misses: u32,
     pub last_spawn: Option<Instant>,
     pub last_error: Option<String>,
@@ -129,12 +121,10 @@ impl StackRuntime {
 /// runtime posture. Split out of [`spawn_engine`] (which adds the conditional
 /// bind/TLS handling on top) so the set is inspectable, and pinned by a test.
 ///
-/// Note what is deliberately NOT here: a model-cache directory. The embedding
-/// model is hundreds of MB and byte-identical for every workspace, so the engine
-/// resolves ONE shared per-user cache itself
-/// (`memory::model_download::apply_default_cache_dir`) and otherwise inherits
-/// whatever the packaged app or the headless service already chose. Pinning it
-/// per workspace here is what used to give every workspace its own copy.
+/// Deliberately NOT here: a model-cache directory. The engine resolves ONE
+/// shared per-user cache itself and otherwise inherits whatever the packaged
+/// app or the headless service already chose (ADR 0061). Pinning it per
+/// workspace here would give every workspace its own copy.
 fn engine_env_overrides(
     ws: &Workspace,
     resolved_dir: &Path,
@@ -152,20 +142,17 @@ fn engine_env_overrides(
     ]
 }
 
-/// Spawn a workspace engine: detached, pointed at its workspace dir + database,
-/// told how to call the gateway back for an in-place restart. Inherits the
-/// gateway's environment (so `LUCIDOS_STATIC_DIR` — the engine serves the built
-/// `dist/` directly, ADR 0014 §4/§5 — plus `LUCIDOS_MODEL`, `VERTEX_*`, etc. flow
-/// through) and overrides the workspace-specific vars. Writes
-/// `<dir>/.lucidos/engine.pid` for re-adoption + reclaim.
+/// Spawn a workspace engine: detached, pointed at its workspace dir and
+/// database, told how to call the gateway back for an in-place restart.
+/// Inherits the gateway's environment and overrides the workspace-specific
+/// vars. Writes `<dir>/.lucidos/engine.pid` for re-adoption and reclaim.
 ///
-/// `loopback` controls the engine's bind (ADR 0014 "Dev runtime topology"):
-///   * **packaged → `true`**: the engine binds loopback only; the gateway is the
-///     sole network-facing surface (the security posture).
-///   * **dev → `false`**: the engine binds all interfaces on `ws.port` (the
-///     user-facing port), so `https://localhost:<port>/` reaches the workspace
-///     app DIRECTLY (base `/`) *in addition* to `…/<slug>/` through the gateway.
-///     This is dev-only convenience, not a relaxation of the packaged posture.
+/// `loopback` controls the engine's bind, per ADR 0014's dev runtime topology:
+///   * **packaged, `true`**: loopback only, so the gateway is the sole
+///     network-facing surface. This is the security posture.
+///   * **dev, `false`**: all interfaces on `ws.port`, so `https://localhost:
+///     <port>/` reaches the workspace app directly as well as through the
+///     gateway. Dev-only convenience, not a relaxation of the posture above.
 pub fn spawn_engine(
     engine_bin: &Path,
     ws: &Workspace,
@@ -186,13 +173,11 @@ pub fn spawn_engine(
     ));
 
     // Never hand a spawned engine a frontend pinned to a coding-agent worktree.
-    // This inherit is precisely what made the 2026-07-26 pin self-perpetuating:
-    // a gateway launched from a worktree passed that worktree's dist/ into every
-    // engine it spawned, so the stack kept serving a frozen build across restarts
-    // and every frontend-only Apply silently did nothing. Dropping the var makes
-    // the engine serve nothing rather than something stale — a visible failure
-    // beats an invisible one, and `LUCIDOS_STATIC_DIR` is already optional
-    // (headless engines run without it).
+    // This inherit is what makes such a pin self-perpetuating: the worktree's
+    // `dist/` reaches every engine the gateway spawns, so the stack keeps
+    // serving a frozen build across restarts. Dropping the var makes the engine
+    // serve nothing rather than something stale, and a visible failure beats an
+    // invisible one. `LUCIDOS_STATIC_DIR` is already optional (ADR 0021).
     if let Some(dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
         if path_is_in_cc_worktree(Path::new(&dir)) {
             crate::log!(
@@ -206,29 +191,26 @@ pub fn spawn_engine(
         }
     }
     if loopback {
-        // Packaged: loopback only — the gateway is the sole network-facing
-        // surface and terminates TLS, so the engine serves plain HTTP on
-        // loopback. Strip any inherited TLS config (else it would serve https
-        // and the gateway's http proxy would fail). `LUCIDOS_BIND_LOOPBACK=1`
-        // is the engine's `behind_gateway` signal; the engine ALSO defaults to a
-        // loopback bind when `LUCIDOS_BIND_ALL` is unset (which it is here), so
-        // this stays loopback-only.
+        // Packaged: loopback only. The gateway is the sole network-facing
+        // surface and terminates TLS, so the engine serves plain HTTP. Strip
+        // any inherited TLS config, or it would serve https and the gateway's
+        // http proxy would fail. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
+        // `behind_gateway` signal, and the engine also defaults to a loopback
+        // bind with `LUCIDOS_BIND_ALL` unset, so this stays loopback-only.
         cmd.env("LUCIDOS_BIND_LOOPBACK", "1")
             .env_remove("LUCIDOS_BIND_ALL")
             .env_remove("LUCIDOS_TLS_CERT")
             .env_remove("LUCIDOS_TLS_KEY");
     } else {
         // Dev: the engine is the direct front on its port. KEEP the inherited
-        // TLS (LUCIDOS_TLS_CERT/KEY) so `https://localhost:<port>/` reaches it
-        // directly; the gateway proxies to it over the matching scheme. Clear
-        // the loopback flag so a respawn stays network-capable and not flagged
-        // as behind-gateway.
+        // TLS so `https://localhost:<port>/` reaches it directly, and the
+        // gateway proxies over the matching scheme. Clear the loopback flag so
+        // a respawn stays network-capable and not flagged as behind-gateway.
         //
-        // Bind: default to all interfaces (the engine defaults to loopback now,
-        // so this must be explicit) — BUT defer to ~/.lucidos/network.toml when
-        // it exists, so the engine's own resolver derives the configured bind
-        // (`[engine] inherit` → the gateway bind, else this workspace's own
-        // `network_bind` preference) instead of being masked by BIND_ALL.
+        // Bind defaults to all interfaces, and must say so explicitly because
+        // the engine now defaults to loopback. Defer to `network.toml` when it
+        // exists, so the engine's own resolver derives the configured bind
+        // rather than being masked by BIND_ALL.
         cmd.env_remove("LUCIDOS_BIND_LOOPBACK");
         if crate::net_config::network_toml_exists() {
             cmd.env_remove("LUCIDOS_BIND_ALL");
@@ -252,11 +234,10 @@ pub fn spawn_engine(
     }
 
     let child = cmd.spawn()?;
-    // Not fatal (the engine is already up and serving), but not silent either:
-    // without the pidfile a re-adopting gateway cannot tell this engine is alive
-    // (`engine_process_alive` reads it for any stack with no `Child` handle) and
-    // `reclaim_stale_engine` cannot free its port on the next respawn. Both
-    // failures surface far from here, so name the cause where it happens.
+    // Not fatal, since the engine is already up and serving, but not silent
+    // either. Without the pidfile a re-adopting gateway cannot tell this engine
+    // is alive, and `reclaim_stale_engine` cannot free its port on the next
+    // respawn. Both failures surface far from here, so name the cause here.
     let pidfile = resolved_dir.join(".lucidos/engine.pid");
     if let Err(e) = std::fs::write(&pidfile, child.id().to_string()) {
         crate::log!(
@@ -281,14 +262,12 @@ pub fn read_pidfile(resolved_dir: &Path) -> Option<u32> {
 /// Whether `pid` names a process that is still RUNNING, reaping it first when
 /// it is one of our own children that has already exited.
 ///
-/// A bare `kill(pid, 0)` does NOT answer this: it succeeds for a **zombie**, a
-/// process that has exited and lingers in the process table only until its
-/// parent reaps it. That matters here because the gateway IS the parent of
-/// every engine it spawns, and after a self re-exec it no longer holds a
-/// `Child` handle for them, so nothing reaps them. A zombie engine then reads
-/// as alive forever, and `respawn_decision` never culls an alive engine, so the
-/// workspace would meta-refresh the boot splash instead of being restarted.
-/// (Observed 2026-07-31: a workspace engine defunct for a day, its port dead.)
+/// A bare `kill(pid, 0)` does NOT answer this. It succeeds for a **zombie**, a
+/// process that has exited and lingers in the process table until its parent
+/// reaps it. The gateway IS the parent of every engine it spawns. After a self
+/// re-exec it holds no `Child` handle for them, so nothing reaps them. A zombie
+/// engine then reads as alive forever, and `respawn_decision` never culls an
+/// alive engine.
 ///
 /// `waitpid(pid, WNOHANG)` answers and repairs in one call. It is scoped to the
 /// single pid, so it can never consume another child's exit status:
@@ -296,15 +275,15 @@ pub fn read_pidfile(resolved_dir: &Path) -> Option<u32> {
 ///   * `== 0`  our child and still running, alive.
 ///   * `< 0`  (`ECHILD`) not our child, so fall back to the existence probe.
 ///
-/// A foreign zombie is indistinguishable in that last branch, but the only
-/// zombies the gateway can create are its own children, which the first branch
-/// clears.
+/// A foreign zombie is indistinguishable in that last branch. But the only
+/// zombies the gateway can create are its own children, and the first branch
+/// clears those.
 #[cfg(unix)]
 pub fn pid_is_live(pid: u32) -> bool {
-    // Pid 0 is never an engine, and passing it on would be actively harmful:
-    // `waitpid(0, ...)` means "any child in MY process group", so a corrupt
-    // pidfile could reap a DIFFERENT engine and steal the exit status its
-    // `Child` handle is waiting for, which then reads as dead and gets culled.
+    // Pid 0 is never an engine, and passing it on would be actively harmful.
+    // `waitpid(0, ...)` means "any child in MY process group". A corrupt
+    // pidfile could then reap a DIFFERENT engine and steal the exit status its
+    // `Child` handle waits for. It would read as dead and get culled.
     if pid == 0 {
         return false;
     }
@@ -331,33 +310,23 @@ pub fn pid_is_live(_pid: u32) -> bool {
 /// Wait on a process this gateway forked but holds no [`Child`] for, off the
 /// caller's thread, so it cannot linger as a zombie.
 ///
-/// **Signalling an engine is not reaping it.** The gateway normally reaps
-/// through the `Child` it got from [`spawn_engine`], but it does not always HAVE
-/// one: `reload_gateway` re-execs the gateway image *in place*, so the pid is
-/// unchanged and every engine the previous image spawned is still a child of
-/// this process, while every `Child` handle died with the image. The fresh image
-/// re-adopts those engines with `engine: None`, and from then on their teardown
-/// runs through [`reclaim_stale_engine`], which only knows a pid. Without this
-/// wait the engine exits and stays `<defunct>` for the gateway's whole lifetime:
-/// the one path that would `waitpid` it ([`pid_is_live`]) runs only while the
-/// stack is still in the supervisor's map with no handle, which stops being true
-/// the moment a stop drops the stack or a respawn stores a fresh `Child`.
-/// Nineteen such zombies had accumulated over a two-day uptime on 2026-08-09.
+/// **Signalling an engine is not reaping it.** `reload_gateway` re-execs the
+/// image in place, so the pid is unchanged. Every engine the previous image
+/// spawned is still a child of this process, while every `Child` handle died
+/// with the image. The fresh image re-adopts those engines with `engine: None`,
+/// and their teardown then runs through [`reclaim_stale_engine`], which only
+/// knows a pid. Without this wait such an engine stays `<defunct>` for the
+/// gateway's whole lifetime.
 ///
-/// A dedicated thread rather than the caller's, because an engine's graceful
-/// drain takes ~10s and the callers are the supervisor and control requests. A
-/// plain `std::thread` rather than `spawn_blocking` so this stays callable from
-/// any context, including a sync helper reached outside a tokio runtime.
+/// A dedicated thread rather than the caller's, because a graceful drain takes
+/// about ten seconds. A plain `std::thread` rather than `spawn_blocking`, so
+/// this stays callable outside a tokio runtime.
 ///
 /// Blocking `waitpid` is safe for a pid that is NOT ours: it returns `ECHILD`
-/// immediately rather than waiting, so a re-adopted engine that a *previous*
-/// gateway process spawned costs only the thread. It is scoped to the single
-/// pid, so it can never consume another child's exit status, the same discipline
-/// [`pid_is_live`] documents. It inherits the pid-recycling exposure the `kill`
-/// in [`reclaim_stale_engine`] already carries (a pidfile can name a pid the OS
-/// has since reused), and is the strictly milder half of that pair: the worst
-/// case is collecting one of our own probe children's exit status, against the
-/// signal's worst case of stopping it.
+/// at once. It is scoped to the single pid, the same discipline
+/// [`pid_is_live`] documents, and it inherits the pid-recycling exposure the
+/// `kill` in [`reclaim_stale_engine`] already carries. It is the milder half of
+/// that pair.
 #[cfg(unix)]
 pub fn reap_forked_pid(pid: u32) {
     // Same guard as `pid_is_live`: `waitpid(0, ...)` means "any child in MY
@@ -388,13 +357,13 @@ pub fn reap_forked_pid(pid: u32) {
 #[cfg(not(unix))]
 pub fn reap_forked_pid(_pid: u32) {}
 
-/// Send SIGUSR1 (the engine's graceful-stop signal — it ignores SIGTERM) to a
-/// stale engine recorded in the pidfile, so a respawn doesn't collide on the
-/// loopback port, and reap it if it turns out to be our own child.
+/// Send SIGUSR1 to a stale engine recorded in the pidfile, so a respawn does
+/// not collide on the loopback port. Reap it too, if it is our own child.
+/// SIGUSR1 rather than SIGTERM, which the engine ignores.
 ///
-/// This is the teardown path for an engine the gateway holds no [`Child`] for,
-/// and the reap is not optional: see [`reap_forked_pid`] for why such an engine
-/// is so often still a child of this process. Best-effort throughout.
+/// The teardown path for an engine the gateway holds no [`Child`] for, and the
+/// reap is not optional: see [`reap_forked_pid`] for why such an engine is so
+/// often still a child of this process. Best-effort throughout.
 pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
     if let Some(pid) = read_pidfile(resolved_dir) {
@@ -403,9 +372,9 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGUSR1);
         }
-        // Started BEFORE the sleep, not after, so the wait is already in place
-        // when the engine exits, and because the pidfile is overwritten by the
-        // very next spawn: this is the last moment the pid is known.
+        // Started BEFORE the sleep, so the wait is already in place when the
+        // engine exits. The very next spawn overwrites the pidfile, so this is
+        // the last moment the pid is known.
         reap_forked_pid(pid);
         // Give it a moment to release the port.
         std::thread::sleep(Duration::from_millis(300));
@@ -414,11 +383,12 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
     let _ = resolved_dir;
 }
 
-/// Outcome of one health probe. Used to detect `Healthy` (which resets the
-/// stack) and to enrich the supervisor's log line. The cull decision keys on
-/// whether the engine PROCESS is alive, NOT on this outcome — an alive engine is
-/// never culled (see `respawn_decision`); only a process that has exited is
-/// respawned. The variants remain for the `Healthy` check and observability.
+/// Outcome of one health probe. Used to detect `Healthy`, which resets the
+/// stack, and to enrich the supervisor's log line.
+///
+/// The cull decision keys on whether the engine PROCESS is alive, NOT on this
+/// outcome. An alive engine is never culled (see `respawn_decision`), and only
+/// a process that has exited is respawned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProbeOutcome {
     /// 2xx from `/api/v1/health`.
@@ -464,10 +434,8 @@ pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> 
 /// its port, probed via `127.0.0.1` (harmless for the plain-http packaged engine).
 ///
 /// The 5s timeout gives a busy engine headroom to answer before the probe is
-/// classified `Slow` (a response that arrives in <5s is healthy). The budget can
-/// stay modest because a `Slow` outcome never culls a live engine at all — only a
-/// process that has actually EXITED is respawned (see `respawn_decision` in
-/// `server.rs`), so a slow probe against a working engine is harmless.
+/// classified `Slow`. The budget can stay modest because a `Slow` outcome never
+/// culls a live engine, so a slow probe against a working engine is harmless.
 pub fn build_health_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
@@ -484,9 +452,9 @@ pub fn build_health_client() -> reqwest::Client {
 /// `None`, so a slow or just-restarted engine simply shows no badge that tick.
 ///
 /// This HTTP read is the ONLY count path: the gateway deliberately holds no DB
-/// handle (ADR 0014 §1), so a STOPPED workspace contributes nothing to the
-/// per-row badge or the aggregate total — the settled "running workspaces only"
-/// behavior. `text()` + manual parse avoids pulling reqwest's `json` feature.
+/// handle (ADR 0014 §1). So a STOPPED workspace contributes nothing to the
+/// per-row badge or the aggregate total, which is the settled behaviour.
+/// `text()` and a manual parse avoid pulling reqwest's `json` feature.
 pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u16) -> Option<u64> {
     let url = format!("{scheme}://127.0.0.1:{port}/api/v1/notifications?limit=0");
     let resp = client.get(&url).send().await.ok()?;
@@ -500,29 +468,27 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
 
 /// Header the engine reads the originating device off. Mirrors
 /// `api::actor::HEADER_DEVICE_ID` in `lucidos-engine`, which the gateway cannot
-/// depend on (see this crate's `Cargo.toml`); rename one and the other must
-/// follow in lockstep, same rule as the CLI's copy of the token header.
+/// depend on. Rename one and the other must follow in lockstep, the same rule
+/// as the CLI's copy of the token header.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
 /// How long the restart-intent notify may take before it is abandoned. Short on
-/// purpose: this sits directly in front of a user-visible Restart click, and the
-/// restart proceeds regardless, so waiting longer buys attribution at the cost of
-/// the responsiveness of the thing the user actually asked for. Well clear of a
-/// loopback round-trip to a healthy engine, which is sub-millisecond.
+/// purpose: this sits in front of a user-visible Restart click, and the restart
+/// proceeds regardless. Well clear of a loopback round-trip to a healthy
+/// engine, which is sub-millisecond.
 ///
 /// The whole budget is only ever spent on an engine that is NOT answering, and
-/// the caller holds that stack's lock while it waits, so a picker poll can stall
-/// behind it. Accepted rather than optimised away: `respawn_stack` runs on the
-/// very next line and holds the same lock across Postgres provisioning and the
-/// spawn, which is longer. Skipping the notify for an `Unhealthy` stack was the
-/// alternative and is worse: a merely BUSY engine misses health probes without
-/// being dead (a `Slow` probe never culls one), and a busy engine is exactly the
-/// one whose in-flight threads the attribution is for.
+/// the caller holds that stack's lock while it waits. A picker poll can
+/// therefore stall behind it. Accepted rather than optimised away, because
+/// `respawn_stack` runs on the very next line and holds the same lock for
+/// longer. Skipping the notify for an `Unhealthy` stack is worse: a merely BUSY
+/// engine misses health probes without being dead, and its in-flight threads
+/// are exactly what the attribution is for.
 const RESTART_INTENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What a restart-intent notify did. Returned rather than logged-and-dropped so
-/// the call sites (and the tests) can state the three outcomes apart; **no
-/// caller may treat any of them as a reason not to restart**.
+/// What a restart-intent notify did. Returned rather than logged and dropped,
+/// so the call sites and the tests can tell the three outcomes apart. **No
+/// caller may treat any of them as a reason not to restart.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartIntentNotify {
     /// No device asked, so there is nothing to attribute and no call was made.
@@ -537,31 +503,24 @@ pub enum RestartIntentNotify {
 }
 
 /// Tell one workspace's engine that a HUMAN asked for the teardown it is about
-/// to be signalled for, and which device they were on. Called immediately before
-/// `stop_engine_process` on the control-plane restart/stop path, and nowhere
+/// to be signalled for, and which device they were on. Called immediately
+/// before `stop_engine_process` on the control-plane restart path, and nowhere
 /// else.
 ///
-/// The engine cannot work this out for itself: `SIGUSR1` carries no sender, so
-/// without this call the picker's Restart is indistinguishable from a crash and
-/// its in-flight threads settle at `failed` with "Response interrupted" and no
-/// auto-resume, while the in-workspace *Switch to new version* (which stashes
-/// its actor over HTTP before asking us to respawn) settles the same threads at
-/// `paused` with "Paused by restart". See the engine's `restart_intent` handler.
+/// The engine cannot work this out for itself: `SIGUSR1` carries no sender.
+/// Without this call the picker's Restart is indistinguishable from a crash,
+/// and its in-flight threads settle at `failed` with no auto-resume. See the
+/// engine's `restart_intent` handler.
 ///
 /// **Best effort, and bounded.** A failure here costs attribution on one
-/// restart; blocking or failing the restart itself would cost the user the thing
-/// they clicked. So every failure mode collapses to [`RestartIntentNotify`] and
-/// the caller carries on.
+/// restart, while blocking the restart would cost the user the thing they
+/// clicked. So every failure mode collapses to [`RestartIntentNotify`].
 ///
-/// **`None` means skip, not "unknown device".** Attribution has to be earned:
-/// the engine refuses a call with no device anyway (it would resolve to an `Api`
-/// actor, which promises no resume and would replace an honest System
-/// attribution), so not calling is both cheaper and the same answer.
+/// **`None` means skip, not "unknown device".** The engine refuses a call with
+/// no device anyway, so not calling is both cheaper and the same answer.
 ///
-/// Scheme comes from the caller's `GatewayState::engine_scheme()`, the same
-/// resolution `probe_health` and `fetch_unread_count` use on this hop: the
-/// gateway spawned this engine and decided its TLS, so it is not guessing and
-/// needs no protocol fallback.
+/// Scheme comes from the caller's `GatewayState::engine_scheme()`. The gateway
+/// spawned this engine and decided its TLS, so it is not guessing.
 pub async fn notify_restart_intent(
     client: &reqwest::Client,
     scheme: &str,
@@ -622,10 +581,9 @@ mod tests {
     /// read: macOS reserves `WNOWAIT` for `waitid`, there is no /proc here, and
     /// `try_wait` would REAP the child, which is the very state under test.
     ///
-    /// A poll rather than a fixed sleep because these tests share a machine with
-    /// every other test in the suite (and with whatever else the developer is
-    /// running): a sleep long enough to be reliable under load is a sleep the
-    /// whole suite pays on every run.
+    /// A poll rather than a fixed sleep, because these tests share a machine
+    /// with the whole suite. A sleep long enough to be reliable under load is a
+    /// sleep the whole suite pays on every run.
     #[cfg(unix)]
     fn wait_until_defunct(pid: u32) -> bool {
         for _ in 0..200 {
@@ -690,8 +648,7 @@ mod tests {
         // Wait for it to actually exit, so it is exactly the kind of child
         // `waitpid(0, …)` would grab if the guard were missing. Polled, not
         // slept: a busy machine can leave a just-spawned `true` unscheduled past
-        // any fixed delay, and the test would then pass for the wrong reason (or
-        // fail spuriously on its own bystander assertion).
+        // any fixed delay, and the test would then pass for the wrong reason.
         assert!(
             wait_until_defunct(pid),
             "bystander never exited, so the guard would not be under test"
@@ -721,15 +678,20 @@ mod tests {
         assert!(!pid_is_live(pid), "a reaped pid must not read as live");
     }
 
-    /// Regression cover for the 2026-07-26 incident: the live stack was running
-    /// out of an ORPHANED coding-agent worktree, so it served a frozen `dist/`
-    /// and every frontend-only Apply silently did nothing.
+    /// Regression cover: a live stack running out of an ORPHANED coding-agent
+    /// worktree serves a frozen `dist/`, so every frontend-only Apply silently
+    /// does nothing.
     #[test]
     fn detects_coding_agent_worktree_paths() {
         for p in [
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc",
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist",
             "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/target/debug/lucidos-engine",
+            // The PUBLISHED launch path (ADR 0063), which is what a worktree
+            // build actually produces and therefore what this guard has to
+            // catch. It moved out of `target/`, and the refusal must not have
+            // moved with it.
+            "/Users/me/workspaces/dev/.lucidos/worktrees/thread-abc/.launch/debug/plain/lucidos-engine",
         ] {
             assert!(
                 path_is_in_cc_worktree(Path::new(p)),
@@ -809,11 +771,10 @@ mod tests {
 
     // ── Restart intent ───────────────────────────────────────────────────────
     //
-    // The notify that turns a picker Restart / Stop from something the engine
-    // cannot distinguish from a crash into a user action it attributes to a
-    // device. Exercised against a mock engine on a real socket, the same shape
-    // `proxy.rs`'s tests use, because the thing worth pinning is the wire: the
-    // method, the path and the header the engine reads the device off.
+    // The notify that turns a picker Restart from something the engine cannot
+    // distinguish from a crash into a user action it attributes to a device.
+    // Exercised against a mock engine on a real socket, because the thing worth
+    // pinning is the wire: the method, the path and the device header.
 
     /// A one-shot engine that records the raw request it was sent, then 204s.
     async fn capturing_engine() -> (u16, std::sync::Arc<tokio::sync::Mutex<String>>) {
@@ -955,12 +916,10 @@ mod tests {
         assert_eq!(json["unread_count"], serde_json::json!(4));
     }
 
-    /// The embedding model is hundreds of MB and identical for every workspace,
-    /// so a spawned engine must INHERIT its cache location rather than be given
-    /// a per-workspace one. Pinning `FASTEMBED_CACHE_DIR` (or `HF_HOME`) here is
-    /// what used to leave a private ~465 MB copy under every workspace's
-    /// `.lucidos/`, and it also overrode the shared directory the packaged app
-    /// and the headless service already set for the gateway.
+    /// A spawned engine must INHERIT its model cache location rather than be
+    /// given a per-workspace one (ADR 0061). Pinning `FASTEMBED_CACHE_DIR` or
+    /// `HF_HOME` here would leave a private copy under every workspace, and
+    /// override the shared directory the packaged app already set.
     #[test]
     fn a_spawned_engine_inherits_the_model_cache_instead_of_getting_its_own() {
         let ws = Workspace {

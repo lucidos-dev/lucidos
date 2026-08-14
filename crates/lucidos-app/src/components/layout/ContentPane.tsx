@@ -4,6 +4,7 @@ import { contentViewKey } from './contentViewKey';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
+import { FilePreviewPath } from '../files/FilePreviewPath';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
 import { onPageResume } from '../../utils/pageResume';
@@ -175,9 +176,21 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           // ref) that the preview needs, and passing it whole is what keeps the
           // two mutually-exclusive halves from having to be reassembled here.
           const repo = parseRepoPath(overlay.path);
-          return repo
-            ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
-            : <FilePreviewInline path={overlay.path} layout={layout} />;
+          // The path row is chrome over BOTH halves, so it is added here rather
+          // than inside either preview: one row, whatever renders under it, and
+          // no way for the two to drift. The column around them is what keeps
+          // the preview's own box the size it was as a direct child of the pane
+          // body (see `.file-preview-frame`).
+          return (
+            <div class="file-preview-frame">
+              <FilePreviewPath path={overlay.path} />
+              <div class="file-preview-frame-body">
+                {repo
+                  ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
+                  : <FilePreviewInline path={overlay.path} layout={layout} />}
+              </div>
+            </div>
+          );
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}
         {overlay?.type === 'notification-detail' && <NotificationDetailInline />}

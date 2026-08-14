@@ -234,7 +234,8 @@ export function installPairedSwallow(): void {
 }
 
 /** Build the handlers (`pointerdown`, `touchend` capture, `click` capture,
- *  `keydown`) that implement the canonical Lucidos modal dismiss contract:
+ *  `click` bubble, `keydown`) that implement the canonical Lucidos modal
+ *  dismiss contract:
  *
  *  - `pointerdown` outside the panel+anchor → call `onDismiss`. For
  *    primary-button (left-click / touch / pen) pointerdowns, also arm
@@ -265,6 +266,14 @@ export function installPairedSwallow(): void {
  *    when the flag is armed. Clicks not preceded by an outside-primary-pointerdown
  *    pass through. On touch the `touchend` already consumed the flag, so the
  *    click path is the mouse case.
+ *  - A click dispatched *within* an inside click's dispatch (a menu item whose
+ *    handler calls `someInput.click()`) is treated as inside too, so the
+ *    synthetic-click fallback never swallows a popover's own action. The window
+ *    is that one dispatch: `onClickCapture` opens it on the inside click and
+ *    `onClickBubble` closes it when that same event reaches document on the way
+ *    back up (with a task-scoped backstop for a handler that stops
+ *    propagation). See the comments at those branches for the file-picker case
+ *    it exists for.
  *  - `Escape` always dismisses.
  *
  *  `onDismiss` may return `false` to declare the call was a no-op (e.g. the
@@ -286,9 +295,15 @@ export function makeDismissHandlers(
   onPointerDown(e: PointerEvent): void;
   onTouchEnd(e: TouchEvent): void;
   onClickCapture(e: MouseEvent): void;
+  onClickBubble(e: MouseEvent): void;
   onKey(e: KeyboardEvent): void;
 } {
   let suppressNextClick = false;
+  // The INSIDE click currently being dispatched, or null. Held as the event
+  // OBJECT rather than a boolean so the window closes on exactly that
+  // dispatch: `onClickBubble` clears it when the same event reaches document
+  // on the way back up. See `onClickCapture` for what it protects.
+  let insideClick: MouseEvent | null = null;
   return {
     onPointerDown(e) {
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
@@ -319,6 +334,39 @@ export function makeDismissHandlers(
         e.preventDefault();
         return;
       }
+      if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) {
+        // An INSIDE click. Anything it dispatches while it is still unwinding
+        // is a consequence of it, not a new outside click, so hold it open and
+        // let the nested event through below.
+        //
+        // What that protects: a menu item whose action is `someInput.click()`
+        // on an element outside the panel. The composer's attach menu is the
+        // one in the tree: its File item clicks the persistent hidden
+        // `<input type="file">`, which lives in `.prompt-box` rather than in
+        // the panel precisely so the menu's re-render can't unmount it
+        // mid-tap. Without this, the fallback below read that nested click as
+        // an outside one and `preventDefault()`d it, and showing the file
+        // chooser is the CANCELABLE DEFAULT ACTION of a click on a file input,
+        // so the item did nothing at all, with nothing logged or shown. The
+        // click has to stay synchronous inside the user gesture (deferring it
+        // drops transient activation, which is what makes a file picker
+        // unreliable on iOS), so the contract is what gives, not the caller.
+        //
+        // The window is exactly this dispatch: `onClickBubble` closes it when
+        // this same event reaches document on the way back up. The timer is
+        // only a BACKSTOP for a target handler that `stopPropagation()`s, so
+        // the bubble never arrives, and it is a task rather than a microtask
+        // because a microtask checkpoint runs every time the JS stack empties
+        // (between two listeners of one dispatch included), which is early
+        // enough to have shipped the bug this fixes: cleared on a microtask,
+        // the mark was gone before the item's own handler ran, the picker
+        // stayed shut, and a unit test calling the two handlers back-to-back
+        // with no checkpoint between them still passed.
+        insideClick = e;
+        setTimeout(() => { if (insideClick === e) insideClick = null; }, 0);
+        return;
+      }
+      if (insideClick) return;
       // Fallback for `click` events that weren't preceded by an outside
       // pointerdown — e.g. `HTMLElement.click()` (synthetic, common in e2e
       // tests and keyboard-shortcut handlers). The replaced hand-rolled
@@ -326,12 +374,23 @@ export function makeDismissHandlers(
       // too; without this branch the canonical hook silently dropped that
       // contract and any caller relying on synthetic clicks (the thread-filter
       // dropdown e2e tests are the canary) wedged its dismiss flow.
-      if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
       const dismissed = onDismiss();
       if (dismissed !== false) {
         e.stopPropagation();
         e.preventDefault();
       }
+    },
+    onClickBubble(e) {
+      // Bubble phase at document, so this is the last thing that runs for an
+      // inside click: the dispatch is over and anything it was going to
+      // dispatch has been dispatched. Matching on the event OBJECT is what
+      // keeps the window tight rather than merely short. A boolean cleared on
+      // a timer would exempt every click in the rest of the task, so a
+      // handler doing `insidebutton.click(); outsideButton.click()` would get
+      // its second click exempted too; and a boolean cleared on the FIRST
+      // bubble would close the window on the nested click's own trip up here,
+      // leaving a second nested click swallowed.
+      if (insideClick === e) insideClick = null;
     },
     onKey(e) {
       if (e.key === 'Escape') onDismiss();
@@ -379,11 +438,16 @@ export function useDismissOnOutside(
     // synthetic click) is honored.
     document.addEventListener('touchend', handlers.onTouchEnd, { capture: true, passive: false });
     document.addEventListener('click', handlers.onClickCapture, true);
+    // Bubble phase, deliberately: it is the far end of the same dispatch the
+    // capture listener above opened, and closing the nested-click window there
+    // is what keeps the window one dispatch wide instead of one task wide.
+    document.addEventListener('click', handlers.onClickBubble);
     document.addEventListener('keydown', handlers.onKey);
     return () => {
       document.removeEventListener('pointerdown', handlers.onPointerDown, true);
       document.removeEventListener('touchend', handlers.onTouchEnd, true);
       document.removeEventListener('click', handlers.onClickCapture, true);
+      document.removeEventListener('click', handlers.onClickBubble);
       document.removeEventListener('keydown', handlers.onKey);
     };
   }, [isOpen, panelRef, anchor]);

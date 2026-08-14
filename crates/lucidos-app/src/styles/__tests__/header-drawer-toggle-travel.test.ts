@@ -241,15 +241,17 @@ describe('the brand region survives losing its leading child', () => {
       .toBe('flex-end');
   });
 
-  it('the action-collapse measurement no longer names a leading zone here', () => {
-    // `centred: true` derives the leading width from the container and the
-    // centre zone instead of measuring an element, so the thread row's
+  it('the action-collapse measurement names no leading zone here', () => {
+    // The measurement derives the leading width from the container and the
+    // centred box instead of measuring an element, so the thread row's
     // `leading` selector was already unread. Leaving it pointing at the deleted
     // `.thread-nav-group` would be a dead selector that reads as live config.
+    // (It used to say so with a `centred: true` flag beside it. The content row
+    // is centred too since 2026-08-13, so there is no other mode left to
+    // distinguish and the flag went with it.)
     const targets = readFileSync(
       resolve(stylesDir, '../components/layout/ThreadHeaderActions.tsx'), 'utf-8',
     );
-    expect(targets).toContain('centred: true');
     expect(targets).not.toContain('leading:');
   });
 });

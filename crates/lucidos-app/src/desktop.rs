@@ -1,56 +1,23 @@
-//! Always-on desktop runtime for a PACKAGED Lucidos build.
+//! Always-on desktop runtime for a PACKAGED Lucidos build. Full picture:
+//! [`docs/desktop-app.md`](../../../docs/desktop-app.md).
 //!
-//! The workspace gateway + bundled Postgres run as a persistent **macOS launchd
-//! LaunchAgent** (`~/Library/LaunchAgents/com.lucidos.engine.plist`,
-//! `RunAtLoad` + `KeepAlive`), independent of any window. Closing the UI does
-//! NOT stop them — triggers, scheduled tasks, coding-agent sessions, and mobile
-//! push keep running headless. The Tauri window and the mobile PWA are pure
-//! clients of the service.
+//! Two roles share this one bundled binary, and both are launchd agents.
 //!
-//! Two roles share this one bundled binary:
+//!  * **Service** (`Lucidos --service`): [`run_service`] spawns and supervises
+//!    the standalone workspace gateway (ADR 0014) on a STABLE port. No window,
+//!    no AppKit.
+//!  * **Client** (the GUI app): [`launch`] ensures the service is running,
+//!    waits for its health, then points the window at it. The login agent
+//!    reopens it with [`LOGIN_FLAG`] after a restart, so a rebooted Mac keeps
+//!    its menu-bar item and native notifications.
 //!
-//!  * **Service** (`Lucidos --service`, started by launchd): [`run_service`]
-//!    spawns + supervises the standalone **workspace gateway** (the
-//!    `lucidos-gateway` binary, ADR 0014) on a STABLE port. The gateway owns the
-//!    rest — it provisions the embedded Postgres + spawns one engine per
-//!    registered workspace and reverse-proxies `/<slug>/` (first run creates no
-//!    workspace; the smart root serves the picker). No window, no AppKit. On
-//!    crash launchd respawns the service (the
-//!    new gateway re-adopts already-running engines); on `launchctl bootout` (the
-//!    explicit "Quit and Stop Background Service") it tears the whole stack down and
-//!    stays stopped.
-//!  * **Client** (the GUI app the user double-clicks): [`launch`] ensures the
-//!    service is installed + running, waits for `/~/api/v1/health` (the gateway),
-//!    then points the window at it (the gateway serves the workspace picker behind
-//!    the sigil namespace `/~/`). Closing the window and Cmd+Q only dismiss the
-//!    window — the client stays resident in the menu bar and the service keeps
-//!    running; only the menu-bar "Quit and Stop Background Service" tears it down.
-//!    It also installs a SECOND agent, the **login agent**
-//!    (`~/Library/LaunchAgents/com.lucidos.client.plist`, `RunAtLoad`, one shot),
-//!    which `open`s the bundle with [`LOGIN_FLAG`] at login so the client is back
-//!    in the menu bar after a restart, menu-bar-only and without a window. Without
-//!    it a rebooted Mac runs the service with no client at all, which means no
-//!    menu-bar item, no Dock badge and no native notifications (the client is what
-//!    shows those).
+//! **Closing the UI does NOT stop the service.** Only `launchctl bootout`,
+//! behind "Quit and Stop Background Service", tears it down. [`launch`]
+//! short-circuits on `tauri::is_dev()`, so none of this runs in development.
 //!
-//! None of this runs in development — `scripts/tauri-dev.sh` keeps using Docker
-//! Postgres + a natively-built engine, and [`launch`] short-circuits on
-//! `tauri::is_dev()`.
-//!
-//! Bundle layout (Tauri `resources`, resolved at runtime relative to the
-//! executable so the service — which has no `AppHandle` — resolves the same
-//! paths the client's `resource_dir()` would):
-//! ```text
-//!   <resources>/postgres/bin/{initdb,pg_ctl,postgres,psql,createdb}  relocatable PG
-//!   <resources>/postgres/lib, <resources>/postgres/share/...         libpq + pgvector
-//!   <resources>/lucidos-gateway                                      workspace gateway binary
-//!   <resources>/lucidos-engine                                       the engine binary
-//!   <resources>/frontend/                                            the built UI (dist)
-//!   <resources>/sdk/                                                 the built JS SDK
-//! ```
-//! State (the Postgres cluster + the workspace's `data/`) lives under the OS
-//! app-data dir so it survives app updates — the updater replaces the `.app`,
-//! never app-data.
+//! Bundle paths resolve relative to the executable, so the service, which has
+//! no `AppHandle`, reaches what the client's `resource_dir()` would. State
+//! lives under the OS app-data dir, which the updater never replaces.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -64,18 +31,14 @@ use tauri::{AppHandle, Manager};
 /// resolve the OS app-data dir from the service role, which has no `AppHandle`.
 const BUNDLE_IDENTIFIER: &str = "com.lucidos.app";
 
-/// Historical launchd label for the **service agent**: the always-on gateway
-/// service. The plist installs at
-/// `~/Library/LaunchAgents/<SERVICE_AGENT_LABEL>.plist`. The value is historical
-/// (`engine`, from before the gateway owned the stack) and must not change: it
-/// keys every already-installed plist.
+/// launchd label for the **service agent**, the always-on gateway service. The
+/// value is historical, from before the gateway owned the stack, and must not
+/// change: it keys every already-installed plist.
 pub const SERVICE_AGENT_LABEL: &str = "com.lucidos.engine";
 
-/// launchd label for the **login agent**: the one-shot job that brings the
-/// CLIENT back at login, so the menu-bar item (and with it native
-/// notifications, which only the client can show) survives a restart. Distinct
-/// from [`SERVICE_AGENT_LABEL`], which is the headless always-on service and
-/// hosts no UI at all.
+/// launchd label for the **login agent**, the one-shot job that reopens the
+/// CLIENT at login. That is what keeps the menu-bar item, and with it native
+/// notifications, across a restart. The service agent hosts no UI at all.
 pub const LOGIN_AGENT_LABEL: &str = "com.lucidos.client";
 
 /// The argument the login agent passes the client, marking a launch as
@@ -87,11 +50,10 @@ pub const LOGIN_AGENT_LABEL: &str = "com.lucidos.client";
 /// drops it: see [`relaunch_args`].
 pub const LOGIN_FLAG: &str = "--login";
 
-/// Fixed default gateway port so the mobile connect URL is stable across
-/// restarts. The historical `engine_port` name is kept for callers, but in ADR
-/// 0014 packaged builds the gateway owns this public port and spawned engines
-/// bind loopback-only per workspace. Configurable: override with
-/// `LUCIDOS_ENGINE_PORT`, or edit `<app-data>/config/engine-port`.
+/// Fixed default port for the gateway, so the mobile connect URL is stable
+/// across restarts. The `engine` in the name is historical: under ADR 0014 the
+/// gateway owns this public port and each spawned engine binds loopback only.
+/// Override with `LUCIDOS_ENGINE_PORT` or `<app-data>/config/engine-port`.
 pub const DEFAULT_ENGINE_PORT: u16 = 5252;
 
 /// How long to wait for the gateway to answer `/~/api/v1/health`
@@ -104,10 +66,9 @@ const ENGINE_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// crashed/idle service is re-kickstarted while the window waits.
 const HEALTH_ENSURE_CYCLE: Duration = Duration::from_secs(30);
 
-/// How often the desktop process refreshes the unread indicator (always the
-/// menu-bar tray title, plus the dock-icon badge while a window is open) from the
-/// gateway's aggregate unread total (macOS only). Independent of the webview's own
-/// polling so the count is correct whichever page (picker or a workspace) is loaded.
+/// How often the desktop process refreshes the unread indicator from the
+/// gateway's aggregate total. Independent of the webview's own polling, so the
+/// count is right whichever page is loaded.
 #[cfg(target_os = "macos")]
 const DOCK_BADGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -138,15 +99,13 @@ pub enum StartupPhase {
 
 /// What [`launch`]'s thread is doing, for the pre-gateway boot splash to read.
 ///
-/// The packaged window paints an inline splash on the bundled asset scheme and
-/// cannot reach any API until [`launch`] navigates it to the gateway, so this
-/// Tauri-IPC channel is the only thing it can ask. Before it existed the splash
-/// showed one static string for however long the wait ran, which is how a start
-/// that was recovering on its own read as a hang.
+/// The packaged window paints an inline splash off the bundled assets and can
+/// reach no API until [`launch`] navigates it to the gateway. This Tauri-IPC
+/// channel is the only thing it can ask, which is why a recovering start would
+/// otherwise read as a hang.
 ///
-/// The sibling of the gateway's `boot_phase` / `boot_failure` narration for the
-/// WORKSPACE splash, one layer earlier: same idea, applied to the wait before
-/// the gateway answers at all.
+/// The sibling of the gateway's `boot_phase` narration for the WORKSPACE
+/// splash, one layer earlier.
 pub struct StartupStatus {
     inner: std::sync::Mutex<StartupProgress>,
 }
@@ -175,11 +134,9 @@ impl Default for StartupStatus {
 }
 
 impl StartupStatus {
-    /// Move to `phase`. Deliberately does NOT touch `detail`: a failure recorded
-    /// while ensuring the service has to survive into the wait that follows it,
-    /// which is the only stretch long enough for anyone to read it. Clearing on
-    /// every phase change instead made the failure text unreachable, since the
-    /// loop moves to `WaitingForGateway` on the line after it records one.
+    /// Move to `phase`. Deliberately does NOT touch `detail`: the loop moves to
+    /// `WaitingForGateway` on the line after it records a failure. That wait is
+    /// the only stretch long enough for anyone to read one.
     fn enter(&self, phase: StartupPhase) {
         if let Ok(mut p) = self.inner.lock() {
             p.phase = phase;
@@ -216,11 +173,10 @@ impl StartupStatus {
 /// The splash's line for a given phase, elapsed time and last failure. Pure, so
 /// the wording is pinned by tests rather than assembled in the poll loop.
 ///
-/// Two rules shape it. A start under [`STARTUP_QUIET_PERIOD`] says exactly what
-/// it says today, so nothing changes for the overwhelming majority of launches.
-/// Past that, the text names what is being waited on and counts, because a
-/// number that moves is what distinguishes "working" from "wedged" to someone
-/// looking at a splash screen.
+/// Two rules shape it. A start under [`STARTUP_QUIET_PERIOD`] says only
+/// [`STARTING_LABEL`], so the overwhelming majority of launches gain no
+/// diagnostic. Past that it names what is being waited on and counts. A number
+/// that moves is what tells a waiting user it is working, not wedged.
 fn startup_label(phase: StartupPhase, elapsed: Duration, detail: Option<&str>) -> String {
     if elapsed < STARTUP_QUIET_PERIOD {
         return STARTING_LABEL.to_string();
@@ -273,26 +229,23 @@ const CLI_RESOURCE_NAME: &str = "lucidos";
 static SERVICE_STOP: AtomicBool = AtomicBool::new(false);
 
 /// The workspace gateway process the SERVICE role owns and supervises (ADR
-/// 0014). The gateway (a standalone `lucidos-gateway` child) provisions the
-/// embedded Postgres + spawns one engine per registered workspace itself, so the
-/// service role no longer manages Postgres or per-workspace engines directly.
+/// 0014). The gateway provisions the embedded Postgres and spawns one engine
+/// per registered workspace, so this role manages neither directly.
 struct GatewayService {
     gateway: Child,
 }
 
 impl GatewayService {
     /// Stop the gateway, then the engines it spawned, then the embedded Postgres
-    /// cluster. Best-effort; logs failures.
+    /// cluster. Best-effort, and logs failures.
     ///
-    /// This is the PERMANENT-stop teardown — "Quit and Stop Background Service"
-    /// (`bootout`) and the supervised-exit path both route here. It is NOT reached by the gateway's
-    /// in-place reload (`execv`, same PID), which deliberately leaves the cluster
-    /// running so the re-exec'd image re-adopts it; stopping Postgres here would
-    /// break that re-adoption, so the stop lives in this path only.
+    /// The PERMANENT-stop teardown: "Quit and Stop Background Service" and the
+    /// supervised-exit path both route here. The gateway's in-place reload does
+    /// NOT. It leaves the cluster running for the re-exec'd image to re-adopt,
+    /// and stopping Postgres here would break that.
     fn shutdown(&mut self, resources: &Path, app_data: &Path) {
-        // The gateway ignores SIGTERM (to survive accidental `xargs kill` from CC
-        // test scripts — see engine main.rs); SIGUSR1 is its graceful-stop
-        // signal. It exits but deliberately LEAVES its engines running for
+        // SIGUSR1 is the gateway's graceful-stop signal, since it ignores
+        // SIGTERM. It exits but deliberately LEAVES its engines running for
         // re-adoption, so we stop those explicitly below.
         #[cfg(unix)]
         {
@@ -307,26 +260,21 @@ impl GatewayService {
         }
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
-        // Record what we are about to stop so the NEXT gateway boot can bring it
-        // back. This teardown runs for a restart (`launchctl kickstart -k`, which
-        // is what the Restart control and the updater use) and for a crash
-        // respawn, not just for a permanent stop, and in those cases the user
-        // never asked for their workspaces to go away. Suppressed when the record
-        // already says `quit`. See `record_workspaces_to_restore`.
+        // A restart and a crash respawn run this same teardown, so record what
+        // is being stopped for the next boot. See `record_workspaces_to_restore`.
         let stopped = stop_workspace_engines(app_data);
         record_workspaces_to_restore(app_data, &stopped);
-        // Stop the embedded cluster last — after the engines that connect to it —
-        // so a permanent shutdown can never leave an orphaned `postgres` holding
-        // the port + postmaster.pid for the next app version to trip over.
+        // Last, after the engines that connect to it. A permanent shutdown must
+        // never leave an orphaned `postgres` holding the port and its
+        // postmaster.pid for the next app version to trip over.
         stop_embedded_postgres(resources, app_data);
     }
 }
 
-/// Stop the embedded Postgres cluster cleanly (`pg_ctl -m fast`) on a permanent
-/// service shutdown. Best-effort + logged; a no-op when no cluster has been
-/// provisioned (no `<app-data>/pgdata/PG_VERSION`). Uses the bundled `pg_ctl` and
-/// libpath — `lucidos-app` links neither the gateway nor engine crate, so this
-/// shells out exactly as the rest of the service role does.
+/// Stop the embedded Postgres cluster cleanly on a permanent service shutdown.
+/// Best-effort and logged, and a no-op when no cluster has been provisioned.
+/// Shells out to the bundled `pg_ctl`, because `lucidos-app` links neither the
+/// gateway nor the engine crate.
 fn stop_embedded_postgres(resources: &Path, app_data: &Path) {
     let data = app_data.join("pgdata");
     if !data.join("PG_VERSION").exists() {
@@ -353,18 +301,15 @@ fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Comman
     cmd
 }
 
-/// SIGUSR1 every workspace engine the gateway spawned (pidfiles under
-/// `<app-data>/workspaces/<id>/.lucidos/engine.pid`), returning the ids of the
-/// ones that were actually alive. Used on a full service stop
-/// ("Quit and Stop Background Service"); the gateway leaves them running on its own
-/// SIGUSR1 so they
-/// can be re-adopted across a gateway restart, but an explicit stop tears the
-/// whole stack down.
+/// SIGUSR1 every workspace engine the gateway spawned, returning the ids of the
+/// ones that were actually alive. Used on a full service stop. The gateway
+/// leaves engines running on its own SIGUSR1 so a restart can re-adopt them,
+/// but an explicit stop tears the whole stack down.
 ///
-/// The returned ids are what the next boot owes the user
-/// ([`record_workspaces_to_restore`]), which is why liveness is checked rather
-/// than trusting the pidfile: a stale pidfile from an engine that died on its own
-/// would otherwise make a restart "restore" a workspace nobody was running.
+/// This checks liveness rather than trusting the pidfile, because the returned
+/// ids are what the next boot owes the user ([`record_workspaces_to_restore`]).
+/// A stale pidfile would otherwise make a restart "restore" a workspace nobody
+/// was running.
 fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
     let workspaces = app_data.join("workspaces");
     let Ok(entries) = std::fs::read_dir(&workspaces) else {
@@ -401,9 +346,9 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
 // ── What the next boot owes the user ────────────────────────────────────────
 
 /// The record the next gateway boot reads to decide which workspaces to bring
-/// back: `<app-data>/.next-boot.json`. The reader is `next_boot.rs` in the
-/// gateway crate, which this crate does not link, so the two spell the same
-/// filename and the same JSON and each pins it with a test.
+/// back. The reader is `next_boot.rs` in the gateway crate, which this crate
+/// does not link. Both spell the same filename and the same JSON, and each
+/// pins it with a test.
 const NEXT_BOOT_FILE: &str = ".next-boot.json";
 
 fn next_boot_path(app_data: &Path) -> PathBuf {
@@ -416,20 +361,18 @@ const NEXT_BOOT_QUIT: &str = "{\"quit\":true}";
 /// Note down the workspaces the teardown just stopped, so the next gateway boot
 /// starts them again.
 ///
-/// The point is that a restart must return what it took. `launchctl kickstart -k`
-/// (the Restart control, and the updater's service restart) and a crash respawn
-/// both run the same teardown as a permanent stop, and the gateway that comes up
-/// afterwards re-adopts only engines that survived, of which there are none. So
-/// without this the workspace the user was sitting in stays stopped, and its open
-/// page cannot even wake it: API traffic never lazy-starts a workspace, because
-/// that guard is what makes the picker's Stop button stick.
+/// A restart must return what it took. `launchctl kickstart -k` and a crash
+/// respawn both run the same teardown as a permanent stop. The gateway that
+/// comes up afterwards re-adopts only engines that survived, and there are
+/// none. So without this the workspace the user was sitting in stays stopped,
+/// and its open page cannot wake it: API traffic never lazy-starts a workspace,
+/// which is what makes the picker's Stop button stick.
 ///
-/// Skipped when the record already says `quit`: [`stop_service`] writes that
-/// BEFORE it signals launchd, so "Quit and Stop Background Service" stays quiet
-/// and the next launch is as lazy as it ever was.
+/// Skipped when the record already says `quit`. [`stop_service`] writes that
+/// BEFORE it signals launchd, so a deliberate quit stays quiet.
 ///
-/// Best-effort. Failing to write it costs a restart its workspaces, which is
-/// today's behaviour, and must never take the teardown down with it.
+/// Best-effort. Failing to write it costs a restart its workspaces, and must
+/// never take the teardown down with it.
 fn record_workspaces_to_restore(app_data: &Path, ids: &[String]) {
     let path = next_boot_path(app_data);
     if quit_was_declared(&path) {
@@ -475,8 +418,8 @@ fn declare_quit_intent(app_data: &Path) {
 }
 
 /// Drop the record, for when the teardown it was written for never happened.
-/// Only the gateway's boot normally consumes it, so an intent whose teardown
-/// fell through has to be taken back here or it silences the next real one.
+/// Only the gateway's boot normally consumes it. An intent whose teardown fell
+/// through has to be taken back here, or it silences the next real one.
 fn clear_next_boot_record(app_data: &Path) {
     match std::fs::remove_file(next_boot_path(app_data)) {
         Ok(()) => {}
@@ -487,11 +430,11 @@ fn clear_next_boot_record(app_data: &Path) {
 
 // ── Path resolution (shared by both roles) ──────────────────────────────────
 
-/// Resolve the bundle's `Resources` dir relative to the executable. In a
-/// macOS `.app` the executable is `Contents/MacOS/lucidos-app` (Tauri names the
-/// bundle from `productName` but the binary inside it from the crate, so the two
-/// differ) and resources live in `Contents/Resources/`, which is exactly what the
-/// client's `resource_dir()` returns, so the service resolves the same bundle.
+/// Resolve the bundle's `Resources` dir relative to the executable, so the
+/// service resolves the same bundle the client's `resource_dir()` returns.
+///
+/// Tauri names the bundle from `productName` but the binary inside it from the
+/// crate, so `Lucidos.app` holds `Contents/MacOS/lucidos-app`.
 fn resource_dir_from_exe() -> io::Result<PathBuf> {
     resource_dir_for_exe(&std::env::current_exe()?)
 }
@@ -542,10 +485,9 @@ pub fn app_data_dir_from_env() -> io::Result<PathBuf> {
         .join(BUNDLE_IDENTIFIER))
 }
 
-/// Resolve the stable gateway port: `LUCIDOS_ENGINE_PORT` env override wins,
-/// then the persisted `<app-data>/config/engine-port`, else the default
-/// (written to that historical file name on first run so it stays stable and
-/// user-editable).
+/// Resolve the stable gateway port: the `LUCIDOS_ENGINE_PORT` override wins,
+/// then the persisted `<app-data>/config/engine-port`, else the default. First
+/// run writes the default there, so the port stays stable and user-editable.
 fn resolve_engine_port(app_data: &Path) -> u16 {
     if let Some(p) = std::env::var("LUCIDOS_ENGINE_PORT")
         .ok()
@@ -579,25 +521,25 @@ pub fn engine_port() -> u16 {
 
 // ── The gateway origin and its ACL capability ────────────────────────────────
 
-/// The URL a packaged client window is pointed at: the always-on gateway on this
-/// install's stable port. The ONE place this string is built, because the
-/// window's resulting origin has to match [`gateway_capability`]'s URL pattern
-/// exactly — if the two ever drift, every IPC call from that window is denied.
+/// The URL a packaged client window is pointed at: the always-on gateway on
+/// this install's stable port.
+///
+/// The ONE place this string is built. The window's resulting origin has to
+/// match [`gateway_capability`]'s URL pattern exactly, and every IPC call from
+/// that window is denied if the two drift.
 pub fn gateway_url(port: u16) -> String {
     format!("http://localhost:{port}")
 }
 
-/// Where [`launch`] should point the main window instead of the gateway root,
-/// set at most once by a native notification tap that arrives while the client
-/// is still starting.
+/// Where [`launch`] should point the main window instead of the gateway root.
+/// Set at most once, by a native notification tap arriving while the client is
+/// still starting.
 ///
-/// A tap has to land in the workspace that raised the banner
-/// (`crate::route_native_tap`), but during startup there is nothing to land in:
-/// the main window has not been navigated yet and [`launch`] owns its first
-/// navigation. Pointing it here ourselves would just be clobbered a moment
-/// later. So the tap leaves the destination here and [`launch`] uses it, which
-/// is what makes tapping a banner while the client is not running open the
-/// client ON that workspace rather than on the picker plus a second window.
+/// A tap has to land in the workspace that raised the banner, and during
+/// startup there is nothing to land in: [`launch`] owns the first navigation,
+/// so pointing the window here ourselves would be clobbered a moment later.
+/// Leaving the destination for [`launch`] is what opens the client ON that
+/// workspace rather than on the picker plus a second window.
 static LAUNCH_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Aim [`launch`]'s first navigation at `url`. Last writer wins: two taps before
@@ -640,49 +582,17 @@ const GATEWAY_PERMISSIONS: &[&str] = &[
 
 /// The ACL capability that lets the packaged window talk to the app at all.
 ///
-/// `frontendDist` makes the Tauri app URL `tauri://localhost`, but [`launch`]
-/// navigates the window to the gateway ([`gateway_url`]). Since tauri 2.11
-/// (`Webview::on_message`: `plugin_command.is_some() || has_app_acl_manifest ||
-/// !is_local`) every IPC request from a non-local URL is ACL-checked as
-/// `Origin::Remote`, so without this capability EVERY command — ours and the
-/// plugins' — is rejected with `Command <x> not allowed by ACL`. That is the
-/// 2.10.2 → 2.11.4 regression this exists to close; the upstream change is
-/// deliberate hardening, so we grant the origin explicitly rather than pin the
-/// old version.
+/// [`launch`] navigates the window off the Tauri app URL and onto the gateway,
+/// which Tauri ACL-checks as `Origin::Remote`. Without this capability EVERY
+/// command is rejected. ADR 0028 records the decision and its scoping: a
+/// resolved port rather than a wildcard, `webviews` rather than `windows`, and
+/// `local(false)`.
 ///
-/// Scoping, tightest the ACL schema allows:
-///  * the URL pattern carries the **resolved port**, not `localhost:*` — the port
-///    is per-install (`<app-data>/config/engine-port`), so it can only be pinned
-///    at runtime, and a wildcard would hand IPC to any other local HTTP server
-///    the window could be navigated to.
-///  * `webviews`, never `windows` — a `windows: ["main"]` entry enables a
-///    capability on every webview of that window, and the `url-preview-*`
-///    webviews showing arbitrary third-party sites live inside the main window.
-///  * `local(false)` — the local app URL is `capabilities/default.json`'s job;
-///    this capability speaks only for the gateway origin.
-///
-/// **What is in the grant set, spelled out (F12).** [`GATEWAY_PERMISSIONS`]
-/// includes `updater:default`, and that pulls in `plugin:updater|download_and_install`.
-/// So the honest statement of what this capability grants is not "the app can
-/// update itself" but "anything answering on `http://localhost:<port>` can drive
-/// a signed bundle swap and a full stack restart", and those are different
-/// sentences. Nothing else in the set reaches as far.
-///
-/// The residual is narrow and it is ACCEPTED rather than unnoticed. The origin is
-/// plain HTTP on loopback with no authentication, so a local process that bound
-/// the port BEFORE the gateway did would receive this window's IPC. Three things
-/// keep that from being reachable in practice: [`launch`] navigates only after
-/// the gateway answers its health check, the gateway holds the port for the life
-/// of the service, and a squatter would have to win the port on a machine where
-/// the user already trusts every local process with their workspace data anyway.
-/// The two obvious hardenings both cost more than they buy: dropping
-/// `updater:default` would move the update path off the window that shows it, and
-/// authenticating loopback would put a shared secret in a page the gateway itself
-/// serves.
-///
-/// Read this before widening [`GATEWAY_PERMISSIONS`]: the question to ask of a
-/// new entry is not whether the frontend needs it, but what it hands to whoever
-/// answers on that port.
+/// **Read this before widening [`GATEWAY_PERMISSIONS`].** The set includes
+/// `updater:default`, so anything answering on that port can drive a signed
+/// bundle swap and a full stack restart. The residual is accepted, and ADR 0028
+/// weighs both hardenings. The question to ask of a new entry is not whether
+/// the frontend needs it, but what it hands to whoever answers on that port.
 pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
     GATEWAY_PERMISSIONS.iter().fold(
         tauri::ipc::CapabilityBuilder::new("gateway")
@@ -696,9 +606,9 @@ pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
 // ── Client role: ensure the service is up, then point the window at it ───────
 
 /// Ensure the always-on service is running and point the main window at the
-/// gateway. No-op in development. Runs the (possibly slow) ensure-and-wait on a
-/// background thread so the window paints immediately; the window is navigated
-/// to the gateway URL once it is healthy.
+/// gateway. No-op in development. The ensure-and-wait runs on a background
+/// thread so the window paints immediately, and the window is navigated once
+/// the gateway is healthy.
 pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     if tauri::is_dev() {
         // No dock-badge thread in dev (unbundled; dev uses the browser) — drop the
@@ -707,20 +617,17 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         return;
     }
 
-    // Unread indicator: mirror the gateway's aggregate unread total (across running
-    // workspaces) onto the menu-bar tray title, and onto the Dock badge too while a
-    // window is open. Its own thread (independent of the service/health/navigate
-    // flow below, and of whichever page the webview shows), so the count always
-    // reflects the TOTAL, not just the active workspace. macOS only (both surfaces
-    // are macOS concepts). The AppKit write is marshalled to the main thread; the
-    // fetch tolerates the gateway not being up yet (returns None until it answers).
+    // Mirror the gateway's aggregate unread total onto the tray title, and onto
+    // the Dock badge while a window is open. Its own thread, independent of the
+    // navigate flow below and of whichever page the webview shows. The count
+    // therefore reflects the TOTAL rather than the active workspace. The AppKit
+    // write is marshalled to the main thread, and the fetch tolerates a gateway
+    // that is not up yet.
     //
-    // Event-driven AND polled: the loop recomputes the instant it's NUDGED (the
-    // active workspace's webview signals `nudge_dock_badge` when a notification SSE
-    // arrives, whether read in-app or from another device) so the count updates without
-    // waiting for the next tick; the periodic `DOCK_BADGE_POLL_INTERVAL` tick is
-    // the safety net that also catches BACKGROUND-workspace changes (whose SSE this
-    // webview never sees).
+    // Event-driven AND polled. A nudge recomputes at once, so a notification
+    // read anywhere updates the count without waiting. The periodic tick is the
+    // safety net for BACKGROUND-workspace changes, whose SSE this webview never
+    // sees.
     #[cfg(target_os = "macos")]
     {
         let handle = app.clone();
@@ -780,20 +687,15 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         };
         let port = resolve_engine_port(&app_data);
 
-        // Grant the gateway origin its IPC permissions BEFORE anything can put a
-        // window on it — the ACL is consulted per invoke, so registering it here
-        // covers the navigation below and every later New Window (which inherits
-        // the main window's URL).
+        // Grant the gateway origin its IPC permissions BEFORE anything can put
+        // a window on it. The ACL is consulted per invoke, so registering here
+        // covers the navigation below and every later New Window.
         //
-        // The realistic failure — a permission identifier that doesn't resolve —
-        // is caught at TEST time, not here: `acl_tests` resolves this exact
-        // capability through tauri's own resolver, and tauri would `unwrap` the
-        // resolve error rather than hand us an `Err`. So this arm is a backstop.
-        // It logs and still navigates on purpose: a reachable UI with a dead
-        // bridge beats stranding the user on the "Starting Lucidos…" splash with
-        // no explanation, and the page's own IPC telemetry (utils/ipcHealth.ts)
-        // then reports the dead bridge to the engine log — where it is visible
-        // without a debugger, unlike this line.
+        // A permission identifier that does not resolve is caught at TEST time
+        // by `acl_tests`, so this arm is a backstop. It logs and still
+        // navigates on purpose: a reachable UI with a dead bridge beats
+        // stranding the user on the splash with no explanation. The page's own
+        // `utils/ipcHealth.ts` then reports the dead bridge to the engine log.
         if let Err(e) = handle.add_capability(gateway_capability(port)) {
             eprintln!(
                 "[desktop] FAILED to register the gateway ACL capability for {} — every Tauri IPC \
@@ -802,21 +704,19 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             );
         }
 
-        // Keep the service up and navigate the window the moment the gateway is
-        // healthy — NEVER permanently give up. A slow post-forced-shutdown start
-        // (Postgres WAL crash recovery + embedding warmup) or a transient
-        // crash-respawn can exceed a single wait; retrying + re-ensuring means the
-        // window resolves whenever the service comes up instead of stranding the
-        // user on the bundled "Starting Lucidos…" splash (main.tsx). Each cycle
-        // re-ensures the LaunchAgent with a bare kickstart — a no-op on a
-        // still-starting service, a restart on a crashed/idle one, so it never
-        // interrupts a slow-but-progressing start — then polls health for one
-        // bounded cycle. `wait_for_health` sleeps between attempts, so this can't
-        // busy-loop.
+        // Keep the service up and navigate the moment the gateway is healthy,
+        // and NEVER permanently give up. A slow start after a forced shutdown,
+        // or a transient crash-respawn, can exceed a single wait. Retrying and
+        // re-ensuring is what resolves the window whenever the service comes
+        // up, rather than stranding the user on the splash.
         //
-        // Each step also tells `StartupStatus` where it is, which is the only
-        // thing the splash on the other side of the IPC bridge can read: waiting
-        // silently is what made a recovering start look like a hung one.
+        // Each cycle re-ensures the LaunchAgent with a bare kickstart. That is
+        // a no-op on a still-starting service and a restart on a crashed one,
+        // so it never interrupts a slow but progressing start.
+        // `wait_for_health` sleeps between attempts, so this cannot busy-loop.
+        //
+        // Each step also tells `StartupStatus` where it is, the only thing the
+        // splash on the other side of the IPC bridge can read.
         let status = handle.state::<StartupStatus>();
         loop {
             status.enter(StartupPhase::EnsuringService);
@@ -852,9 +752,9 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     });
 }
 
-/// Point the declared main window at `url`. Best-effort: a missing window or an
-/// unparseable URL is logged, never fatal, since the alternative is stranding
-/// the user on the bundled "Starting Lucidos…" splash with no explanation.
+/// Point the declared main window at `url`. Best-effort: a missing window or
+/// an unparseable URL is logged, never fatal. The alternative is stranding the
+/// user on the boot splash with no explanation.
 fn navigate_main_window(app: &AppHandle, url: String) {
     match (
         app.get_webview_window(crate::MAIN_WINDOW_LABEL),
@@ -898,10 +798,9 @@ enum GatewayStart {
 /// `None` means neither is decisive yet, so keep waiting.
 ///
 /// **Health is checked first, and the order is load-bearing.** A gateway that
-/// answered and only then exited has done its job for this function: the
-/// supervise loop below is what notices the exit, and it reacts by shutting down
-/// for a launchd respawn, which is a different and correct thing from reporting
-/// that the boot failed.
+/// answered and only then exited has done its job here: the supervise loop
+/// notices the exit and shuts down for a launchd respawn. That is a different
+/// and correct outcome from reporting that the boot failed.
 ///
 /// Pure, so the ordering is pinned by a test rather than by reading the loop.
 fn gateway_start_poll(healthy: bool, exited: bool, out_of_time: bool) -> Option<GatewayStart> {
@@ -920,18 +819,16 @@ fn gateway_start_poll(healthy: bool, exited: bool, out_of_time: bool) -> Option<
 /// Wait for a just-spawned gateway to answer, giving up the moment its process
 /// is gone rather than serving out the whole deadline.
 ///
-/// The deadline exists for a gateway that is slow but PROGRESSING (migrations
-/// and embedding warmup on a fresh workspace can take a while), and it still
-/// applies to one. What it must not do is govern a gateway that has already
-/// exited: a bind failure kills the process in under a second, and waiting the
-/// remaining two minutes on the corpse is time the packaged window spends on its
-/// startup splash for no reason at all, before launchd even gets the chance to
-/// respawn. Watching the child collapses that to the respawn throttle.
+/// The deadline exists for a gateway that is slow but PROGRESSING, and it still
+/// applies to one. What it must not govern is a gateway that has already
+/// exited. A bind failure kills the process in under a second. The packaged
+/// window would then spend the rest of the deadline on its startup splash for
+/// nothing. Watching the child collapses that to the respawn throttle.
 fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> GatewayStart {
     let deadline = Instant::now() + timeout;
     loop {
         // A failed `try_wait` means we can no longer tell whether the child is
-        // alive; treat that as gone rather than waiting out the deadline on a
+        // alive. Treat that as gone, rather than waiting out the deadline on a
         // question we cannot answer.
         let exited = !matches!(gateway.try_wait(), Ok(None));
         if let Some(outcome) = gateway_start_poll(
@@ -954,16 +851,13 @@ fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> Gat
 ///    gateway exited and launchd's `KeepAlive` should respawn us.
 ///  * non-zero — boot failed; launchd respawns after `ThrottleInterval`.
 pub fn run_service() -> i32 {
-    // FIRST, before anything else in the process. launchd hands us an
-    // environment the user's shell profile never touched, so the provider keys
-    // the engine discovers from env are absent and PATH is the bare
-    // `/usr/bin:/bin:/usr/sbin:/sbin`. Everything below this line inherits what
-    // we have here: the gateway, every workspace engine, every coding agent.
+    // FIRST, before anything else in the process. Everything below inherits
+    // what we set here: the gateway, every workspace engine, every coding
+    // agent. See `shell_env` for what launchd leaves out and why.
     //
-    // Placed at the top rather than beside `spawn_gateway` because it sets
-    // process env, which is only sound while the process is single-threaded.
-    // `main` reaches here before any Tauri, AppKit or thread setup, and nothing
-    // above this statement changes that. See `shell_env` for the whole story.
+    // At the top rather than beside `spawn_gateway` because it sets process
+    // env, which is only sound while the process is single-threaded. `main`
+    // reaches here before any Tauri, AppKit or thread setup.
     #[cfg(target_os = "macos")]
     crate::shell_env::hydrate_login_shell_env();
 
@@ -996,9 +890,9 @@ pub fn run_service() -> i32 {
         GatewayStart::Healthy => {}
         GatewayStart::ChildExited => {
             // Say WHICH of the two ways the start failed. The gateway logs its
-            // own reason (a held port, an address that does not exist yet) to
-            // the same file, immediately above this line, so naming the exit
-            // points the reader at it instead of at a timeout that never ran.
+            // own reason to the same file, immediately above this line. Naming
+            // the exit points the reader at it, not at a timeout that never
+            // ran.
             eprintln!(
                 "[service] the gateway exited before answering on port {port}; see its error above"
             );
@@ -1064,18 +958,17 @@ fn install_stop_handlers() {}
 /// loaded and running. Installs the login agent alongside it, so the client
 /// itself also comes back at the next login.
 ///
-/// Note: the plist captures `current_exe()`. A SIGNED + NOTARIZED app in
-/// `/Applications` has a stable path. An UNSIGNED local test build run from
-/// Downloads can be Gatekeeper *app-translocated* to a random read-only mount,
-/// so the captured path would later vanish — move the `.app` into
-/// `/Applications` (or sign it) before relying on the service across reboots.
+/// The plist captures `current_exe()`. A signed and notarized app in
+/// `/Applications` has a stable path. An unsigned local test build run from
+/// Downloads can be Gatekeeper app-translocated to a random read-only mount,
+/// so the captured path later vanishes. Move the `.app` into `/Applications`,
+/// or sign it, before relying on the service across reboots.
 fn ensure_service_installed_and_running(app_data: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
 
-    // Best-effort and deliberately first-and-forgotten: the service is what this
-    // function must not fail to deliver, and a login agent that did not install
-    // costs only what every build before it already cost, a client the user
-    // opens by hand.
+    // Best-effort, and deliberately first-and-forgotten. The service is what
+    // this function must not fail to deliver. A login agent that did not
+    // install costs only a client the user opens by hand.
     #[cfg(target_os = "macos")]
     ensure_login_agent_installed(&exe, app_data);
 
@@ -1083,9 +976,9 @@ fn ensure_service_installed_and_running(app_data: &Path) -> io::Result<()> {
 
     if changed && is_service_loaded() {
         // A rewritten definition only takes effect after a reload. Remove the
-        // old one, then re-bootstrap UNCONDITIONALLY — don't branch on a fresh
-        // `is_service_loaded()` here, which can still report the just-booted-out
-        // job as loaded before launchd settles and would kickstart the stale
+        // old one, then re-bootstrap UNCONDITIONALLY. A fresh
+        // `is_service_loaded()` here can still report the just-booted-out job
+        // as loaded before launchd settles, and would kickstart the stale
         // definition. `bootstrap_service` tolerates an already-loaded job.
         let _ = bootout_service();
         bootstrap_service()?;
@@ -1197,9 +1090,8 @@ fn install_or_update_service_plist(exe: &Path, app_data: &Path) -> io::Result<bo
 // ── Login agent: the client comes back in the menu bar at login ─────────────
 
 /// How many times the login agent retries `open` before giving up. At login
-/// LaunchServices can still be coming up, and the whole point of this agent is
-/// that the client is there afterwards, so one refused `open` must not be the
-/// end of it.
+/// LaunchServices can still be coming up, and this agent exists so the client
+/// is there afterwards. One refused `open` must not be the end of it.
 #[cfg(target_os = "macos")]
 const LOGIN_OPEN_ATTEMPTS: u32 = 10;
 
@@ -1212,12 +1104,11 @@ const LOGIN_OPEN_RETRY_SECONDS: u32 = 3;
 /// background, with [`LOGIN_FLAG`], retrying a bounded number of times.
 ///
 /// `open` rather than the bundle's inner binary, for two reasons. It launches
-/// the app exactly as a double-click does (the same reason
-/// [`relaunch_watcher_script`] uses it), and on an ALREADY-RUNNING client it
-/// merely activates that instance, so this job can never produce a second
-/// client no matter what kickstarts it. `-g` keeps that activation out of the
-/// foreground: a login start belongs in the menu bar, not in front of whatever
-/// the user is doing.
+/// the app exactly as a double-click does, the same reason ADR 0072 gives for
+/// [`relaunch_watcher_script`]. And on an ALREADY-RUNNING client it merely
+/// activates that instance, so this job can never produce a second client.
+/// `-g` keeps that activation out of the foreground: a login start belongs in
+/// the menu bar, not in front of whatever the user is doing.
 ///
 /// Pure, so the bound, the ordering and the quoting are unit-tested rather than
 /// eyeballed. Errors on a bundle path that isn't valid UTF-8: it cannot be
@@ -1275,9 +1166,8 @@ fn desired_login_plist(bundle: &Path, app_data: &Path) -> Result<String, String>
     ))
 }
 
-/// Pure: what the login agent's plist should contain for this executable, or
-/// `None` when there is nothing to install because the binary is not inside a
-/// `.app` (dev, `cargo run`, an unbundled build) and LaunchServices would have
+/// Pure: what the login agent's plist should contain for this executable. It is
+/// `None` when the binary is not inside a `.app`, so LaunchServices would have
 /// nothing to open. `Err` only for a bundle path that cannot be shell-quoted.
 ///
 /// Split from [`ensure_login_agent_installed`] so the skip-when-unbundled
@@ -1298,15 +1188,13 @@ fn desired_login_plist_for_exe(exe: &Path, app_data: &Path) -> Result<Option<Str
 ///  * **Nothing happens without a `.app`.** A dev or unbundled binary has no
 ///    bundle for LaunchServices to open, so no plist is written at all.
 ///  * **An unchanged plist never touches launchd.** Switching the item off in
-///    System Settings records a launchd override keyed by the label, which our
-///    idempotent write does not clear, and we never `launchctl enable`. So the
-///    user's "off" survives every later client launch. A bootstrap is attempted
-///    only on a first install or a moved bundle, where launchd genuinely holds
-///    nothing or holds a stale path; on a disabled job that attempt fails
-///    harmlessly, and the item stays off.
+///    System Settings records a launchd override keyed by the label. The
+///    idempotent write does not clear it and nothing here runs `launchctl
+///    enable`, so the user's "off" survives every later client launch. A
+///    bootstrap is attempted only on a first install or a moved bundle.
 ///
-/// Every failure is logged and swallowed: the client is already running, so the
-/// worst case is the behaviour every build before this one had.
+/// Every failure is logged and swallowed. The client is already running, so the
+/// worst case is a missing login agent.
 #[cfg(target_os = "macos")]
 fn ensure_login_agent_installed(exe: &Path, app_data: &Path) {
     let desired = match desired_login_plist_for_exe(exe, app_data) {
@@ -1441,11 +1329,10 @@ fn kickstart_service(kill: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Restart the gateway service in place (`launchctl kickstart -k`). The
-/// supervisor catches the SIGTERM, tears the stack down gracefully, and
-/// launchd respawns it. Used by the packaged "Restart" control. In development
-/// there is no service, so this returns an error the caller can show (the
-/// frontend only routes here in packaged mode, so it shouldn't be hit).
+/// Restart the gateway service in place. The supervisor catches the SIGTERM,
+/// tears the stack down gracefully, and launchd respawns it. Used by the
+/// packaged "Restart" control. In development there is no service, so this
+/// returns an error the caller can show.
 pub fn restart_service() -> Result<(), String> {
     if tauri::is_dev() {
         return Err("Gateway service restart is only available in a packaged build".to_string());
@@ -1453,15 +1340,14 @@ pub fn restart_service() -> Result<(), String> {
     kickstart_service(true).map_err(|e| e.to_string())
 }
 
-/// Stop the always-on service entirely (`launchctl bootout`) — the explicit
-/// "Quit and Stop Background Service" path (menu-bar item / app menu). Removes the
-/// agent so it won't respawn; the next GUI launch re-installs and re-bootstraps
-/// it. No-op in development (no service).
+/// Stop the always-on service entirely, the explicit "Quit and Stop Background
+/// Service" path. Removes the agent so it will not respawn, and the next GUI
+/// launch re-installs and re-bootstraps it. No-op in development.
 ///
-/// This is the ONE teardown that means *stay down*, so it declares that first:
-/// the service's own teardown otherwise records its workspaces for the next boot
-/// to restore, which is right for a restart and wrong here. Declaring before the
-/// `bootout` (rather than clearing the record after it) is what keeps the
+/// The ONE teardown that means *stay down*, so it declares that first. The
+/// service's own teardown otherwise records its workspaces for the next boot to
+/// restore, which is right for a restart and wrong here. Declaring before the
+/// `bootout`, rather than clearing the record after it, is what keeps the
 /// ordering structural.
 pub fn stop_service() {
     if tauri::is_dev() {
@@ -1481,8 +1367,7 @@ pub fn stop_service() {
         eprintln!("[desktop] stop service failed: {e}");
         // The service is still up, so the teardown this intent was written for
         // never happens and nothing consumes the record. Left behind, it would
-        // silence the NEXT restart's restore list and put us straight back in the
-        // bug this exists to fix, so take it back.
+        // silence the NEXT restart's restore list, so take it back.
         if let Some(app_data) = &app_data {
             clear_next_boot_record(app_data);
         }
@@ -1500,28 +1385,18 @@ const RELAUNCH_POLL_SECONDS: &str = "0.1";
 /// How many [`RELAUNCH_POLL_SECONDS`] probes the watcher makes before giving up
 /// on the client ever exiting: roughly five minutes.
 ///
-/// This bounds the WATCHER's life, not the relaunch: a detached shell that could
-/// loop forever is the failure it exists to prevent. It is deliberately far
-/// longer than a shutdown takes, because giving up is giving up for good, and
-/// the launch is conditional on the client actually being gone. Launching on the
-/// timeout instead would spend the one relaunch on a still-live process (`open`
-/// would just activate it) and leave nothing to bring the client back when it
-/// finally did exit. A client still running after five minutes is not shutting
-/// down, and it needs no relaunch: it is on screen.
+/// This bounds the WATCHER's life, not the relaunch. It is deliberately far
+/// longer than a shutdown takes, because giving up is giving up for good. ADR
+/// 0072 records why the bound exists and why reaching it must not launch.
 #[cfg(target_os = "macos")]
 const RELAUNCH_WAIT_PROBES: u32 = 3000;
 
 /// This client's argv, minus [`LOGIN_FLAG`], for handing to a relaunch of
 /// itself.
 ///
-/// The flag is one-shot launch CONTEXT ("launchd started you at login"), never a
-/// mode the process keeps. Both relaunch paths forward argv verbatim, so without
-/// this filter a client that came up at login and was later restarted (the
-/// updater's relaunch, or the Restart App action) would come back hidden and
-/// menu-bar-only even though the user had a window open, which reads as the app
-/// vanishing mid-update. It would also quietly undo the frontmost relaunch
-/// [`schedule_relaunch_after_exit`] exists to guarantee, since there would be no
-/// window to bring forward.
+/// The flag is one-shot launch CONTEXT, never a mode the process keeps, and
+/// both relaunch paths forward argv verbatim. Without this filter a restarted
+/// client comes back hidden and menu-bar-only. ADR 0072 has the rest.
 pub fn relaunch_args() -> Vec<std::ffi::OsString> {
     strip_login_flag(std::env::args_os().skip(1))
 }
@@ -1534,29 +1409,11 @@ fn strip_login_flag(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<s
 }
 
 /// Arrange for LaunchServices to relaunch this app once THIS process has
-/// exited. `Ok` means it is arranged and the caller MUST exit; `Err` means it
-/// isn't, and the caller must fall back to respawning the executable itself.
+/// exited. `Ok` means it is arranged and the caller MUST exit. `Err` means it
+/// is not, and the caller must fall back to respawning the executable itself.
 ///
-/// **Why LaunchServices instead of spawning the executable again.** Tauri's
-/// `process::restart` (and our own `restart_process`) fork/exec the binary
-/// directly, which never asks the system to activate the new instance. The only
-/// way such an instance lands in front is by inheriting the front slot from its
-/// dying parent, and that is a race it loses whenever it registers with the
-/// window server *after* the parent is gone. The 0.20 → 0.20.1 update on
-/// 2026-08-03 lost it by ~280ms: the old client died still frontmost, the front
-/// slot went to the next app, and the updated client sat behind everything until
-/// the user Cmd+Tabbed to it. `open` has LaunchServices launch the app the way a
-/// double-click does, which grants activation outright, and the watcher runs it
-/// strictly after we are gone, so there is no front slot to inherit and no race
-/// to lose.
-///
-/// **Why it waits for our exit** rather than launching straight away: `open`
-/// against a running app activates the running (here: dying) instance instead of
-/// launching a new one, and `open -n` would leave two clients overlapping. The
-/// wait is what keeps this to exactly one instance.
-///
-/// Development needs no special case: an unbundled `tauri dev` binary has no
-/// enclosing `.app`, so the resolution below fails and the caller falls back.
+/// ADR 0072 records why this goes through LaunchServices, why the watcher waits
+/// for our exit, and why an unbundled dev binary needs no special case.
 #[cfg(target_os = "macos")]
 pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("resolve this executable: {e}"))?;
@@ -1584,14 +1441,12 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
 /// instance's arguments.
 ///
 /// The launch is guarded by a second `kill -0` rather than following the loop
-/// unconditionally, because the loop can also end at its ceiling. Launching then
-/// would aim `open` at a process that is still alive, which merely activates it,
-/// and the watcher would be gone by the time the client actually exited.
+/// unconditionally, because the loop can also end at its ceiling. ADR 0072
+/// records what launching there would cost.
 ///
-/// Pure, so the bound, the ordering (wait *then* launch) and the quoting are
-/// unit-tested rather than eyeballed. Errors on a path or argument that isn't
-/// valid UTF-8: it cannot be quoted into a shell word without corrupting it, and
-/// the caller's fallback passes `OsString`s through faithfully.
+/// Errors on a path or argument that is not valid UTF-8: it cannot be quoted
+/// into a shell word without corrupting it, and the caller's fallback passes
+/// `OsString`s through faithfully.
 #[cfg(target_os = "macos")]
 fn relaunch_watcher_script(
     pid: u32,
@@ -1630,36 +1485,29 @@ fn sh_quote(s: &str) -> String {
 
 // ── Uninstall (client role) ─────────────────────────────────────────────────
 
-/// Fully remove the bundled Lucidos install from the GUI — modeled on Docker
-/// Desktop's uninstall so a non-developer never needs a terminal. Stops the
-/// background service + embedded Postgres, removes the launchd agent + plist,
-/// deletes the support data (the embedded database + workspaces AND the WKWebView
-/// web storage — localStorage + service worker — only when `delete_data`; the
-/// ephemeral caches/prefs/saved-state always), and moves the running `.app` to
-/// the Trash. Clearing the WebView storage on `delete_data` is what makes a
-/// reinstall start clean (see `support_data_paths` for why a leftover service
-/// worker / `lucidos-last-workspace` wedges the next boot on the picker).
+/// Fully remove the bundled Lucidos install from the GUI, so a non-developer
+/// never needs a terminal. Stops the service and embedded Postgres, removes the
+/// launchd agent, deletes the support data, and trashes the running `.app`.
+/// `delete_data` is what also clears the database, the workspaces and the
+/// WKWebView web storage, which is what makes a reinstall start clean (see
+/// `support_data_paths`).
 ///
-/// Every step is best-effort + logged and continues on error; failures are
-/// collected. Returns `Ok(())` only when the CRITICAL steps succeeded — booting
-/// out the service (or it not being loaded) AND every attempted support-data
-/// deletion — otherwise `Err` with all collected failures joined. Stopping
-/// engines / Postgres, deleting the plist, and trashing the bundle are
-/// best-effort: their failures are logged + included in any returned `Err`, but
-/// do not on their own fail the uninstall.
+/// Returns `Ok(())` only when the CRITICAL steps succeeded: booting out the
+/// service, and every attempted support-data deletion. Stopping engines,
+/// deleting the plist and trashing the bundle are best-effort. Their failures
+/// are logged and joined into any returned `Err`, but do not on their own fail
+/// the uninstall.
 ///
-/// Touches ONLY the bundled install's paths (`com.lucidos.app` / `lucidos-app`
-/// under `~/Library`, and the running `.app`) — never the developer dev-setup
-/// dirs (`~/projects/lucidos`, `~/workspaces`, `~/.lucidos`).
+/// Touches ONLY the bundled install's paths, never the developer dev-setup dirs.
 #[cfg(target_os = "macos")]
 pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
 
-    // (a) Stop per-workspace engines — best-effort + logged internally.
+    // (a) Stop per-workspace engines. Best-effort, and logged internally.
     stop_workspace_engines(app_data);
 
-    // (b) Stop the embedded Postgres cluster BEFORE deleting its data dir, so no
-    //     running postmaster holds the tree. Best-effort; logs internally.
+    // (b) Stop the embedded Postgres cluster BEFORE deleting its data dir, so
+    //     no running postmaster holds the tree.
     match resource_dir_from_exe() {
         Ok(resources) => stop_embedded_postgres(&resources, app_data),
         Err(e) => {
@@ -1667,9 +1515,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         }
     }
 
-    // (c) Stop + unload the launchd agent (CRITICAL). `bootout` errors when the
-    //     job isn't loaded — that's the goal already met, not a failure — so only
-    //     bootout when it is actually loaded.
+    // (c) Stop and unload the launchd agent (CRITICAL). `bootout` errors when
+    //     the job is not loaded, which is the goal already met rather than a
+    //     failure, so only bootout what is actually loaded.
     let bootout_ok = if is_service_loaded() {
         match bootout_service() {
             Ok(()) => {
@@ -1687,9 +1535,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         true
     };
 
-    // (c2) Boot out the login agent too (best-effort). It is a one-shot job that
-    //      has normally already run and exited, but while it stays loaded a
-    //      `kickstart` could still fire it at the bundle we are about to trash.
+    // (c2) Boot out the login agent too, best-effort. It is a one-shot job that
+    //      has normally run and exited. While it stays loaded, a `kickstart`
+    //      could still fire it at the bundle we are about to trash.
     let login = login_target();
     if is_job_loaded(&login) {
         match bootout_job(&login) {
@@ -1701,9 +1549,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         }
     }
 
-    // (d) Delete BOTH LaunchAgent plists (best-effort) so neither can reload at
-    //     login: the service agent, and the login agent that would otherwise
-    //     spend a boot trying to `open` a bundle sitting in the Trash.
+    // (d) Delete BOTH LaunchAgent plists, so neither can reload at login. The
+    //     login one would otherwise spend a boot trying to `open` a bundle
+    //     sitting in the Trash.
     for resolved in [service_plist_path(), login_plist_path()] {
         match resolved {
             Ok(plist) => match delete_path(&plist) {
@@ -1748,9 +1596,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         }
     }
 
-    // (f) Move the running .app bundle to the Trash (best-effort) — derived from
-    //     the current exe, so it trashes wherever the app actually lives. Done
-    //     LAST so current_exe() stays valid for the resource resolution above.
+    // (f) Move the running `.app` bundle to the Trash, best-effort, derived
+    //     from the current exe so it trashes wherever the app lives. Done LAST,
+    //     so `current_exe()` stays valid for the resource resolution above.
     match std::env::current_exe()
         .ok()
         .and_then(|exe| app_bundle_root_from_exe(&exe))
@@ -1786,39 +1634,30 @@ pub fn uninstall(_app_data: &Path, _delete_data: bool) -> Result<(), String> {
 }
 
 /// The support-data paths the uninstall removes, derived from `$HOME`. The App
-/// Support data dir (the embedded Postgres cluster + all workspaces) AND the
-/// WKWebView web-storage trees (`~/Library/WebKit/<id>`, `~/Library/HTTPStorages/<id>`)
-/// are included ONLY when `delete_data`; the ephemeral caches / preferences /
-/// saved window state are always included. Pure path construction (no IO) so it
-/// is unit-testable against a fake HOME.
+/// Support data dir AND the WKWebView web-storage trees go only when
+/// `delete_data`. The ephemeral caches, preferences and saved window state
+/// always go.
 ///
-/// The WebKit trees are load-bearing for a clean reinstall: they hold the
-/// embedded WebView's `localStorage` (the device-global `lucidos-last-workspace`
-/// key) and the registered **service worker** + its `CacheStorage`/`IndexedDB`.
-/// Without removing them, a "delete my data" uninstall leaves both behind — on
-/// reinstall the stale `lucidos-last-workspace` drives the cold-start redirect
-/// (index.html) to the now-deleted workspace slug, and the surviving service
-/// worker serves its cached `/<slug>/` shell, so the app boots `<App/>` against a
-/// workspace the gateway 404s and wedges the boot splash instead of reaching the
-/// picker. Both the current (`com.lucidos.app`) and legacy (`lucidos-app`) bundle
-/// names are cleared, mirroring the Caches removal. The keep-data path leaves
-/// them intact: the workspaces survive, so the SW + last-workspace memory are
-/// still valid (and theme/font/scale prefs in `localStorage` are preserved).
+/// The WebKit trees are load-bearing for a clean reinstall. They hold the
+/// embedded WebView's `localStorage`, including the device-global
+/// last-workspace key, and the registered SERVICE WORKER with its caches. Left
+/// behind, the stale key drives the next cold start at a deleted workspace
+/// slug, and the surviving worker serves its cached shell. The app then wedges
+/// on the boot splash instead of reaching the picker. The keep-data path leaves
+/// them intact, because the workspaces survive and the memory is still valid.
 #[cfg(target_os = "macos")]
 fn support_data_paths(home: &Path, app_data: &Path, delete_data: bool) -> Vec<PathBuf> {
     let library = home.join("Library");
     let mut paths = Vec::new();
     if delete_data {
-        // The authoritative data dir (`~/Library/Application Support/<id>`),
-        // passed in so it matches exactly what the service uses.
+        // Passed in, so it matches exactly what the service uses.
         paths.push(app_data.to_path_buf());
-        // The WKWebView web storage (localStorage + service worker +
-        // CacheStorage/IndexedDB). Removing it is what makes a reinstall actually
-        // clean — see the doc comment above. Both bundle names, like Caches.
+        // The WKWebView web storage. Removing it is what makes a reinstall
+        // clean, per the doc comment above. Both bundle names, like Caches.
         paths.push(library.join("WebKit").join(BUNDLE_IDENTIFIER));
         paths.push(library.join("WebKit").join("lucidos-app"));
-        // Disk HTTP cache + cookies (may not exist on every machine; delete_path
-        // treats a missing path as success).
+        // Disk HTTP cache and cookies. `delete_path` treats a path that is not
+        // on this machine as success.
         paths.push(library.join("HTTPStorages").join(BUNDLE_IDENTIFIER));
         paths.push(library.join("HTTPStorages").join("lucidos-app"));
         paths.push(
@@ -1844,8 +1683,7 @@ fn support_data_paths(home: &Path, app_data: &Path, delete_data: bool) -> Vec<Pa
 
 /// Walk an executable path up to its enclosing `.app` bundle root. A macOS
 /// bundle runs `<bundle>.app/Contents/MacOS/<exe>`, so the bundle is three
-/// parents up. Returns `None` when the exe isn't inside a `.app` (e.g. an
-/// unbundled `tauri dev` / `cargo` binary), so the caller skips bundle removal.
+/// parents up. `None` for an unbundled binary, so the caller skips the removal.
 #[cfg(target_os = "macos")]
 fn app_bundle_root_from_exe(exe: &Path) -> Option<PathBuf> {
     let bundle = exe.parent()?.parent()?.parent()?;
@@ -1859,9 +1697,9 @@ fn app_bundle_root_from_exe(exe: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Delete a file or directory tree. A missing path is success (the goal — it's
-/// already gone). Uses `symlink_metadata` so a symlink is removed as a link, not
-/// followed.
+/// Delete a file or directory tree. A missing path is success, since that is
+/// the goal already met. Uses `symlink_metadata`, so a symlink is removed as a
+/// link rather than followed.
 #[cfg(target_os = "macos")]
 fn delete_path(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
@@ -1886,8 +1724,8 @@ fn trash_or_remove_bundle(bundle: &Path) -> Result<(), String> {
     }
 }
 
-/// `tell application "Finder" to delete POSIX file "<path>"` — moves the bundle
-/// to the Trash so it's recoverable rather than permanently deleted.
+/// Move the bundle to the Trash via Finder, so it is recoverable rather than
+/// permanently deleted.
 #[cfg(target_os = "macos")]
 fn move_bundle_to_trash(bundle: &Path) -> Result<(), String> {
     let script = format!(
@@ -1918,18 +1756,13 @@ fn applescript_escape(s: &str) -> String {
 // ── Gateway boot (service role) ─────────────────────────────────────────────
 
 /// Spawn the bundled standalone `lucidos-gateway` (ADR 0014) pointed at the OS
-/// app-data dir, configured for the EMBEDDED Postgres backend (bundled
-/// `initdb`/`pg_ctl`). The gateway owns the rest: it reads/creates the workspace
-/// registry, provisions one embedded shared Postgres cluster with one database
-/// per workspace, and spawns each workspace's engine (by path via
-/// `LUCIDOS_ENGINE_BIN`, inheriting `LUCIDOS_STATIC_DIR` /
-/// `LUCIDOS_SDK_DIR` / `LUCIDOS_SYSTEM_KNOWHOW_DIR` /
-/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` from this env), and
-/// reverse-proxies `/<slug>/`. First run creates no workspace — the smart root
-/// serves the picker so the user names their first one.
-/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` lets engines boot before the user has
-/// configured a provider — into a clear no-provider onboarding state, NOT mock
-/// output (see engine main.rs).
+/// app-data dir, configured for the EMBEDDED Postgres backend.
+///
+/// The gateway owns the rest. It creates the workspace registry, provisions one
+/// shared Postgres cluster with a database per workspace, spawns each
+/// workspace's engine, and reverse-proxies `/<slug>/`. Every engine inherits
+/// this environment, so the paths set below reach all of them. First run
+/// creates no workspace, and the smart root serves the picker instead.
 fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<GatewayService> {
     let bundle = bundled_resources(resources);
 
@@ -1951,20 +1784,13 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_PG_BIN_DIR", &bundle.pg_bin)
         .env("LUCIDOS_PG_LIB_DIR", &bundle.pg_lib)
         .env("LUCIDOS_ENGINE_BIN", &bundle.engine_bin)
-        // Absolute path to the bundled `lucidos` CLI. The engine reads this in
-        // `lucidos_cli_dir()` so the coding-agent permission/question MCP
-        // servers, CC hooks, and chat-script `lucidos …` calls resolve without
-        // relying on a dev-only PATH (the gateway passes its env to engines).
         .env("LUCIDOS_CLI_BIN", &bundle.cli_bin)
         .env("LUCIDOS_STATIC_DIR", &bundle.frontend)
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
-        // Absolute path to the bundled engine-shipped reference knowhow
-        // (`system-knowhow/`). The engine resolves it here (via
-        // `resolve_system_knowhow_dir`) so `load_knowhow('system-knowhow/…')`,
-        // `GET /api/v1/knowhow`, and the data-API read path all work in a
-        // packaged install (the gateway passes its env to engines).
         .env("LUCIDOS_SYSTEM_KNOWHOW_DIR", &bundle.system_knowhow)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
+        // Engines may boot before the user has configured a provider, into a
+        // clear no-provider onboarding state and NOT mock output.
         .env("LUCIDOS_BOOT_WITHOUT_PROVIDER", "1")
         // Tell the gateway it's a packaged build so the picker hides the dev-only
         // gateway self-reload control (packaged updates go through the app updater
@@ -2052,8 +1878,8 @@ mod tests {
     #[test]
     fn a_gateway_that_answered_is_healthy_even_if_it_has_since_exited() {
         // Health is checked first on purpose. An exit after a healthy probe is
-        // the supervise loop's business (shut down, let launchd respawn), which
-        // is a different outcome from "this boot never came up".
+        // the supervise loop's business, which is a different outcome from
+        // "this boot never came up".
         assert_eq!(
             gateway_start_poll(true, true, true),
             Some(GatewayStart::Healthy)
@@ -2193,9 +2019,9 @@ mod tests {
 
     #[test]
     fn a_failure_recorded_while_ensuring_survives_into_the_wait() {
-        // The bug this pins: the loop records an ensure failure and moves to
-        // WaitingForGateway on the very next line, so a phase change that
-        // cleared the detail made the failure text unreachable. The wait is the
+        // What this pins: the loop records an ensure failure and moves to
+        // WaitingForGateway on the very next line. A phase change that cleared
+        // the detail would make the failure text unreachable. That wait is the
         // only stretch long enough for anyone to read it.
         let status = StartupStatus::default();
         status.enter(StartupPhase::EnsuringService);
@@ -2212,8 +2038,8 @@ mod tests {
     #[test]
     fn a_cycle_that_ensures_cleanly_drops_the_previous_complaint() {
         // The other half: the detail's life is tied to the OUTCOME, not to
-        // progress through the loop, so a service that started on the retry
-        // leaves the splash reading as an ordinary wait.
+        // progress through the loop. A service that started on the retry leaves
+        // the splash reading as an ordinary wait.
         let status = StartupStatus::default();
         status.note_failure("Could not start the background service: nope.");
         status.enter(StartupPhase::EnsuringService);
@@ -2269,8 +2095,8 @@ mod tests {
         // The retry only happens when `open` FAILED; a success leaves at once.
         assert!(script.contains("&& exit 0"));
         // Giving up says so in the agent's own log. "Lucidos is not in my menu
-        // bar" is the whole symptom this feature exists to fix, so the one place
-        // that can explain it must not exit silently.
+        // bar" is the symptom this feature exists to fix. The one place that
+        // can explain it must not exit silently.
         assert!(script.contains("gave up opening"));
         assert!(script.contains(">&2"));
     }
@@ -2407,10 +2233,10 @@ mod tests {
     fn a_relaunch_never_carries_the_login_flag_forward() {
         let os = |s: &str| std::ffi::OsString::from(s);
 
-        // The bug this prevents: a client the login agent started keeps `--login`
-        // in its argv forever, and both relaunch paths forward argv verbatim. So
-        // an update or a Restart App would bring the client back HIDDEN, even
-        // with a window open at the time, which reads as the app vanishing.
+        // What this prevents: a client the login agent started keeps `--login`
+        // in its argv forever, and both relaunch paths forward argv verbatim.
+        // So an update or a Restart App would bring the client back HIDDEN,
+        // even with a window open, which reads as the app vanishing.
         assert_eq!(
             strip_login_flag([os(LOGIN_FLAG)]),
             Vec::<std::ffi::OsString>::new()
@@ -2672,9 +2498,8 @@ mod tests {
     }
 
     // Reaching the ceiling is NOT a reason to launch. `open` against a client
-    // that is still alive would only activate it, and the watcher would then be
-    // gone by the time that client actually exited, so the relaunch would be
-    // spent on nothing and the app would stay closed.
+    // that is still alive would only activate it, and the watcher would be gone
+    // by the time that client exited. The relaunch would be spent on nothing.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_watcher_launches_only_once_the_client_is_actually_gone() {
@@ -2803,8 +2628,8 @@ mod tests {
     }
 
     // "Quit and Stop Background Service" is the one teardown that means stay
-    // down, and it says so before it signals, so the teardown that follows must
-    // leave its marker alone rather than recording a restore over it.
+    // down, and it says so before it signals. The teardown that follows must
+    // leave its marker alone rather than record a restore over it.
     #[test]
     fn a_declared_quit_survives_the_teardown_that_follows_it() {
         let tmp = TempAppData::new("quit");
@@ -2814,9 +2639,9 @@ mod tests {
     }
 
     // A quit intent whose `bootout` failed describes a teardown that never
-    // happened, and nothing else clears it (only the gateway's boot consumes the
-    // record, and the service is still up). Left behind it would silence the next
-    // real restart's restore list.
+    // happened, and nothing else clears it: only the gateway's boot consumes
+    // the record, and the service is still up. Left behind it would silence the
+    // next real restart's restore list.
     #[test]
     fn a_quit_intent_can_be_taken_back_when_the_stop_fails() {
         let tmp = TempAppData::new("unquit");
@@ -2868,8 +2693,8 @@ mod tests {
             .spawn()
             .expect("spawn a stand-in engine");
         tmp.write_pidfile("live-ws", child.id());
-        // A pid that cannot exist (macOS caps pids well below this), standing in
-        // for a pidfile left behind by an engine that died on its own.
+        // A pid that cannot exist, since macOS caps pids well below this. It
+        // stands in for a pidfile an engine left behind when it died.
         tmp.write_pidfile("stale-ws", 999_999);
 
         let stopped = stop_workspace_engines(tmp.path());

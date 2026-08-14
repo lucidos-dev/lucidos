@@ -11,11 +11,15 @@ import { computeFitsInOneRow } from './useFitsInOneRow';
  *  `actionWidths` is ordered nearest-centre first, since that is the end
  *  collapse eats from. */
 export interface HeaderCollapseInput {
-  /** Inner width of the 3-zone flex row. */
+  /** Inner width of the row. */
   containerWidth: number;
-  /** Leading zone, flex-shrink:0, always fully visible. */
+  /** Leading zone. The centre box is CENTRED on the row, so this is half of
+   *  what that box leaves rather than any measured control: the same room is
+   *  spent on the other side whether anything is standing there or not, and
+   *  feeding that half in turns the linear fit below into exactly that
+   *  symmetric rule (see the hook). */
   leadingWidth: number;
-  /** NATURAL (un-ellipsized) width of the centre zone, 0 when it is empty. */
+  /** Width of the centred box, 0 when the row has none. */
   centreWidth: number;
   /** Action widths, nearest-centre first (the anchor excluded). */
   actionWidths: readonly number[];
@@ -41,8 +45,9 @@ export interface HeaderCollapseResult {
    *  replaces it 1:1 — so the first collapse step takes the two nearest. */
   collapsed: number;
   /** True only once the icons are at their minimal state (⋯ + anchor, or no
-   *  collapse possible) and the full centre zone STILL does not fit, so it
-   *  ellipsizes on its right edge (CSS does the clipping; this flag is the
+   *  collapse possible) and the centre box STILL does not fit beside them, so
+   *  the row is into the regime where its clamp has bottomed out on its own
+   *  min-span and the two can reach each other (CSS clips; this flag is the
    *  pure-math mirror for tests). */
   titleEllipsized: boolean;
 }
@@ -68,9 +73,9 @@ export function iconsRowWidth(
 
 /** Pure collapse math, exported so the decision can be unit-tested without
  *  ResizeObserver/jsdom (same pattern as `computeFitsInOneRow`). Picks the
- *  SMALLEST collapse count whose icon row leaves room for the FULL title next
- *  to the nav zone; icons always give way before the title truncates. The
- *  candidate counts are 0, then 2..N (never exactly 1 — see
+ *  SMALLEST collapse count whose icon row fits in the room the centred box
+ *  leaves at its end of the row; icons always give way before they reach the
+ *  box. The candidate counts are 0, then 2..N (never exactly 1: see
  *  `HeaderCollapseResult.collapsed`). The fit test delegates to
  *  `computeFitsInOneRow` so the gap model and its sub-pixel fudge live in one
  *  place. */
@@ -92,28 +97,29 @@ export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollaps
   for (const c of candidates) {
     if (fits(c)) return { collapsed: c, titleEllipsized: false };
   }
-  // Even the minimal icon row (⋯ + the anchor) can't host the full centre zone,
-  // so that zone shrinks and CSS ellipsizes it on the right.
+  // Even the minimal icon row (⋯ + the anchor) does not fit beside the centred
+  // box, so the two are into each other and CSS clips whichever overlaps.
   return { collapsed: candidates[candidates.length - 1], titleEllipsized: true };
 }
 
 /** Which boxes a cluster's collapse measurement reads. Every collapsing header
- *  row is the same three zones, so the two callers differ only in selectors.
+ *  row has the same shape, so the two callers differ only in selectors.
  *
- *  `centre` is measured by SUMMING ITS CHILDREN's `scrollWidth`, which is the
- *  natural (un-ellipsized) width even when one of them is currently clipped. So
- *  it must be the element whose children are the real content: the title
- *  cluster, not the flex zone wrapping it. */
+ *  `centre` is the row's CENTRED box (the content pane's title cluster, the
+ *  thread pane's brand label), measured at its own rendered width. That width
+ *  is a pure function of the row's, both being a `clamp` against it, so it can
+ *  be read back without feeding the collapse count into its own input.
+ *
+ *  It used to be measured by summing the box's CHILDREN's `scrollWidth`, the
+ *  natural un-ellipsized content width, capped at the box's declared
+ *  `max-width`. That is the wrong question once the box is a fixed span: what
+ *  the actions have to clear is the BOX, and a short title inside a box at its
+ *  min-span floor reported a fraction of it, leaving the cluster free to reach
+ *  the forward chevron. */
 export interface HeaderCollapseTargets {
-  /** The 3-zone row the cluster lives in. */
+  /** The row the cluster lives in. */
   container: string;
-  /** The leading zone, flex-shrink:0. Required UNLESS `centred`, which derives
-   *  the leading width from the container and the centre zone instead of
-   *  measuring anything (see below) and so never reads this. The thread pane's
-   *  row omits it: its leading control, the drawer toggle, is positioned
-   *  against the header rather than being a member of the row at all. */
-  leading?: string;
-  /** The centre zone (see above). */
+  /** The centred box (see above). */
   centre: string;
   /** A trailing member of the cluster that never collapses: the content pane's
    *  notifications bell, the thread pane's recovery spinner. Measured at its own
@@ -121,13 +127,6 @@ export interface HeaderCollapseTargets {
    *  same size, and re-queried on every measurement, because one of them mounts
    *  and unmounts while the header is up. */
   anchor?: string;
-  /** The centre zone is absolutely CENTRED on the container rather than being a
-   *  flex zone between its neighbours (the thread pane's brand cluster). Then
-   *  the room left for the actions is not "whatever the row has spare" but half
-   *  of what the centred box leaves, since the same amount is spent on the other
-   *  side whether anything is there or not. Feeding that half in as the leading
-   *  width turns the linear fit into exactly that symmetric rule. */
-  centred?: boolean;
 }
 
 /**
@@ -146,26 +145,27 @@ export interface HeaderCollapseTargets {
  *   at a time and published `--mobile-content-title-max` / `-shift` so the
  *   centred box could slide into whichever side had slack; a constant trailing
  *   cluster makes all of it dead weight, and the CSS bounds the title now.
- * - **Desktop** keeps the measured progressive collapse over the 3-zone flex
- *   row, with `computeHeaderCollapse` picking the fewest collapses that still
- *   fit the centre zone whole.
+ * - **Desktop** keeps the measured progressive collapse, with
+ *   `computeHeaderCollapse` picking the fewest collapses that fit the cluster
+ *   into the room the centred box leaves at its end of the row.
  *
  * Desktop measurement model (all inputs independent of the current collapse
  * state, so the computation can never oscillate):
- * - container / leading widths come from the live boxes (both are invariant
- *   under collapse: the container is positioned by the split geometry, the
- *   leading zone is flex-shrink:0);
- * - the centre's NATURAL width is its children's `scrollWidth` (an ellipsized
- *   span still reports its full content width there);
+ * - the container's width comes from the live box, and is set by the split
+ *   geometry rather than by anything in the row;
+ * - so is the centre box's, which is a `clamp` against the container, and the
+ *   leading width is derived as half of what it leaves (the box is centred, so
+ *   that same room is spent on the other side whether anything stands there or
+ *   not);
  * - icon widths are uniform: every action (and the ⋯ trigger) is a
  *   `.icon-btn.header-icon`, so any one of them is the measuring stick.
  *
- * Re-measures on container resize (ResizeObserver: split drags, window
- * resizes) and on centre-zone mutation (MutationObserver: title text changes;
- * deliberately NOT the whole container, so notification-badge ticks don't
- * force no-op re-measures); action-set swaps re-run the effect via
- * `actionCount`. Gap comes from rem at measure time (`getRemPx`), so user
- * font scaling feeds in, with no hard-coded px breakpoints.
+ * Re-measures on a resize of EITHER box (ResizeObserver: split drags, window
+ * resizes, and a retuned span token, which the live style remote can write
+ * without the container changing at all); action-set swaps re-run the effect
+ * via `actionCount`. Gap comes from rem at measure time (`getRemPx`), so user
+ * font scaling feeds in, with no hard-coded px breakpoints. Nothing watches the
+ * title TEXT any more: it cannot move the box's edges.
  */
 export function useHeaderActionCollapse(
   hostRef: RefObject<HTMLElement>,
@@ -193,14 +193,13 @@ export function useHeaderActionCollapse(
       setCollapsed(0);
       return;
     }
-    // The three anchor elements are structurally stable for the effect's
+    // The two observed elements are structurally stable for the effect's
     // lifetime (Preact reuses the DOM nodes across re-renders; the effect
     // re-runs when the action set changes), so resolve them once instead of
     // per ResizeObserver fire — measure() runs every frame during a split
     // drag. A missing bell degrades to iconWidth 0 → "everything fits" → no
-    // collapse; the flex layout still guarantees non-overlap (the title just
-    // ellipsizes earlier instead of icons folding into ⋯).
-    const nav = targets.leading ? container.querySelector<HTMLElement>(targets.leading) : null;
+    // collapse; the centred box's own clamp still keeps it off the cluster
+    // everywhere but that clamp's min-span arm.
     const titleZone = container.querySelector<HTMLElement>(targets.centre);
     const measure = () => {
       // The stick is whichever control the host currently renders: every action
@@ -214,26 +213,13 @@ export function useHeaderActionCollapse(
       // grew a member without re-measuring is exactly how it ends up crowding
       // the centred brand.
       const anchor = targets.anchor ? host.querySelector<HTMLElement>(targets.anchor) : null;
-      let titleWidth = 0;
-      if (titleZone) {
-        for (const child of Array.from(titleZone.children)) {
-          titleWidth += (child as HTMLElement).scrollWidth;
-        }
-        // A centre zone that declares a maximum never grows past it, so the fit
-        // question is about that maximum and not about the natural content:
-        // uncapped, a long title folds the actions into ⋯ to free room the zone
-        // cannot use. Read from the element rather than from a token so the cap
-        // is whatever the stylesheet says, and it is a CONSTANT, so capping
-        // cannot feed the collapse count back into its own input.
-        const declaredMax = parseFloat(getComputedStyle(titleZone).maxWidth);
-        if (Number.isFinite(declaredMax)) titleWidth = Math.min(titleWidth, declaredMax);
-      }
+      // The box's own width, not its content's: it is a fixed span with its
+      // members at the ends, so what the cluster has to clear is the box.
+      const titleWidth = titleZone ? titleZone.getBoundingClientRect().width : 0;
       const containerWidth = container.clientWidth;
       const { collapsed: next } = computeHeaderCollapse({
         containerWidth,
-        leadingWidth: targets.centred
-          ? Math.max(0, (containerWidth - titleWidth) / 2)
-          : (nav ? nav.getBoundingClientRect().width : 0),
+        leadingWidth: Math.max(0, (containerWidth - titleWidth) / 2),
         centreWidth: titleWidth,
         actionWidths: Array.from({ length: actionCount }, () => iconWidth),
         anchorWidth: anchor ? anchor.getBoundingClientRect().width : 0,
@@ -246,21 +232,14 @@ export function useHeaderActionCollapse(
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(container);
-    // Mutations only matter where they can change an input: the title zone's
-    // text (natural width). Observing the whole container would also fire on
-    // every notifications-badge tick — a forced re-measure that can never
-    // change the result (the badge is absolutely positioned). Action-set
-    // changes re-run the effect via `actionCount`; geometry changes hit the
-    // ResizeObserver.
-    let mo: MutationObserver | null = null;
-    if (titleZone) {
-      mo = new MutationObserver(measure);
-      mo.observe(titleZone, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-      });
-    }
+    // The centred box too, and not because the container's resize misses a
+    // split drag (it does not): its width is `clamp(min, 100% - 2 * reserve,
+    // span)`, and the live style remote can rewrite any of those three tokens
+    // on a running app, which moves the box's edges with the row standing
+    // still. Observing the box is also what lets the title TEXT go unwatched:
+    // a MutationObserver used to re-measure on every title change, back when
+    // the input was the content's natural width rather than the box's.
+    if (titleZone) ro.observe(titleZone);
     // The host's own membership, which changes without the action set changing:
     // an anchor that mounts (the recovery spinner) is a wider cluster nothing
     // else would report. `childList` WITHOUT `subtree`, which is what keeps the
@@ -271,11 +250,10 @@ export function useHeaderActionCollapse(
     hostMo.observe(host, { childList: true });
     return () => {
       ro.disconnect();
-      mo?.disconnect();
       hostMo.disconnect();
     };
   }, [hostRef, actionCount, gapRem, alwaysCollapseFrom, layout, targets.container,
-      targets.leading, targets.centre, targets.anchor, targets.centred]);
+      targets.centre, targets.anchor]);
   // Mobile collapses the whole set, unconditionally and without a measurement,
   // so it is also immune to the stale-count race the desktop clamp handles.
   if (layout === 'mobile') return actionCount;

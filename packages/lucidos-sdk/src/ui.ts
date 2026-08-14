@@ -11,10 +11,10 @@ import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
 import type { NavigateTarget, NavigateUi } from './notifications';
 
-/** Params for `lucidos.ui.navigate` — the `NavigateUi` payload minus `target`
- *  (which is the first argument). Carries the generated `settings_view`
- *  (`SettingsViewTarget`) so the full Settings sub-section set is type-checked
- *  and discoverable from the SDK, in lockstep with the engine `navigate_ui` tool. */
+/** Params for `lucidos.ui.navigate`: the `NavigateUi` payload minus `target`,
+ *  which is the first argument. Carries the generated `settings_view`, so the
+ *  full Settings sub-section set is type-checked and discoverable from the SDK,
+ *  in lockstep with the engine `navigate_ui` tool. */
 export type NavigateParams = Omit<NavigateUi, 'target'>;
 
 /** The stylesheet to load for a font key, or `undefined` for a font already on
@@ -35,10 +35,10 @@ const loadedFonts = new Set<string>();
 let watchingPrefs = false;
 
 /**
- * iOS / iPadOS detection — mirrors `crates/lucidos-app/src/utils/platform.ts`.
+ * iOS / iPadOS detection, mirroring `crates/lucidos-app/src/utils/platform.ts`.
  * Exported for tests; `nav` defaults to the global navigator. Used to skip the
  * live OS-appearance listener on iOS, whose WKWebView fires bogus
- * `prefers-color-scheme` change events (telemetry-confirmed theme flashing).
+ * `prefers-color-scheme` change events and flashes the theme.
  */
 export function isIOSAgent(
   nav: { userAgent: string; platform?: string; maxTouchPoints?: number } | undefined =
@@ -81,14 +81,14 @@ export type ToastType = 'success' | 'info' | 'warning' | 'error';
 const TOAST_TYPES: readonly ToastType[] = ['success', 'info', 'warning', 'error'];
 
 export interface ToastOptions {
-  /** Auto-dismiss after this many ms. Omit for the host default (errors/warnings
-   *  stay until dismissed; success/info auto-close). */
+  /** Auto-dismiss after this many ms. Omit for the host default: an error or
+   *  warning stays until dismissed, success and info auto-close. */
   durationMs?: number;
   /** false = hide the close (X) button. Default true. */
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
-   *  updates the existing toast (message/type/etc.) instead of stacking a new
-   *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
+   *  updates the existing toast instead of stacking a new one, so an
+   *  'Opening...' toast can become 'Opened'. */
   key?: string;
   /** true = show an indeterminate "work in progress" spinner in place of the
    *  severity icon. Pair it with a `key` so a later keyed toast replaces the
@@ -218,17 +218,15 @@ let primingExternalLinkTarget: Promise<void> | null = null;
 /** Warm {@link externalLinkTargetCache} without going through
  *  `applyPreferences`.
  *
- *  Needed because `applyPreferences` is OPTIONAL: an app shipping its own
- *  complete visual identity legitimately never calls it, yet still gets the
- *  SDK's delegated link handler (installed unconditionally by `browser.ts`).
- *  Left to theming alone, those apps would hold a `null` cache forever, take the
- *  host path on every link, and silently ignore the user's "Ask" choice, since
- *  by then the activation `navigator.share` needs is long gone.
+ *  Needed because `applyPreferences` is OPTIONAL. An app shipping its own
+ *  complete visual identity never calls it, yet still gets the SDK's delegated
+ *  link handler. Left to theming alone, such an app holds a `null` cache
+ *  forever and takes the host path on every link. It then ignores the user's
+ *  "Ask" choice, since by then the activation `navigator.share` needs is gone.
  *
  *  Called at load from `browser.ts`, and only inside an installed iOS PWA, the
- *  one place the cache is ever read. Best-effort: a failure leaves the cache
- *  null, which falls back to the host path (the same behaviour as before this
- *  preference existed).
+ *  one place the cache is ever read. A failure leaves the cache null, which
+ *  falls back to the host path.
  *
  *  Not live: an app that never calls `watchPreferences` keeps the mode it saw at
  *  load until the next reload. Subscribing SSE from every app iframe to catch a
@@ -256,14 +254,14 @@ const HTTP_SCHEME_RE = /^https?:\/\//i;
 /**
  * The live style remote, iframe realm.
  *
- * A fourth copy of the same validator, alongside `utils/styleOverrides.ts`
- * (app realm), the `index.html` FOUC block (boot realm) and
- * `api/sdk_prefs.rs` (iframe first paint). The SDK is a separate package and
- * cannot import the app's copy, exactly as it cannot import its font map, so
- * this mirrors the existing theme/font/scale arrangement rather than inventing
- * a new one. The rules must stay identical in all four: the preference is
- * writable by any app and by the chat agent, so it is an untrusted path into
- * inline style, and a rule relaxed in one realm is a hole in all of them.
+ * A fourth copy of the same validator, alongside `utils/styleOverrides.ts`,
+ * the `index.html` FOUC block and `api/sdk_prefs.rs`. The SDK is a separate
+ * package and cannot import the app's copy, exactly as it cannot import its
+ * font map.
+ *
+ * The rules must stay identical in all four. The preference is writable by any
+ * app and by the chat agent, so it is an untrusted path into inline style. A
+ * rule relaxed in one realm is a hole in all of them.
  */
 const OVERRIDE_NAME_RE = /^--[a-z][a-z0-9-]*$/;
 const OVERRIDE_VALUE_BANNED_RE = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
@@ -374,11 +372,11 @@ export const ui = {
   watchPreferences(): void {
     if (watchingPrefs) return;
     watchingPrefs = true;
-    // Best-effort live re-application: a transient prefs-fetch failure must not
-    // surface as an unhandled rejection — the next PreferencesChanged / OS-theme
-    // flip re-runs applyPreferences, and the app keeps its already-applied theme
-    // in the meantime. Swallow with a warn so a developer can still see a
-    // persistent failure.
+    // Best-effort live re-application. A transient prefs-fetch failure must not
+    // surface as an unhandled rejection: the next PreferencesChanged or
+    // OS-theme flip re-runs applyPreferences, and the app keeps its
+    // already-applied theme meanwhile. Warn, so a persistent failure is still
+    // visible to a developer.
     const reapply = () => {
       ui.applyPreferences().catch((err) => {
         console.warn('[lucidos-sdk] live preference re-apply failed:', err);
@@ -387,12 +385,11 @@ export const ui = {
     sse.on('PreferencesChanged', reapply);
     sse.connect();
     // A live OS light/dark flip under a `system` theme preference does NOT emit
-    // PreferencesChanged, so also re-apply on the media-query change — matching
-    // the host shell (preferences.ts → syncSystemThemeListener). `applyPreferences`
-    // stays the source of truth for which theme actually applies (for an explicit
-    // light/dark preference it re-applies the same value — a visual no-op). Skipped
-    // on iOS, whose WKWebView fires bogus
-    // prefers-color-scheme events; there `system` resolves once per applyPreferences().
+    // PreferencesChanged, so also re-apply on the media-query change, matching
+    // the host shell. `applyPreferences` stays the source of truth for which
+    // theme actually applies. Skipped on iOS, whose WKWebView fires bogus
+    // prefers-color-scheme events: there `system` resolves once per
+    // applyPreferences().
     if (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && !isIOSAgent()) {
       window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', reapply);
     }
@@ -460,9 +457,9 @@ export const ui = {
 
   /**
    * Open a fresh chat thread, optionally prefilling the compose textarea.
-   * The user must click Send — this never auto-submits. If the user is on
-   * an app/trigger/settings panel it closes the overlay first; if a thread
-   * is focused it drops the focus so the compose lands on a new thread.
+   * The user must click Send: this never auto-submits. On an app, trigger or
+   * settings panel it closes the overlay first. With a thread focused it drops
+   * the focus, so the compose lands on a new thread.
    */
   startThread(opts?: { prompt?: string }): Promise<void> {
     const params: NavigateParams = {};
@@ -486,7 +483,7 @@ export const ui = {
     if (typeof options.message !== 'string' || options.message.length === 0) {
       return Promise.reject(new TypeError('options.message must be a non-empty string'));
     }
-    // No parent (e.g. SDK loaded in a top-level window) — fall back to native
+    // No parent, e.g. the SDK loaded in a top-level window. Fall back to native
     // window.confirm so the API still works in standalone testing contexts.
     if (window.parent === window) {
       return Promise.resolve(window.confirm(options.message));
@@ -515,13 +512,12 @@ export const ui = {
 
   /**
    * Show a transient toast rendered by the host shell (above all app content,
-   * themed by the user's preferences). Fire-and-forget — there is no result.
+   * themed by the user's preferences). Fire-and-forget, with no result.
    *
    * Only the serializable subset of the host toast is exposed: `message`, the
-   * `type` severity, and `opts` (`durationMs`, `dismissable`, `key`,
-   * `spinning`). The host's action-button callbacks can't cross the postMessage
-   * boundary, so they're intentionally not available here. An unknown `type`
-   * degrades to `info`.
+   * `type` severity, and `opts`. The host's action-button callbacks cannot
+   * cross the postMessage boundary, so they are deliberately unavailable here.
+   * An unknown `type` degrades to `info`.
    */
   toast(message: string, type: ToastType = 'info', opts?: ToastOptions): void {
     if (typeof message !== 'string' || message.length === 0) {
@@ -536,8 +532,8 @@ export const ui = {
       key: opts && typeof opts.key === 'string' && opts.key.length > 0 ? opts.key : undefined,
       spinning: opts && typeof opts.spinning === 'boolean' ? opts.spinning : undefined,
     };
-    // No host parent (SDK loaded in a top-level window) — surface via console so
-    // a standalone testing context still sees the feedback instead of silence.
+    // No host parent, so surface via console: a standalone testing context then
+    // still sees the feedback instead of silence.
     if (window.parent === window) {
       const line = `[lucidos.ui.toast:${safeType}] ${message}`;
       if (safeType === 'error') console.error(line);
@@ -562,9 +558,9 @@ export const ui = {
     if (typeof key !== 'string' || key.length === 0) {
       throw new TypeError('lucidos.ui.dismissToast: key must be a non-empty string');
     }
-    // No host parent (SDK loaded in a top-level window): mirror the console
-    // fallback in `toast()` so a standalone testing context sees both halves of
-    // the exchange instead of a toast line with no matching dismissal.
+    // No host parent, so mirror the console fallback in `toast()`. A standalone
+    // testing context then sees both halves of the exchange, instead of a toast
+    // line with no matching dismissal.
     if (window.parent === window) {
       console.log(`[lucidos.ui.dismissToast] ${key}`);
       return;
@@ -584,7 +580,7 @@ export const ui = {
     if (typeof options.message !== 'string' || options.message.length === 0) {
       return Promise.reject(new TypeError('options.message must be a non-empty string'));
     }
-    // No parent (e.g. SDK loaded in a top-level window) — fall back to native
+    // No parent, e.g. the SDK loaded in a top-level window. Fall back to native
     // window.prompt so the API still works in standalone testing contexts.
     if (window.parent === window) {
       const def = typeof options.defaultValue === 'string' ? options.defaultValue : '';
@@ -657,15 +653,13 @@ export const ui = {
       line: typeof params.line === 'number' ? params.line : undefined,
       line_end: typeof params.line_end === 'number' ? params.line_end : undefined,
     };
-    // No host shell around this window (an app opened in its own tab, or the SDK
-    // loaded in a top-level page), so there is no modal to show and no reply to
-    // wait for. Reject rather than quietly calling `navigate` here: that request
-    // goes through the engine and lands in whichever OTHER window is running the
-    // shell, so the reader clicking a citation would see nothing happen while a
-    // different window navigated its Files panel behind their back, and the
-    // promise would resolve as if it had worked. The escalation is the app
-    // author's to make, from its own catch, where it is a deliberate "take me to
-    // the workspace" rather than a silent side effect somewhere else.
+    // No host shell around this window, so there is no modal to show and no
+    // reply to wait for. Reject rather than quietly calling `navigate` here:
+    // that request goes through the engine and lands in whichever OTHER window
+    // runs the shell. The reader clicking a citation would see nothing happen.
+    // A different window would navigate its Files panel, and this promise would
+    // resolve as if it had worked. The escalation is the app author's to make,
+    // from its own catch.
     if (window.parent === window) {
       return Promise.reject(new Error(
         'lucidos.ui.previewFile: no host to show the preview (this app is not running inside Lucidos)',
@@ -691,14 +685,14 @@ export const ui = {
     });
   },
 
-  /** Themed dropdown — replaces native `<select>` so popups can be styled. */
+  /** Themed dropdown, replacing native `<select>` so popups can be styled. */
   Select,
 
   /**
    * Enhance every `<select class="lucidos-select">` under `root` (default
-   * `document`) with a themed dropdown. The native element stays in the DOM
-   * (hidden) so existing form code keeps working — `change` fires on it and
-   * its `value` mirrors the user's selection.
+   * `document`) with a themed dropdown. The native element stays in the DOM,
+   * hidden, so existing form code keeps working: `change` fires on it and its
+   * `value` mirrors the user's selection.
    */
   enhanceSelects,
 };

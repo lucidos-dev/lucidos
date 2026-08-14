@@ -502,6 +502,107 @@ describe('makeDismissHandlers', () => {
     expect(click.stopPropagation).not.toHaveBeenCalled();
   });
 
+  it('a click the INSIDE click dispatches is not an outside click (the attach menu File item)', async () => {
+    // Regression: the composer's attach menu closes itself and calls .click()
+    // on the persistent hidden <input type="file">, which lives OUTSIDE the
+    // panel (inside .prompt-box, so the menu's re-render can't unmount it
+    // mid-tap). That nested click reached the fallback below, which
+    // preventDefault()'d it, and showing the file chooser is the cancelable
+    // DEFAULT ACTION of a click on a file input, so the menu item did nothing
+    // at all, silently. A click dispatched while an inside click is still
+    // unwinding is a consequence of that click, never a new outside one.
+    const panel = elWith();
+    const anchor = elWith();
+    const hiddenFileInput = elWith(); // outside the panel, like the real one
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    // Document capture sees the menu item's click first, then the item's own
+    // bubble handler runs and dispatches input.click(), whose click re-enters
+    // the same capture listener before the outer dispatch has unwound.
+    //
+    // The await between them is NOT ceremony: the browser runs a microtask
+    // checkpoint every time the JS stack empties, so one runs between two
+    // listeners of a single dispatch. Without it this test passes against a
+    // guard cleared on a microtask, which is exactly the version that shipped
+    // green here and dead in Chromium.
+    h.onClickCapture(clickEvent(panel));
+    await Promise.resolve();
+    const nested = clickEvent(hiddenFileInput);
+    h.onClickCapture(nested);
+
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(nested.stopPropagation).not.toHaveBeenCalled();
+    expect(nested.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('the window closes when the inside click finishes, so an unrelated outside click in the SAME task is still swallowed', () => {
+    // The other half of the guard: it must not become "one free outside click
+    // for the rest of the task", which would break the fallback for anything
+    // clicking twice in one go. The inside click's own bubble to document is
+    // the end of its dispatch, so nothing after it is nested in it.
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    const inside = clickEvent(panel);
+    h.onClickCapture(inside);
+    h.onClickBubble(inside); // the dispatch ends here, no timer involved
+
+    const later = clickEvent(elsewhere);
+    h.onClickCapture(later);
+
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(later.stopPropagation).toHaveBeenCalledTimes(1);
+    expect(later.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it('a nested click bubbling back up does NOT close the window, so a second nested click is also let through', () => {
+    // The nested click reaches document in the bubble phase too, before the
+    // outer one does. Matching on the event object is what keeps that from
+    // closing the window early on a handler that clicks two elements.
+    const panel = elWith();
+    const anchor = elWith();
+    const first = elWith();
+    const second = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    const inside = clickEvent(panel);
+    h.onClickCapture(inside);
+
+    const nestedA = clickEvent(first);
+    h.onClickCapture(nestedA);
+    h.onClickBubble(nestedA);
+    const nestedB = clickEvent(second);
+    h.onClickCapture(nestedB);
+
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(nestedB.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('the window is backstopped by a task, for an inside click whose handler stops propagation', async () => {
+    // A target handler that calls stopPropagation() means the bubble never
+    // reaches document, so the event-object match alone would strand the
+    // window open for the life of the overlay.
+    const panel = elWith();
+    const anchor = elWith();
+    const elsewhere = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, anchor, onDismiss);
+
+    h.onClickCapture(clickEvent(panel)); // no matching onClickBubble: swallowed
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const later = clickEvent(elsewhere);
+    h.onClickCapture(later);
+
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(later.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
   it('onDismiss returning false on the click-only fallback path skips the swallow', () => {
     // Mirror of the pointerdown-side test: a no-op dismiss (e.g. Drawer
     // already mid-close) must not eat the synthetic click either.
