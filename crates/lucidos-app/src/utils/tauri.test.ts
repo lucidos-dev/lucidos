@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { currentWindowLabel, listen, windowReadyToShow } from './tauri';
+import { checkAppUpdate, currentWindowLabel, listen, windowReadyToShow } from './tauri';
 
-const invoke = vi.fn(() => Promise.resolve());
+const invoke = vi.fn((): Promise<unknown> => Promise.resolve());
 
 /** Install the Tauri bridge stub, optionally with the per-window metadata the
  *  runtime injects into every main frame. */
@@ -70,5 +70,47 @@ describe('listen', () => {
     expect(currentWindowLabel()).toBeNull();
     stubInternals();
     expect(currentWindowLabel()).toBeNull();
+  });
+});
+
+/** The client BINARY owns `check_app_update` and the frontend BUNDLE owns this
+ *  call. The two reach each other across releases, so every shape the command
+ *  has ever returned arrives here. `invoke<T>` casts rather than checks, so an
+ *  unparsed payload lands straight in UI copy. */
+describe('checkAppUpdate', () => {
+  it('reads the offer, notes included', async () => {
+    invoke.mockResolvedValueOnce({ version: '0.27.0', notes: '## 0.27.0\n\nFixed things.' });
+    expect(await checkAppUpdate()).toEqual({ version: '0.27.0', notes: '## 0.27.0\n\nFixed things.' });
+  });
+
+  it('null when there is no update', async () => {
+    invoke.mockResolvedValueOnce(null);
+    expect(await checkAppUpdate()).toBeNull();
+  });
+
+  it('reads a bare version string from a client older than the notes field', async () => {
+    // The mirror of the bug that prompted this. There, a new client's struct
+    // reached a page expecting a string, and rendered "Lucidos [object Object]
+    // available". Here an old client's string reaches a page expecting the
+    // struct, and nothing downstream may see the difference.
+    invoke.mockResolvedValueOnce('0.26.4');
+    expect(await checkAppUpdate()).toEqual({ version: '0.26.4', notes: null });
+  });
+
+  it('drops notes that are not markdown text', async () => {
+    invoke.mockResolvedValueOnce({ version: '0.27.0', notes: { body: 'nope' } });
+    expect(await checkAppUpdate()).toEqual({ version: '0.27.0', notes: null });
+  });
+
+  it('rejects a shape it cannot read, rather than reporting no update', async () => {
+    // `null` is the answer for "up to date", so an unreadable payload must not
+    // borrow it: the caller records the rejection on the check-error surface.
+    invoke.mockResolvedValueOnce({ latest: { version: '0.27.0' } });
+    await expect(checkAppUpdate()).rejects.toThrow(/check_app_update/);
+  });
+
+  it('rejects a blank version', async () => {
+    invoke.mockResolvedValueOnce({ version: '  ', notes: null });
+    await expect(checkAppUpdate()).rejects.toThrow(/check_app_update/);
   });
 });

@@ -339,6 +339,16 @@ pub struct AppUpdateOffer {
 /// available, else `None`. The packaged workspace UI polls this (gated on running
 /// in the Tauri client) to drive the in-app update toast.
 /// No-op (`None`) in development.
+///
+/// **This return value is a compatibility surface.** This binary and the frontend
+/// calling it are installed separately, so either can be a release behind the
+/// other. Widening the struct is safe: an older page ignores a field it does not
+/// read.
+///
+/// Replacing the shape is not. This once answered the bare version string, and
+/// the struct that replaced it reached a page still expecting a string. That page
+/// rendered `Lucidos [object Object] available`. `utils/tauri.ts` parses both
+/// shapes now, so add fields here and never swap the outer type again.
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateOffer>, String> {
     if tauri::is_dev() {

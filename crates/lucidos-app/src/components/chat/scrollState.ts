@@ -310,9 +310,10 @@ function recordFollowSeed(on: boolean): void {
  *  Routed through `resumeFollowingBottom` rather than arming directly. It is the
  *  same act, and reusing it keeps the arming entry points at two.
  *
- *  For `in-place` the return is NOT the same as "the follow is now armed": that
- *  branch declines over a link that has already landed, and this cannot see it.
- *  Only the `live-edge` caller reads the return, and there the two coincide. */
+ *  For `in-place` the return is NOT the same as "the follow is now armed". That
+ *  branch declines over a link that landed OFF the live edge, and this cannot
+ *  see it. Only the `live-edge` caller reads the return, and the two coincide
+ *  there. */
 export function applyFollowSeed(el: HTMLElement, from: FollowResumeFrom = 'live-edge'): boolean {
   if (!_followSeed.value) return false;
   resumeFollowingBottom(el, from);
@@ -495,21 +496,33 @@ let _pendingLanding: { resolveTurn: TurnResolver; at: number } | null = null;
  *  growth branch inert. */
 const LANDING_DEADLINE_MS = 1000;
 
-/** The ONE at-the-live-edge threshold. 2px of slack absorbs subpixel rounding
- *  (mobile zoom, device-pixel snapping) and the iOS overscroll bounce, without
- *  making the chevron look stuck. Shared by the chevron's reconcile, the send's
- *  "are they already there" test and both observers, so they cannot drift. */
-function isAtLiveEdge(el: HTMLElement): boolean {
-  return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
-}
-
 /** The scroll offset the live edge sits at: the MAX offset rather than
  *  `scrollHeight`, which the browser would clamp to the same place. Naming the
  *  real target keeps every write meaningful instead of leaning on the clamp.
  *  One definition also keeps everything aiming at the live edge, or measuring
- *  against it, from drifting apart. Same reason as `isAtLiveEdge` above. */
+ *  against it, from drifting apart. */
 function liveEdgeTop(el: HTMLElement): number {
   return Math.max(0, el.scrollHeight - el.clientHeight);
+}
+
+/** The ONE at-the-live-edge threshold, asked of an OFFSET. 2px of slack absorbs
+ *  subpixel rounding (mobile zoom, device-pixel snapping) and the iOS overscroll
+ *  bounce, without making the chevron look stuck.
+ *
+ *  Taking an offset rather than reading `scrollTop` is what lets a navigation
+ *  ask it of a landing it has not made yet. Two do, and both must: turn stepping
+ *  reconciles the chevron against its target, and a deep link decides the ride's
+ *  fate by where it is about to come to rest. A target BEYOND the edge answers
+ *  true, the browser clamping it back to the edge. */
+function isLiveEdgeTop(el: HTMLElement, top: number): boolean {
+  return top >= liveEdgeTop(el) - 2;
+}
+
+/** Is the reader ON the live edge right now? Read by the chevron's reconcile,
+ *  the send's "are they already there" test and both observers. One definition,
+ *  so those cannot drift from each other or from the offset form above. */
+function isAtLiveEdge(el: HTMLElement): boolean {
+  return isLiveEdgeTop(el, el.scrollTop);
 }
 
 /** Can this transcript be scrolled at all? One definition, read by the up
@@ -599,11 +612,15 @@ function armFollowOn(el: HTMLElement | null) {
  *  it holds the OUTGOING thread's offset. Arming alone would leave the reader
  *  there until the next growth round.
  *
- *  `in-place` writes nothing, because a DEEP LINK owns where the reader is
- *  looking on this open. It holds the ride open for a link still IN FLIGHT, so a
- *  link that turns out dead costs the reader nothing. A link that LANDS ends the
- *  ride, and the guard in the branch below keeps this from reinstating it. Asked
- *  for by `standDownForDeepLink` and by `onPageWake`'s claim-held branch. */
+ *  `in-place` defers to a DEEP LINK, which owns where the reader is looking on
+ *  this open. For a link still IN FLIGHT it writes nothing at all, so one that
+ *  turns out dead costs the reader nothing.
+ *
+ *  A link that LANDED off the live edge ends the ride, and the guard in the
+ *  branch below keeps this from reinstating it. One that landed ON the edge is
+ *  heading where the ride was heading, so the ride takes its motion over. That
+ *  is the one case where `in-place` writes. Asked for by
+ *  `standDownForDeepLink` and by `onPageWake`'s claim-held branch. */
 export type FollowResumeFrom = 'live-edge' | 'in-place';
 
 /** Resume a standing follow the reader armed in this thread BEFORE they left it:
@@ -626,27 +643,47 @@ export function resumeFollowingBottom(el: HTMLElement, from: FollowResumeFrom = 
     // clear the held stamp `isFollowScroll` reads, which silently switches what
     // this landing records from the live edge to an offset.
     if (_followingBottom.value) return;
-    // ALREADY LANDED means the link has ended the ride ON PURPOSE
+    // LANDED OFF THE LIVE EDGE means the link has ended the ride ON PURPOSE
     // (`scrollToSelectorAndPulse`), because a link is a request to be at ONE
     // place. Resuming afterwards would undo that decision, so the resume is
-    // only for a link still IN FLIGHT: it holds the ride open until the answer
-    // is known.
+    // only for a link still IN FLIGHT or one that landed where the ride was
+    // heading anyway. Either way it holds the ride open until the answer is
+    // known.
     //
-    // It asks whether the LANDING happened, NOT whether the agent is running.
-    // Liveness is the wrong proxy in the commonest deep-link case, because
+    // It asks about the LANDING, never whether the agent is running. Liveness
+    // is the wrong proxy in the commonest deep-link case, because
     // `waiting_for_user_answer` is quiescent (`isRenderedThreadIdle`). A thread
     // parked on a question card therefore reads as IDLE.
     //
     // Both callers get it: `standDownForDeepLink`, which can run either side of
     // the landing, and `onPageWake`'s claim-held branch. One guard rather than
-    // an ordering rule at each.
-    if (deepLinkHasResolved()) return;
-    // No stamp: the reader is wherever the LINK put them, which is not a
-    // position the follow wrote and must not be recorded as the live edge. It
-    // is an ordinary offset, as it is for a same-thread link (see
-    // `currentPosition` in `hooks/useScrollMemory.ts`). The first growth round
-    // after the thread wakes stamps it properly.
-    armFollowOn(null);
+    // an ordering rule at each. That is also what makes the two resolve
+    // orderings agree, a cached thread resolving before this runs and an
+    // unloaded one after it.
+    if (deepLinkLandedOffLiveEdge()) return;
+    // A link that has ALREADY landed is, by the guard above, heading for the
+    // live edge. So the ride TAKES ITS MOTION OVER rather than arming beside
+    // it, exactly as the landing itself does when the ride is already armed.
+    //
+    // Arming beside it is not enough, and the case is the ordinary cross-thread
+    // tap. `focusThread` retired the ride before the link resolved, so the
+    // landing ran as a plain element tween, and `.thread-content` arrives
+    // holding the OUTGOING thread's offset. Those frames therefore travel a
+    // long way marking plain navigation, which is not where the follow held
+    // anybody. Every one of them records this thread's position as an offset,
+    // and the ride the reader never ended is lost on the way back in.
+    if (deepLinkHasResolved()) {
+      armFollowOn(el);
+      rideToLiveEdge(el);
+      return;
+    }
+    // Still in flight, so the link owns a position nobody knows yet and this
+    // writes nothing. The stamp follows the POSITION, the reader being wherever
+    // the open left them. OFF the edge that is an ordinary offset, which the
+    // follow never wrote and must not record as the live edge (see
+    // `currentPosition` in `hooks/useScrollMemory.ts`). ON the edge it is
+    // exactly what the follow writes, so stamping is honest there.
+    armFollowOn(isAtLiveEdge(el) ? el : null);
     return;
   }
   armFollowOn(el);
@@ -1145,9 +1182,9 @@ function snapToLiveEdge(el: HTMLElement): void {
  *  re-targeting it would only restart the easing part-way. Every other tween is
  *  superseded, a deep-link's and a chevron's included.
  *
- *  A LANDING glide cannot be the tween it finds. Reaching this branch means the
- *  follow is armed, and the only thing that arms it cancels whatever tween is in
- *  flight on its way. */
+ *  A LANDING glide is superseded rather than stood down for, by
+ *  `animateScroll`'s own cancel. Every caller here is serving an ARMED follow,
+ *  which outranks a landing the reader has since navigated past. */
 function glideToLiveEdge(el: HTMLElement): void {
   if (_heldAnim && _heldAnimTarget === 'live-edge') return;
   if (prefersReducedMotion()) {
@@ -1159,6 +1196,28 @@ function glideToLiveEdge(el: HTMLElement): void {
   // container, and then no scroll event arrives to do it.
   animateScroll(liveEdgeTop, syncAwayFromBottom, markHeldScroll);
   _heldAnimTarget = 'live-edge';
+}
+
+/** Take a rider to the live edge, writing nothing where they are already on it.
+ *  That half is not tidiness. A redundant tween cancels an iOS momentum scroll.
+ *  And a write that moves nothing fires no scroll event for the chevron to
+ *  settle on, hence the reconcile instead.
+ *
+ *  It still SUPERSEDES a tween there, which the glide would have done through
+ *  `animateScroll`. A tween in flight is taking the rider somewhere else, and
+ *  both callers outrank it: pressing the toggle asks to stay at the bottom, and
+ *  a link owns the viewport. Without it an up-chevron glide tapped a frame
+ *  earlier still reads as at-the-edge. It survives, and carries the reader to
+ *  the top with the link's marker left on a turn at the bottom.
+ *
+ *  THREE callers, and each has armed the follow on the line above. They are the
+ *  toggle's own press, a deep link whose landing IS the live edge, and the
+ *  resume over such a landing. Arming stays the caller's act, so this never
+ *  turns a navigation into a ride. */
+function rideToLiveEdge(el: HTMLElement): void {
+  if (!isAtLiveEdge(el)) { glideToLiveEdge(el); return; }
+  cancelScrollAnim();
+  syncAwayFromBottom();
 }
 
 /** THE SUBMIT REACTION. One function, because "same reaction everywhere" is a
@@ -1457,27 +1516,38 @@ function animateScroll(
   _scrollAnimRaf = requestAnimationFrame(step);
 }
 
-/** Scroll the active container so `el`'s top lands at the container top, minus
- *  the element's CSS `scroll-margin-top`. This is the "navigation to element"
- *  motion for a notification or Changes deep link.
+/** WHERE `el` comes to rest: the absolute `scrollTop` putting its top at the
+ *  container top, minus its CSS `scroll-margin-top`. That margin is the deep
+ *  link's header and fade clearance, per breakpoint in chat/response.css.
+ *  Reading the resolved px is what rests the element on the shared landing line.
  *
- *  It runs on the shared `animateScroll`, so the deep link and the chevrons
- *  scroll identically (ADR 0065). `scroll-margin-top` is the deep link's header
- *  and fade clearance, defined per breakpoint in chat/response.css. Reading the
- *  resolved px and subtracting it lands the element in the same place.
+ *  Returned as a per-container closure, because the tween re-reads it every
+ *  frame. The margin is resolved once: it is a breakpoint-level constant.
  *
- *  The target is recomputed each frame. An element still growing as markdown or
- *  images render is therefore tracked, and so is the whole transcript
- *  re-anchoring after a render-all. Reduced motion jumps instantly. */
-function smoothScrollToElement(el: HTMLElement): void {
+ *  ONE definition, and that is load-bearing rather than tidy. A deep link both
+ *  SCROLLS to this number and decides the ride's fate by it (see `tryResolve`).
+ *  Two copies could disagree about where the reader is going to end up. */
+function landingTargetOf(el: HTMLElement): (c: HTMLElement) => number {
   const marginTop =
     typeof getComputedStyle === 'function'
       ? (parseFloat(getComputedStyle(el).scrollMarginTop) || 0)
       : 0;
-  const targetOf = (c: HTMLElement) =>
+  return (c: HTMLElement) =>
     typeof c.getBoundingClientRect === 'function' && typeof el.getBoundingClientRect === 'function'
       ? el.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - marginTop
       : 0;
+}
+
+/** Scroll the active container so `el` rests on the landing line: the
+ *  "navigation to element" motion for a notification or Changes deep link.
+ *
+ *  It runs on the shared `animateScroll`, so the deep link and the chevrons
+ *  scroll identically (ADR 0065). The target is recomputed each frame. An
+ *  element still growing as markdown or images render is therefore tracked, and
+ *  so is the whole transcript re-anchoring after a render-all. Reduced motion
+ *  jumps instantly. */
+function smoothScrollToElement(el: HTMLElement): void {
+  const targetOf = landingTargetOf(el);
   if (prefersReducedMotion()) {
     cancelScrollAnim();
     const c = resolveTarget();
@@ -1576,8 +1646,7 @@ export function setFollowLiveEdge(on: boolean): void {
   const el = resolveTarget();
   if (!el) return;
   armFollowOn(el);
-  if (isAtLiveEdge(el)) { syncAwayFromBottom(); return; }
-  glideToLiveEdge(el);
+  rideToLiveEdge(el);
 }
 
 /** Jump the transcript to the bottom in one write: the reduced-motion form of
@@ -1711,6 +1780,37 @@ export function deepLinkHasResolved(): boolean {
   return _pendingEventScrollClaim !== null && _pendingEventScrollResolved;
 }
 
+/** Did the LAST LANDING rest somewhere other than the live edge? Reset with each
+ *  new claim, beside `_pendingEventScrollResolved`.
+ *
+ *  The last landing rather than the live claim's, because the write is ungated
+ *  exactly as the retirement it describes is. A superseded call still lands and
+ *  still acts on the ride, and the reader ends up where IT put them.
+ *
+ *  It records the PLACE rather than the retirement, and the difference decides a
+ *  real case. `focusThread` has already retired the ride on a cross-thread tap,
+ *  before the link resolves. So the landing retires nothing there, however high
+ *  in the transcript it rests. Reading the retirement would call a link to the
+ *  newest turn ride-ending. The resume below would then leave the reader at the
+ *  bottom with the toggle dark. */
+let _pendingEventScrollLandedOffEdge = false;
+
+/** Did a landing rest off the live edge? The state a resume must not overwrite:
+ *  there the landing named a place, and the ride ended on purpose. A landing AT
+ *  the live edge names the ride's own place, so a recorded ride is resumed over
+ *  it.
+ *
+ *  It asks the flag ALONE, and adds no `deepLinkHasResolved()` term. The flag is
+ *  false until something lands, so the resolve term buys nothing. It also takes
+ *  the answer away in one real case. A superseded call can land off the edge
+ *  while the NEWER claim is still resolving, and that landing retires the ride.
+ *  The newer claim has no resolve to report, so the resume would re-arm what the
+ *  landing just ended. A newer link that then turns out dead leaves the reader
+ *  following from the older one's event. */
+function deepLinkLandedOffLiveEdge(): boolean {
+  return _pendingEventScrollLandedOffEdge;
+}
+
 /** While true, the mobile hide-on-scroll header stays pinned fully visible (see
  *  `useHideOnScroll.onScroll`). The deep-link scroll lands the element at the
  *  container top minus its `scroll-margin-top`, which adds the fixed app header
@@ -1780,6 +1880,7 @@ function scrollToSelectorAndPulse(
   // the saved position over this one.
   _pendingEventScrollClaim = claim;
   _pendingEventScrollResolved = false;
+  _pendingEventScrollLandedOffEdge = false;
   // Announce the claim to anything holding a positioning decision of its own,
   // which is `useScrollMemory`'s saved-position restore (see
   // `onDeepLinkClaimed`). Notified AFTER the slot is set, so a listener asking
@@ -1800,6 +1901,7 @@ function scrollToSelectorAndPulse(
     if (_pendingEventScrollClaim === claim) {
       _pendingEventScrollClaim = null;
       _pendingEventScrollResolved = false;
+      _pendingEventScrollLandedOffEdge = false;
       deepLinkRenderAll.value = false;
     }
   };
@@ -1869,25 +1971,44 @@ function scrollToSelectorAndPulse(
     if (typeof document !== 'undefined' && document.dispatchEvent) {
       document.dispatchEvent(new Event('reveal-mobile-header'));
     }
-    // Going to a link ends the ride: the reader asked to be at THIS place, and
-    // the standing follow would carry them off it on the next token. Retired
-    // BEFORE the scroll below, so the landing's own frames are marked as a plain
-    // navigation. The reading position recorded for this thread is then the
-    // offset the link landed on.
-    //
-    // UNCONDITIONAL, and this is the one navigation that is. Not gated on the
-    // CLAIM being ours, because the two describe one landing and must not
-    // disagree. A superseded call still lands, since the pin, the scroll and the
-    // pulse below are all ungated. Gating this way would leave a reader who was
-    // just moved still following.
-    //
-    // Not gated on LIVE either, unlike the scroll disarm, the up chevron and
-    // turn stepping. Those three are browsing when the thread is quiet, so
-    // keeping the ride costs the reader nothing. A LINK names one event, and
-    // that ask is durable rather than a moment's position, so it must survive
-    // the thread waking. See ADR 0064 for the gate this replaced.
-    stopFollowingBottom();
-    smoothScrollToElement(target);
+    // WHERE THIS LANDING RESTS decides the ride's fate, and it is measured
+    // before anything moves. `landingTargetOf` is the number the scroll below
+    // aims at, so the two cannot answer differently.
+    const container = resolveTarget();
+    const landsOnTheEdge =
+      !!container && isLiveEdgeTop(container, landingTargetOf(target)(container));
+    if (container && landsOnTheEdge && _followingBottom.value) {
+      // The link and the ride ask for the same place, so there is nothing to
+      // retire. The reader tapped a notification pointing at the newest turn,
+      // and the ride was already holding them there.
+      //
+      // Served by the RIDE's own motion rather than by the element tween. Both
+      // rest in the same place, the browser clamping the element's target back
+      // to the edge. Only this one marks its frames as HELD, which is what keeps
+      // `isFollowScroll` true and records the live edge as the reading position.
+      // It also re-reads a growing bottom per frame, where the element's own top
+      // stops being the edge the moment the reply resumes.
+      rideToLiveEdge(container);
+    } else {
+      // Going to a link ends the ride: the reader asked to be at THIS place, and
+      // the standing follow would carry them off it on the next token. Retired
+      // BEFORE the scroll below, so the landing's own frames are marked as a
+      // plain navigation. The reading position recorded for this thread is then
+      // the offset the link landed on.
+      //
+      // Not gated on the CLAIM being ours, because the two describe one landing
+      // and must not disagree. A superseded call still lands, since the pin, the
+      // scroll and the pulse are all ungated. Gating this way would leave a
+      // reader who was just moved still following.
+      //
+      // Not gated on LIVE either, unlike the scroll disarm, the up chevron and
+      // turn stepping. Those three are browsing when the thread is quiet, so
+      // keeping the ride costs the reader nothing. A LINK names one event, and
+      // that ask is durable rather than a moment's position, so it must survive
+      // the thread waking. See ADR 0064 for the gate this replaced.
+      stopFollowingBottom();
+      smoothScrollToElement(target);
+    }
     // Record and announce the landing AFTER the scroll above. Two things read
     // this, and the second is why the order matters. One wants to know the link
     // is no longer a candidate for the dead-link rescue. The other records WHERE
@@ -1895,9 +2016,17 @@ function scrollToSelectorAndPulse(
     // above IS the whole landing, so announcing first would hand that recorder
     // the position the reader was leaving.
     //
-    // Only while the claim is still OURS. A superseded call keeps observing
-    // until its own deadline, and letting its late resolve speak for a newer
-    // link's claim is the collision the claim is an object to prevent.
+    // WHERE the landing rested is recorded UNGATED, exactly as the retirement
+    // above is, and for the one reason: they are two halves of one decision and
+    // must not disagree. A superseded call still lands, and still acts on the
+    // ride. A flag it declined to write would describe the newer link while the
+    // reader sat at the older one's target. The resume would then reinstate a
+    // ride that landing had just ended.
+    _pendingEventScrollLandedOffEdge = !landsOnTheEdge;
+    // The RESOLVE is gated, unlike the line above, because it is about the
+    // CLAIM rather than the landing. A superseded call keeps observing until
+    // its own deadline. Letting its late resolve speak for a newer link's claim
+    // is the collision the claim is an object to prevent.
     if (_pendingEventScrollClaim === claim) {
       _pendingEventScrollResolved = true;
       for (const listener of _deepLinkResolvedListeners) listener();
@@ -2053,6 +2182,7 @@ export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions)
 export function clearPendingEventScroll(): void {
   _pendingEventScrollClaim = null;
   _pendingEventScrollResolved = false;
+  _pendingEventScrollLandedOffEdge = false;
   deepLinkRenderAll.value = false;
   // A plain focus or explicit scroll is deliberate engagement elsewhere, so drop
   // any persistent focus marker rather than let it leak onto the next thread.
@@ -2188,8 +2318,8 @@ export function stepThreadTurn(direction: 1 | -1): void {
   // at or beyond the live edge, so the browser clamps the scroll to the bottom.
   // When the container is ALREADY at the bottom the clamped write moves nothing,
   // so no scroll event fires and `onScroll` never reconciles the chevron. The
-  // 2px slack mirrors `isAtLiveEdge`.
-  awayFromBottom.value = targetOf(el) < liveEdgeTop(el) - 2;
+  // threshold is `isLiveEdgeTop`, the same one a deep link's landing asks.
+  awayFromBottom.value = !isLiveEdgeTop(el, targetOf(el));
 
   // A deliberate jump AWAY from the live edge ends the ride, and it has to say
   // so itself. A scroll only speaks for the reader when a gesture is behind it,

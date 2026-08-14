@@ -174,7 +174,7 @@ fn thinking_config(
 /// `provider_tag` labels the pre-flight stub-injection log line.
 pub(crate) fn build_claude_request(
     mut messages: Vec<Message>,
-    tools: Vec<ToolDefinition>,
+    mut tools: Vec<ToolDefinition>,
     model: &str,
     system_prompt: Option<&str>,
     reasoning_effort: Option<&str>,
@@ -193,6 +193,21 @@ pub(crate) fn build_claude_request(
             "[{}] WARNING: pre-flight injected {} stub tool_result block(s) before Claude API call (model={})",
             provider_tag,
             stubs,
+            model
+        );
+    }
+
+    // Pre-flight: a tool name outside `^[a-zA-Z0-9_-]{1,128}$` makes the API
+    // reject the ENTIRE request, so one bad name would otherwise cost the turn
+    // rather than the tool. Every thread in the workspace then fails the same
+    // way, including the one asking what broke. Reaching here means an
+    // upstream layer built a name it should not have.
+    for name in crate::llm::validate::drop_unsafe_tool_names(&mut tools) {
+        crate::log!(
+            "[{}] WARNING: dropped tool {:?} before Claude API call: name is not \
+             ^[a-zA-Z0-9_-]{{1,128}}$ (model={})",
+            provider_tag,
+            name,
             model
         );
     }

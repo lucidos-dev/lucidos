@@ -76,9 +76,10 @@ describe('stripReleaseHeading', () => {
   // the CHANGELOG section HEADER INCLUDED, unlike the engine's parser. Left on,
   // the offered row prints its version a second time as an h2 inside its body.
 
-  it('takes the heading off and keeps its date', () => {
+  it('takes the heading off and keeps the version and date it named', () => {
     const notes = `## v9.9.9 ${EM_DASH} 2026-09-01\n\n### Added\n\n- the new thing\n`;
     expect(stripReleaseHeading(notes)).toEqual({
+      version: '9.9.9',
       date: '2026-09-01',
       body: '### Added\n\n- the new thing',
     });
@@ -92,6 +93,7 @@ describe('stripReleaseHeading', () => {
 
   it('leaves notes that carry no heading exactly as they are', () => {
     expect(stripReleaseHeading('### Added\n\n- a thing')).toEqual({
+      version: null,
       date: null,
       body: '### Added\n\n- a thing',
     });
@@ -99,11 +101,15 @@ describe('stripReleaseHeading', () => {
 
   it('does not mistake a prose heading for a release one', () => {
     const notes = '## various notes\n\n- a thing';
-    expect(stripReleaseHeading(notes).body).toBe(notes);
+    expect(stripReleaseHeading(notes)).toEqual({ version: null, date: null, body: notes });
   });
 
   it('yields no date for a heading that carries only a version', () => {
-    expect(stripReleaseHeading('## v1.0.0\n\nbody')).toEqual({ date: null, body: 'body' });
+    expect(stripReleaseHeading('## v1.0.0\n\nbody')).toEqual({
+      version: '1.0.0',
+      date: null,
+      body: 'body',
+    });
   });
 });
 
@@ -128,6 +134,28 @@ describe('offeredRelease', () => {
 
   it('renders no row when there is no update to describe', () => {
     expect(offeredRelease(null, '### Added')).toBe(null);
+  });
+
+  it('names the release its own notes name, not the argument', () => {
+    // The argument comes from `latestTauriAppVersion`, which the health poll
+    // overwrites with the engine's `latest_tauri_app_version`. On a dev
+    // workspace that is a CalVer app build id, and the row wore it.
+    const offered = offeredRelease('2026.08.13.1', `## v9.9.9 ${EM_DASH} 2026-09-01\n\n- a thing`);
+    expect(offered?.version).toBe('9.9.9');
+  });
+
+  it('still takes the argument when the notes name no release', () => {
+    // A hand-cut manifest whose body is bare notes. The argument is the only
+    // thing left that can name the row.
+    expect(offeredRelease('9.9.9', '- a thing')?.version).toBe('9.9.9');
+  });
+
+  it('renders no row for a release the list below already carries', () => {
+    // The list can now reach past the running release, so the offer and the
+    // history can name the same version. One version, one row.
+    const known = [{ version: '9.9.9', date: '2026-09-01', notes: '- a thing' }];
+    expect(offeredRelease('9.9.9', `## v9.9.9\n\n- a thing`, known)).toBe(null);
+    expect(offeredRelease('9.9.9', `## v9.9.10\n\n- a thing`, known)?.version).toBe('9.9.10');
   });
 
   it('renders no row when the manifest carried no notes', () => {

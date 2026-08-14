@@ -85,7 +85,7 @@ export function ClearIcon() {
 
 // The class is not decoration: this glyph paints far less of its viewBox than
 // the icons it sits beside, so the boxes that hold it correct for that by name.
-// See `.icon-btn.row-icon .trash-icon` in styles/global/host-components.css.
+// See the `.trash-icon` rule in styles/global/host-components.css.
 export function TrashIcon() {
   return (
     <svg class="trash-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

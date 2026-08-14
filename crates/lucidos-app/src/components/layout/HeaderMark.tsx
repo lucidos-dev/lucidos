@@ -29,9 +29,13 @@ import { WorkspacesMenuRow } from './WorkspaceSwitcher';
  *
  *  Pure, so `vnodeToText` can flatten it with no DOM: which element it becomes
  *  and which classes it carries IS this surface's behaviour, the same way it is
- *  for the workspace rows. */
+ *  for the workspace rows.
+ *
+ *  The SHORT detail. The panel is `--brand-menu-width` wide, so the explainer
+ *  wrapped to three lines and pushed every row below it down. The connection
+ *  bar states the full sentence, on screen and without a tap. */
 export function connectionNoticeRow(status: ConnectionStatus, workspace: string | null) {
-  const notice = connectionNotice(status, workspace);
+  const notice = connectionNotice(status, workspace, 'short');
   if (!notice) return null;
   return (
     <div class={`brand-menu-notice brand-menu-notice-${status}`} role="none">
@@ -291,13 +295,13 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
   // `brandBadgeTooltip`): the state is a second fact about the mark, not a
   // subordinate clause of the first.
   //
-  // The degraded states spend the second half on the WHOLE notice rather than on
-  // the phrase alone. Naming the state is enough while everything works, and is
-  // the least useful half of what we know once it does not: "disconnected from
-  // dev" leaves the reader to guess whether anything still functions, which is
-  // the guess the detail sentence answers. Same table as the bar and the menu
-  // notice, so a hover and a glance cannot disagree.
-  const sentence = connectionNoticeSentence(status, visibleWorkspaceName.value);
+  // The degraded states spend the second half on the notice rather than on the
+  // phrase alone. Naming the state is enough while everything works, and is the
+  // least useful half of what we know once it does not. The SHORT detail: a
+  // tooltip is read at a glance, and the bar under this row is already stating
+  // the rest of it in full. Same table as the bar and the menu notice, so a
+  // hover and a glance cannot disagree.
+  const sentence = connectionNoticeSentence(status, visibleWorkspaceName.value, 'short');
   const label = inRow
     ? 'Lucidos menu'
     : `Lucidos menu · ${sentence ?? connectionPhrase(status, visibleWorkspaceName.value)}`;

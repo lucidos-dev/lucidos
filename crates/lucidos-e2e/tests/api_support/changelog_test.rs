@@ -26,13 +26,22 @@ async fn changelog_returns_every_release_newest_first() {
     );
 
     // The panel marks "you are running this" by matching /health's `release`
-    // against a version in this list. They come from two different baked
-    // constants (RELEASE and CHANGELOG.md), so nothing but this holds them
-    // together, and a drift would leave the panel silently marking nothing.
-    assert_eq!(
-        releases[0]["version"],
-        lucidos_engine::LUCIDOS_RELEASE,
-        "the newest release should be the one this engine reports running"
+    // against a version in this list, so the list has to CONTAIN it. Nothing
+    // else holds the two together, and a drift would leave the panel silently
+    // marking nothing.
+    //
+    // Contains, not equals-the-newest. The endpoint serves the newest changelog
+    // it can reach, which on a branch cut before the last release is ahead of
+    // this binary. That is the point of the panel, and it is the same property
+    // `changelog::select_releases` trusts a fresher source on.
+    let versions: Vec<&str> = releases
+        .iter()
+        .filter_map(|r| r["version"].as_str())
+        .collect();
+    assert!(
+        versions.contains(&lucidos_engine::LUCIDOS_RELEASE),
+        "the release this engine reports running ({}) should have notes; got {versions:?}",
+        lucidos_engine::LUCIDOS_RELEASE
     );
 
     for release in releases {
@@ -52,12 +61,14 @@ async fn changelog_returns_every_release_newest_first() {
     }
 }
 
-/// The endpoint reads a compile-time constant, so it must answer identically
-/// whatever the workspace, the checkout or the database are doing. A handler
-/// that grew a filesystem or state dependency would show up here as a difference
-/// between two calls, and on a packaged install as an empty panel.
+/// The endpoint needs no workspace and no database, and asking twice must not
+/// answer twice differently. It does read the checkout, and it may fetch the
+/// published changelog. So repeatability is a property of the cache in front of
+/// that fetch, rather than of a constant. A second call that disagreed would
+/// mean the cache is not holding, and the panel would flicker between two
+/// histories.
 #[tokio::test]
-async fn changelog_is_stateless_and_repeatable() {
+async fn changelog_answers_the_same_twice() {
     let client = http_client();
     let url = format!("{}/api/v1/engine/changelog", base_url());
 

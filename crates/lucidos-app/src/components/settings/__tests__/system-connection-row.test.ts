@@ -33,7 +33,9 @@ const systemCss: string = readFileSync(
 describe('the Connection block reads the shared notice', () => {
   it('takes both halves from the one table', () => {
     expect(source).toContain("import { connectionNotice } from '../../utils/connectionNotice'");
-    expect(source).toContain('const notice = connectionNotice(status, name);');
+    // The FULL detail, like the bar: this page has a paragraph's room, and a
+    // user reading it came here for the whole state.
+    expect(source).toContain("const notice = connectionNotice(status, name, 'full');");
     expect(source).toContain('{notice ? notice.title : \'Connected\'}');
     expect(source).toContain('<p class="system-status-note">{notice.detail}</p>');
   });

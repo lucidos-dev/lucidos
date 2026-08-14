@@ -26,6 +26,43 @@ type McpServerRow = (
     chrono::DateTime<chrono::Utc>,
 );
 
+/// Longest server id that still leaves room for `mcp__<id>__<tool>` with one
+/// character of tool name. Past it the wire name is truncated through the
+/// separator, and no tool call parses back to a server.
+pub(crate) const MAX_SERVER_ID_LEN: usize =
+    crate::llm::validate::MAX_TOOL_NAME_LEN - "mcp__".len() - "__".len() - 1;
+
+/// Reject a server id the tool-name layer could not carry.
+///
+/// The id is half of every wire tool name (`mcp__<id>__<tool>`), so it has to
+/// survive that round trip untouched. `__` is the separator itself. Any other
+/// character outside the Messages API alphabet would be rewritten, leaving a
+/// server whose tools are visible but cannot be dispatched.
+pub(crate) fn validate_server_id(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let shape = "use letters, digits, '-' and single '_' (e.g. 'backstage', 'dev-docs')";
+    if !crate::llm::validate::is_wire_safe_tool_name(id) {
+        return Err(format!("MCP server id '{}' is not usable: {}", id, shape).into());
+    }
+    if id.contains("__") {
+        return Err(format!(
+            "MCP server id '{}' must not contain '__', which separates the id from the tool name: {}",
+            id, shape
+        )
+        .into());
+    }
+    if id.len() > MAX_SERVER_ID_LEN {
+        return Err(format!(
+            "MCP server id '{}' is {} characters, over the {} that fit in a tool name: {}",
+            id,
+            id.len(),
+            MAX_SERVER_ID_LEN,
+            shape
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The registry of external MCP servers whose tools the agent can call.
 ///
 /// **No caller can skip the event.** [`Self::register`], [`Self::unregister`]
@@ -179,6 +216,7 @@ impl McpServerStore {
         env: &std::collections::HashMap<String, String>,
         actor: Option<MessageOrigin>,
     ) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
+        validate_server_id(id)?;
         let server = Self::upsert_row(pool, id, name, command, args, env).await?;
         event_bus
             .emit_or_log(
@@ -253,6 +291,40 @@ impl McpServerStore {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An id that cannot round-trip through `mcp__<id>__<tool>` is refused
+    /// where the cause is obvious. The alternative is a server whose tools the
+    /// agent can see but never call.
+    #[test]
+    fn server_id_must_survive_the_wire_tool_name() {
+        for ok in ["backstage", "dev-docs", "roblox_studio", "bq2"] {
+            assert!(validate_server_id(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["", "back.stage", "my server", "a__b", "café"] {
+            assert!(
+                validate_server_id(bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    /// An id can be wire-safe on its own and still leave no room for the
+    /// separator plus a tool name. The composed name is then truncated through
+    /// the `__`, and every tool the server advertises fails to parse back.
+    #[test]
+    fn the_longest_accepted_server_id_still_leaves_room_for_a_tool() {
+        let longest = "a".repeat(MAX_SERVER_ID_LEN);
+        assert!(validate_server_id(&longest).is_ok());
+        assert!(validate_server_id(&"a".repeat(MAX_SERVER_ID_LEN + 1)).is_err());
+
+        // The tightest wire name that id can produce still round-trips.
+        let wire = crate::llm::validate::wire_safe_tool_name(&format!("mcp__{longest}__x"));
+        assert!(crate::llm::validate::is_wire_safe_tool_name(&wire));
+        assert_eq!(
+            crate::mcp::McpManager::parse_mcp_tool_name(&wire),
+            Some((longest, "x".to_string()))
+        );
+    }
 
     /// Registering an MCP server changes the agent's own tool surface, and
     /// auto-approve decides whether those tools prompt. Both now reach the

@@ -125,6 +125,21 @@ This applies to the **`.dmg` desktop app only**. The headless install (the
 `curl … | sh` runtime) has no updater: neither the gateway nor the engine polls
 for releases, and you update it by re-running the installer.
 
+### Release notes
+
+Opening **Settings > System > What's New** fetches the project's published
+changelog. That is what lets the panel show you a release newer than the copy
+you are running. The request goes to
+`raw.githubusercontent.com/lucidos-dev/lucidos/main/CHANGELOG.md` and tells
+GitHub your IP address, under GitHub's privacy policy. It is a plain download of
+a public file. It carries no workspace data, no usage information, and not even
+your version.
+
+Unlike the update check above, this is **not** recurring: it happens when you
+open the panel, never on a schedule, and the answer is reused for hours. If it
+fails, the panel silently shows the release notes that shipped inside your own
+copy, so it still works offline.
+
 ### Plugins and plugin marketplaces
 
 Plugins live in **git repositories**. Installing a plugin clones or fetches from
@@ -142,11 +157,15 @@ install a plugin or add a marketplace yourself.
 Lucidos contains **no telemetry**. It does not collect analytics or usage
 statistics, does not send crash or error reports to us or any third party, and
 does not phone home — there is no Lucidos-operated server for it to report to.
-The only network traffic Lucidos originates is the activity described above:
-LLM, tool, coding-agent and plugin calls, each either serving a task you
-initiated or polling a source you configured; the desktop app's update check
-against GitHub Releases; and the service worker's checks against **your own
-local engine** for a fresh frontend build.
+Lucidos originates no network traffic beyond the activity described above:
+
+- LLM, tool, coding-agent and plugin calls. Each one serves a task you
+  initiated, or polls a source you configured.
+- The desktop app's update check against GitHub Releases.
+- The *What's New* panel's download of the published changelog, when you open
+  it.
+- The service worker's checks against **your own local engine** for a fresh
+  frontend build.
 
 ## Questions and reports
 

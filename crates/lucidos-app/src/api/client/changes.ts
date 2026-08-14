@@ -224,6 +224,13 @@ export interface EngineVersionStatus {
    *  and lands right back here. The UI withholds the button and names the
    *  operator fix instead. Absent/false when packaged. */
   rebuild_wedged?: boolean;
+  /** Dev only: why the last build failed, present only with
+   *  `build_state: 'failed'`. The toast renders this INSTEAD of pointing at the
+   *  engine log, which is unreachable on the phone the toast is often read on.
+   *
+   *  Absent on a failure means the output could not be read back. The toast
+   *  then reports an unknown cause, rather than dressing one up. */
+  build_failure?: BuildFailure;
   /** Dev only: the checkout-shared engine-build lock is currently held — a
    *  background rebuild of the shared binary is in flight (a co-located peer
    *  workspace's build OR this engine's own). Lets a workspace that lost the
@@ -248,6 +255,26 @@ export interface EngineVersionStatus {
    *  no build is in flight), never "none pending". A present object with
    *  `total: 0` is the only way to say there is nothing to bring. */
   pending_commits?: PendingCommits;
+}
+
+/** Why a background build failed, reduced to what a toast can carry.
+ *
+ *  One line rather than a log tail, because this IS the message: the engine log
+ *  it replaces cannot be opened from a phone. See engine `BuildFailure`. */
+export interface BuildFailure {
+  /** The first real error line from the build. For a build-script panic this is
+   *  the panic message, not cargo's generic "failed to run custom build
+   *  command", which says nothing a reader can use. */
+  summary: string;
+  /** The shell command that clears this failure, when the class is recognized
+   *  and its fix is exact. Absent for an ordinary compile error, whose fix is
+   *  to change the code. */
+  remedy?: string;
+  /** Retrying is PROVED futile, so the toast withholds Retry (the
+   *  `rebuild_wedged` treatment for a failing build). Never inferred from
+   *  silence: an unreadable or unrecognized failure is `false`, since retiring
+   *  the button wrongly strands a build that would have succeeded. */
+  repeatable: boolean;
 }
 
 /** Which bucket a pending commit falls in, from its conventional-commit type.

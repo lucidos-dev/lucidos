@@ -646,7 +646,7 @@ mod tests {
             "engine1"
         ));
         assert!(!frontend_advance_is_safe(
-            &BuildState::Failed,
+            &BuildState::failed_with(None),
             Some("engine1"),
             "engine1"
         ));

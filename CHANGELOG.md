@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.27.1 — 2026-08-14
+
+### Changed
+
+- A workspace row opens in a second window. Right-click the row, in the picker or in the in-app switcher, and pick Open in New Window. The item also leads the row's overflow menu, so touch and keyboard reach it.
+- What's New lists every release published, including ones newer than the running build. It reads the newest changelog it can reach: the public repository, the local checkout, then the copy baked into the binary.
+- The connection notice names the engine serving the workspace and explains itself once. The header bar and Settings > System carry the full sentence; the Lucidos menu and the mark's tooltip carry the recovery line alone.
+- An MCP server id is capped in length, and a server whose id cannot produce usable tool names refuses to start.
+
+### Fixed
+
+- MCP tool names are wire-safe, so one server can no longer make every model request fail. Two servers offering the same tool name each get a distinct wire name, assigned in a stable order that does not shift when a tool is granted or revoked.
+- An update offer names the release it is offering, instead of reading "Lucidos [object Object] available", and a failed update check reports the reason without an "Error:" prefix.
+- Opening a thread holds the skeleton until the transcript is on screen, not just until the fetch returns, so the iOS PWA no longer flashes a blank screen.
+- A deep link that lands at the live edge keeps following new output, and one that lands further up stops following, including when a second link overtakes the first mid-scroll.
+- The composer keeps the Diff button on the bottom row whenever the row has space for it.
+- Two clients opening What's New at the same moment download the changelog once between them.
 ## v0.27.0 — 2026-08-14
 
 ### Added

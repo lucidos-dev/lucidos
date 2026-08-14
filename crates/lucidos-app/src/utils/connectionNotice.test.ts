@@ -18,7 +18,12 @@ import { dirname, join, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { connectionNotice, connectionNoticeSentence, connectionPhrase } from './connectionNotice';
+import {
+  connectionNotice,
+  connectionNoticeSentence,
+  connectionPhrase,
+  hasConnectionNotice,
+} from './connectionNotice';
 import type { ConnectionStatus } from '../store/types';
 
 const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting'];
@@ -27,18 +32,27 @@ const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting'];
  *  tooltip, so it has to read as English in all three states and survive the
  *  window before /health has named the workspace. */
 describe('connectionPhrase', () => {
-  it('names what the mark is connected to, with the preposition each state wants', () => {
-    expect(connectionPhrase('connected', 'dev')).toBe('connected to dev');
-    expect(connectionPhrase('connecting', 'dev')).toBe('connecting to dev');
+  it('names the ENGINE it is reaching, not the workspace that owns it', () => {
+    // The workspace has not gone anywhere: the gateway keeps listing and
+    // switching workspaces throughout an outage. What stopped answering is the
+    // process serving this one, and saying so is the difference between an
+    // alarming claim and a true one.
+    expect(connectionPhrase('connected', 'dev')).toBe('connected to the dev engine');
+    expect(connectionPhrase('connecting', 'dev')).toBe('connecting to the dev engine');
     // Not "disconnected TO dev": each state brings its own preposition for
     // exactly this one.
-    expect(connectionPhrase('disconnected', 'dev')).toBe('disconnected from dev');
+    expect(connectionPhrase('disconnected', 'dev')).toBe('disconnected from the dev engine');
   });
 
-  it('falls back to the bare state before the workspace has a name', () => {
+  it('keeps the noun when the workspace has no name yet', () => {
+    // Before /health first answers there is nothing to name. A title of one
+    // bare state word would leave the sentence under it with nothing to be
+    // about.
     for (const state of ['connected', 'connecting', 'disconnected']) {
-      expect(connectionPhrase(state, null)).toBe(state);
-      expect(connectionPhrase(state, '')).toBe(state);
+      for (const nameless of [null, '']) {
+        expect(connectionPhrase(state, nameless)).toContain('the engine');
+        expect(connectionPhrase(state, nameless)).toContain(state);
+      }
     }
   });
 
@@ -50,30 +64,50 @@ describe('connectionPhrase', () => {
 describe('connectionNotice', () => {
   it('speaks for exactly the states the mark dims for', () => {
     for (const state of DIMMED) {
-      expect(connectionNotice(state, 'dev'), `${state} leaves the mark receded`).not.toBeNull();
+      expect(connectionNotice(state, 'dev', 'full'), `${state} leaves the mark receded`)
+        .not.toBeNull();
+      // The bar decides whether to exist at all from this, so it has to answer
+      // for the same set the words are written for.
+      expect(hasConnectionNotice(state)).toBe(true);
     }
     // The mark is at full strength, so there is nothing to explain.
-    expect(connectionNotice('connected', 'dev')).toBeNull();
+    expect(connectionNotice('connected', 'dev', 'full')).toBeNull();
+    expect(hasConnectionNotice('connected')).toBe(false);
   });
 
   it('titles itself with the phrase the toggle already says, sentence-cased', () => {
-    // One table, so the tooltip cannot say "disconnected from dev" while the
-    // panel says something else. The preposition each state wants is decided in
+    // One table, so the tooltip cannot name one thing while the panel names
+    // another. The preposition each state wants is decided in
     // `connectionPhrase` and nowhere twice.
     for (const state of DIMMED) {
       const phrase = connectionPhrase(state, 'dev');
-      expect(connectionNotice(state, 'dev')!.title)
+      expect(connectionNotice(state, 'dev', 'short')!.title)
         .toBe(phrase.charAt(0).toUpperCase() + phrase.slice(1));
     }
-    expect(connectionNotice('disconnected', 'dev')!.title).toBe('Disconnected from dev');
-    expect(connectionNotice('connecting', 'dev')!.title).toBe('Connecting to dev');
+    expect(connectionNotice('disconnected', 'dev', 'short')!.title)
+      .toBe('Disconnected from the dev engine');
+    expect(connectionNotice('connecting', 'dev', 'short')!.title)
+      .toBe('Connecting to the dev engine');
   });
 
-  it('falls back to the bare state before the workspace has a name', () => {
+  it('still names the engine before the workspace has a name', () => {
     // The window before /health answers, which is exactly when the mark is
     // breathing and the notice is most likely to be read.
-    expect(connectionNotice('connecting', null)!.title).toBe('Connecting');
-    expect(connectionNotice('disconnected', '')!.title).toBe('Disconnected');
+    expect(connectionNotice('connecting', null, 'short')!.title).toBe('Connecting to the engine');
+    expect(connectionNotice('disconnected', '', 'short')!.title)
+      .toBe('Disconnected from the engine');
+  });
+
+  it('grows the full form out of the short one, never a second sentence', () => {
+    // The two lengths are one table read twice: full is the consequence with
+    // the short form after it. Two authored strings would drift on the first
+    // reword, which is why the clauses are stored apart.
+    for (const state of DIMMED) {
+      const short = connectionNotice(state, 'dev', 'short')!.detail;
+      const full = connectionNotice(state, 'dev', 'full')!.detail;
+      expect(full.endsWith(short), `${state}'s full detail ends with its short one`).toBe(true);
+      expect(full.length).toBeGreaterThan(short.length);
+    }
   });
 
   it('promises recovery only where recovery is honest', () => {
@@ -81,21 +115,27 @@ describe('connectionNotice', () => {
     // engine we cannot reach, and Refresh reloads a client that is not what
     // broke. The health poll genuinely does recover on its own, so that is the
     // only thing the line may claim.
-    const detail = connectionNotice('disconnected', 'dev')!.detail;
-    expect(detail).toContain('Still trying');
+    // The short form is that claim alone, at the interval the poll runs at.
+    expect(connectionNotice('disconnected', 'dev', 'short')!.detail)
+      .toBe('Retrying every few seconds.');
     for (const remedy of ['Refresh', 'Restart']) {
-      expect(detail, `naming ${remedy} as the fix would be wrong in the ordinary case`)
+      expect(connectionNotice('disconnected', 'dev', 'full')!.detail,
+        `naming ${remedy} as the fix would be wrong in the ordinary case`)
         .not.toContain(remedy);
     }
   });
 
-  it('claims only this workspace, since the gateway is a different process', () => {
+  it('claims only this workspace, and only where there is room to scope it', () => {
     // `connectionStatus` is driven solely by `/api/v1/health` against this
     // workspace's engine, and the Workspaces row under the notice reaches the
     // GATEWAY instead, so it keeps listing and switching through an engine
     // outage. A blanket "nothing loads or sends" is refuted by the row directly
     // below the sentence making the claim.
-    expect(connectionNotice('disconnected', 'dev')!.detail).toContain('in this workspace');
+    // The full form scopes the claim. The short form makes none at all, which
+    // is what lets the menu state it above a switcher that still works.
+    expect(connectionNotice('disconnected', 'dev', 'full')!.detail).toContain('in this workspace');
+    expect(connectionNotice('disconnected', 'dev', 'short')!.detail)
+      .not.toContain('loads or sends');
   });
 });
 
@@ -103,13 +143,18 @@ describe('connectionNoticeSentence', () => {
   it('joins the two halves for a surface with a name but no room for both', () => {
     // Derived rather than authored, so an accessible name cannot drift from the
     // text rendered beside it.
-    const notice = connectionNotice('disconnected', 'dev')!;
-    expect(connectionNoticeSentence('disconnected', 'dev'))
+    const notice = connectionNotice('disconnected', 'dev', 'short')!;
+    expect(connectionNoticeSentence('disconnected', 'dev', 'short'))
       .toBe(`${notice.title}. ${notice.detail}`);
   });
 
+  it('carries whichever length it was asked for', () => {
+    expect(connectionNoticeSentence('disconnected', 'dev', 'full'))
+      .toContain(connectionNotice('disconnected', 'dev', 'full')!.detail);
+  });
+
   it('is silent in the state that has nothing to say', () => {
-    expect(connectionNoticeSentence('connected', 'dev')).toBeNull();
+    expect(connectionNoticeSentence('connected', 'dev', 'full')).toBeNull();
   });
 });
 
@@ -138,10 +183,13 @@ describe('the wording lives in exactly one module', () => {
   it('no other source file restates a detail sentence', () => {
     // The literals, not a variable: this is the check that a second copy would
     // fail, and reading them out of the module under test would make it pass on
-    // a copy that had drifted.
+    // a copy that had drifted. Every clause of every length, since a surface
+    // wanting a shorter line is exactly the thing that retypes a trimmed one.
     const details = [
-      'Waiting for the workspace to answer.',
-      'Nothing in this workspace loads or sends. Still trying.',
+      'Nothing in this workspace loads or sends yet.',
+      'Waiting for an answer.',
+      'Nothing in this workspace loads or sends.',
+      'Retrying every few seconds.',
     ];
     for (const file of sources(srcDir)) {
       const text: string = readFileSync(file, 'utf-8');

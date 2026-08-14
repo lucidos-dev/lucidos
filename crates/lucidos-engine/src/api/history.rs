@@ -435,9 +435,11 @@ pub(super) async fn engine_version_status(
 /// `GET /api/v1/engine/changelog`: every published release's notes, newest
 /// first, for the *What's New* panel (Settings > System).
 ///
-/// Takes no state and touches no disk. The text is baked into this binary
-/// (`crate::engine::changelog`), so the answer is the same offline, on a
-/// packaged install, and with the database down.
+/// Takes no state and needs no database. It DOES read the checkout and may
+/// reach the network: a panel answering "what is new" cannot be limited to what
+/// shipped with this binary. `crate::engine::changelog` owns that and degrades
+/// to the baked copy, which is why this handler is the one request the fetch
+/// ever runs on.
 ///
 /// Deliberately does NOT restate which release is running. `/health` already
 /// carries `release` and the frontend already holds it. One source of truth
@@ -445,7 +447,7 @@ pub(super) async fn engine_version_status(
 /// Versions section two tabs away.
 pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "releases": crate::engine::changelog::changelog_releases(),
+        "releases": crate::engine::changelog::changelog_releases().await,
     }))
 }
 

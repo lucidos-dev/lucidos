@@ -98,10 +98,20 @@ describe('connectionBannerBody renders the bar', () => {
     connectionBannerBody({ layout: 'desktop', status, workspace: ws });
 
   it('states the notice, from the table every other surface reads', () => {
-    const notice = connectionNotice('disconnected', 'dev')!;
+    const notice = connectionNotice('disconnected', 'dev', 'full')!;
     const text = textOf(body('disconnected'));
     expect(text).toContain(notice.title);
     expect(text).toContain(notice.detail);
+  });
+
+  it('is the surface that carries the FULL detail', () => {
+    // It spans the window, so both clauses fit on the line the bar already
+    // costs. The menu notice and the tooltip take the short form on the
+    // strength of this one saying the rest.
+    const text = textOf(body('disconnected'));
+    const short = connectionNotice('disconnected', 'dev', 'short')!.detail;
+    expect(text).toContain(connectionNotice('disconnected', 'dev', 'full')!.detail);
+    expect(text.length).toBeGreaterThan(short.length);
   });
 
   it('leads with a dot in the state colour, and lets the words say it out loud', () => {

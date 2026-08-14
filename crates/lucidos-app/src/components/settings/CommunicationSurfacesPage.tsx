@@ -116,25 +116,35 @@ export function CommunicationSurfacesPage() {
           it: everything that can be deferred is a toast instead.
         </p>
         <div class="settings-row">
-          <span class="settings-row-label">Shipping today</span>
+          <span class="settings-row-label">
+            Decision
+            <Explainer title="Decision dialogs">
+              <p>
+                A choice the user has to make before anything proceeds. A confirmation
+                guards an action the user cannot take back. A consent prompt asks on
+                behalf of another thread, and the user can decline.
+              </p>
+            </Explainer>
+          </span>
           <div class="settings-row-options surfaces-sample-buttons">
             <button class="action-btn" onClick={sampleConfirmDanger}>Confirm, danger</button>
             <button class="action-btn" onClick={sampleConfirmDefault}>Confirm, default</button>
+            <button class="action-btn" onClick={sampleConsentPrompt}>Thread wants to open</button>
+          </div>
+        </div>
+        <div class="settings-row">
+          <span class="settings-row-label">Input</span>
+          <div class="settings-row-options surfaces-sample-buttons">
             <button class="action-btn" onClick={samplePrompt}>Prompt</button>
           </div>
         </div>
         <div class="settings-row">
           <span class="settings-row-label">
-            Proposed
-            <Explainer title="Proposed dialogs">
+            Acknowledgement
+            <Explainer title="Acknowledgement dialogs">
               <p>
-                Four messages that are toasts today but behave like dialogs: each sets
-                itself non-dismissable and offers a single button, which is an
-                acknowledgement box with no way out.
-              </p>
-              <p>
-                Nothing is wired to these yet. They render here so the shape can be
-                judged before any real flow is pointed at them.
+                Something has already happened and the user has to see it. There is
+                nothing to decide, so it carries one button and no way to decline.
               </p>
             </Explainer>
           </span>
@@ -142,12 +152,11 @@ export function CommunicationSurfacesPage() {
             <button class="action-btn" onClick={sampleAcknowledgeWedged}>Cannot deliver</button>
             <button class="action-btn" onClick={sampleAcknowledgeDeferred}>Applied, deferred</button>
             <button class="action-btn" onClick={sampleAcknowledgeStranded}>Not served yet</button>
-            <button class="action-btn" onClick={sampleConsentPrompt}>Thread wants to open</button>
           </div>
         </div>
         <div class="settings-row">
           <span class="settings-row-label">
-            Progress dialog
+            Progress
             <Explainer title="Progress dialog">
               <p>
                 For the two flows that take the workspace away and bring it back: the

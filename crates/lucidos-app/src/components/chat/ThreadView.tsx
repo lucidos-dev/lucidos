@@ -19,6 +19,7 @@ import { useScrollMemory, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
+import { forcedSkeletonThreadId, showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
 import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
 import { isIOS } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
@@ -542,15 +543,30 @@ export function ThreadView() {
 
     // Drives the fading skeleton overlay (ThreadSkeletonOverlay): we're in the
     // 'loading' empty state — no exchanges yet, and not animating / failed /
-    // loaded-empty. Delay-gated so a fast / prefetched open never shows it. This
-    // mirrors emptyReason(...).kind === 'loading' but is also valid before the
-    // thread is in the map (cold start: eventsLoaded/eventsLoadFailed are false).
-    // Suppressed when disconnected so the shimmer doesn't sit over the honest
-    // "Can't reach this workspace" state (emptyReason maps that same case to
-    // 'disconnected', not 'loading').
-    const isThreadLoadingNow = !hasExchanges && !animating && !eventsLoadFailed && !eventsLoaded
-        && connectionStatus.value !== 'disconnected';
-    const showThreadSkeleton = useDelayedFlag(isThreadLoadingNow);
+    // loaded-empty. This mirrors emptyReason(...).kind === 'loading' but is also
+    // valid before the thread is in the map (cold start: eventsLoaded and
+    // eventsLoadFailed are false). Suppressed when disconnected so the shimmer
+    // doesn't sit over the honest "Can't reach this workspace" state
+    // (emptyReason maps that same case to 'disconnected', not 'loading').
+    //
+    // Two clocks arm it, and the second is why the first is not enough. The
+    // delay gate keeps a fast / prefetched open from flashing it. A big snapshot
+    // landing INSIDE that delay raises the flag itself: the render it triggers
+    // blocks the main thread, and the gate's timer cannot fire during it (see
+    // threadSkeletonGate.ts).
+    const loadingState: ThreadLoadingState = {
+        hasExchanges,
+        animating,
+        eventsLoadFailed,
+        eventsLoaded,
+        disconnected: connectionStatus.value === 'disconnected',
+    };
+    const delayElapsed = useDelayedFlag(threadIsLoadingNow(loadingState));
+    const showThreadSkeleton = showThreadSkeletonNow(
+        loadingState,
+        delayElapsed,
+        threadId !== null && forcedSkeletonThreadId.value === threadId,
+    );
     // Remember whether the skeleton was shown for this thread, so the content
     // fade-in below can step aside and let the overlay crossfade do the reveal.
     const skeletonShownRef = useRef<string | null>(null);

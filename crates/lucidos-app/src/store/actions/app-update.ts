@@ -2,6 +2,7 @@ import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, app
 import { openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
+import { errorDetail } from '../../utils/errorDetail';
 import { formatBytes } from '../../utils/formatBytes';
 import {
   checkAppUpdate,
@@ -254,8 +255,11 @@ export async function checkForAppUpdate(): Promise<void> {
   try {
     offer = await checkAppUpdate();
   } catch (e) {
-    // Recorded for Settings → System; the next poll retries.
-    appUpdateCheckError.value = String(e);
+    // Recorded for Settings → System; the next poll retries. Through
+    // `errorDetail` because the rejection is no longer always Rust's own error
+    // string: an unreadable IPC payload arrives as an Error, and `String` would
+    // put its "Error: " prefix in front of the reason on the System page.
+    appUpdateCheckError.value = errorDetail(e);
     console.warn('[app-update] update check failed; will retry next poll', e);
     return;
   }
@@ -351,7 +355,7 @@ export async function installAppUpdate(): Promise<void> {
     // failed update can never leave the toast spinning forever.
     if (appUpdateProgress.value) {
       appUpdateProgress.value = null;
-      showToast(`Update failed: ${String(e)}`, 'error', { key: UPDATE_TOAST_KEY });
+      showToast(`Update failed: ${errorDetail(e)}`, 'error', { key: UPDATE_TOAST_KEY });
     }
   }
 }

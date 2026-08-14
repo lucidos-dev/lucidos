@@ -1,7 +1,7 @@
 import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, hasContentEvents, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -16,6 +16,8 @@ import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
+import { forcedSkeletonThreadId, releaseForcedSkeleton, shouldHoldForSkeleton } from '../../components/chat/threadSkeletonGate';
+import { nextPaint } from '../../utils/nextPaint';
 import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads. Hundreds of
@@ -862,6 +864,21 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         const fetchStart = performance.now();
         const snapshot = await fetchThreadEvents(threadId);
         const fetchMs = performance.now() - fetchStart;
+        // Put the skeleton on screen before a big snapshot is applied, and let
+        // the browser paint it. The write below triggers the fold and the
+        // markdown pass in ONE synchronous render, and nothing paints while
+        // that runs. A snapshot landing inside `SPINNER_DELAY_MS` would
+        // otherwise cancel a skeleton that never got a frame, leaving the pane
+        // blank for the whole render (see `shouldHoldForSkeleton`). The flag is
+        // released in this function's `finally`, on every exit.
+        if (shouldHoldForSkeleton({
+          focused: threadId === focusedThreadId.value,
+          snapshotEventCount: snapshot.events.length,
+          hasContent: hasContentEvents(thread.events) || thread.pendingUserMessages.length > 0,
+        })) {
+          forcedSkeletonThreadId.value = threadId;
+          await nextPaint();
+        }
         // Re-read from current map — the map reference may have changed
         // during the async fetch (other threads loaded/updated).
         const current = threadMap.value.get(threadId);
@@ -956,6 +973,10 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   } finally {
     // Only while this attempt still owns the slot (see `fetchAttemptSeq`).
     if (loadingThreads.get(threadId) === attemptToken) loadingThreads.delete(threadId);
+    // The one guaranteed exit, so a forced skeleton cannot outlive the load
+    // that raised it: a success, a failure, a retry giving up, and the
+    // restarting-engine bail all pass through here.
+    releaseForcedSkeleton(threadId);
   }
 }
 

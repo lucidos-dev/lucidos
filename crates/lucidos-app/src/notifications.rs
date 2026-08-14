@@ -140,8 +140,10 @@ fn tap_belongs_to(link: &serde_json::Value, workspace: Option<&str>) -> bool {
 /// leading/trailing hyphen), which is itself `registry::slugify`'s output shape.
 /// The gateway's reserved sigil (`/~/…`, ADR 0014) fails it on the character
 /// class, which is why nothing tests for `~` separately.
-#[cfg(any(target_os = "macos", test))]
-fn is_workspace_slug(segment: &str) -> bool {
+///
+/// Compiled on every platform: it is also the gate on the slug a page hands
+/// `crate::open_workspace_window`, not only on a slug read back off a URL.
+pub(crate) fn is_workspace_slug(segment: &str) -> bool {
     !segment.is_empty()
         && !segment.starts_with('-')
         && !segment.ends_with('-')
@@ -169,7 +171,6 @@ enum WindowContext<'a> {
 /// Everything after `http://` / `https://`, or `None` for any other scheme.
 /// A non-http URL is the bundled app URL, i.e. a window that has not been
 /// navigated to the gateway.
-#[cfg(any(target_os = "macos", test))]
 fn strip_http_scheme(url: &str) -> Option<&str> {
     ["http://", "https://"].into_iter().find_map(|prefix| {
         let (head, rest) = url.split_at_checked(prefix.len())?;
@@ -189,8 +190,10 @@ fn strip_http_scheme(url: &str) -> Option<&str> {
 /// can parse, so `desktop::launch` would fail to navigate and leave the client
 /// on the boot splash for good. Restricting to http(s) by construction is what
 /// makes that unrepresentable.
-#[cfg(any(target_os = "macos", test))]
-fn window_origin(url: &str) -> Option<&str> {
+///
+/// Also the origin `crate::open_workspace_window` opens a second window on, so
+/// it is compiled on every platform rather than only where the tap delegate is.
+pub(crate) fn window_origin(url: &str) -> Option<&str> {
     let rest = strip_http_scheme(url)?;
     let authority = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     (authority > 0).then(|| &url[..url.len() - rest.len() + authority])
@@ -250,8 +253,7 @@ pub(crate) enum TapTarget {
 /// The gateway URL serving `workspace`, e.g. `http://localhost:3210/myws/`.
 /// `origin` carries no trailing slash; the slug is known-safe (callers gate on
 /// [`is_workspace_slug`]), so nothing needs escaping.
-#[cfg(any(target_os = "macos", test))]
-fn workspace_url(origin: &str, workspace: &str) -> String {
+pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
     format!("{origin}/{workspace}/")
 }
 

@@ -638,7 +638,8 @@
  * answered nothing. It is keyed on the STATE rather than on which mark opened
  * the panel, which matters on the mobile threads row: that mark deliberately
  * carries no connection light, so the notice is the only place the state
- * appears there. See `connectionNotice` in HeaderMark.tsx.
+ * appears there. It states the SHORT detail, this panel being too narrow for
+ * the explainer the connection bar carries. See `utils/connectionNotice.ts`.
  *
  * An earlier revision of this panel led with a status band, and the commit that
  * made the menu a centred modal dropped it on the grounds that the mark already
@@ -964,6 +965,30 @@ div.brand-menu-ws-row {
 .brand-menu-ws-manage {
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+}
+
+/* The action a right-click unfolds under a workspace, dressed as a satellite of
+   that row: muted and at the smaller step, the same way Manage workspaces is.
+   It is a row of the panel rather than a popover over it, and
+   `switcherActionRow` in WorkspaceSwitcher.tsx owns why.
+
+   Its GLYPH starts on the name column, one step in from the dots above it, so
+   the row hangs under the workspace it belongs to. Derived, not guessed: the
+   base padding, plus the dot the rows above lead with, plus the row's own gap.
+   The picker indents its fault note off the same two tokens. The label lands
+   one glyph further in again, which is the indent that says satellite. */
+.brand-menu-ws-action {
+    padding-left: calc(var(--space-sm) + var(--ws-picker-dot-size) + var(--space-sm));
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* Sized here rather than left to the icon, so it cannot reshape a row whose
+   height every other row in this list shares. */
+.brand-menu-ws-action svg {
+    flex: 0 0 auto;
+    width: 0.875rem;
+    height: 0.875rem;
 }
 
 .brand-menu-ws-note {

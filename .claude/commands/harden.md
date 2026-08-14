@@ -333,6 +333,27 @@ hooks. Fix a failure by restoring the missing half, never by deleting the other
 one. Adding a *second* mirror needs the proof spelled out in
 `scripts/lib/prompt_mirror_scan.sh`.
 
+### Also always: no build script bakes a checkout path
+
+```bash
+./scripts/check-build-script-paths.sh
+```
+
+Whole-tree and unconditional, like the two gates above. Milliseconds, and a
+merge is a way this regresses without any edit on the branch.
+
+A cargo build script that reads `env!("CARGO_MANIFEST_DIR")` remembers the
+checkout it was COMPILED in. Two checkouts of one package share a `-C metadata`
+hash, so a shared `CARGO_TARGET_DIR` hands the artifact to whichever builds
+next. The baked path then names another tree, or a deleted one (ADR 0079).
+
+Deterministic rather than a review habit because two of the three failures are
+**silent**: a frozen `GATEWAY_BUILD_ID`, and an app stamped `0000.00.00.0`. Only
+the engine's panics, which is how this was found at all. Fix a failure by
+reading the variable at run time, never by exempting the file. The gate is
+scoped to a `build.rs` beside a `Cargo.toml`, so ordinary source keeping
+compile-time `env!` (`crates/lucidos-engine/src/paths.rs`) is untouched.
+
 ### Also always: registered hooks can actually run
 
 ```bash

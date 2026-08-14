@@ -710,17 +710,29 @@ describe('attachScrollMemory teardown', () => {
      *  aimed at its last turn.
      *
      *  `opts.rectTop` puts it somewhere else, for the cases that need a landing
-     *  that MOVES: the container ends at `el.scrollTop + rectTop`.
-     *  `opts.reducedMotion` makes that landing a synchronous write rather than
-     *  a tween, so a test can see the value at the instant the landing is
-     *  announced. Returns the teardown. */
-    function withFindableTarget(el: any, opts: { rectTop?: number; reducedMotion?: boolean } = {}) {
-      const rectTop = opts.rectTop ?? 0;
+     *  that MOVES: the container ends at `el.scrollTop + rectTop`. That target
+     *  CHASES the container, so pair it with `opts.reducedMotion`, which makes
+     *  the landing a synchronous write rather than a tween. Doing so also lets
+     *  a test see the value at the instant the landing is announced.
+     *
+     *  `opts.absTop` is the other way round: it pins the target at one offset
+     *  in the transcript, by reporting a rect the container's own scrolling
+     *  moves. A tween therefore has a STABLE destination and settles on it,
+     *  which is what a test of an asynchronous landing needs. Returns the
+     *  teardown. */
+    function withFindableTarget(
+      el: any,
+      opts: { rectTop?: number; absTop?: number; reducedMotion?: boolean } = {},
+    ) {
+      const rectTopOf = () => (opts.absTop !== undefined ? opts.absTop - el.scrollTop : opts.rectTop ?? 0);
       el.getBoundingClientRect = () => ({ width: 800, height: 800, top: 0, bottom: 800, left: 0, right: 800 });
       const target = {
         parentElement: null,
         classList: { add: () => {}, remove: () => {} },
-        getBoundingClientRect: () => ({ width: 200, height: 200, top: rectTop, bottom: rectTop + 200, left: 0, right: 200 }),
+        getBoundingClientRect: () => {
+          const top = rectTopOf();
+          return { width: 200, height: 200, top, bottom: top + 200, left: 0, right: 200 };
+        },
         matches: () => false,
         querySelector: () => null,
       } as any;
@@ -881,24 +893,22 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('records a landing that moved nobody as the OFFSET, because the link ended the ride', async () => {
+    it('records a landing OFF the live edge as the offset, the link having ended the ride', async () => {
       // A position is an offset OR the live edge, and the recorder must answer
-      // the same way the scroll listener would. A deep-link landing always
-      // answers with the offset, by construction. Going to a link retires the
-      // standing follow: the reader asked to be at ONE place, and the transcript
-      // must stop moving under them there. So coming back returns them to the
-      // event they went to, not to a live edge they stopped riding.
+      // the same way the scroll listener would. A link naming a place other than
+      // the live edge ends the ride: the reader asked to be at ONE place, and
+      // the transcript must stop moving under them there. So coming back returns
+      // them to the event they went to, not to a live edge they stopped riding.
       //
       // A same-thread deep-link is the way into this case, `focusThread`
-      // retiring the follow only for a DIFFERENT thread.
-      //
-      // The thread is LIVE here and IDLE in the test below. The pair pins that
-      // the answer does not depend on which.
+      // retiring the follow only for a DIFFERENT thread. The recorded ride puts
+      // the reader on the bottom as the thread opens, and the link then takes
+      // them 15000px back up it.
       vi.useFakeTimers();
       try {
         localStorage.setItem('k', LIVE_EDGE_VALUE);
-        const el = makeEl(4200, 5000); // 4200 + 800 clientHeight IS the bottom
-        const restoreDom = withFindableTarget(el);
+        const el = makeEl(19200, 20000); // opening on its own bottom
+        const restoreDom = withFindableTarget(el, { rectTop: -15000, reducedMotion: true });
         captureObservers();
         const detach = attachScrollMemory(el, 'k', {
           live: transcript,
@@ -929,15 +939,55 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
-    it('answers the same for that landing on an IDLE thread', async () => {
-      // The mirror of the test above, and it agrees with it. The landing retires
-      // the ride whatever the agent is doing, so the same same-thread link with
-      // nowhere to move records the same offset.
+    it('records a landing ON the live edge as the LIVE EDGE, the ride surviving it', async () => {
+      // The reader's own case, from the recording side. A link to the bottom of
+      // the thread asks for the place the ride already holds. The two agree, so
+      // there is nothing to end.
       //
-      // Answering the other way would cost the reader the event. A quiet thread
-      // is routinely one about to run, a question card being quiescent by
-      // `isRenderedThreadIdle`. The first thing the wake does is carry an armed
-      // reader to the live edge.
+      // The record has to follow, or the ride is lost on the way back in: an
+      // offset written here opens the thread parked, with the toggle dark. Both
+      // halves again, the record following from the stamp.
+      //
+      // The thread is LIVE here and IDLE in the test below. The pair pins that
+      // the answer does not depend on which.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 5000); // 4200 + 800 clientHeight IS the bottom
+        const restoreDom = withFindableTarget(el);
+        captureObservers();
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+        setFollowLiveEdge(true); // the reader armed the follow here
+        setThreadLive(true);     // and the agent is working
+
+        try {
+          scrollToEventAndPulse('e1');
+          await vi.advanceTimersByTimeAsync(200);
+          expect(followingLiveEdge.value).toBe(true);
+          expect(isFollowScroll(el)).toBe(true);
+          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+        } finally {
+          detach();
+          stopFollowingBottom();
+          restoreDom();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('answers the same for that landing on an IDLE thread', async () => {
+      // The mirror of the test above, and it agrees with it. Where the landing
+      // rests is what decides, so the agent decides nothing here.
+      //
+      // A quiet thread is routinely one about to run, a question card being
+      // quiescent by `isRenderedThreadIdle`. This reader is parked on such a
+      // card, and answering it is what wakes the thread. Riding on from there is
+      // the whole of what they asked for.
       //
       // The recorder still asks the POSITION rather than whether a link landed.
       // The reason is listener ORDER inside `.thread-content`'s two scroll
@@ -958,10 +1008,88 @@ describe('attachScrollMemory teardown', () => {
         try {
           scrollToEventAndPulse('e1');
           await vi.advanceTimersByTimeAsync(200);
-          expect(followingLiveEdge.value).toBe(false);
-          expect(isFollowScroll(el)).toBe(false);
-          expect(localStorage.getItem('k')).toBe(String(el.scrollTop));
-          expect(localStorage.getItem('k')).not.toBe(LIVE_EDGE_VALUE);
+          expect(followingLiveEdge.value).toBe(true);
+          expect(isFollowScroll(el)).toBe(true);
+          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+        } finally {
+          detach();
+          stopFollowingBottom();
+          restoreDom();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('resumes a recorded ride when the landing it MISSED was at the live edge', async () => {
+      // The resolve-first ordering, and it is the ordinary one for a cached
+      // thread: the target renders on the commit's microtask checkpoint, while
+      // Preact defers this attach past it. So the stand-down ASKS what it
+      // missed, and the question is not "did it land" but "did it land
+      // somewhere the ride disagrees with".
+      //
+      // Asking the first would make the toggle's state after a notification tap
+      // depend on whether the thread's events happened to be cached.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(4200, 5000); // arriving clamped to its own bottom
+        const restoreDom = withFindableTarget(el);
+        captureObservers();
+
+        scrollToEventAndPulse('e1'); // resolves before anything attaches
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          expect(el.scrollTop).toBe(4200); // and the link still owns the place
+          await vi.advanceTimersByTimeAsync(200);
+          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+        } finally {
+          detach();
+          stopFollowingBottom();
+          restoreDom();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('takes over a landing still gliding to the edge, so the record stays the live edge', async () => {
+      // The ordinary cross-thread tap. `focusThread` retired the ride before
+      // the link resolved, so the landing ran as a plain element tween, and
+      // `.thread-content` arrives holding the OUTGOING thread's offset.
+      //
+      // Arming beside that tween is not enough. Its frames mark plain
+      // navigation, so every one records an offset. The ride the reader never
+      // ended is then lost on the way back in. The resume takes the motion
+      // over instead.
+      vi.useFakeTimers();
+      try {
+        localStorage.setItem('k', LIVE_EDGE_VALUE);
+        const el = makeEl(2000, 20000); // arriving on the outgoing thread's offset
+        const restoreDom = withFindableTarget(el, { absTop: 19200 }); // the newest turn
+        captureObservers();
+
+        scrollToEventAndPulse('e1'); // resolves before anything attaches
+        const detach = attachScrollMemory(el, 'k', {
+          live: transcript,
+          resetOnEmpty: true,
+          followsLiveEdge: true,
+        });
+
+        try {
+          expect(followingLiveEdge.value).toBe(true);
+          await vi.advanceTimersByTimeAsync(1500); // the glide settles
+          expect(el.scrollTop).toBe(19200);
+          el.fireScroll();                         // its trailing scroll event
+          await vi.advanceTimersByTimeAsync(200);
+          expect(isFollowScroll(el)).toBe(true);
+          expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
         } finally {
           detach();
           stopFollowingBottom();

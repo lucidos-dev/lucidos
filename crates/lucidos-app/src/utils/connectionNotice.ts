@@ -25,6 +25,21 @@
 
 import type { ConnectionStatus } from '../store/types';
 
+/** What the client is reaching for, named as what it is: the ENGINE serving
+ *  this workspace, not the workspace itself.
+ *
+ *  A workspace is a place the user keeps things, and it is still there. Its
+ *  engine is a process, and that is what stopped answering. "Disconnected from
+ *  dev" reads as having lost the workspace, which is alarming and untrue: the
+ *  gateway keeps listing and switching workspaces throughout.
+ *
+ *  Before `/health` first answers there is no name, so the target is the bare
+ *  noun. A title of one bare state word would leave the sentence under it with
+ *  nothing to be about. */
+function connectionTarget(workspace: string | null): string {
+  return workspace ? `the ${workspace} engine` : 'the engine';
+}
+
 /** Readable spelling of the connection light, naming what it is connected TO.
  *
  *  The mark carries the state as colour and motion, and this is its readable
@@ -39,23 +54,41 @@ import type { ConnectionStatus } from '../store/types';
  *  "connected to what?" at any width.
  *
  *  Each state brings its own preposition rather than sharing one, because
- *  "disconnected to dev" is not English. With no workspace name yet (before
- *  /health answers) the phrase is the bare state word. */
-const CONNECTION_PHRASE: Record<string, (ws: string) => string> = {
-  connected: (ws) => `connected to ${ws}`,
-  connecting: (ws) => `connecting to ${ws}`,
-  disconnected: (ws) => `disconnected from ${ws}`,
+ *  "disconnected to dev" is not English. What they share is the target, composed
+ *  once in `connectionTarget`. */
+const CONNECTION_PHRASE: Record<string, (target: string) => string> = {
+  connected: (target) => `connected to ${target}`,
+  connecting: (target) => `connecting to ${target}`,
+  disconnected: (target) => `disconnected from ${target}`,
 };
 
 export function connectionPhrase(status: string, workspace: string | null): string {
   const phrase = CONNECTION_PHRASE[status];
   if (!phrase) return status;
-  return workspace ? phrase(workspace) : status;
+  return phrase(connectionTarget(workspace));
 }
+
+/** How much of the detail a surface asks for.
+ *
+ *  `full` is the explainer, and one surface earns it: the connection bar, which
+ *  spans the window and has a line to spend. `short` is for a surface the reader
+ *  has to reach for, the menu notice and the hover tooltip. There the explainer
+ *  wrapped to three lines and pushed the panel's rows down, to say what the
+ *  title had mostly said already.
+ *
+ *  A caller names it rather than taking a default, so a new surface has to
+ *  decide which one it is. */
+export type NoticeLength = 'short' | 'full';
 
 /** What the degraded surfaces say, and nothing at all while the mark is lit.
  *
- *  A state with no line here renders no notice anywhere, and `connected` is the
+ *  Two clauses per state, because two surfaces want different amounts of it.
+ *  One sentence cannot be cut at the callsite without becoming a second copy.
+ *  The CONSEQUENCE is what stopped working, the RECOVERY is what happens next.
+ *  Short is the recovery alone: the title already names the state, so what a
+ *  reader still wants there is whether it fixes itself.
+ *
+ *  A state with no entry here renders no notice anywhere, and `connected` is the
  *  only one the closed `ConnectionStatus` union leaves out. That is the whole
  *  condition, and it is deliberately the same one the MARK recedes on:
  *  `styles/header-mark.css` dims disconnected and breathes connecting, so a
@@ -63,43 +96,49 @@ export function connectionPhrase(status: string, workspace: string | null): stri
  *
  *  In the menu the condition is the STATE, not the host that opened the panel,
  *  and on one host those differ. The mobile threads row's mark carries no
- *  `data-conn` at all (see `BrandMenuButton`: a glyph dimming itself among a row
- *  of icons that do not reads as disabled), so there is no light on that pane to
- *  explain, and the notice is instead the only place the state appears. Keying
- *  it on the host to "match" the mark would take it away exactly where it is
- *  worth most.
- *
- *  The disconnected line names no remedy, on purpose. Restart posts to the
- *  engine we cannot reach, and Refresh reloads a client that is not the thing
- *  that broke, so pointing at either would be wrong in the ordinary case. The 5s
- *  health poll in `store/actions/connection.ts` genuinely does recover on its
- *  own, so that is what it promises instead. */
-const CONNECTION_DETAIL: Record<string, string> = {
-  connecting: 'Waiting for the workspace to answer.',
-  // Scoped to THIS WORKSPACE rather than the app, because a bare "nothing loads
-  // or sends" is refuted by the row directly under it in the menu:
-  // `connectionStatus` is driven solely by `/api/v1/health` against this
-  // workspace's engine, while the Workspaces row talks to the GATEWAY
-  // (`/~/api/v1/control/*`, a different process), so unfolding the list and
-  // switching away still work while this engine is unreachable. The narrower
-  // claim is both true and more useful, since switching is the one thing in the
-  // panel that still goes anywhere.
-  // Two lines in the panel's 17.5rem, and that is the ceiling worth spending:
-  // the notice pushes every row below it down, so a third line buys nothing the
-  // first two have not already said.
-  disconnected: 'Nothing in this workspace loads or sends. Still trying.',
+ *  `data-conn` at all, so that pane has no light to explain. The notice is
+ *  instead the only place the state appears there. Keying it on the host would
+ *  take it away exactly where it is worth most. */
+const CONNECTION_DETAIL: Record<string, { consequence: string; recovery: string }> = {
+  connecting: {
+    consequence: 'Nothing in this workspace loads or sends yet.',
+    recovery: 'Waiting for an answer.',
+  },
+  // The consequence claims THIS WORKSPACE rather than the app. A bare "nothing
+  // loads or sends" is refuted by the Workspaces row in the menu. That row
+  // reaches the GATEWAY, a different process, and keeps working through this.
+  //
+  // The recovery names no remedy, on purpose. Restart posts to an engine we
+  // cannot reach, and Refresh reloads a client that is not what broke. The 5s
+  // health poll in `store/actions/connection.ts` does recover on its own, so
+  // the line promises that instead, at the interval it runs at.
+  disconnected: {
+    consequence: 'Nothing in this workspace loads or sends.',
+    recovery: 'Retrying every few seconds.',
+  },
 };
+
+/** Whether this state has anything to say, for a surface deciding whether to
+ *  exist at all. Keyed on the same table the words come from, so a bar and a
+ *  notice cannot disagree about which states are worth mentioning. */
+export function hasConnectionNotice(status: string): boolean {
+  return CONNECTION_DETAIL[status] !== undefined;
+}
 
 export function connectionNotice(
   status: ConnectionStatus,
   workspace: string | null,
+  length: NoticeLength,
 ): { title: string; detail: string } | null {
   const detail = CONNECTION_DETAIL[status];
   if (!detail) return null;
   // Sentence-cased rather than a second string table: the preposition each
   // state wants is already decided once, above.
   const phrase = connectionPhrase(status, workspace);
-  return { title: phrase.charAt(0).toUpperCase() + phrase.slice(1), detail };
+  return {
+    title: phrase.charAt(0).toUpperCase() + phrase.slice(1),
+    detail: length === 'full' ? `${detail.consequence} ${detail.recovery}` : detail.recovery,
+  };
 }
 
 /** The whole notice as one sentence, for a surface that has an accessible name
@@ -108,7 +147,8 @@ export function connectionNotice(
 export function connectionNoticeSentence(
   status: ConnectionStatus,
   workspace: string | null,
+  length: NoticeLength,
 ): string | null {
-  const notice = connectionNotice(status, workspace);
+  const notice = connectionNotice(status, workspace, length);
   return notice ? `${notice.title}. ${notice.detail}` : null;
 }

@@ -21,11 +21,12 @@
  * still carries the class the rule selects, and that it is still drawn at the
  * stroke-width the rule divides.
  *
- * The second describe covers what the `--icon-glyph` indirection is FOR: the
- * header band and a list row take different nominals off one shared box, and
- * only the glyph moves, never the 2.25rem tap target the box rule exists to
- * guarantee. It also pins the split as the SINGLE source of both sizes, since a
- * caller that reintroduces a local nominal is back to two places to look.
+ * The second describe covers what the `--icon-glyph` indirection is FOR. Three
+ * bands take three nominals off one shared box: a header band, a list row's
+ * action cluster, and an icon inline in a run of text. Only the glyph moves,
+ * never the 2.25rem tap target the box rule exists to guarantee. It also pins
+ * the split as the SINGLE source of all three sizes: a caller that reintroduces
+ * a local nominal is back to two places to look.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -45,9 +46,16 @@ const icons = readFileSync(resolve(here, '../../components/shared/icons.tsx'), '
 const chatExchange = readFileSync(resolve(here, '../../components/chat/ChatExchange.tsx'), 'utf8');
 const groupHeader = readFileSync(resolve(here, '../../components/triggers/TriggerGroupHeader.tsx'), 'utf8');
 
+/** The three bands, widest nominal first. The order is asserted below. */
+const BANDS = ['header-icon', 'row-icon', 'inline-icon'];
+
+/** Parsed once and shared. Every lookup below reads this sheet, and each call
+ *  into the helpers would otherwise re-parse the whole of it. */
+const hostRules = cssRules(css);
+
 /** The correction rule, found by a member of its selector list so grouping it
- *  with the row-icon twin cannot make this lookup silently miss. */
-const rule = cssRules(css).find(r =>
+ *  with the other bands' twins cannot make this lookup silently miss. */
+const rule = hostRules.find(r =>
   selectorList(r.selector).includes('.icon-btn.header-icon .trash-icon'),
 );
 
@@ -77,6 +85,16 @@ describe('the trash is sized by its ink', () => {
       .toMatch(/calc\(2 \* var\(--trash-ink\) \/ var\(--pencil-ink\)\)/);
   });
 
+  it('applies to the trash in every band', () => {
+    // The correction is what makes one nominal mean one rendered height across
+    // the set. A band left off this list ships an uncorrected trash, a fifth
+    // short, which is the defect the rule was added for.
+    for (const band of BANDS) {
+      expect(selectorList(rule!.selector), `.${band}'s trash is not corrected`)
+        .toContain(`.icon-btn.${band} .trash-icon`);
+    }
+  });
+
   it('is aimed at artwork that still carries the class and the stroke it assumes', () => {
     const trashIcon = /export function TrashIcon\(\)[\s\S]*?\n}/.exec(icons)?.[0] ?? '';
     expect(trashIcon, 'TrashIcon not found in icons.tsx').not.toBe('');
@@ -101,23 +119,27 @@ for (const r of cssRules(baseCss)) {
   }
 }
 
-/** The rule that owns the 2.25rem tap target the two bands share. */
-const boxRule = cssRules(css).find(r => {
+/** The rule that owns the 2.25rem tap target the three bands share. */
+const boxRule = hostRules.find(r => {
   const members = selectorList(r.selector);
-  return members.includes('.icon-btn.header-icon') && members.includes('.icon-btn.row-icon');
+  return BANDS.every(band => members.includes(`.icon-btn.${band}`));
 });
 
-/** Every rule that sets a nominal for one of the two boxes, per band. */
-const nominals = (className: string) =>
-  rulesTargeting(css, className).filter(r => r.props.has('--icon-glyph'));
-const headerNominals = nominals('header-icon');
-const rowNominals = nominals('row-icon');
+/** Every rule that sets a nominal for one of the three boxes, keyed by band.
+ *  Both tests below read this one map, so neither can derive a different
+ *  answer from the other. */
+const bandNominals = new Map(
+  BANDS.map(band => [
+    band,
+    rulesTargeting(css, band).filter(r => r.props.has('--icon-glyph')),
+  ]),
+);
 
 /** The `--icon-size-*` step a nominal rule names, or undefined if it is not on
  *  the scale at all. */
 const step = (value: string) => /^var\((--icon-size-[\w-]+)\)$/.exec(value)?.[1];
 
-/** Every rule in a caller's own sheet aimed at one of the two row buttons. */
+/** Every rule in a caller's own sheet aimed at one of the three buttons. */
 const callerRules = [
   ...rulesTargeting(chatCss, 'queued-message-remove'),
   ...rulesTargeting(groupCss, 'trigger-group-delete'),
@@ -126,20 +148,21 @@ const callerRules = [
 
 describe('the nominal glyph size is declared per band, on the shared tap target', () => {
   it('keeps the tap target on one rule and puts a nominal on each class it names', () => {
-    expect(boxRule, 'no shared .icon-btn.header-icon, .icon-btn.row-icon rule').toBeDefined();
+    expect(boxRule, 'no rule shares the tap target across all three bands').toBeDefined();
     expect(boxRule!.props.get('width'), 'the shared rule is not the 2.25rem tap target').toBe('2.25rem');
     expect(boxRule!.props.get('height')).toBe('2.25rem');
-    // The two bands take different nominals, so one riding the shared rule
-    // would be a default that silently reaches both again.
-    expect(boxRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for both bands').toBe(false);
+    // The bands take different nominals, so one riding the shared rule would be
+    // a default that silently reaches all of them again.
+    expect(boxRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for every band').toBe(false);
 
-    for (const [className, found] of [['header-icon', headerNominals], ['row-icon', rowNominals]] as const) {
+    for (const band of BANDS) {
+      const found = bandNominals.get(band)!;
       // Exactly one: a second in this sheet would be a silent second default,
       // and whichever lost would be dead code.
-      expect(found.length, `.${className} does not declare exactly one nominal`).toBe(1);
+      expect(found.length, `.${band} does not declare exactly one nominal`).toBe(1);
       // On a selector the shared box rule itself names, which is what keeps a
       // nominal from landing on anything that is not one of these tap targets.
-      expect(selectorList(boxRule!.selector), `.${className}'s nominal is not on a shared tap target`)
+      expect(selectorList(boxRule!.selector), `.${band}'s nominal is not on a shared tap target`)
         .toContain(found[0].selector);
       // And the nominal rule moves the glyph only. The box was grown
       // deliberately after the trash was reported unhittable on mobile.
@@ -148,31 +171,37 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
     }
 
     // The nominals are only worth anything while the glyph actually reads them.
-    for (const sel of ['.icon-btn.header-icon svg', '.icon-btn.row-icon svg']) {
-      const svg = cssRules(css).find(r => selectorList(r.selector).includes(sel));
+    for (const band of BANDS) {
+      const sel = `.icon-btn.${band} svg`;
+      const svg = hostRules.find(r => selectorList(r.selector).includes(sel));
       expect(svg, `no ${sel} rule`).toBeDefined();
       expect(svg!.props.get('width'), `${sel} is not sized from the nominal`).toBe('var(--icon-glyph)');
       expect(svg!.props.get('height')).toBe('var(--icon-glyph)');
     }
   });
 
-  it('gives the header band the large step and puts a row one step below it', () => {
-    const header = step(headerNominals[0].props.get('--icon-glyph')!);
-    const row = step(rowNominals[0].props.get('--icon-glyph')!);
-    expect(header, 'the header nominal is not an --icon-size-* step').toBeDefined();
-    expect(row, 'the row nominal is not an --icon-size-* step').toBeDefined();
-    expect(header, 'the header nominal moved off the large step').toBe('--icon-size-lg');
-    expect(steps.get(header!), `${header} is not a rem step in base.css`).toBeGreaterThan(0);
-    expect(steps.get(row!), `${row} is not a rem step in base.css`).toBeGreaterThan(0);
-    // The whole point of the split: a row glyph reads against the header icons
-    // a few rows up, and the pencil paints more of its box than they do, so at
-    // one nominal it looked a fifth too big (e2e/trigger-group-icon-optics.spec.ts
-    // measures the pair's real ink).
-    expect(steps.get(row!), `${row} is not smaller than ${header}`).toBeLessThan(steps.get(header!)!);
+  it('starts the bands at the large step and takes one step down per band', () => {
+    const named = BANDS.map(band => {
+      const s = step(bandNominals.get(band)![0].props.get('--icon-glyph')!);
+      expect(s, `the ${band} nominal is not an --icon-size-* step`).toBeDefined();
+      expect(steps.get(s!), `${s} is not a rem step in base.css`).toBeGreaterThan(0);
+      return s!;
+    });
+    expect(named[0], 'the header nominal moved off the large step').toBe('--icon-size-lg');
+    // Strictly descending, which is the whole point of the split. A row glyph
+    // reads against the header icons a few rows up. The pencil paints more of
+    // its box than they do, so at the header nominal it looked a fifth too
+    // big. An inline one reads against the type it interrupts, and steps down
+    // again. The trash is wider than it is tall, which the height-matching
+    // correction cannot see.
+    for (let i = 1; i < named.length; i++) {
+      expect(steps.get(named[i]), `${named[i]} is not smaller than ${named[i - 1]}`)
+        .toBeLessThan(steps.get(named[i - 1])!);
+    }
   });
 
   it('is the single source: no caller retunes it in its own sheet', () => {
-    // Both row callers want the same step, so neither carries a local override
+    // A caller takes its band's step whole, so none carries a local override
     // that would have to out-rank the shared rule on specificity.
     for (const r of callerRules) {
       expect(r.props.has('--icon-glyph'), `"${r.selector}" picked up a local nominal`).toBe(false);
@@ -185,8 +214,8 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
     }
 
     // A caller only gets the nominal while it still wears the class.
-    expect(chatExchange, 'the queued button no longer carries the row-icon class')
-      .toContain('class="icon-btn row-icon queued-message-remove"');
+    expect(chatExchange, 'the queued button no longer carries the inline-icon class')
+      .toContain('class="icon-btn inline-icon queued-message-remove"');
     for (const name of ['trigger-group-rename', 'trigger-group-delete']) {
       expect(groupHeader, `${name} no longer carries the row-icon class`)
         .toContain(`class="icon-btn row-icon ${name}"`);

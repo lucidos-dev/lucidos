@@ -117,7 +117,8 @@ export function releaseNotesBody(release: ChangelogRelease, open: boolean): VNod
 }
 
 /**
- * Split a leading `## v<version>` heading off manifest notes, keeping its date.
+ * Split a leading `## v<version>` heading off manifest notes, keeping the
+ * version and the date it named.
  *
  * **The manifest's notes are not shaped like the endpoint's.** Both come from
  * the same `CHANGELOG.md` section, but `release_notes_extract_section`
@@ -127,37 +128,61 @@ export function releaseNotesBody(release: ChangelogRelease, open: boolean): VNod
  * does. So the heading comes off here, at the boundary where manifest text
  * becomes a release.
  *
- * Its date comes off with it rather than being discarded, since that is the one
- * place the offered release's date exists. Same separator-blind rule the engine
- * parser uses, and for the same reason: the separator is an em dash that
+ * Its version and date come off with it rather than being discarded. The
+ * heading is the one place the offered release NAMES itself, which is what
+ * {@link offeredRelease} identifies the row by. Same separator-blind rule the
+ * engine parser uses, and for the same reason: the separator is an em dash that
  * `.claude/rules/no-em-dashes.md` forbids this source from naming.
  */
-export function stripReleaseHeading(notes: string): { date: string | null; body: string } {
+export function stripReleaseHeading(
+  notes: string,
+): { version: string | null; date: string | null; body: string } {
   const lines = notes.replace(/^\s*\n/, '').split('\n');
   const head = lines[0] ?? '';
   const rest = head.startsWith('## v') && /^\d/.test(head.slice(4)) ? head.slice(4) : null;
-  if (rest === null) return { date: null, body: notes.trim() };
+  if (rest === null) return { version: null, date: null, body: notes.trim() };
   const date = rest.replace(/^\S+/, '').replace(/^[^\p{L}\p{N}]+/u, '').trimEnd();
-  return { date: date || null, body: lines.slice(1).join('\n').trim() };
+  return {
+    version: /^\S+/.exec(rest)?.[0] ?? null,
+    date: date || null,
+    body: lines.slice(1).join('\n').trim(),
+  };
 }
 
 /**
  * The release the updater is OFFERING, as a row for the top of the list, or
- * `null` when none is offered or its manifest carried no notes.
+ * `null` when there is nothing to show.
  *
  * This row is the only place in the app that can say what a pending update
  * contains. Its notes come from the update manifest rather than from the
- * changelog below it, because the offered version postdates the binary that
- * baked that changelog: falling back to the list would show the notes for the
- * release already running, under a heading naming the one being offered.
+ * changelog below it, because the offered version can postdate both the baked
+ * changelog and the published one: falling back to the list would show the
+ * notes for the release already running, under a heading naming another.
+ *
+ * **The version comes from the notes' own heading, not from `version`.** That
+ * argument is derived from `latestTauriAppVersion`, which the health poll
+ * overwrites every few seconds with the engine's `latest_tauri_app_version`. On
+ * a dev workspace that field is a CalVer app build id, not a release. So the row
+ * headed itself with a build id, or vanished while the offer toast beside it
+ * still named the release. A heading cannot disagree with the notes under it.
+ * `version` stays as the fallback for a hand-cut manifest carrying no heading.
+ *
+ * `known` is the list this row sits above. A release already in it is not news,
+ * and rendering it anyway would show one version twice.
  */
-export function offeredRelease(version: string | null, notes: string | null): ChangelogRelease | null {
-  if (!version || !notes) return null;
-  const { date, body } = stripReleaseHeading(notes);
+export function offeredRelease(
+  version: string | null,
+  notes: string | null,
+  known: readonly ChangelogRelease[] = [],
+): ChangelogRelease | null {
+  if (!notes) return null;
+  const { version: named, date, body } = stripReleaseHeading(notes);
+  const offered = named ?? version;
   // A manifest whose notes were ONLY a heading leaves nothing to read, so it
   // degrades to no row, exactly like a manifest that carried no notes at all.
-  if (!body) return null;
-  return { version, date, notes: body };
+  if (!offered || !body) return null;
+  if (known.some((r) => r.version === offered)) return null;
+  return { version: offered, date, notes: body };
 }
 
 /**
@@ -171,7 +196,6 @@ export function WhatsNewPage() {
   const dirty = lucidosReleaseDirty.value;
   const showSkeleton = useDelayedLoading(loadable);
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
-  const offered = offeredRelease(packagedUpdateVersion(), latestTauriAppNotes.value);
 
   useEffect(() => {
     void loadChangelog();
@@ -197,6 +221,9 @@ export function WhatsNewPage() {
   }
 
   const releases = loadable.status === 'loaded' ? loadable.data : [];
+  // Derived from the list, not just above it: the list can now carry a release
+  // newer than the running one, the offered one included.
+  const offered = offeredRelease(packagedUpdateVersion(), latestTauriAppNotes.value, releases);
   // A running release with no section of its own marks nothing, rather than
   // marking the newest and claiming something untrue. Reachable whenever RELEASE
   // is bumped ahead of its changelog entry.

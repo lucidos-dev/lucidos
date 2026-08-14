@@ -79,8 +79,10 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const status = connectionStatus.value;
   const name = visibleWorkspaceName.value;
   // Non-null for exactly the states that are not `connected`, which is what the
-  // Connection block below renders its state word AND its explanation from.
-  const notice = connectionNotice(status, name);
+  // Connection block below renders its state word AND its explanation from. The
+  // FULL detail, like the bar: this page is where a puzzled user comes to read
+  // the whole state, and it has a paragraph's room to answer in.
+  const notice = connectionNotice(status, name, 'full');
   const path = workspacePath.value;
   const startedAt = engineStartedAt.value;
   const release = lucidosRelease.value;

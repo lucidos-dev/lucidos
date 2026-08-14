@@ -1,4 +1,5 @@
 import { isIOSPwa } from './platform';
+import { openNewTab } from './newTab';
 import { currentExternalLinkTarget } from '../store/actions/preferences';
 import { postClientLog } from './clientLog';
 import { showToast, dismissToast } from '../store/store';
@@ -40,34 +41,6 @@ function shortUrl(url: string): string {
  *  which is the loss this whole path exists to prevent. */
 function blockedKey(url: string): string {
   return `url-blocked-${url}`;
-}
-
-/** Open `url` in a new tab, reporting whether the browser actually did it.
- *
- *  Deliberately NOT `window.open(url, '_blank', 'noopener')`, so nobody puts the
- *  feature back: with `noopener` set, the HTML spec REQUIRES `window.open` to
- *  return null (step 14 of its algorithm) on SUCCESS exactly as on a block, so
- *  the return value carries no signal at all. Checked against both engines we
- *  ship on, Chromium and WebKit: a gesture-driven open that really did open a
- *  tab still returns null with the feature, and a real window without it.
- *
- *  Severing `opener` on the handle re-establishes the half of the feature that
- *  is a reachable path, reverse tabnabbing: the new browsing context is still
- *  on its initial `about:blank` (same-origin, inherited from us) when
- *  `window.open` returns, and runs no script until this task yields, so the
- *  reference is gone before the target document exists. What is NOT
- *  re-established is the separate browsing-context group `noopener` also puts
- *  the tab in. That costs isolation depth, not a way back: the tab is opened
- *  as `_blank` and so has no name to be re-targeted by, and it is top-level,
- *  so its own `top`/`parent` are itself.
- *
- *  Some blockers hand back a window that is already `closed` rather than null,
- *  so both count as blocked. */
-function openNewTab(url: string): boolean {
-  const opened = window.open(url, '_blank');
-  if (!opened || opened.closed) return false;
-  opened.opener = null;
-  return true;
 }
 
 /** Open a new tab, and when the browser refuses, keep the URL reachable instead

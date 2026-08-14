@@ -327,3 +327,112 @@ fn llm_does_not_depend_on_engine() {
             .join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wire-safe tool names
+// ---------------------------------------------------------------------------
+
+fn def(name: &str) -> crate::llm::provider::ToolDefinition {
+    crate::llm::provider::ToolDefinition {
+        name: name.to_string(),
+        description: "d".to_string(),
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+    }
+}
+
+#[test]
+fn wire_safe_predicate_matches_the_anthropic_pattern() {
+    assert!(is_wire_safe_tool_name("read_file"));
+    assert!(is_wire_safe_tool_name("mcp__slack__channels_list"));
+    assert!(is_wire_safe_tool_name("a-b_C9"));
+    assert!(is_wire_safe_tool_name(&"x".repeat(MAX_TOOL_NAME_LEN)));
+
+    // The shape that wedged a workspace: a Backstage tool name carries a dot.
+    assert!(!is_wire_safe_tool_name(
+        "mcp__backstage__catalog.get-catalog-entity"
+    ));
+    assert!(!is_wire_safe_tool_name(""));
+    assert!(!is_wire_safe_tool_name("has space"));
+    assert!(!is_wire_safe_tool_name("has/slash"));
+    assert!(!is_wire_safe_tool_name("café"));
+    assert!(!is_wire_safe_tool_name(&"x".repeat(MAX_TOOL_NAME_LEN + 1)));
+}
+
+#[test]
+fn sanitizer_replaces_every_disallowed_char() {
+    assert_eq!(
+        wire_safe_tool_name("mcp__backstage__catalog.get-catalog-entity"),
+        "mcp__backstage__catalog_get-catalog-entity"
+    );
+    assert_eq!(wire_safe_tool_name("a b/c:d"), "a_b_c_d");
+    // One replacement per char, not per byte: a multi-byte char is one `_`.
+    assert_eq!(wire_safe_tool_name("café"), "caf_");
+}
+
+#[test]
+fn sanitizer_leaves_an_already_safe_name_byte_identical() {
+    for name in ["read_file", "mcp__slack__channels_list", "a-b_C9"] {
+        assert_eq!(wire_safe_tool_name(name), name);
+    }
+}
+
+#[test]
+fn sanitizer_truncates_to_the_length_ceiling() {
+    let long = format!("mcp__srv__{}", "t".repeat(300));
+    let safe = wire_safe_tool_name(&long);
+    assert_eq!(safe.len(), MAX_TOOL_NAME_LEN);
+    assert!(safe.starts_with("mcp__srv__"));
+}
+
+#[test]
+fn sanitizer_output_is_always_wire_safe() {
+    let nasty = [
+        "",
+        ".",
+        "café",
+        "a b/c:d",
+        "mcp__backstage__techdocs.search-techdocs",
+        &"x".repeat(500),
+        "🙂🙂🙂",
+    ];
+    for input in nasty {
+        let out = wire_safe_tool_name(input);
+        assert!(
+            is_wire_safe_tool_name(&out),
+            "sanitizing {:?} produced {:?}, which is still unsafe",
+            input,
+            out
+        );
+    }
+}
+
+#[test]
+fn unsafe_tool_definitions_are_dropped_rather_than_failing_the_request() {
+    // The whole point: one bad name must cost one tool, never the turn.
+    let mut tools = vec![
+        def("read_file"),
+        def("mcp__backstage__auth.who-am-i"),
+        def("run_bash"),
+        def(&"x".repeat(MAX_TOOL_NAME_LEN + 1)),
+    ];
+    let dropped = drop_unsafe_tool_names(&mut tools);
+
+    assert_eq!(
+        tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        vec!["read_file", "run_bash"],
+        "every safe definition survives, in order"
+    );
+    assert_eq!(dropped.len(), 2);
+    assert_eq!(dropped[0], "mcp__backstage__auth.who-am-i");
+}
+
+#[test]
+fn a_fully_safe_tool_list_is_untouched() {
+    let mut tools = vec![def("read_file"), def("mcp__slack__users_search")];
+    let before = tools.clone();
+    assert!(drop_unsafe_tool_names(&mut tools).is_empty());
+    assert_eq!(
+        tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        before.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+}

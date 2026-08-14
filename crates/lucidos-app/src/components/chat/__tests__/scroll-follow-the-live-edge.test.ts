@@ -1679,10 +1679,10 @@ describe('resuming IN PLACE, when a deep link owns the position', () => {
   });
 
   it('is what a LIVE thread gets too: the agent decides nothing here', () => {
-    // The landing does end the ride, but liveness is the wrong way to ask
-    // whether it has happened. The guard is `deepLinkHasResolved()`, so the
-    // branch reads no `_threadLive` at all: same call, live thread, same result
-    // as the idle one above.
+    // A landing off the live edge does end the ride, but liveness is the wrong
+    // way to ask whether that happened. The guard is
+    // `deepLinkLandedOffLiveEdge()`, so the branch reads no `_threadLive` at
+    // all: same call, live thread, same result as the idle one above.
     //
     // The landed-link guard itself is pinned in `hooks/useScrollMemory.test.ts`
     // ("a deep-link claiming the open mid-restore"), which has the DOM harness

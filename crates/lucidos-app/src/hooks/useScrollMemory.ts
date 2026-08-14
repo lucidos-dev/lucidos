@@ -307,9 +307,10 @@ export function attachScrollMemory(
     // down means do not place the reader. Every branch below places them, so a
     // deep-linked open is the one open that never reaches the resume. The
     // request is resumed here instead, `in-place` so nothing is written over
-    // the landing. `resumeFollowingBottom` declines once the link has LANDED, a
-    // landing ending the ride on purpose. The ride is held open only while the
-    // link is still in flight, so a dead link costs the reader nothing.
+    // the landing. `resumeFollowingBottom` declines once the link has landed
+    // OFF the live edge, that landing having ended the ride on purpose. So the
+    // ride is held open for a link still in flight, and for one that came to
+    // rest where the ride was heading anyway. A dead link costs nothing either.
     //
     // Kept ahead of the early return below, even though a landed link declines
     // inside the resume. Both orderings must reach the same place, and one
@@ -395,11 +396,12 @@ export function attachScrollMemory(
    *  One expression, two callers (the scroll listener and the deep-link landing
    *  below), so the two cannot disagree about which form a position takes.
    *
-   *  A deep-link landing answers OFFSET whenever it MOVED the reader, the
-   *  ordinary case: they asked for one specific place, so coming back returns
-   *  them there. On a LIVE thread the landing also retires the standing follow
-   *  before recording (see `stopFollowingBottom`). On an IDLE thread the follow
-   *  survives the landing, and the positional test still answers correctly.
+   *  A deep-link landing answers OFFSET whenever it rested somewhere OTHER than
+   *  the live edge, the ordinary case: the reader asked for one specific place,
+   *  so coming back returns them there. Such a landing retires the standing
+   *  follow before recording (see `stopFollowingBottom`), whatever the agent is
+   *  doing. A landing ON the live edge keeps the ride and records it, the
+   *  positional test answering correctly either way.
    *
    *  A scroll the FOLLOW made records as the live edge, not the offset it
    *  produced. Every growth round writes `scrollTop`, so recording the number

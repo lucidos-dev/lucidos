@@ -41,17 +41,29 @@ describe('the notice as rendered', () => {
     expect(text).toContain('brand-menu-notice-disconnected');
     // Read out of the table rather than retyped, which is what
     // `utils/connectionNotice.test.ts` scans for.
-    const notice = connectionNotice('disconnected', 'dev')!;
+    const notice = connectionNotice('disconnected', 'dev', 'short')!;
     expect(text).toContain(notice.title);
     expect(text).toContain(notice.detail);
+  });
+
+  it('takes the short detail, leaving the explainer to the bar', () => {
+    // The panel is a fixed width, so the full sentence wrapped to three lines
+    // and pushed every row below it down. What it bought was a consequence the
+    // connection bar states already, on screen and without a tap.
+    for (const state of ['disconnected', 'connecting'] as ConnectionStatus[]) {
+      const text = row(state);
+      expect(text).toContain(connectionNotice(state, 'dev', 'short')!.detail);
+      expect(text, `${state} wraps the panel with the bar's explainer`)
+        .not.toContain(connectionNotice(state, 'dev', 'full')!.detail);
+    }
   });
 
   it('states the connecting case in its own words, not the settled one', () => {
     const text = row('connecting');
     expect(text).toContain('<span class="status-dot connecting">');
     expect(text).toContain('brand-menu-notice-connecting');
-    expect(text).toContain(connectionNotice('connecting', 'dev')!.title);
-    expect(text).not.toContain('Still trying');
+    expect(text).toContain(connectionNotice('connecting', 'dev', 'short')!.title);
+    expect(text).not.toContain(connectionNotice('disconnected', 'dev', 'short')!.detail);
   });
 
   it('is a statement, not a menu item', () => {

@@ -1,7 +1,24 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The crate directory, read from the environment cargo sets when it RUNS this
+/// build script. Hand-synced with the engine and app build scripts.
+///
+/// Never `env!`, which bakes the value at compile time. Two checkouts of one
+/// package share a `-C metadata` hash, so a shared `CARGO_TARGET_DIR` hands
+/// this compiled binary to whichever checkout builds next. A baked path then
+/// names somebody else's tree, or a deleted one. Here that failure is SILENT:
+/// git cannot run in a missing directory, so every build id collapses to one
+/// constant and the picker's new-gateway badge stops firing.
+/// See docs/plans/2026-08-14-build-script-paths-and-actionable-build-failure.md.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set by cargo when it runs a build script"),
+    )
+}
 
 /// Files outside this crate that are compiled INTO the gateway binary, so they
 /// are gateway source for build-id purposes even though they live elsewhere.
@@ -26,7 +43,8 @@ const EMBEDDED_SOURCES: &[&str] = &["crates/lucidos-app/index.html"];
 /// repo) we fall back to a hash of the compiled-in source so the id is at least
 /// stable per build tree.
 fn main() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = manifest_dir();
+    let manifest_dir = manifest_dir.as_path();
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
 
     // Re-run when gateway source, the manifest, or git state changes. `.git/HEAD`

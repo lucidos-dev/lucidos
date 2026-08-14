@@ -69,9 +69,13 @@ function textRowSpan(): string {
  *
  *  The one-tag check is what makes that permanent rather than a property of the
  *  anchoring being right: any span reaching back past another control fails HERE,
- *  loudly, instead of quietly satisfying the assertions below from a neighbour. */
+ *  loudly, instead of quietly satisfying the assertions below from a neighbour.
+ *
+ *  Either attribute form matches. The class is a plain string now, since the
+ *  button carries no state in it. Pinning the template-literal form would fail
+ *  on the tidier spelling rather than on anything this guard protects. */
 function clearButton(): string {
-  const classAttr = /class=\{`[^`]*\bprompt-clear\b[^`]*`\}/.exec(promptSource);
+  const classAttr = /class=(\{`|")[^`"]*\bprompt-clear\b[^`"]*(`\}|")/.exec(promptSource);
   if (!classAttr) throw new Error('nothing carries the prompt-clear class in PromptInput.tsx');
   const open = promptSource.lastIndexOf('<button', classAttr.index);
   if (open < 0) throw new Error('the prompt-clear element is not inside a <button>');
@@ -122,7 +126,7 @@ describe('the composer has one control on its right edge', () => {
 
 describe('the clear button is one of the prompt row icons', () => {
   it('wears the same box and glyph classes as its neighbours', () => {
-    expect(clearButton()).toMatch(/class=\{`icon-btn header-icon prompt-clear/);
+    expect(clearButton()).toMatch(/class=("|\{`)icon-btn header-icon prompt-clear/);
   });
 
   it('is measured by the row-overflow hook', () => {
@@ -131,8 +135,14 @@ describe('the clear button is one of the prompt row icons', () => {
     expect(clearButton()).toMatch(/\bdata-row-item\b/);
   });
 
-  it('keeps its width while hidden, so the row does not jitter when typing', () => {
-    expect(clearButton()).toMatch(/hasText \? '' : ' invisible'/);
+  // It used to render at `visibility: hidden` instead, holding a 2.25rem box in
+  // a row that had nothing to clear. On a phone that reservation is what lifted
+  // the Diff button onto a row of its own while the bottom row looked empty.
+  // Nothing on screen moves when the button arrives: it is last in the left
+  // cluster, whose next sibling has `margin-left: auto`.
+  it('renders only while there is a draft to clear', () => {
+    expect(promptSource).toMatch(/\{hasText && \(\s*<button\s+key="prompt-clear"/);
+    expect(clearButton()).not.toMatch(/\binvisible\b/);
   });
 
   it('declares no size or colour of its own, on any viewport', () => {

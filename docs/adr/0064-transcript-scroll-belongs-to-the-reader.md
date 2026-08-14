@@ -64,6 +64,17 @@ deep-link landing. A gesture and not merely a scroll, because the platform
 scrolls the container too. The last three are presses rather than gestures, so
 each retires the ride at its own call site.
 
+**A navigation retires it only when it lands the reader OFF the live edge.** The
+ride asks for one place, and a navigation resting there has asked for the same
+thing. Turn stepping and the deep link both measure their own landing, and both
+read one threshold.
+
+**A landing the ride survives is served by the ride's own glide**, never by the
+element tween. The two rest in the same place. Only the ride's marks its frames
+as held, which is what keeps the thread's recorded position the live edge rather
+than an offset. Both sites do it: the landing itself while the ride is armed,
+and the resume that picks a recorded ride back up.
+
 **A scroll the platform made retires nothing and is undone.** The iOS soft
 keyboard, a PWA resuming onto a restored offset and a restored session all move
 the container with no gesture. Leaving the follow armed there is only half the
@@ -84,7 +95,8 @@ places.
 **The deep link is the one navigation exempt from the liveness term.** The
 others describe a moment, where the reader happens to be looking. A link names
 one event and expects to still be on it later, so the ask has to survive the
-thread waking.
+thread waking. It is not exempt from the POSITION term: a link to the bottom of
+a thread names the ride's own place, so it ends nothing.
 
 ## Consequences
 
@@ -151,6 +163,19 @@ a question card is quiescent, so it reads as idle. A "needs your answer"
 notification points at exactly such a thread by construction. The reader landed
 on the question, answered, and was carried off the event the notification
 existed to show them.
+
+**Retire the ride on every deep-link landing, wherever it rests.** Held for a
+day, and it read the reader's ask off the tap rather than off the place. A link
+to the BOTTOM of a thread moves nobody, so it took a ride away over a navigation
+that never happened. Answering the question there then left the reader parked
+while the reply grew below them. The position term draws the line where the
+report did.
+
+**Retire it only where the landing MOVED the reader.** Nearly the same rule, and
+wrong in one direction. A link carrying a scrolled-up rider back down to the
+live edge moves them a long way. It also puts them exactly where the ride wanted
+them. Measuring the pixels would end the ride there, at the one moment it and
+the link finally agreed.
 
 **Read "did the reader take over" from the position alone.** Content growth
 changes `scrollHeight` and never `scrollTop`, so the position test is exact for

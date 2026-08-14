@@ -18,7 +18,7 @@ vi.mock('../../hooks/sw-update', () => ({
 import { checkEngineVersion, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
-import type { PendingCommits } from '../../api/client';
+import type { BuildFailure, PendingCommits } from '../../api/client';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed, markEngineVersionDismissed } from '../../hooks/sw-update';
 import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
@@ -40,6 +40,7 @@ function status(over: Partial<{
   shared_build_in_progress: boolean;
   build_elapsed_ms: number;
   pending_commits: PendingCommits;
+  build_failure: BuildFailure;
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -307,6 +308,124 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(toast?.action?.label).toBe('Retry build');
     toast?.action?.onClick();
     expect(mockRebuild).toHaveBeenCalled();
+  });
+});
+
+/** What a failed build TELLS the user.
+ *
+ *  The copy this replaced said "see the engine log" and offered Retry, which is
+ *  two dead ends at once on a phone: the log is unreachable there, and for a
+ *  deterministic failure Retry replays the same cached artifact forever. */
+describe('the build-failed toast says what broke, and what to do', () => {
+  beforeEach(() => {
+    mockStatus.mockReset();
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
+    mockRebuild.mockReset();
+    mockRebuild.mockResolvedValue(undefined);
+    toasts.value = [];
+    engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    engineRebuildWedged.value = false;
+    engineBuilding.value = false;
+    engineRestarting.value = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  const failedWith = (build_failure?: BuildFailure) =>
+    status({ source_behind_head: true, build_state: 'failed', build_failure });
+  const failedToast = () => toasts.value.find((t) => t.key === 'engine-build-failed');
+
+  it('names the actual error instead of pointing at a log', async () => {
+    mockStatus.mockResolvedValue(failedWith({
+      summary: 'error[E0308]: mismatched types',
+      repeatable: false,
+    }));
+    await checkEngineVersion();
+    expect(failedToast()?.message).toContain('error[E0308]: mismatched types');
+    expect(failedToast()?.message).not.toContain('engine log');
+  });
+
+  it('withholds Retry when retrying is proved futile, and names the fix', async () => {
+    // The reported loop: cargo calls the broken artifact fresh, so every tap
+    // reruns it byte for byte. The button has to go, exactly as it does for a
+    // wedged successful build.
+    mockStatus.mockResolvedValue(failedWith({
+      summary: 'Failed to create default VERSION: NotFound',
+      remedy: 'cargo clean -p lucidos-engine',
+      repeatable: true,
+    }));
+    await checkEngineVersion();
+    const toast = failedToast();
+    expect(toast?.type).toBe('warning');
+    expect(toast?.action?.label).toBe('OK');
+    expect(toast?.message).toContain('retrying cannot help');
+    expect(toast?.message).toContain('cargo clean -p lucidos-engine');
+    toast?.action?.onClick();
+    expect(mockRebuild).not.toHaveBeenCalled();
+  });
+
+  it('OK actually puts the repeatable toast away, and the 4s poll leaves it away', async () => {
+    // The button has to mean something. `showToast` recreates a keyed toast the
+    // instant it is gone. So without an acknowledgement, OK on an
+    // un-dismissable toast brought it straight back on the next poll, forever.
+    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
+    await checkEngineVersion();
+    failedToast()?.action?.onClick();
+    expect(failedToast()).toBeUndefined();
+    await checkEngineVersion();
+    expect(failedToast()).toBeUndefined();
+  });
+
+  it('a DIFFERENT failure surfaces again after one was acknowledged', async () => {
+    // The acknowledgement is keyed on the cause, so it silences that failure
+    // and not the surface. A new thing going wrong is a new thing to say.
+    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
+    await checkEngineVersion();
+    failedToast()?.action?.onClick();
+    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck differently', repeatable: true }));
+    await checkEngineVersion();
+    expect(failedToast()?.message).toContain('stuck differently');
+  });
+
+  it('a build that starts or succeeds re-arms the acknowledged failure', async () => {
+    // Clearing on the way out matters: the next failure is a new event even
+    // when it reads identically, and the user has not seen THAT one.
+    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
+    await checkEngineVersion();
+    failedToast()?.action?.onClick();
+    mockStatus.mockResolvedValue(status({ build_state: 'building' }));
+    await checkEngineVersion();
+    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
+    await checkEngineVersion();
+    expect(failedToast()?.message).toContain('stuck');
+  });
+
+  it('still offers a way forward when there is no exact remedy to name', async () => {
+    mockStatus.mockResolvedValue(failedWith({ summary: 'something deterministic', repeatable: true }));
+    await checkEngineVersion();
+    // A summary with no full stop must not run into the instruction after it.
+    expect(failedToast()?.message).toContain('something deterministic. Ask a coding agent');
+  });
+
+  it('keeps Retry when the cause could not be read at all', async () => {
+    // An unreadable failure is UNKNOWN, never "proved repeatable". Retiring the
+    // button here would strand a build that the next attempt would have passed.
+    mockStatus.mockResolvedValue(failedWith(undefined));
+    await checkEngineVersion();
+    const toast = failedToast();
+    expect(toast?.type).toBe('error');
+    expect(toast?.action?.label).toBe('Retry build');
+    expect(toast?.message).toContain('could not read the build output');
+  });
+
+  it('an old engine that cannot describe its failure still gets a usable toast', async () => {
+    // Cross-version: the frontend republishes seconds after Apply while the old
+    // engine binary keeps serving until Switch, so it answers without the field.
+    mockStatus.mockResolvedValue(status({ source_behind_head: true, build_state: 'failed' }));
+    await checkEngineVersion();
+    expect(failedToast()?.action?.label).toBe('Retry build');
   });
 });
 

@@ -515,7 +515,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       {queuedMessageId && (
         <button
           type="button"
-          class="icon-btn row-icon queued-message-remove"
+          class="icon-btn inline-icon queued-message-remove"
           aria-label="Remove queued message"
           data-tooltip="Remove queued message"
           onClick={(e) => {

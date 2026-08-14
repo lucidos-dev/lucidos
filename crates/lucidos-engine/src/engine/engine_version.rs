@@ -66,9 +66,131 @@ pub enum BuildState {
     /// finished-at, because an Apply landing mid-build would otherwise make the
     /// finished build claim a HEAD it did not compile.
     Ready { built_head: Option<String> },
-    /// The rebuild failed (compile error). The old engine keeps running; the
-    /// error is surfaced as "Build failed, view log".
-    Failed,
+    /// The rebuild failed. The old engine keeps running.
+    ///
+    /// Carries WHY, for the same reason `Building` carries its instant. The
+    /// toast has to tell the user something they can act on. "Failed, but
+    /// nobody knows why" is not worth being able to represent. `None` only
+    /// when the build's own output could not be read back.
+    Failed { reason: Option<BuildFailure> },
+}
+
+/// Why a background build failed, reduced to what a toast can carry.
+///
+/// One line, not a log tail. The reader is often on a phone, where the engine
+/// log is unreachable. So this has to BE the message, rather than point at one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BuildFailure {
+    /// The first real error line from the build, already trimmed.
+    pub summary: String,
+    /// A likely fix, when the output looks like a class we recognize. A
+    /// SUGGESTION shown beside the error, never a verdict, so it does not
+    /// decide whether Retry is offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+    /// True only when retrying is PROVED futile, which is what lets the toast
+    /// withhold Retry. That is the `rebuild_wedged` treatment, applied to a
+    /// failing build rather than a fruitless successful one.
+    ///
+    /// **Proof takes a recognized failure AND an observed repeat**, because
+    /// either alone over-fires. See the two paragraphs in
+    /// [`classify_build_failure`] for the false positive each one prevents.
+    ///
+    /// So an unreadable, unrecognized, or first-time failure is `false`.
+    pub repeatable: bool,
+}
+
+/// Longest summary a toast should carry. Past this the line stops being
+/// readable on a phone, which is the device this whole shape exists for.
+const BUILD_FAILURE_SUMMARY_CAP: usize = 200;
+
+/// Reduce a failed build's output to the one line worth showing, and decide
+/// whether retrying could ever change the answer.
+///
+/// `previous_summary` is the failure the build being reported was retrying, or
+/// `None` when it was not retrying one. It is half of what sets
+/// [`BuildFailure::repeatable`]; the recognized shape is the other half, and
+/// the body says why neither is sufficient alone.
+///
+/// Pure, so every recognizer is testable without running a build.
+///
+/// `None` when the output carries no error at all. Cargo always prints one for
+/// a real failure, so nothing found means the output was never captured. The
+/// caller must then say the cause is unknown rather than invent one.
+pub fn classify_build_failure(
+    output: &str,
+    previous_summary: Option<&str>,
+) -> Option<BuildFailure> {
+    // The `error:` line and the panic message are two different things, and
+    // for a build script the panic is the informative one: cargo's own line
+    // only ever says "failed to run custom build command".
+    let error_line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error:") || l.starts_with("error["));
+    let panic_message = output
+        .lines()
+        .skip_while(|l| !l.contains("panicked at"))
+        .nth(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+
+    let summary = panic_message.or(error_line)?;
+    let summary = summary
+        .get(..summary.floor_char_boundary(BUILD_FAILURE_SUMMARY_CAP))
+        .unwrap_or(summary)
+        .trim_end()
+        .to_string();
+
+    // BOTH halves are required, and each answers a way the other is wrong.
+    //
+    // Repetition alone over-fires, because a summary is not an identity. Two
+    // unrelated type errors both read `error[E0308]: mismatched types`, so a
+    // user fixing one and meeting the next would lose the button mid-progress.
+    //
+    // The shape alone over-fires too. A build script reporting a missing file
+    // may be missing a real input, which a rebuild fixes once it is back.
+    //
+    // Together they are the standard `rebuild_is_wedged` sets: a specific
+    // failure we recognize, observed to survive an attempt that changed nothing.
+    let remedy = stale_artifact_remedy(output);
+    Some(BuildFailure {
+        repeatable: remedy.is_some() && previous_summary == Some(summary.as_str()),
+        remedy,
+        summary,
+    })
+}
+
+/// `cargo clean` for a build script that failed on a path which is not there.
+/// That is the shape of a stale cached artifact (ADR 0079). Such a binary is
+/// reused across checkouts sharing a target directory. It can therefore name a
+/// tree that is gone, which cargo calls fresh forever.
+///
+/// A SUGGESTION, never a proof. The same output comes from a build script whose
+/// input is genuinely missing. There a clean fixes nothing and restoring the
+/// file fixes everything. So this names a likely fix beside the error, and
+/// never decides whether Retry is offered.
+fn stale_artifact_remedy(output: &str) -> Option<String> {
+    let build_script_failed = output.contains("failed to run custom build command");
+    let path_missing = output.contains("No such file or directory") || output.contains("NotFound");
+    if !(build_script_failed && path_missing) {
+        return None;
+    }
+    Some(match failing_package(output) {
+        Some(pkg) => format!("cargo clean -p {pkg}"),
+        None => "cargo clean".to_string(),
+    })
+}
+
+/// The package name out of cargo's ``failed to run custom build command for
+/// `name v1.2.3 (/path)` `` line, so the remedy can name `-p <package>`.
+///
+/// `None` rather than a guess when the line is not shaped as expected: a wrong
+/// `-p` would send the user to clean a package that is not the broken one.
+fn failing_package(output: &str) -> Option<&str> {
+    let tail = output.split("custom build command for `").nth(1)?;
+    let name = tail.split([' ', '`']).next()?;
+    (!name.is_empty()).then_some(name)
 }
 
 impl BuildState {
@@ -78,7 +200,15 @@ impl BuildState {
             BuildState::Idle => "idle",
             BuildState::Building { .. } => "building",
             BuildState::Ready { .. } => "ready",
-            BuildState::Failed => "failed",
+            BuildState::Failed { .. } => "failed",
+        }
+    }
+
+    /// Why this build failed, when it did and the output could be read.
+    pub fn failure(&self) -> Option<&BuildFailure> {
+        match self {
+            BuildState::Failed { reason } => reason.as_ref(),
+            _ => None,
         }
     }
 
@@ -102,6 +232,12 @@ impl BuildState {
     /// constructor for `Ready`, so a completion site cannot forget the stamp.
     pub fn ready_from(built_head: Option<String>) -> Self {
         BuildState::Ready { built_head }
+    }
+
+    /// A failed build carrying why, when the output could be read. The one
+    /// constructor for `Failed`, matching its two siblings above.
+    pub fn failed_with(reason: Option<BuildFailure>) -> Self {
+        BuildState::Failed { reason }
     }
 }
 
@@ -335,6 +471,13 @@ pub struct VersionStatus {
     /// same build from the same source, so it completes in seconds and puts the
     /// same toast straight back. Always false packaged.
     pub rebuild_wedged: bool,
+    /// Why the last build failed, absent unless `build_state` is `failed`.
+    ///
+    /// The toast renders this INSTEAD of pointing at the engine log, which a
+    /// phone cannot open. Absent on a failure means the build's output could
+    /// not be read, and the toast says the cause is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_failure: Option<BuildFailure>,
     /// How long THIS engine's own background rebuild has been running, in ms,
     /// or absent when no build of ours is in flight. A co-located peer's build
     /// is absent too, since we do not have its clock.
@@ -795,6 +938,7 @@ impl LucidosEngine {
             source_behind_head,
             head_commit,
             rebuild_wedged,
+            build_failure: build_state.failure().cloned(),
             shared_build_in_progress,
             build_elapsed_ms: build_state
                 .elapsed()
@@ -960,6 +1104,10 @@ impl LucidosEngine {
         // Stamped once here, so the state the SSE poke reports and the state the
         // elapsed counter reads are the same start moment.
         let building = BuildState::building_now();
+        // Read the failure this build is retrying BEFORE `Building` overwrites
+        // it. An identical repeat is the only PROOF that retrying is futile,
+        // and it is what lets the toast withhold Retry.
+        let previous_failure = self.build_state().failure().map(|f| f.summary.clone());
         self.set_build_state(building.clone());
         let engine = self.clone();
         let workspace = self.workspace_path().to_path_buf();
@@ -994,13 +1142,13 @@ impl LucidosEngine {
             // wrong forever, and the wedge for that HEAD is missed. One fork per
             // build, against a build running for tens of seconds, is cheap.
             let built_head = current_head_sha().await;
-            let outcome = run_engine_build(&workspace).await;
+            let outcome = run_engine_build(&workspace, previous_failure.as_deref()).await;
             // Only the latest generation updates state. A superseded build's
             // completion is ignored, since a newer build is already `Building`.
             if engine.build_generation.load(Ordering::SeqCst) == generation {
                 let state = match outcome {
                     EngineBuildOutcome::Succeeded => BuildState::ready_from(built_head),
-                    EngineBuildOutcome::Failed => BuildState::Failed,
+                    EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
                     // A co-located engine holds the shared build lock. This is
                     // NOT our compile failure, so it must not surface the
                     // build-failed toast. The peer's build advances the shared
@@ -1042,7 +1190,9 @@ impl LucidosEngine {
 /// surface the "build failed" toast.
 enum EngineBuildOutcome {
     Succeeded,
-    Failed,
+    /// Carries why, so the toast can say it. `None` only when the build's own
+    /// output could not be read back.
+    Failed(Option<BuildFailure>),
     SkippedLocked,
 }
 
@@ -1451,7 +1601,10 @@ async fn current_head_sha() -> Option<String> {
 /// process group so a coalescing abort kills `cargo` too, not just the script
 /// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for
 /// the whole build, and returns `SkippedLocked` when a peer already holds it.
-async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
+async fn run_engine_build(
+    workspace: &std::path::Path,
+    previous_failure: Option<&str>,
+) -> EngineBuildOutcome {
     // Elect a single builder across co-located engines. With no resolvable
     // checkout there is no shared `target/` to coordinate on, so proceed
     // uncoordinated rather than never building. Only a genuinely held lock
@@ -1475,11 +1628,22 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
         Ok(s) => s,
         Err(e) => {
             crate::log!("[Rebuild] cannot locate web-dev.sh: {e}");
-            return EngineBuildOutcome::Failed;
+            return EngineBuildOutcome::Failed(Some(BuildFailure {
+                summary: format!("cannot locate web-dev.sh: {e}"),
+                remedy: None,
+                repeatable: false,
+            }));
         }
     };
     let ws = workspace.to_string_lossy().to_string();
     let log_path = workspace.join(".lucidos/engine.log");
+    // Where THIS build's output will start. The build appends to the shared
+    // engine log. Without the mark, a failure would read back every earlier
+    // build's errors too and report the oldest one.
+    //
+    // `None` is UNKNOWN, never 0. Defaulting an unreadable length to the start
+    // of the file would report some long-dead build's error as this one's.
+    let log_start = std::fs::metadata(&log_path).map(|m| m.len()).ok();
     let mut cmd = tokio::process::Command::new(&script);
     cmd.args(["-w", &ws, "--engine-build"]).kill_on_drop(true);
     // Own process group, so a coalescing abort can reach the `cargo` grandchild
@@ -1505,7 +1669,11 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
         Ok(child) => child,
         Err(e) => {
             crate::log!("[Rebuild] failed to spawn engine build: {e}");
-            return EngineBuildOutcome::Failed;
+            return EngineBuildOutcome::Failed(Some(BuildFailure {
+                summary: format!("could not start the build: {e}"),
+                remedy: None,
+                repeatable: false,
+            }));
         }
     };
     let mut group_guard = BuildProcessGroupGuard(child.id());
@@ -1516,27 +1684,211 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
         Ok(status) if status.success() => EngineBuildOutcome::Succeeded,
         Ok(status) => {
             crate::log!("[Rebuild] engine build exited {status}");
-            EngineBuildOutcome::Failed
+            let output = build_output_since(&log_path, log_start);
+            let reason = classify_build_failure(&output, previous_failure);
+            if let Some(r) = &reason {
+                crate::log!("[Rebuild] cause: {}", r.summary);
+            }
+            EngineBuildOutcome::Failed(reason)
         }
         Err(e) => {
             crate::log!("[Rebuild] engine build could not be waited on: {e}");
-            EngineBuildOutcome::Failed
+            EngineBuildOutcome::Failed(Some(BuildFailure {
+                summary: format!("the build could not be waited on: {e}"),
+                remedy: None,
+                repeatable: false,
+            }))
         }
     }
+}
+
+/// Longest slice of a failed build's output to read back. Cargo stops at the
+/// error, so it sits near the start of what this build appended. The cap
+/// therefore costs nothing and bounds a pathological log.
+const BUILD_OUTPUT_READ_CAP: u64 = 512 * 1024;
+
+/// What the build appended to the engine log, from `start` to the cap.
+///
+/// Empty when the log cannot be read, and when `start` is `None`. An absent
+/// mark means there is no way to tell this build's output from an older one's.
+/// `classify_build_failure` then finds no error line and reports the cause as
+/// unknown, which is the honest answer rather than a stale one.
+fn build_output_since(log_path: &std::path::Path, start: Option<u64>) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut buf = String::new();
+    let Some(start) = start else { return buf };
+    if let Ok(mut f) = std::fs::File::open(log_path) {
+        if f.seek(SeekFrom::Start(start)).is_ok() {
+            // Lossy, deliberately. A partial UTF-8 sequence can land at the
+            // cap, and a decode error must not cost us the error line before
+            // it.
+            let mut bytes = Vec::new();
+            if f.take(BUILD_OUTPUT_READ_CAP)
+                .read_to_end(&mut bytes)
+                .is_ok()
+            {
+                buf = String::from_utf8_lossy(&bytes).into_owned();
+            }
+        }
+    }
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_engine_build_lock_waiting, build_id_commit, classify_commit_subject,
-        classify_pending_commits, commit_is_strict_ancestor, disk_upgrade_verdict,
-        engine_build_lock_path, lock_held_at, open_teardown, parse_pending_commits,
-        rebuild_is_wedged, self_heal_is_wedged, stash_first_restart_actor, try_lock_file,
-        BuildProcessGroupGuard, BuildState, CommitGroupKind, COMMIT_GROUP_ORDER,
-        PENDING_COMMIT_DESCRIPTION_CAP,
+        acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
+        classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
+        disk_upgrade_verdict, engine_build_lock_path, lock_held_at, open_teardown,
+        parse_pending_commits, rebuild_is_wedged, self_heal_is_wedged, stash_first_restart_actor,
+        try_lock_file, BuildProcessGroupGuard, BuildState, CommitGroupKind,
+        BUILD_FAILURE_SUMMARY_CAP, COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
     };
     use crate::engine::thread_events::MessageOrigin;
     use std::time::Duration;
+
+    // ── Why a build failed ───────────────────────────────────────────────────
+
+    /// The real output from the incident that produced this code path: a build
+    /// script carrying a path into a checkout that had been deleted.
+    const STALE_BUILD_SCRIPT_OUTPUT: &str = "\
+   Compiling lucidos-engine v0.1.0 (/repo/crates/lucidos-engine)
+error: failed to run custom build command for `lucidos-engine v0.1.0 (/repo/crates/lucidos-engine)`
+
+Caused by:
+  process didn't exit successfully: `/repo/target/debug/build/lucidos-engine-7d7f/build-script-build` (exit status: 101)
+  --- stderr
+
+  thread 'main' (11466974) panicked at crates/lucidos-engine/build.rs:52:45:
+  Failed to create default VERSION: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+";
+
+    #[test]
+    fn the_stale_build_script_failure_is_named_with_its_likely_remedy() {
+        // The class this whole change exists for: the panic message is the
+        // cause, and cargo's own line only says "custom build command".
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None)
+            .expect("a build-script panic must classify");
+        assert!(
+            f.summary.contains("Failed to create default VERSION"),
+            "the panic message is the cause, not cargo's generic line: {}",
+            f.summary
+        );
+        assert_eq!(f.remedy.as_deref(), Some("cargo clean -p lucidos-engine"));
+    }
+
+    #[test]
+    fn a_recognized_shape_alone_never_retires_the_retry_button() {
+        // The shape is a GUESS. A build script reporting a missing file may be
+        // missing a real input, which a rebuild fixes once it is back, and
+        // `cargo clean` does not. So a first sighting keeps Retry.
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
+        assert!(
+            !f.repeatable,
+            "a pattern is not proof; only a repeat is: {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_identical_repeat_is_what_proves_retrying_futile() {
+        // The build in between changed nothing, so the button goes. Same
+        // evidence-based shape as `rebuild_is_wedged`.
+        let first = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
+        let second = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, Some(&first.summary))
+            .expect("must classify");
+        assert!(second.repeatable);
+    }
+
+    #[test]
+    fn a_repeating_generic_error_line_never_retires_retry_on_its_own() {
+        // A summary is not an identity. Two unrelated type errors both read
+        // `error[E0308]: mismatched types`. Fix one, meet the next, and the
+        // button would go while the user is making progress. So repetition
+        // only counts for a failure we actually recognize.
+        let out = "error[E0308]: mismatched types\n --> src/b.rs:9:1\n";
+        let f = classify_build_failure(out, Some("error[E0308]: mismatched types"))
+            .expect("must classify");
+        assert!(
+            !f.repeatable,
+            "a repeated generic line is not a repeated failure: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_build_that_fails_differently_re_arms_retry() {
+        // Something changed between the two attempts, so the next one is
+        // worth taking. A restored input lands here.
+        let previous = "error[E0308]: mismatched types";
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, Some(previous))
+            .expect("must classify");
+        assert!(!f.repeatable);
+    }
+
+    #[test]
+    fn an_ordinary_compile_error_keeps_the_retry_button() {
+        let f = classify_build_failure(
+            "error[E0308]: mismatched types\n --> crates/lucidos-engine/src/foo.rs:12:5\n",
+            None,
+        )
+        .expect("a compile error must classify");
+        assert_eq!(f.summary, "error[E0308]: mismatched types");
+        assert_eq!(f.remedy, None);
+        assert!(!f.repeatable);
+    }
+
+    #[test]
+    fn output_that_could_not_be_read_reports_no_cause_at_all() {
+        // The safety direction. Empty output means the log could not be read,
+        // NOT that the build failed for a knowable reason. Inventing one here
+        // is how a toast starts lying.
+        assert!(classify_build_failure("", None).is_none());
+        assert!(classify_build_failure("   Compiling lucidos-engine v0.1.0\n", None).is_none());
+    }
+
+    #[test]
+    fn a_missing_path_outside_a_build_script_gets_no_clean_remedy() {
+        // `cargo clean` is not the fix for a source file that genuinely is not
+        // there, so the recognizer must not claim it.
+        let f = classify_build_failure(
+            "error: couldn't read src/gone.rs: No such file or directory (os error 2)\n",
+            None,
+        )
+        .expect("must classify");
+        assert_eq!(f.remedy, None);
+    }
+
+    #[test]
+    fn an_unparseable_package_line_falls_back_to_a_bare_clean() {
+        // A wrong `-p` would send the user to clean the wrong package. So an
+        // unrecognized line drops the flag rather than guess at a name.
+        let out = "error: failed to run custom build command\n\
+                   No such file or directory\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(f.remedy.as_deref(), Some("cargo clean"));
+    }
+
+    #[test]
+    fn a_runaway_error_line_is_capped_without_splitting_a_character() {
+        // The summary goes in a toast on a phone. Capping by BYTE index would
+        // panic on a multi-byte character straddling the boundary.
+        let long = format!("error: {}", "\u{e9}".repeat(400));
+        let f = classify_build_failure(&long, None).expect("must classify");
+        assert!(f.summary.len() <= BUILD_FAILURE_SUMMARY_CAP);
+    }
+
+    #[test]
+    fn the_failure_rides_in_the_variant_and_only_the_failed_variant_has_one() {
+        // Same argument as `Building` carrying its instant: "failed, but nobody
+        // knows why" should not be reachable through the state.
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None);
+        let state = BuildState::failed_with(f);
+        assert_eq!(state.as_wire(), "failed");
+        assert!(state.failure().is_some());
+        assert!(BuildState::Idle.failure().is_none());
+        assert!(BuildState::ready_from(None).failure().is_none());
+        assert!(BuildState::building_now().failure().is_none());
+    }
 
     // ── The restart-actor stash ──────────────────────────────────────────────
 
@@ -1956,7 +2308,11 @@ mod tests {
         // conclude from.
         assert!(!self_heal_is_wedged(0, &ready, Some("head1")));
         // A compile error is retryable, not wedged.
-        assert!(!self_heal_is_wedged(1, &BuildState::Failed, Some("head1")));
+        assert!(!self_heal_is_wedged(
+            1,
+            &BuildState::failed_with(None),
+            Some("head1")
+        ));
         // Idle: no build outcome to judge (the caller already excluded Building).
         assert!(!self_heal_is_wedged(1, &BuildState::Idle, Some("head1")));
         // Deliberately still true at the cap: nothing clears `Ready`, so the
@@ -1988,7 +2344,10 @@ mod tests {
         assert!(!rebuild_is_wedged(&ready, None));
         // Only a COMPLETED build is evidence.
         assert!(!rebuild_is_wedged(&BuildState::Idle, Some("head1")));
-        assert!(!rebuild_is_wedged(&BuildState::Failed, Some("head1")));
+        assert!(!rebuild_is_wedged(
+            &BuildState::failed_with(None),
+            Some("head1")
+        ));
         assert!(!rebuild_is_wedged(
             &BuildState::building_now(),
             Some("head1")
@@ -2240,7 +2599,7 @@ mod tests {
         assert!(BuildState::building_now().elapsed().is_some());
         assert!(BuildState::Idle.elapsed().is_none());
         assert!(BuildState::ready_from(None).elapsed().is_none());
-        assert!(BuildState::Failed.elapsed().is_none());
+        assert!(BuildState::failed_with(None).elapsed().is_none());
         assert_eq!(BuildState::building_now().as_wire(), "building");
         // The HEAD a build was started from is bookkeeping for the wedge
         // verdict, not a new wire state: `ready` stays `ready` either way.

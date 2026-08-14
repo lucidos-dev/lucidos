@@ -2,7 +2,7 @@ import type { Ref, VNode } from 'preact';
 import { useRef } from 'preact/hooks';
 import { connectionStatus, visibleWorkspaceName } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
-import { connectionNotice } from '../../utils/connectionNotice';
+import { connectionNotice, hasConnectionNotice } from '../../utils/connectionNotice';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
@@ -42,9 +42,7 @@ export function shouldRenderConnectionBanner(opts: {
   connectingSettled: boolean;
 }): boolean {
   if (!bannerBelongsToLayout(opts.layout, opts.mobileViewport)) return false;
-  // The workspace name is irrelevant to whether there is anything to say, and
-  // passing null here keeps that explicit: a nameless workspace still gets a bar.
-  if (connectionNotice(opts.status, null) === null) return false;
+  if (!hasConnectionNotice(opts.status)) return false;
   return opts.status === 'connecting' ? opts.connectingSettled : true;
 }
 
@@ -71,7 +69,10 @@ export function connectionBannerBody(props: {
   workspace: string | null;
   elRef?: Ref<HTMLDivElement>;
 }): VNode | null {
-  const notice = connectionNotice(props.status, props.workspace);
+  // The one surface that takes the FULL detail. It spans the window, so both
+  // clauses fit on a line the bar already costs. Every narrower surface is then
+  // free to state the short form, knowing this one has said the rest.
+  const notice = connectionNotice(props.status, props.workspace, 'full');
   if (!notice) return null;
   return (
     <div

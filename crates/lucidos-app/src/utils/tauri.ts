@@ -283,11 +283,36 @@ export interface AppUpdateOffer {
   notes: string | null;
 }
 
+/** Read what `check_app_update` actually answered.
+ *
+ *  This boundary is the one place that knows the command has had more than one
+ *  return shape. The client BINARY owns the command and the frontend BUNDLE owns
+ *  the call. They are installed separately, so a packaged client can run either
+ *  half a release behind the other. Before 0.27.0 the command answered the bare
+ *  version string; it now answers the version plus the release notes.
+ *  {@link invoke} casts rather than checks. A frontend that trusted the
+ *  annotation put the whole object where the version goes, and the update offer
+ *  read `Lucidos [object Object] available`.
+ *
+ *  Both known shapes parse to one offer, so no surface downstream has to ask
+ *  which client it is talking to. Anything else THROWS: null is the answer for
+ *  "up to date", and a payload we cannot read is not that. The caller records
+ *  the rejection on the check-error surface instead. */
+function parseAppUpdateOffer(raw: unknown): AppUpdateOffer | null {
+  if (raw === null || raw === undefined) return null;
+  const offer = typeof raw === 'string' ? { version: raw } : (raw as Record<string, unknown>);
+  const { version, notes } = offer;
+  if (typeof version !== 'string' || version.trim() === '') {
+    throw new Error(`check_app_update returned an unreadable offer: ${JSON.stringify(raw)}`);
+  }
+  return { version, notes: typeof notes === 'string' ? notes : null };
+}
+
 /** Check GitHub Releases for a newer signed packaged build. Returns the offer
  *  when one is available, else null. Drives the in-app update toast. Only call
  *  when isTauri() is true (no-op → null in dev). */
-export function checkAppUpdate(): Promise<AppUpdateOffer | null> {
-  return invoke<AppUpdateOffer | null>('check_app_update');
+export async function checkAppUpdate(): Promise<AppUpdateOffer | null> {
+  return parseAppUpdateOffer(await invoke<unknown>('check_app_update'));
 }
 
 /** Install the available packaged update and restart the WHOLE stack onto the
@@ -396,6 +421,20 @@ export interface ConnectInfo {
  *  Only call when isTauri() is true. */
 export function openExternal(url: string): Promise<void> {
   return invoke('open_url_external', { url });
+}
+
+/** Open a workspace in a NEW top-level app window (lib.rs
+ *  `open_workspace_window`). The desktop half of `openWorkspaceWindow`, which is
+ *  the only thing that should call it.
+ *
+ *  Takes the workspace SLUG, never a URL, and the shell composes the URL itself
+ *  on the calling window's own origin. A `window-*` webview carries the full IPC
+ *  grant on the gateway origin (ADR 0028). Rejects with a string when the slug is
+ *  not one the gateway serves, or the window could not be built.
+ *
+ *  Only call when isTauri() is true. */
+export function openWorkspaceInNativeWindow(workspace: string): Promise<void> {
+  return invoke('open_workspace_window', { workspace });
 }
 
 /** Surface the engine's connect URLs (localhost / LAN / Tailscale). Only call

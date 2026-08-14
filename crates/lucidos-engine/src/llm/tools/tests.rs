@@ -986,3 +986,22 @@ fn await_event_description_carves_out_the_threads_own_child() {
          name how to target it, or the exclusion reads as a blanket ban:\n{d}"
     );
 }
+
+/// Every built-in name must satisfy the Messages API pattern. One violation
+/// rejects the whole request, so this cannot be caught in review or at
+/// runtime: it has to fail here, before the name ever ships.
+#[test]
+fn every_built_in_tool_name_is_wire_safe() {
+    let offenders: Vec<String> = get_default_tools()
+        .into_iter()
+        .chain(crate::capability_manifest::llm_tools())
+        .map(|t| t.name)
+        .filter(|n| !crate::llm::validate::is_wire_safe_tool_name(n))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "tool names must match ^[a-zA-Z0-9_-]{{1,128}}$, or the Anthropic API \
+         rejects every request carrying them: {:?}",
+        offenders
+    );
+}

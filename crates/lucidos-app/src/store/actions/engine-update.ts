@@ -169,6 +169,80 @@ function renderVersionToast(shape: VersionAnnouncement): void {
   });
 }
 
+/** The repeatable failure the user has acknowledged, so the 4s poll stops
+ *  redrawing it.
+ *
+ *  Without this the OK button is a lie. `showToast` re-creates a keyed toast
+ *  the moment it is gone, so an acknowledged toast came straight back on the
+ *  next poll, forever. That is tolerable for the retryable shape, which is a
+ *  standing nag about something the user CAN act on here. It is not tolerable
+ *  for a toast whose whole message is "there is nothing to do about this from
+ *  the phone in your hand".
+ *
+ *  Keyed on the cause, not a boolean, so a DIFFERENT failure still surfaces.
+ *  Cleared when the build state leaves `failed`, since the next failure is a
+ *  new event even if it reads the same. */
+let acknowledgedBuildFailure: string | null = null;
+
+/** Draw the build-failed toast, in whichever of its two shapes the failure
+ *  earns. Keyed, so a re-poll updates it in place rather than stacking.
+ *
+ *  Both shapes SAY WHAT BROKE. The copy this replaced said only "see the engine
+ *  log". That names a file no phone can open, and the phone is where this gets
+ *  read.
+ *
+ *  The shapes differ only in whether the user can do anything with Retry:
+ *
+ *  - **ordinary**: the next build could genuinely succeed, so offer Retry.
+ *  - **repeatable**: a rebuild is proved futile, because the same cached
+ *    artifact is replayed byte for byte. Offering the button anyway is the loop
+ *    the user reported. So the button goes, the tone rises to `warning`, and
+ *    the copy names the one command that does resolve it. This is exactly the
+ *    `wedged` treatment above, applied to a failing build rather than a
+ *    fruitless successful one, down to the `dismissable: false` + explicit OK.
+ *
+ *  An ABSENT failure is not a third shape. The engine could not read its own
+ *  build output, so the cause is unknown and Retry stays. That is the same
+ *  fallible-but-worth-trying position as an ordinary error. */
+function renderBuildFailedToast(failure: EngineVersionStatus['build_failure']): void {
+  // A compiler error line does not end in a full stop, so it would run
+  // straight into the instruction after it.
+  const sentence = (s: string) => (/[.!?]$/.test(s.trim()) ? s.trim() : `${s.trim()}.`);
+  // "Ask a coding agent" is the honest instruction on a phone: the workspace
+  // can fix its own build, and it is the only remedy that does not require
+  // being sat at the checkout.
+  const cause = sentence(failure?.summary ?? 'the engine could not read the build output');
+  if (failure?.repeatable) {
+    if (acknowledgedBuildFailure === cause) return;
+    const fix = failure.remedy
+      ? `Run \`${failure.remedy}\` in your checkout, or ask a coding agent to fix it.`
+      : 'Ask a coding agent to fix it.';
+    showToast(
+      `New engine version failed to build, and retrying cannot help: ${cause} ${fix}`,
+      'warning',
+      {
+        key: BUILD_FAILED_TOAST_KEY,
+        dismissable: false,
+        action: {
+          label: 'OK',
+          onClick: () => {
+            acknowledgedBuildFailure = cause;
+            dismissToast(BUILD_FAILED_TOAST_KEY);
+          },
+        },
+      },
+    );
+    return;
+  }
+  // A retryable failure keeps nagging while it stands, which is the behavior
+  // this toast has always had: there IS something to do about it, and it
+  // clears itself the moment a build starts or succeeds.
+  showToast(`New engine version failed to build: ${cause}`, 'error', {
+    key: BUILD_FAILED_TOAST_KEY,
+    action: { label: 'Retry build', onClick: () => { void triggerRebuild(); } },
+  });
+}
+
 /** The announced engine version id the last poll saw, so the badge tap below can
  *  name the version it is asking to see again without re-reading the status. */
 let lastAnnouncedId: string | undefined;
@@ -195,6 +269,7 @@ let reopenedVersionId: string | undefined;
 export function resetEngineVersionToastForTest(): void {
   lastAnnouncedId = undefined;
   reopenedVersionId = undefined;
+  acknowledgedBuildFailure = null;
 }
 
 /** Re-open the pending version toast on demand (the brand badge was tapped).
@@ -273,17 +348,12 @@ async function pollEngineVersion(): Promise<void> {
     // surface stands down rather than putting a second badge and a second
     // rebuild button on screen for the same stuck version.
     setEngineVersionPending(false);
-    // A new version exists in source but the last rebuild failed. Offer a manual
-    // retry so the user isn't stuck (the engine self-heal driver also retries, up
-    // to a per-HEAD cap). No auto-switch — the build must succeed first.
-    showToast('New engine version failed to build — see the engine log.', 'error', {
-      key: BUILD_FAILED_TOAST_KEY,
-      action: { label: 'Retry build', onClick: () => { void triggerRebuild(); } },
-    });
+    renderBuildFailedToast(status.build_failure);
     return;
   }
   // A prior failure cleared once a build starts / succeeds.
   dismissToast(BUILD_FAILED_TOAST_KEY);
+  acknowledgedBuildFailure = null;
 
   // A background rebuild of the shared binary is in flight — this engine's own
   // (build_state === 'building') OR a CO-LOCATED peer's. Co-located workspaces

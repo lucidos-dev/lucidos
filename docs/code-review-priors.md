@@ -648,6 +648,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A new deep-link claim clearing `_pendingEventScrollLandedOffEdge` cannot
+  resurrect a ride, because the thread's RECORD is the durable guard.** The flag
+  (`components/chat/scrollState.ts`) says the last landing rested off the live
+  edge, and it resets when a claim begins. A reviewer correctly observes what
+  that costs. A second link claiming right after a first landed off the edge
+  clears the one piece of state saying that landing ended the ride. Codex
+  flagged exactly this, twice, on the branch that added the flag.
+
+  The in-place resume never runs on that state alone. Both callers read the
+  thread's *reading position* first: `standDownForDeepLink` resumes only for
+  `recorded?.kind === 'live-edge'`, and `onPageWake` returns early otherwise. An
+  off-edge landing records an OFFSET for that thread (`recordDeepLinkLanding`),
+  so a beat later there is no live-edge record to resume at all. The *follow
+  seed*'s own branch (`recorded === null`) reaches the same resume, and the same
+  landing gives that thread a record too.
+
+  What is left is the save's own debounce, a couple of hundred milliseconds in
+  which the record still reads live-edge. Reaching it needs a second link
+  claimed AND an attach or page wake inside that window. Widening the flag's
+  lifetime does not close it either, since `releaseClaim` clears the flag on the
+  same path. Re-flag only if the resume stops reading the record first, or if
+  the landing stops recording an offset.
+
 - **The derived live `Thinking` row carrying no `created` is deliberate, and no
   consumer reads a missing one.** Every other `pushStep` in
   `store/thread-events/exchange-render.ts` stamps the source event's `created`,
@@ -2418,3 +2441,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   return should not acquire. Re-flag only if the callers stop sharing
   `keepTheLiveEdge`, or if something between them can change the container's
   geometry. (`components/chat/scrollState.ts`.)
+
+- **`classify_build_failure` naming a `cargo clean` remedy for a build script
+  that failed on a missing path is a SUGGESTION, not a repeatability verdict**
+  (2026-08-14). The recognizer looks like it is deciding something load-bearing,
+  and an earlier revision of it genuinely was: it set `repeatable` from that
+  shape, which removed the toast's Retry button. Codex flagged it correctly:
+  the same output comes from a build script whose input is genuinely absent,
+  where a rebuild fixes it and a clean does not.
+
+  The verdict now takes BOTH the recognized shape AND an observed repeat, which
+  is why it looks redundant. Each half answers a false positive the other
+  causes. The shape alone fires on a genuinely missing input. Repetition alone
+  fires on two unrelated errors sharing one generic line (`error[E0308]:
+  mismatched types`), which is a user midway through fixing things.
+
+  Re-flag only if one half is dropped, or if a remedy string gains the power to
+  remove an affordance on its own.
+  (`crates/lucidos-engine/src/engine/engine_version.rs`,
+  `crates/lucidos-app/src/store/actions/engine-update.ts`.)

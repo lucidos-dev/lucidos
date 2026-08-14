@@ -86,3 +86,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0076: Coding-agent branch names are unique by construction and the create decides, superseding 0041's accepted allocation race](0076-concurrent-branch-allocation-is-create-decided.md)
 - [0077: The default UI font is vendored and served locally; only an opt-in font may take the Google CDN](0077-default-ui-font-is-vendored.md)
 - [0078: The scroll-anchor correction rounds its write to a whole pixel; the tween deliberately does not](0078-anchor-correction-rounds-the-tween-does-not.md)
+- [0079: A cargo build script resolves CARGO_MANIFEST_DIR at run time, never with compile-time env!](0079-build-scripts-never-bake-a-checkout-path.md)

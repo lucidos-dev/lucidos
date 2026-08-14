@@ -983,14 +983,14 @@
     font-size: var(--font-size-md);
 }
 
-/* Box, nominal and correction all come from `.icon-btn.row-icon`
-   (host-components.css), shared with the trigger group heading's trash. It used
-   to be hand-sized here, at 1.25rem around a 0.85rem glyph on no icon step: a
-   target a thumb misses, holding a glyph off the scale entirely. Being smaller
-   than the heading's trash was never the defect; being off the scale in an
-   undersized box was. It later kept a local `--icon-glyph` one step below the
-   heading's, which is the step the shared class now takes for every row icon,
-   so only the colour stays local. */
+/* Box, nominal and correction all come from `.icon-btn.inline-icon`
+   (host-components.css): this trash interrupts a line of text rather than
+   sitting beside one, which is a band of its own, one step under the trigger
+   group heading's pair. It used to be hand-sized here, at 1.25rem around a
+   0.85rem glyph on no icon step: a target a thumb misses, holding a glyph off
+   the scale entirely. Being smaller than the heading's trash was never the
+   defect; being off the scale in an undersized box was. Only the colour stays
+   local. */
 .queued-message-remove {
     color: var(--text-muted);
 }

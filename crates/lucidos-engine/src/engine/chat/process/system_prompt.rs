@@ -1842,6 +1842,7 @@ mod tests {
             source_behind_head,
             head_commit: None,
             rebuild_wedged,
+            build_failure: None,
             shared_build_in_progress: false,
             build_elapsed_ms: None,
             pending_commits: None,

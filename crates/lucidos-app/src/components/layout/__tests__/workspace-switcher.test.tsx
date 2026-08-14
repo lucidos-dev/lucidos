@@ -17,8 +17,10 @@
  * `Sk*` leaves read it through a hook, so `vnodeToText` cannot flatten it, but
  * the SHAPE it draws is pure and is exactly where the height parity lives.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import type { VNode } from 'preact';
 import { workspacesMenuRow, workspaceSwitcherList, skeletonShape } from '../WorkspaceSwitcher';
+import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
@@ -30,11 +32,44 @@ function ws(over: Partial<WorkspaceStatus> & { id: string }): WorkspaceStatus {
   return { name: over.id, port: 5200, health: 'healthy', autostart: false, ...over };
 }
 
+function listVNode(
+  state: Loadable<WorkspaceStatus[]>,
+  over: Partial<Omit<SwitcherListProps, 'state'>> = {},
+) {
+  return workspaceSwitcherList({
+    state,
+    currentId: 'dev',
+    manageHref: MANAGE,
+    contextId: null,
+    onSwitch: NOOP,
+    onNavigate: NOOP,
+    onContext: NOOP,
+    onOpenWindow: NOOP,
+    ...over,
+  });
+}
+
 function list(
   state: Loadable<WorkspaceStatus[]>,
-  { currentId = 'dev', manageHref = MANAGE as string | null } = {},
+  over: Partial<Omit<SwitcherListProps, 'state'>> = {},
 ): string {
-  return vnodeToText(workspaceSwitcherList({ state, currentId, manageHref, onSwitch: NOOP, onNavigate: NOOP }));
+  return vnodeToText(listVNode(state, over));
+}
+
+/** Every vnode in the tree, depth-first. `vnodeToText` drops props, and a
+ *  handler is the whole of what a right-click does here. */
+function vnodes(node: unknown): VNode[] {
+  if (Array.isArray(node)) return node.flatMap(vnodes);
+  if (!node || typeof node !== 'object' || !('type' in node)) return [];
+  const v = node as VNode<{ children?: unknown }>;
+  return [v, ...vnodes(v.props?.children)];
+}
+
+/** The row for workspace `id`, found by the key every row carries. */
+function rowNode(node: unknown, id: string): VNode<Record<string, unknown>> {
+  const found = vnodes(node).find((v) => v.key === id);
+  expect(found, `no row keyed "${id}"`).toBeTruthy();
+  return found as VNode<Record<string, unknown>>;
 }
 
 /** The whole flattened row that names `name`: from its own opening tag to the
@@ -48,6 +83,16 @@ function rowFor(text: string, name: string): string {
   expect(start, `row "${name}" has no opening tag`).toBeTruthy();
   const next = opens.find((m) => m.index! > at);
   return text.slice(start!.index!, next ? next.index! : text.length);
+}
+
+/** The classes of the row emitted immediately AFTER the one naming `name`. The
+ *  action row is that workspace's next sibling. So this is what says it landed
+ *  under the right one rather than merely somewhere in the list. */
+function classesAfter(text: string, name: string): string {
+  const at = text.indexOf(`>${name}<`);
+  expect(at, `no row named "${name}"`).toBeGreaterThanOrEqual(0);
+  const opens = [...text.matchAll(/<(?:div|button|a) class="(brand-menu-ws-row[^"]*)">/g)];
+  return opens.find((m) => m.index! > at)?.[1] ?? '';
 }
 
 function row(over: Partial<Parameters<typeof workspacesMenuRow>[0]> = {}): string {
@@ -230,5 +275,92 @@ describe('the loading placeholder', () => {
     // An unfolded list pushes the rows below it down, so the cheaper guess is
     // the one that moves less when it is wrong.
     expect(skeletonShape(null, MANAGE)).toEqual({ rows: 2, manage: true });
+  });
+});
+
+describe('the right-click action row', () => {
+  const two = { status: 'loaded' as const, data: [ws({ id: 'dev' }), ws({ id: 'work' })] };
+
+  it('is absent until a row is right-clicked', () => {
+    expect(list(two)).not.toContain('brand-menu-ws-action');
+  });
+
+  it('unfolds directly under the workspace it belongs to, and under nothing else', () => {
+    const text = list(two, { contextId: 'work' });
+    expect(classesAfter(text, 'work')).toContain('brand-menu-ws-action');
+    expect(classesAfter(text, 'dev')).not.toContain('brand-menu-ws-action');
+  });
+
+  it('is a plain row of this menu, never a panel over it', () => {
+    // A nested overlay would break twice. The panel is transformed and clipped,
+    // so a fixed child lands in the wrong place. And a portaled one reads as
+    // OUTSIDE this menu, so the first press on it would shut the menu.
+    expect(list(two, { contextId: 'work' }))
+      .toContain('<button class="brand-menu-ws-row brand-menu-ws-action">');
+  });
+
+  it('says what pressing it does, in this platform\'s words', () => {
+    // The node suite is not Tauri, so the browser wording is the one to see.
+    expect(list(two, { contextId: 'work' })).toContain('Open in new tab');
+  });
+
+  it('is offered on the workspace you are already in', () => {
+    // Two windows on one workspace is a real want, and File > New Window
+    // already does exactly that.
+    expect(classesAfter(list(two, { contextId: 'dev' }), 'dev'))
+      .toContain('brand-menu-ws-action');
+  });
+
+  it('is never offered on an unhealthy workspace', () => {
+    // Its row is not a switch either: opening one lands in a dead app shell,
+    // and a second window would be that same shell in a new frame.
+    const data = [ws({ id: 'dev' }), ws({ id: 'work', health: 'unhealthy', last_error: 'boom' })];
+    expect(list({ status: 'loaded', data }, { contextId: 'work' }))
+      .not.toContain('brand-menu-ws-action');
+  });
+
+  it('takes a key no workspace slug can reach', () => {
+    // A slug is `[a-z0-9-]`, so keying the action `${id}-window` collides with
+    // the row of a workspace actually named that. Two siblings sharing a key
+    // is how keyed diffing reuses the wrong node.
+    const data = [ws({ id: 'work' }), ws({ id: 'work-window' })];
+    const keys = vnodes(listVNode({ status: 'loaded', data }, { contextId: 'work' }))
+      .map((v) => v.key)
+      .filter((k) => k != null);
+    expect(keys.length).toBeGreaterThan(2);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe('the right-click itself', () => {
+  const two = { status: 'loaded' as const, data: [ws({ id: 'dev' }), ws({ id: 'work' })] };
+
+  /** Fire a row's `contextmenu` handler, reporting what it did. */
+  function rightClick(node: unknown, id: string) {
+    const handler = rowNode(node, id).props.onContextMenu as
+      | ((e: { preventDefault(): void }) => void)
+      | undefined;
+    const preventDefault = vi.fn();
+    handler?.({ preventDefault });
+    return { claimed: preventDefault.mock.calls.length > 0, wired: handler !== undefined };
+  }
+
+  it('takes the gesture off the browser, whose own menu would cover the panel', () => {
+    const onContext = vi.fn();
+    const onSwitch = vi.fn();
+    const node = listVNode(two, { onContext, onSwitch });
+    expect(rightClick(node, 'work').claimed).toBe(true);
+    expect(onContext).toHaveBeenCalledWith('work');
+    // A right-click dispatches no `click`, and nothing here reaches for one.
+    expect(onSwitch).not.toHaveBeenCalled();
+  });
+
+  it('is wired on the workspace you are already in', () => {
+    expect(rightClick(listVNode(two), 'dev').wired).toBe(true);
+  });
+
+  it('is left to the browser on an unhealthy row, which offers nothing', () => {
+    const data = [ws({ id: 'dev' }), ws({ id: 'work', health: 'unhealthy', last_error: 'boom' })];
+    expect(rightClick(listVNode({ status: 'loaded', data }), 'work').wired).toBe(false);
   });
 });

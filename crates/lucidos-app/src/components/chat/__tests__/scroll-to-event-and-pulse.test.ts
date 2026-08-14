@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom, resumeFollowingBottom } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
@@ -322,21 +322,25 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   });
 });
 
-describe('a deep-link landing retires a standing follow while the agent is LIVE', () => {
-  /** Going to a link on a live thread is the reader asking to be at ONE place,
-   *  so the ride ends there. The scroll disarm cannot do this on its own: it
-   *  needs the reader to be off the live edge AND away from where the follow
-   *  last wrote, and the ordinary link into a thread the reader is riding points
-   *  at its newest turn, which lands them precisely ON the live edge. So the
-   *  follow survived the landing and the next token carried them off the event
-   *  they had just asked to see.
+describe('a deep-link landing retires a standing follow only when it lands OFF the live edge', () => {
+  /** Going to a link is the reader asking to be at ONE place, so the ride ends
+   *  there. Unless the place IS the live edge: the two asks agree, and there is
+   *  nothing to end. `stepThreadTurn` already asks that of its own landing, and
+   *  the deep link was the one navigation that never did.
    *
-   *  On an IDLE thread it retires nothing, in step with the scroll disarm, the
-   *  up chevron and turn stepping: the reader is browsing, there is no next
-   *  token, and their next submit should still take them to the live edge. That
-   *  half is the second block below. The counterpart to both lives in
-   *  `scroll-follow-the-live-edge.test.ts`, which pins what does and does not
-   *  ARM the same follow. */
+   *  The disarm in `onScroll` cannot answer it. That wants the reader off the
+   *  live edge AND away from the follow's last write, and a landing at the edge
+   *  is neither.
+   *
+   *  It is measured on the LANDING, not on the pixels moved. A link carrying a
+   *  scrolled-up rider TO the live edge moves them a long way. It keeps the
+   *  ride, having put them where the ride wanted them.
+   *
+   *  Retiring is not gated on the thread being LIVE, unlike the scroll disarm,
+   *  the up chevron and turn stepping. A link names one event and expects to
+   *  still be on it later, so the ask survives the thread waking. That half is
+   *  the block below. What ARMS the same follow is pinned in
+   *  `scroll-follow-the-live-edge.test.ts`. */
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -371,10 +375,10 @@ describe('a deep-link landing retires a standing follow while the agent is LIVE'
     } as any;
   }
 
-  it('leaves the reader on the event even when the link lands ON the live edge', () => {
-    // The blind spot, reproduced: the target is the thread's newest turn, so
-    // the landing writes the same offset the follow was already holding and no
-    // scroll event can read as the reader leaving.
+  it('keeps the ride when the link lands ON the live edge', () => {
+    // The reported case. The target is the thread's newest turn, so the landing
+    // rests exactly where the ride was already holding the reader. Nothing
+    // moved, so there is nothing for the ride to be inconsistent with.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
     const { onResize } = makeScrollObservers(container);
 
@@ -389,12 +393,166 @@ describe('a deep-link landing retires a standing follow while the agent is LIVE'
     scrollToEventAndPulse('e-7');     // and then taps a notification
     vi.advanceTimersByTime(1500);     // the landing settles
     expect(container.scrollTop).toBe(9200);
+    expect(followingLiveEdge.value).toBe(true);
 
-    container.scrollHeight = 20000;   // the agent keeps working
+    container.scrollHeight = 20000;   // they answer, and the agent replies
+
     onResize();
 
+    expect(container.scrollTop).toBe(19200);
+    // Recorded as the live edge, not as the offset the landing produced. So
+    // coming back to the thread resumes the ride instead of parking them.
+    expect(isFollowScroll(container)).toBe(true);
+  });
+
+  it('ends the ride when the link lands ABOVE the live edge', () => {
+    // The other side of the same measurement. The link names a place the ride
+    // disagrees with, so the ride ends where it puts them. Left armed, the next
+    // token would carry them off the very event they asked to see.
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
+    const { onResize } = makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+    expect(container.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(false);
+
+    container.scrollHeight = 20000;
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('measures the landing, so a target just short of the edge still ends it', () => {
+    // The retirement and the scroll read ONE target (`landingTargetOf`), which
+    // is what stops them disagreeing about where the reader is going to end up.
+    // 9100 is inside the last viewport and well outside the edge's 2px slack,
+    // so it is a place like any other.
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9100)] });
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    expect(container.scrollTop).toBe(9100);
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('supersedes a tween that was taking the reader somewhere else', () => {
+    // Keeping the ride must not cost the link its ownership of the viewport.
+    // The reader is at the edge, so the ride writes nothing. An up-chevron
+    // glide tapped a frame earlier would otherwise survive it. It would then
+    // carry them to the top, the link's marker left on a turn at the bottom.
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
+    makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    setThreadLive(false);         // idle, so the chevron leaves the ride armed
+    scrollToTop();                // and its glide is in flight, having moved nobody yet
     expect(container.scrollTop).toBe(9200);
-    expect(isFollowScroll(container)).toBe(false);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    expect(container.scrollTop).toBe(9200);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('keeps the ride when the link CARRIES a scrolled-up rider to the live edge', () => {
+    // Pixels moved is the wrong question. The platform left this armed reader
+    // 6200px up, with no gesture, so the ride survived. The link takes them all
+    // the way back down, which is where the ride wanted them.
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
+    const { onResize } = makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    container.scrollTop = 3000;
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    expect(container.scrollTop).toBe(9200);
+    expect(followingLiveEdge.value).toBe(true);
+    // The ride's OWN motion took them there, so its frames are held writes and
+    // the position still records as the live edge.
+    expect(isFollowScroll(container)).toBe(true);
+
+    container.scrollHeight = 20000;
+    onResize();
+
+    expect(container.scrollTop).toBe(19200);
+  });
+
+  it('answers to WHERE a superseded call landed, that being where the reader is', () => {
+    // A superseded call still lands, and still acts on the ride. So the place it
+    // rested is what a later resume has to answer to. Let the newer claim speak
+    // for it and the resume glides the reader off the event they are looking at.
+    const matches: any[] = [];
+    restore = installFakeDom({ dataEventMatches: matches });
+    makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-old');   // still resolving, so its observer is armed
+
+    matches.push(makeVisibleEl(9200));
+    scrollToEventAndPulse('e-new');   // a second tap, landing ON the edge
+    vi.advanceTimersByTime(50);
+    expect(followingLiveEdge.value).toBe(true);
+
+    // The older call finds its target late, well above the edge.
+    matches.length = 0;
+    matches.push(makeVisibleEl(3000));
+    lastMoCallback?.(
+      [{ addedNodes: [{ nodeType: 1, matches: () => true, querySelector: () => null }] }] as any,
+      {} as any,
+    );
+    // Long enough for its glide, short of the newer claim's own settle release.
+    vi.advanceTimersByTime(800);
+    expect(container.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(false);
+
+    // The resume must decline: the reader is on the older call's event.
+    resumeFollowingBottom(container, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('honours a superseded landing while the NEWER link is still resolving', () => {
+    // The newer claim has no resolve to report yet. Asking whether IT landed
+    // therefore says nothing about the reader, who is sitting where the older
+    // call put them. Re-arming there hands the ride back over a landing that
+    // ended it. A newer link that then turns out dead leaves them following
+    // from the older one's event.
+    const matches: any[] = [];
+    restore = installFakeDom({ dataEventMatches: matches });
+    makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-old');
+    const oldCallback = lastMoCallback;   // captured before the newer link takes the slot
+    scrollToEventAndPulse('e-new');       // still resolving, and it may never land
+
+    matches.push(makeVisibleEl(3000));
+    oldCallback?.(
+      [{ addedNodes: [{ nodeType: 1, matches: () => true, querySelector: () => null }] }] as any,
+      {} as any,
+    );
+    vi.advanceTimersByTime(800);
+    expect(container.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(false);
+
+    resumeFollowingBottom(container, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(container.scrollTop).toBe(3000);
   });
 
   it('leaves a ride alone when the link never lands', () => {

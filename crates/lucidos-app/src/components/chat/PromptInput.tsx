@@ -155,11 +155,18 @@ export function PromptInput() {
   const menuRef = useRef<HTMLDivElement>(null);
   const promptActionsAreaRef = useRef<HTMLDivElement>(null);
   // Measure-driven stacking. The hook sums every `[data-row-item]`'s width and
-  // compares against `promptActionsAreaRef.clientWidth`. User font scaling,
-  // browser zoom and per-thread label changes therefore feed in directly, with
-  // no viewport-width heuristic to miss the squeeze on a dense row. When false,
+  // compares against the row's content width. User font scaling, browser zoom
+  // and per-thread label changes therefore feed in directly, with no
+  // viewport-width heuristic to miss the squeeze on a dense row. When false,
   // the secondary candidate lifts to a row above the icons.
-  const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef);
+  //
+  // `.prompt-actions-right` is the row's ONLY gapped cluster: the row itself
+  // declares no `gap`, so its leading icon boxes touch. Naming the cluster
+  // stops the check billing four gaps the row never spends. Those phantom gaps
+  // lifted the Diff button off rows that could hold it.
+  const fitsInOneRow = useFitsInOneRow(promptActionsAreaRef, {
+    gappedCluster: '.prompt-actions-right',
+  });
   // Scroll-vs-tap gate for the one-tap prompt buttons: the morph Send→Cancel
   // and the answer control's Submit / Cancel. An iOS PWA touch can stay under
   // iOS's ~10 px native cancel threshold during a scroll. It then lands a
@@ -1167,35 +1174,40 @@ export function PromptInput() {
               mobile override made it 22.5px, LARGER than the send, so the two
               controls' size relationship inverted between viewports.
 
-              `.invisible` rather than unmounting, as before: the row keeps one
-              measured width across the empty/typed boundary, so neither the
-              cluster nor `useFitsInOneRow`'s stacking decision moves as the
-              first character lands. Last in the cluster and left of a
-              `margin-left: auto` neighbour, the reserved box is trailing
-              whitespace and costs nothing on screen.
+              It renders only while there is a draft to clear. The row no
+              longer reserves the box. An empty row spent 2.25rem on nothing,
+              and on a phone that is what lifted the Diff button onto a row of
+              its own. Reserving bought little: the banner leaves on the same
+              keystroke this button arrives on, a far larger swing. Nothing on
+              screen moves either way. This is the last item
+              of the left cluster, and its next sibling has `margin-left: auto`,
+              so mounting it only eats free space.
 
               Leaving `.prompt-row` also hands the textarea back its right
               content edge: as an in-flow flex sibling this button took its
               width, margin and the row gap out of the field in EVERY state,
               invisible ones included, so the typed text stopped 51px short of
               the box on the right against 13px on the left. */}
-          <button
-            class={`icon-btn header-icon prompt-clear${hasText ? '' : ' invisible'}`}
-            aria-label="Clear draft"
-            data-tooltip="Clear draft"
-            onClick={() => {
-              const el = inputRef.current;
-              if (!el) return;
-              el.value = '';
-              const id = focusedThreadId.value;
-              if (id) updateCompose(id, { text: '' });
-              autoResize();
-              el.focus();
-            }}
-            data-row-item
-          >
-            <ClearIcon />
-          </button>
+          {hasText && (
+            <button
+              key="prompt-clear"
+              class="icon-btn header-icon prompt-clear"
+              aria-label="Clear draft"
+              data-tooltip="Clear draft"
+              onClick={() => {
+                const el = inputRef.current;
+                if (!el) return;
+                el.value = '';
+                const id = focusedThreadId.value;
+                if (id) updateCompose(id, { text: '' });
+                autoResize();
+                el.focus();
+              }}
+              data-row-item
+            >
+              <ClearIcon />
+            </button>
+          )}
           <div class={rightClass}>
             {isStacked ? (
               <>

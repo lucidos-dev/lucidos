@@ -11,6 +11,7 @@
       "Bash(./scripts/new-migration.sh*)",
       "Bash(./scripts/check-em-dashes.sh*)",
       "Bash(./scripts/check-prose.sh*)",
+      "Bash(./scripts/check-build-script-paths.sh*)",
       "Bash(cargo check*)",
       "Bash(cargo build*)",
       "Bash(cargo test*)",

@@ -35,6 +35,7 @@
           "window_ready_to_show",
           "start_window_drag",
           "toggle_window_maximize",
+          "open_workspace_window",
           "get_connect_info",
           "tailscale_up",
           "tailscale_serve",

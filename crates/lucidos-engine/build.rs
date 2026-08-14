@@ -1,14 +1,30 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The crate directory, read from the environment cargo sets when it RUNS this
+/// build script.
+///
+/// Never `env!`, which bakes the value at compile time. Two checkouts of one
+/// package share a `-C metadata` hash, so a shared `CARGO_TARGET_DIR` hands
+/// this compiled binary to whichever checkout builds next. A baked path then
+/// names somebody else's tree, or a deleted one.
+/// See docs/plans/2026-08-14-build-script-paths-and-actionable-build-failure.md.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set by cargo when it runs a build script"),
+    )
+}
 
 /// Auto-bump CalVer version (YYYY.MM.DD.patch) at build time.
 /// Only bumps when the git HEAD has changed AND engine source files differ
 /// since the last bump. Uses a local stamp file (gitignored) to track state.
 fn main() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = manifest_dir();
+    let manifest_dir = manifest_dir.as_path();
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
     let version_file = manifest_dir.join("VERSION");
     let stamp_file = manifest_dir.join(".version_stamp");

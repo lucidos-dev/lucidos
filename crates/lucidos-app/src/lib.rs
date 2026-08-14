@@ -501,6 +501,60 @@ fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
     WebviewUrl::App("index.html".into())
 }
 
+/// The URL a second window on `workspace` should load, or `None` when
+/// `workspace` is not a slug the gateway would serve.
+///
+/// The caller's OWN origin is preferred, because that is what the web path does:
+/// both workspace lists reach a workspace as the origin-relative `/<slug>/`. So a
+/// client reached over a tailnet address opens its second window there too. A
+/// dev window on the vite port stays put. `fallback_origin` covers a caller on no
+/// http(s) URL at all, i.e. the bundled asset scheme before `desktop::launch` has
+/// navigated it.
+///
+/// Pure, so the whole rule is unit-testable without a window.
+fn workspace_window_url(
+    caller_url: Option<&str>,
+    workspace: &str,
+    fallback_origin: &str,
+) -> Option<String> {
+    if !notifications::is_workspace_slug(workspace) {
+        return None;
+    }
+    let origin = caller_url
+        .and_then(notifications::window_origin)
+        .unwrap_or(fallback_origin);
+    Some(notifications::workspace_url(origin, workspace))
+}
+
+/// Open `workspace` in a NEW top-level app window: what "Open in new window"
+/// does on a workspace row, in the gateway picker and in the Lucidos menu's
+/// switcher.
+///
+/// A command exists at all because the web answer is unavailable here. A browser
+/// opens a tab with `window.open`, which WKWebView drops: wry installs a
+/// new-window delegate only when a builder calls `.on_new_window()`, and no app
+/// window does.
+///
+/// It takes a SLUG, never a URL, and composes the URL itself. Every `window-*`
+/// webview holds the full IPC permission set on the gateway origin (ADR 0028). A
+/// URL chosen by the page would therefore be the page choosing what loads in a
+/// window carrying that grant.
+#[tauri::command]
+fn open_workspace_window(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    workspace: String,
+) -> Result<(), String> {
+    let caller = window.url().ok().map(|u| u.to_string());
+    let fallback = desktop::gateway_url(desktop::engine_port());
+    let url = workspace_window_url(caller.as_deref(), &workspace, &fallback)
+        .ok_or_else(|| format!("{workspace:?} is not a workspace"))?;
+    let parsed = url
+        .parse::<tauri::Url>()
+        .map_err(|e| format!("could not open {url}: {e}"))?;
+    open_app_window(&app, WebviewUrl::External(parsed))
+}
+
 /// The difference between Tauri's window logical height and the CSS viewport
 /// height the frontend reported.
 fn title_bar_gap(app: &tauri::AppHandle, viewport_height: f64) -> f64 {
@@ -1681,6 +1735,7 @@ pub fn run() {
             window_ready_to_show,
             start_window_drag,
             toggle_window_maximize,
+            open_workspace_window,
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
@@ -2085,6 +2140,69 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn the_titlebar_script_is_empty_off_macos() {
         assert_eq!(titlebar_inset_script(), "");
+    }
+
+    /// The stable gateway URL, standing in for what the command passes as its
+    /// fallback. Any value works: what the tests pin is when it is reached for.
+    const FALLBACK: &str = "http://localhost:3210";
+
+    /// The second window lands on the origin the CALLING window is already on,
+    /// which is what makes this match the web path's origin-relative `/<slug>/`.
+    #[test]
+    fn a_new_workspace_window_takes_the_callers_own_origin() {
+        assert_eq!(
+            workspace_window_url(Some("http://localhost:3210/dev/?pick"), "work", FALLBACK),
+            Some("http://localhost:3210/work/".to_string())
+        );
+        // Reached over a tailnet address, so the second window goes there too:
+        // sending it to loopback would open a window the user cannot use.
+        assert_eq!(
+            workspace_window_url(Some("https://box.tailnet.ts.net/dev/"), "work", FALLBACK),
+            Some("https://box.tailnet.ts.net/work/".to_string())
+        );
+        // A dev window on the vite port stays on it.
+        assert_eq!(
+            workspace_window_url(Some("http://localhost:5173/~/"), "work", FALLBACK),
+            Some("http://localhost:5173/work/".to_string())
+        );
+    }
+
+    /// A caller on no http(s) origin at all: the bundled asset scheme, before
+    /// `desktop::launch` has navigated the window. `tauri::Url::origin()` would
+    /// answer the literal "null" there, which is why the fallback exists.
+    #[test]
+    fn a_caller_on_no_http_origin_falls_back_to_the_gateway_url() {
+        for caller in [None, Some("tauri://localhost"), Some("")] {
+            assert_eq!(
+                workspace_window_url(caller, "work", FALLBACK),
+                Some("http://localhost:3210/work/".to_string()),
+                "caller {caller:?}"
+            );
+        }
+    }
+
+    /// The page supplies the slug. So this refusal is the whole gate on what can
+    /// load in a window carrying the `window-*` IPC grant (ADR 0028).
+    #[test]
+    fn a_workspace_that_is_not_a_slug_opens_nothing() {
+        for bad in [
+            "",
+            "..",
+            "../../etc",
+            "~",
+            "work/../dev",
+            "Work",
+            "work space",
+            "http://evil.example.com",
+            "-work",
+            "work-",
+        ] {
+            assert_eq!(
+                workspace_window_url(Some("http://localhost:3210/dev/"), bad, FALLBACK),
+                None,
+                "{bad:?} was accepted"
+            );
+        }
     }
 
     #[test]

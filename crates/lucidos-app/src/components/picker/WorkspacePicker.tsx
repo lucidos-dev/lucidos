@@ -6,10 +6,13 @@
  * href is `/~/`) instead of the full app, so it never boots the app's SSE /
  * thread machinery. It lists every registered workspace with health, and is the
  * always-reachable recovery surface: Open / Create / Restore / Rename / Delete /
- * Retry. A self-contained screen with inline forms, no global store and no
- * native dialogs. The footer (`PickerFooter.tsx`) keeps Create and Restore side
- * by side in every state, since this is also the FIRST screen a new user meets,
- * with nothing on it yet.
+ * Retry. A right-click on a row opens that row's overflow menu, which also
+ * offers the workspace in a new window or tab. A self-contained screen with
+ * inline forms, no global store and no native dialogs.
+ *
+ * The footer (`PickerFooter.tsx`) keeps Create and Restore side by side in
+ * every state. This is also the FIRST screen a new user meets, with nothing on
+ * it yet.
  *
  * Visual language: the Lucidos app mark is the hero (animated), painted on the
  * brand-blue gradient the mark itself uses. Rows are flat (no card chrome): the
@@ -33,6 +36,11 @@ import { isInteractiveTarget } from '../../utils/dom';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { applyAppBadge } from '../../store/actions/app-badge';
+import {
+  offersWorkspaceWindow,
+  openWorkspaceWindow,
+  workspaceWindowLabel,
+} from '../../utils/workspaceWindow';
 import {
   recallLastWorkspace,
   forgetLastWorkspace,
@@ -109,6 +117,12 @@ const RESTORE_DONE_LINGER_MS = 6000;
  *  the first-run "name your first workspace" nudge. Clicking one fills the
  *  (editable) field; the user still confirms with Create. */
 const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
+
+/** A row's overflow trigger, so a right-click anywhere on the row can resolve
+ *  it. A `data-role` rather than an `id`, which is banned on a dual-rendered
+ *  component. Scoping the query to the row is what lets one selector serve
+ *  every row. */
+const MORE_BUTTON = '[data-role="ws-row-more"]';
 
 /* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 
@@ -210,6 +224,20 @@ function MoreIcon() {
       <circle cx="12" cy="5" r="1.8" />
       <circle cx="12" cy="12" r="1.8" />
       <circle cx="12" cy="19" r="1.8" />
+    </svg>
+  );
+}
+
+// A box with an arrow leaving it: "this opens away from here". The same glyph
+// `PopOutIcon` draws in components/shared/icons, redrawn here because every icon
+// on this surface is local. Its neighbours in this menu are copies of the same
+// three shared glyphs.
+function PopOutIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="15 3 21 3 21 9" />
+      <line x1="10" y1="14" x2="21" y2="3" />
     </svg>
   );
 }
@@ -679,6 +707,26 @@ export function WorkspacePicker() {
     openWorkspace(w.id);
   }
 
+  /** Right-click a row: open that row's own overflow menu, where "Open in new
+   *  window" lives beside rename and delete.
+   *
+   *  The menu is anchored to the OVERFLOW BUTTON rather than to the row, for
+   *  two reasons. It is CSS-positioned under that button, so this is where it
+   *  appears whichever way it was opened. And the anchor is exempt from the
+   *  Overlay's outside-click dismiss: with the row as anchor, a left-click on
+   *  it would neither close the menu nor be swallowed, so a dismissing click
+   *  would open the workspace.
+   *
+   *  A row with no trigger (renaming, deleting) is not one of these rows at all,
+   *  and never carries this handler. */
+  function openRowMenu(e: MouseEvent, id: string) {
+    const trigger = (e.currentTarget as HTMLElement).querySelector<HTMLElement>(MORE_BUTTON);
+    if (!trigger) return;
+    e.preventDefault();
+    menuAnchor.value = trigger;
+    menuOpenId.value = id;
+  }
+
   const v = workspaces.value;
   // Gate the skeleton behind the standard SPINNER_DELAY_MS (300ms), like every
   // other view — a fast local gateway resolves well inside that window, so the
@@ -908,6 +956,7 @@ export function WorkspacePicker() {
                       // unread if it were not folded in.
                       aria-label={fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`}
                       onClick={() => openOrRetry(w, state)}
+                      onContextMenu={(e) => openRowMenu(e, w.id)}
                       onKeyDown={(e) => {
                         // Only the row itself opens on Enter/Space — a keydown
                         // bubbling up from a focused action button (rename, play,
@@ -1023,6 +1072,7 @@ export function WorkspacePicker() {
                         <div class="ws-picker-menu-wrap">
                           <button
                             class="ws-picker-icon ws-picker-icon-more"
+                            data-role="ws-row-more"
                             disabled={busy.value}
                             data-tooltip="More"
                             aria-label={`More actions for ${w.name}`}
@@ -1047,6 +1097,32 @@ export function WorkspacePicker() {
                             panelClass="ws-picker-menu"
                             panelRole="menu"
                           >
+                            {/* Leads the menu because it is the only item that
+                                OPENS the workspace, which is what the row is
+                                for; the three below it configure or destroy it.
+                                Which rows carry it is `offersWorkspaceWindow`,
+                                shared with the in-app switcher. */}
+                            {offersWorkspaceWindow(state) && (
+                              <button
+                                class="ws-picker-menu-item"
+                                role="menuitem"
+                                disabled={busy.value}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  menuOpenId.value = null;
+                                  // `withBusy` reports a rejection on the
+                                  // picker's own error line, which is the only
+                                  // surface it has: no toast host is mounted
+                                  // here.
+                                  void withBusy(async () => {
+                                    await openWorkspaceWindow(w.id);
+                                  });
+                                }}
+                              >
+                                <PopOutIcon />
+                                <span>{workspaceWindowLabel()}</span>
+                              </button>
+                            )}
                             <button
                               class={`ws-picker-menu-item${w.autostart ? ' is-on' : ''}`}
                               role="menuitem"

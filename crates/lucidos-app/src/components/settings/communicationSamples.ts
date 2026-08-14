@@ -112,11 +112,8 @@ export function samplePrompt(): void {
   });
 }
 
-/** The three [OK]-only acknowledgements that are toasts today, as dialogs.
- *
- *  Each sets `dismissable: false` and offers a lone [OK] at its real call site,
- *  which is a dialog wearing toast clothes. Rendered here so the proposed shape
- *  can be compared against the one shipping. */
+/** The three acknowledgements: something has already happened and the user has
+ *  to see it. Nothing to decide, so each carries a lone [OK] and no Cancel. */
 export function sampleAcknowledgeWedged(): void {
   void showConfirm(
     'New engine version pending, and rebuilding cannot deliver it: a build for '
@@ -144,7 +141,8 @@ export function sampleAcknowledgeStranded(): void {
   );
 }
 
-/** The cross-thread consent prompt, today a toast with a lone [Open]. */
+/** The cross-thread consent prompt: another thread asks to put something on
+ *  screen, and the user can decline. */
 export function sampleConsentPrompt(): void {
   void showConfirm(
     '"Nightly digest" wants to open the Files panel.',
