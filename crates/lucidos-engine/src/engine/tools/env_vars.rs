@@ -84,8 +84,9 @@ impl LucidosEngine {
         }
         match EnvironmentVariableStore::delete(&self.pool, &self.event_bus, name, None).await {
             Ok(true) => Ok(format!(
-                "[ACTION COMPLETED] Environment variable '{}' deleted. The change takes \
-                     effect on newly spawned subprocesses — no restart needed.",
+                "[ACTION COMPLETED] Environment variable '{}' deleted. Newly spawned \
+                     subprocesses stop seeing it with no restart. The engine's own process \
+                     environment is unchanged until the next engine restart.",
                 name
             )),
             Ok(false) => Ok(format!("Environment variable '{}' not found.", name)),
@@ -100,7 +101,9 @@ impl LucidosEngine {
     /// alias) — define a user environment variable. Validates the name (shape +
     /// not engine-reserved), upserts, and emits `EnvironmentVariableSet` (value
     /// carried — these are non-secret). Takes effect on the next spawned
-    /// subprocess; no restart.
+    /// subprocess with no restart. The engine's own process env is a separate
+    /// consumer: `environment_variables::apply_to_process_env` loads it once at
+    /// startup, so a variable the engine itself reads needs an engine restart.
     pub(crate) async fn execute_environment_variable_tool(
         &self,
         args: &serde_json::Value,
@@ -123,8 +126,10 @@ impl LucidosEngine {
 
         Ok(format!(
             "[ACTION COMPLETED] Environment variable '{}' set. It is injected into newly \
-             spawned subprocesses (run_bash, run_python, scheduled scripts, coding agents) — \
-             no restart needed. Note these are NOT secret; for API keys/tokens use a credential.",
+             spawned subprocesses (run_bash, run_python, scheduled scripts, coding agents) with \
+             no restart. The engine loads its own process environment from this store only at \
+             startup, so a variable the engine itself reads needs an engine restart. Note these \
+             are NOT secret; for API keys/tokens use a credential.",
             name
         ))
     }

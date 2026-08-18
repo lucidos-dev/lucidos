@@ -17,7 +17,7 @@ pub const NO_PROVIDER_MESSAGE: &str =
 /// A packaged desktop build sets `LUCIDOS_BOOT_WITHOUT_PROVIDER=1` so the engine
 /// still boots on first run — before the user has entered any provider
 /// credential — instead of crashing the `.app` on launch. When no real provider
-/// (Vertex / OpenAI / Anthropic / OpenRouter / local) is configured, this
+/// (Vertex / OpenAI / Anthropic / OpenRouter / xAI / local) is configured, this
 /// provider is installed instead of the deterministic `MockProvider`: it lets
 /// the engine boot but returns a clear, actionable error on every chat attempt,
 /// so a shipped release never serves mock output to a real user.

@@ -7,6 +7,9 @@ import {
   TOAST_AUTO_DISMISS_MS,
   type ToastPlacement,
 } from '../../store/store';
+import { restartDialogState, appUpdateDialogState } from '../../store/progressDialogCopy';
+import type { ProgressDialogState } from '../../store/types';
+import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
@@ -153,16 +156,28 @@ export function sampleConsentPrompt(): void {
 
 // --- Progress dialog ---
 
-/** Phases the packaged install really walks, with the fractions it reports.
- *  A null fraction is a phase with no honest percentage. */
-const INSTALL_PHASES: { message: string; progress: number | null; cancellable: boolean }[] = [
-  { message: 'Checking for a new version…', progress: null, cancellable: true },
-  { message: 'Downloading Lucidos 0.31.0…', progress: 0.18, cancellable: true },
-  { message: 'Downloading Lucidos 0.31.0…', progress: 0.64, cancellable: true },
-  { message: 'Verifying the download…', progress: 0.92, cancellable: true },
-  { message: 'Installing…', progress: null, cancellable: false },
-  { message: 'Relaunching Lucidos…', progress: null, cancellable: false },
+/** Frames the packaged install really emits, in order. Real frames rather than
+ *  invented copy: the dialog is then built by the shipped `appUpdateDialogState`,
+ *  so the preview cannot drift from the run it depicts. */
+const INSTALL_FRAMES: AppUpdateRunning[] = [
+  { version: '0.31.0', phase: 'checking' },
+  { version: '0.31.0', phase: 'downloading', downloaded: 12_582_912, total: 68_157_440 },
+  { version: '0.31.0', phase: 'downloading', downloaded: 43_646_976, total: 68_157_440 },
+  { version: '0.31.0', phase: 'verifying' },
+  { version: '0.31.0', phase: 'installing' },
+  { version: '0.31.0', phase: 'restarting-services' },
+  { version: '0.31.0', phase: 'relaunching' },
 ];
+
+/** One install frame as the gallery shows it: the real dialog, with its Cancel
+ *  swapped for a way out of the preview. The swap is what keeps the sample
+ *  inert, since the real Cancel would abandon an actual run. */
+function sampleInstallDialog(frame: AppUpdateRunning): ProgressDialogState {
+  return {
+    ...appUpdateDialogState(frame, stopSampleProgressDialog),
+    cancel: { label: 'Close preview', onClick: stopSampleProgressDialog },
+  };
+}
 
 let ticker: ReturnType<typeof setInterval> | null = null;
 
@@ -176,28 +191,17 @@ export function stopSampleProgressDialog(): void {
   progressDialog.value = { visible: false, title: '', message: '', progress: null };
 }
 
-/** Walk the install phases on a slow ticker, so every one can be looked at.
+/** Walk the install frames on a slow ticker, so every one can be looked at.
  *  The real run passes through some of these in under a second, which is
  *  exactly why the gallery does not reuse its timing. */
 export function playSampleProgressDialog(): void {
   stopSampleProgressDialog();
   let i = 0;
-  const render = () => {
-    const phase = INSTALL_PHASES[i];
-    progressDialog.value = {
-      visible: true,
-      title: 'Updating Lucidos',
-      message: phase.message,
-      progress: phase.progress,
-      cancel: phase.cancellable
-        ? { label: 'Cancel', onClick: stopSampleProgressDialog }
-        : undefined,
-    };
-  };
+  const render = () => { progressDialog.value = sampleInstallDialog(INSTALL_FRAMES[i]); };
   render();
   ticker = setInterval(() => {
     i += 1;
-    if (i >= INSTALL_PHASES.length) {
+    if (i >= INSTALL_FRAMES.length) {
       stopSampleProgressDialog();
       return;
     }
@@ -208,24 +212,16 @@ export function playSampleProgressDialog(): void {
 /** Hold one phase still, for looking at the layout rather than the sequence. */
 export function showSampleProgressPhase(index: number): void {
   stopSampleProgressDialog();
-  const phase = INSTALL_PHASES[Math.min(Math.max(index, 0), INSTALL_PHASES.length - 1)];
-  progressDialog.value = {
-    visible: true,
-    title: 'Updating Lucidos',
-    message: phase.message,
-    progress: phase.progress,
-    cancel: { label: 'Close preview', onClick: stopSampleProgressDialog },
-  };
+  const frame = INSTALL_FRAMES[Math.min(Math.max(index, 0), INSTALL_FRAMES.length - 1)];
+  progressDialog.value = sampleInstallDialog(frame);
 }
 
-/** The engine restart, which shares the dialog and has no honest percentage. */
+/** The engine restart, which shares the dialog and has no honest percentage.
+ *  Built from the shipped builder, so this is the real thing with a way out. */
 export function sampleRestartDialog(): void {
   stopSampleProgressDialog();
   progressDialog.value = {
-    visible: true,
-    title: 'Starting new version',
-    message: 'The workspace is unavailable until the engine comes back.',
-    progress: null,
+    ...restartDialogState(true),
     cancel: { label: 'Close preview', onClick: stopSampleProgressDialog },
   };
 }

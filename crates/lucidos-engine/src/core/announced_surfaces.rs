@@ -56,10 +56,22 @@
 /// A reachable writer that deliberately does not announce, with the reason. Kept
 /// per surface rather than as a global list so the justification sits next to
 /// the surface it applies to.
+///
+/// **Announcing is the default, and this is the narrow exit from it.** Reach for
+/// it only when emitting would be WRONG, never when it is merely inconvenient.
+/// "No variant fits this yet" is a reason to ADD one, not to skip the event. A
+/// new variant costs five match arms and a row in `.claude/rules/db.md`. A
+/// state change that reaches nothing stays invisible to the timeline, to SSE
+/// and to every trigger, permanently.
+///
+/// Every current entry is one of three shapes. The write is downstream of an
+/// emit that already happened. It is a cascade the parent event already covers.
+/// Or it records something the engine observed, not a decision a caller made.
 pub struct ExemptWriter {
     /// The function name as it appears in the owning source file.
     pub function: &'static str,
-    /// Why reaching this writer without an emit is correct.
+    /// Why reaching this writer without an emit is correct. State what the
+    /// write records and why every candidate event would misdescribe it.
     pub why: &'static str,
 }
 
@@ -235,9 +247,20 @@ pub const TABLES: &[TableRule] = &[
             events: &[
                 "McpServerRegistered",
                 "McpServerUpdated",
+                "McpServerDisabledToolsChanged",
                 "McpServerRemoved",
             ],
-            exempt: &[],
+            exempt: &[ExemptWriter {
+                function: "set_tools",
+                why: "Caches the tool manifest a live server just advertised, \
+                      which is an observation rather than a decision anyone \
+                      made. The only event that could carry it, \
+                      McpServerUpdated, is documented as an auto-approve \
+                      change, so emitting it would put a permission change \
+                      nobody made on the timeline. The row's \
+                      tools_observed_at stamp is the signal instead, and the \
+                      MCP settings page reads it.",
+            }],
         },
     },
     TableRule {

@@ -61,6 +61,68 @@ test.describe('Queued chat messages', () => {
       await expect(page.locator(`${USER_MSG_SELECTOR}:visible`).filter({ hasText: queuedTwo })).toHaveCount(1);
       await expect(group.locator('.exchange-status-label:visible')).toHaveCount(2);
       await expect(group.locator('.response-panel:visible')).toHaveCount(0);
+
+      // The remove button takes its tap target from an overlay, not from its
+      // box (`.icon-btn.inline-icon`, global/host-components.css). That is the
+      // one claim in the rule a source scan cannot make: it is about rendered
+      // boxes, and about where a thumb actually lands.
+      const measured = await group.locator('.queued-message-remove').first().evaluate(el => {
+        const btn = el as HTMLElement;
+        const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
+        const line = getComputedStyle(document.documentElement).getPropertyValue('--turn-header-line');
+        const box = btn.getBoundingClientRect();
+        const cx = box.left + box.width / 2;
+        const cy = box.top + box.height / 2;
+        const hits = (dx: number, dy: number) => {
+          const at = document.elementFromPoint(cx + dx, cy + dy);
+          return !!at && (at === btn || btn.contains(at));
+        };
+        const reach = 2.25 * root / 2;
+        const stamp = btn.closest('.initiator-header')!
+          .querySelector('.initiator-timestamp') as HTMLElement;
+        const stampBox = stamp.getBoundingClientRect();
+        const atStampEdge = document.elementFromPoint(stampBox.left + 2, stampBox.top + stampBox.height / 2);
+        // The label on the other side is a bare text node. Measure it with a
+        // range rather than looking for a box it does not have. Measured at the
+        // EDGE: a centre probe passes while the overlay eats the last letters,
+        // and this is the thinnest gap in the layout.
+        const label = document.createRange();
+        label.selectNodeContents(btn.closest('.exchange-status-label')!.firstChild!);
+        const labelRight = label.getBoundingClientRect().right;
+        return {
+          // The field the button sits in, which is what the trash used to
+          // stretch. It wraps on a narrow pane, so measure the field itself
+          // rather than the header around it.
+          fieldHeight: btn.closest('.exchange-status-label')!.getBoundingClientRect().height,
+          lineHeight: parseFloat(line) * root,
+          insideTarget: [hits(-(reach - 2), 0), hits(reach - 2, 0), hits(0, -(reach - 2)), hits(0, reach - 2)],
+          pastTarget: [hits(-(reach + 3), 0), hits(reach + 3, 0)],
+          stampIsOwnTarget: atStampEdge === stamp || stamp.contains(atStampEdge),
+          labelClearance: (cx - reach) - labelRight,
+        };
+      });
+
+      // A thumb landing anywhere in the 2.25rem target still hits the trash,
+      // which is what the box used to guarantee and the overlay now does.
+      expect(measured.insideTarget, 'the tap target no longer covers 2.25rem').toEqual([true, true, true, true]);
+      expect(measured.pastTarget, 'the tap target reaches past 2.25rem').toEqual([false, false]);
+      // And it takes no space in the line it interrupts. The reported defect
+      // was the button holding this field at 2.25rem, nearly twice the row
+      // unit, with the extra showing as air around the glyph.
+      expect(
+        Math.abs(measured.fieldHeight - measured.lineHeight),
+        `status field ${measured.fieldHeight}px against a row unit of ${measured.lineHeight}px`,
+      ).toBeLessThan(1.5);
+      // The overlay reaches past the glyph, so both neighbours have to keep
+      // their own ground. The timestamp is a button of its own, and the label
+      // is what the clickable header folds the turn on. The label side is the
+      // thinner of the two and the only one nothing else would catch: the
+      // 0.375rem gap against a reach the chip and the glyph size both feed.
+      expect(measured.stampIsOwnTarget, 'the trash overlay swallowed the timestamp button').toBe(true);
+      expect(
+        measured.labelClearance,
+        `the overlay's left edge is ${(-measured.labelClearance).toFixed(2)}px into the Queued label`,
+      ).toBeGreaterThanOrEqual(0);
     } finally {
       psql([
         `DELETE FROM events WHERE thread_id = '${threadId}'`,

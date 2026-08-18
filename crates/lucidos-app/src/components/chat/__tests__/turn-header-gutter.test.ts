@@ -29,9 +29,10 @@ function declarationValue(block: string, property: string): string | undefined {
  * is what tells the longhand apart.
  *
  * `.response-header` was the header that declared both, until its
- * `scroll-margin-bottom` went with the landing that read it (a submit lands its
- * turn's TOP now, see `landOnOwnTurn`). The boundary stays: it costs nothing and
- * it is what makes re-adding such a property safe rather than silently wrong.
+ * `scroll-margin-bottom` went with the landing that read it (a submit rests on
+ * the live edge now, see `landAtLiveEdge`). The boundary stays: it costs
+ * nothing, and it is what makes re-adding such a property safe rather than
+ * silently wrong.
  */
 function gapBelow(block: string): string | undefined {
   return block.match(/(?:^|[;{\s])margin-bottom\s*:\s*([^;]+)/)?.[1].trim();

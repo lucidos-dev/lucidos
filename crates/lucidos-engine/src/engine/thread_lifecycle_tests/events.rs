@@ -11,7 +11,7 @@ fn change_proposed_surfaces_cc_to_inbox() {
         "ChangeProposed",
         ThreadType::CodingAgent,
         ArchiveState::Archived,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -27,7 +27,7 @@ fn change_proposed_keeps_cc_in_inbox_if_already_in_inbox() {
         "ChangeProposed",
         ThreadType::CodingAgent,
         ArchiveState::Inbox,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
@@ -56,7 +56,7 @@ fn user_question_asked_surfaces_cc_to_inbox() {
         "UserQuestionAsked",
         ThreadType::CodingAgent,
         ArchiveState::Archived,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
@@ -72,7 +72,7 @@ fn user_question_asked_surfaces_chat_to_inbox() {
         "UserQuestionAsked",
         ThreadType::Chat,
         ArchiveState::Archived,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(result.new_section, Some(ArchiveState::Inbox));
@@ -84,7 +84,7 @@ fn user_question_answered_no_section_change() {
         "UserQuestionAnswered",
         ThreadType::CodingAgent,
         ArchiveState::Inbox,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -99,7 +99,7 @@ fn user_question_answered_no_section_change_on_chat() {
         "UserQuestionAnswered",
         ThreadType::Chat,
         ArchiveState::Inbox,
-        true,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -259,7 +259,7 @@ fn cc_settings_changed_accepted_for_cc_threads() {
         "CodingAgentSettingsChanged",
         ThreadType::CodingAgent,
         ArchiveState::Archived,
-        true,
+        false,
     );
     assert!(
         result.is_ok(),
@@ -278,7 +278,7 @@ fn cc_settings_changed_rejected_for_chat_threads() {
         "CodingAgentSettingsChanged",
         ThreadType::Chat,
         ArchiveState::Archived,
-        true,
+        false,
     );
     assert!(
         result.is_err(),

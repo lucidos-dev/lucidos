@@ -4,6 +4,7 @@ import {
   dropdownPanelStyle,
   filterDropdownOptions,
   isTypeaheadSeedKey,
+  openMenuFocusTarget,
   type DropdownOption,
 } from './Dropdown';
 
@@ -116,5 +117,36 @@ describe('isTypeaheadSeedKey (when a keystroke starts type-to-search)', () => {
     expect(isTypeaheadSeedKey(key({ metaKey: true }), { freeText: false, searching: false })).toBe(false);
     expect(isTypeaheadSeedKey(key({ ctrlKey: true }), { freeText: false, searching: false })).toBe(false);
     expect(isTypeaheadSeedKey(key({ altKey: true }), { freeText: false, searching: false })).toBe(false);
+  });
+});
+
+describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () => {
+  const target = (over: Partial<Parameters<typeof openMenuFocusTarget>[0]> = {}) =>
+    openMenuFocusTarget({ freeText: false, searching: false, positioned: true, mobile: false, ...over });
+
+  it('holds focus on the trigger while the menu is open and unsearched', () => {
+    // The trigger's own keydown handler is what seeds the typeahead, so it has
+    // to hold focus however the menu opened. WebKit does not focus a <button>
+    // on click, so a mouse-opened menu left the keystrokes in the prompt.
+    expect(target()).toBe('trigger');
+  });
+
+  it('hands input to the filter box once searching, and the panel is placed', () => {
+    expect(target({ searching: true })).toBe('filter');
+  });
+
+  it('leaves focus alone while the panel is unpositioned, and so unfocusable', () => {
+    expect(target({ searching: true, positioned: false })).toBeNull();
+  });
+
+  it('focuses the freeText input in every state, since its trigger IS the input', () => {
+    expect(target({ freeText: true })).toBe('input');
+    expect(target({ freeText: true, mobile: true })).toBe('input');
+    expect(target({ freeText: true, searching: true, positioned: false })).toBe('input');
+  });
+
+  it('never moves focus on mobile, where it would only pop the on-screen keyboard', () => {
+    expect(target({ mobile: true })).toBeNull();
+    expect(target({ mobile: true, searching: true })).toBeNull();
   });
 });

@@ -12,10 +12,10 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Which provider backend serves a model. `OpenAi`, `OpenRouter`, and `Local`
-/// all speak the OpenAI Chat Completions wire format but are distinct backends
-/// (different base URL / key / headers), so they map to separate provider
-/// instances in [`crate::llm::routing::RoutingProvider`].
+/// Which provider backend serves a model. `OpenAi`, `OpenRouter`, `XAi` and
+/// `Local` all speak the OpenAI Chat Completions wire format but are distinct
+/// backends (different base URL / key / headers). Each maps to its own provider
+/// instance in [`crate::llm::routing::RoutingProvider`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Vertex,
@@ -23,6 +23,10 @@ pub enum ProviderKind {
     OpenAi,
     /// OpenRouter (`https://openrouter.ai/api/v1`) — e.g. GLM 5.2.
     OpenRouter,
+    /// xAI direct (`https://api.x.ai/v1`), the Grok family. Ids are bare here
+    /// (`grok-4.6`); the same models via OpenRouter carry its `x-ai/` prefix and
+    /// are separate rows on [`Self::OpenRouter`].
+    XAi,
     /// A generic OpenAI-compatible local server (Ollama / LM Studio / vLLM /
     /// llama.cpp), base URL configurable.
     Local,
@@ -38,6 +42,7 @@ impl ProviderKind {
             "anthropic" => Self::Anthropic,
             "openai" => Self::OpenAi,
             "openrouter" => Self::OpenRouter,
+            "xai" => Self::XAi,
             "local" => Self::Local,
             _ => Self::Vertex,
         }
@@ -52,6 +57,7 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
+            Self::XAi => "xai",
             Self::Local => "local",
         }
     }
@@ -95,7 +101,7 @@ pub fn empty() -> ModelRegistry {
 /// - `gpt-5` → 400k **understates** the GPT-5.5 / GPT-5.6 families (1,050,000).
 ///   The OpenAI path has no context opt-in, so the full window always applies;
 ///   those rows declare it instead.
-/// - There is **no rule at all** for OpenRouter / Gemini / local ids, so they
+/// - There is **no rule at all** for OpenRouter / xAI / Gemini / local ids, so they
 ///   take the bare 200k default — kimi-k3 (1,048,576 real) was budgeted at 200k
 ///   and the trim loop evicted context at ~8% of the true window. That is the
 ///   gap the `context_window` column was added to close.
@@ -179,7 +185,7 @@ pub fn provider_kind_for(registry: &ModelRegistry, model: &str) -> ProviderKind 
 /// has one, else the id-shape guess.
 ///
 /// This is the fix for the trim budget being computed from a hardcoded prefix
-/// map that had no rule for OpenRouter / Gemini / local ids and handed all of
+/// map that had no rule for OpenRouter / xAI / Gemini / local ids and handed all of
 /// them 200k — kimi-k3 (1,048,576 real) was trimmed as if it held 200k, so the
 /// agentic loop evicted context at roughly 8% of the true window.
 pub fn context_window_for(registry: &ModelRegistry, model: &str) -> usize {
@@ -244,9 +250,57 @@ mod tests {
         assert_eq!(ProviderKind::parse("anthropic"), ProviderKind::Anthropic);
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAi);
         assert_eq!(ProviderKind::parse("openrouter"), ProviderKind::OpenRouter);
+        assert_eq!(ProviderKind::parse("xai"), ProviderKind::XAi);
         assert_eq!(ProviderKind::parse("local"), ProviderKind::Local);
         assert_eq!(ProviderKind::parse("vertex"), ProviderKind::Vertex);
         assert_eq!(ProviderKind::parse("something-new"), ProviderKind::Vertex);
+    }
+
+    /// `parse` and `as_str` are inverses for every variant. The column value is
+    /// the name root every layer shares. A half-added variant would route a
+    /// stored row to the Vertex fallback instead.
+    #[test]
+    fn as_str_round_trips_through_parse() {
+        for kind in [
+            ProviderKind::Vertex,
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::OpenRouter,
+            ProviderKind::XAi,
+            ProviderKind::Local,
+        ] {
+            assert_eq!(ProviderKind::parse(kind.as_str()), kind, "{kind:?}");
+        }
+    }
+
+    /// Grok reaches Lucidos two ways at once, and the registry keys on the FULL
+    /// id. So the bare xAI id and OpenRouter's prefixed one are separate rows on
+    /// separate backends. Adding the xAI provider must not re-route the
+    /// OpenRouter row a user already has in their picker.
+    #[test]
+    fn bare_and_prefixed_grok_ids_route_to_different_providers() {
+        let reg = registry(&[
+            ("grok-4.6", ProviderKind::XAi),
+            ("x-ai/grok-4.6", ProviderKind::OpenRouter),
+        ]);
+        assert_eq!(provider_kind_for(&reg, "grok-4.6"), ProviderKind::XAi);
+        assert_eq!(
+            provider_kind_for(&reg, "x-ai/grok-4.6"),
+            ProviderKind::OpenRouter,
+            "the OpenRouter route for Grok must survive the xAI provider"
+        );
+    }
+
+    /// A bare Grok id has no prefix rule, deliberately: the four shipped ids are
+    /// seeded builtins that cannot be deleted, and a user-added Grok row
+    /// declares its own provider. Routing on an id shape is the mistake
+    /// `llm/reasoning.rs` documents at length.
+    #[test]
+    fn an_unseeded_grok_id_takes_the_vertex_fallback_not_a_shape_guess() {
+        assert_eq!(
+            provider_kind_for(&empty(), "grok-4.6"),
+            ProviderKind::Vertex
+        );
     }
 
     #[test]
@@ -355,10 +409,11 @@ mod tests {
     /// over-reporting makes the engine pack a prompt the provider rejects.
     #[test]
     fn prefix_map_under_reports_where_it_has_no_rule() {
-        // No rule at all for OpenRouter / Gemini / local ids → bare 200k default.
+        // No rule for OpenRouter / xAI / Gemini / local ids → bare 200k default.
         for id in [
             "moonshotai/kimi-k3",
             "z-ai/glm-5.2",
+            "grok-4.20",
             "gemini-3.1-pro-preview",
             "gemini-3.5-flash",
         ] {

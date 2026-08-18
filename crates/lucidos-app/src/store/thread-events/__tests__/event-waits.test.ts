@@ -6,6 +6,7 @@ import {
   secondsRemaining,
 } from '../event-waits';
 import { resolveVisualStatus } from '../../../components/shared/ThreadStatusIcon';
+import { awaitedSubject, eventWaitStoppedSummary } from '../thread-event-types';
 import type { EventWaitSummary, ThreadEvent } from '../thread-event-types';
 import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';
 
@@ -108,11 +109,11 @@ describe('eventWaitProjection', () => {
   });
 });
 
-/** The status dot reads `meta.liveEventWaitCount`, which comes from the backend
- *  projection, NOT from `meta.liveEventWaits.length`. The two agree whenever
- *  both are populated, and the split is what makes the dot right on a drawer
- *  row whose events were never loaded and after a reload, where the list is
- *  empty by construction. These pin that separation. */
+/** The status dot reads `meta.liveEventWaitCount`, NOT
+ *  `meta.liveEventWaits.length`. The backend derives one from the other and
+ *  ships both on the same snapshot, so they agree in production. The aggregates
+ *  here carry the count alone, which is what keeps the dot the only thing under
+ *  test. These pin that separation. */
 describe('liveEventWaitCount', () => {
   const aggregate = (liveEventWaitCount: number): ThreadAggregate =>
     ({ liveEventWaitCount } as unknown as ThreadAggregate);
@@ -185,5 +186,70 @@ describe('describeWaitSubscription', () => {
     ]);
     expect(text).toBe('ChangeProposed (filtered)');
     expect(text).not.toContain('$gt');
+  });
+});
+
+/** **The stutter this exists to kill.** Both transcript labels supply the verb,
+ *  so a reason opening "waiting for" rendered `Stopped waiting: waiting for the
+ *  e2e lock`. The reason is the model's free text, so the label drops the word
+ *  it duplicates rather than trusting the guidance to keep it out. */
+describe('awaitedSubject', () => {
+  it.each([
+    ['waiting for the e2e lock', 'the e2e lock'],
+    ['waiting on E2ELockReleased', 'E2ELockReleased'],
+    ['waiting until the nightly reports', 'the nightly reports'],
+    ['wait for the release build', 'the release build'],
+    ['Waiting for tonight\'s e2e run', 'tonight\'s e2e run'],
+    ['WAITING FOR the apply', 'the apply'],
+    // Any run of whitespace. `core::awaited_subject` is pinned on this same
+    // input: two implementations of one rule must not disagree.
+    ['waiting  for  the lock', 'the lock'],
+  ])('drops the duplicated verb in %s', (reason, subject) => {
+    expect(awaitedSubject(reason)).toBe(subject);
+  });
+
+  /** The reason is the model's own words. Only a leading phrase the label
+   *  already said is removable; everything else survives verbatim, including a
+   *  waiting word that is not at the front. */
+  it.each([
+    'the release build to finish',
+    'tonight\'s E2E suite to pass',
+    'the lock, which another run is waiting for too',
+    'waiting',
+    'waited for the lock',
+    // The preposition must be a whole word.
+    'waiting formally',
+  ])('leaves %s exactly as written', (reason) => {
+    expect(awaitedSubject(reason)).toBe(reason);
+  });
+
+  /** A strip that emptied the reason would leave a dangling colon. So the
+   *  phrase-only reason comes back whole, reading as the odd input it is. */
+  it.each(['waiting for', 'waiting for ', '  waiting until   '])(
+    'returns %s whole rather than emptying it',
+    (reason) => {
+      expect(awaitedSubject(reason)).toBe(reason);
+    },
+  );
+});
+
+/** One phrasing for one concept: this label is the transcript's stop row AND
+ *  the header of the turn a user's **Stop waiting** opens, so both inherit the
+ *  strip. A legacy row carries no reason and says the one thing it knows. */
+describe('eventWaitStoppedSummary', () => {
+  it('does not say "waiting" twice', () => {
+    expect(eventWaitStoppedSummary('waiting for the e2e lock')).toBe(
+      'Stopped waiting: the e2e lock',
+    );
+  });
+
+  it('keeps a reason that never duplicated the verb', () => {
+    expect(eventWaitStoppedSummary('the release build to finish')).toBe(
+      'Stopped waiting: the release build to finish',
+    );
+  });
+
+  it.each([undefined, ''])('falls back for a legacy row carrying %s', (reason) => {
+    expect(eventWaitStoppedSummary(reason)).toBe('Stopped waiting for an event');
   });
 });

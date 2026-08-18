@@ -18,7 +18,7 @@ struct Scenario {
     #[serde(default)]
     assert_invariant: Option<Invariant>,
     #[serde(default)]
-    is_top_level: Option<bool>,
+    is_unattended: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -74,7 +74,7 @@ fn all_scenarios_pass() {
             continue;
         }
         let thread_type = parse_thread_type(&scenario.thread_type);
-        let is_top_level = scenario.is_top_level.unwrap_or(true);
+        let is_unattended = scenario.is_unattended.unwrap_or(false);
         let mut current_section = ArchiveState::Archived;
         let mut has_pending_changes = false;
 
@@ -82,7 +82,8 @@ fn all_scenarios_pass() {
             if let Some(val) = step.set_pending_changes {
                 has_pending_changes = val;
             }
-            let result = resolve_transition(&step.emit, thread_type, current_section, is_top_level);
+            let result =
+                resolve_transition(&step.emit, thread_type, current_section, is_unattended);
 
             if let Some(expected_error) = &step.expect_error {
                 assert!(

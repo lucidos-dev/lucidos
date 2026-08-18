@@ -21,7 +21,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { block, cssRules, decl, rulesTargeting, type CssRule } from './css-rule-helpers';
+import { block, cssRules, decl, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -212,26 +212,71 @@ describe('on the overlay build the leading control only steps sideways', () => {
     // selector text: the box is shared with `.icon-btn.row-icon`, so an exact
     // compare reads `undefined` the moment the two are declared together and
     // the guard silently stops guarding.
-    const iconBox = rulesTargeting(
-      readFileSync(resolve(stylesDir, 'global/host-components.css'), 'utf-8'),
-      'header-icon',
-    ).find(r => r.props.has('height'));
+    const button = cssRules(styles('global/host-components.css'))
+      .filter(r => selectorList(r.selector).includes('.icon-btn.header-icon'));
+    const iconBox = button.find(r => r.props.has('height'));
     expect(iconBox, 'no .icon-btn.header-icon rule declaring a height').toBeDefined();
+    // Resolve one level of indirection. The button takes its height from a var
+    // shared with the two other icon bands. A raw compare would weigh a `var()`
+    // against a length and never agree. Resolved from the button's OWN rules,
+    // so a narrower rule redeclaring the var for this band wins over whichever
+    // copy comes first.
+    const height = iconBox!.props.get('height')!;
+    const named = /^var\((--[\w-]+)\)$/.exec(height)?.[1];
+    const resolved = named ? button.map(r => r.props.get(named)).find(v => v !== undefined) : height;
+    expect(resolved, `${named} is declared on no .icon-btn.header-icon rule`).toBeDefined();
     expect(root?.props.get('--header-icon-box'), '--header-icon-box drifted from the button')
-      .toBe(iconBox?.props.get('height'));
+      .toBe(resolved);
   });
 
   it('the drawer toggle clears the lights, and moves in no other direction', () => {
     // It moves the RESTING PLACE, not `left`: only the drawer-shut position
     // differs between the builds. Overriding `left` here would restate the
     // drawer-open rule, and be free to drift from it.
-    const rule = desktopRule(':root[data-titlebar-overlay] .thread-toggle-slot');
-    expect(rule.props.get('--thread-toggle-home')).toBe('var(--titlebar-lights-reserve)');
-    expect([...rule.props.keys()], 'the overlay build is horizontal-only now')
-      .toEqual(['--thread-toggle-home']);
+    //
+    // The resting place is --brand-lead-inset on :root, and it has to be there
+    // rather than on the slot: --brand-side-reserve reads the same value, so
+    // the centred brand cluster knows where this control actually is. A private
+    // copy on the slot is how the two came apart, which is the overlap the two
+    // cases below now rule out.
+    expect(desktopRule(':root[data-titlebar-overlay]').props.get('--brand-lead-inset'))
+      .toBe('var(--titlebar-lights-reserve)');
+    // No rule of its own for the slot on this build: the override is the value.
+    expect(shellRules.filter(
+      r => r.selector === ':root[data-titlebar-overlay] .thread-toggle-slot',
+    ), 'the resting place has two declarations again').toEqual([]);
     // And the base rule is what consumes it, so the override cannot be inert.
     expect(desktopRule('.thread-toggle-slot').props.get('left'))
-      .toBe('var(--thread-toggle-home)');
+      .toBe('var(--brand-lead-inset)');
+    expect(shellCss, '--thread-toggle-home is retired; one name for one place')
+      .not.toContain('--thread-toggle-home');
+  });
+
+  it('the reserve the centred cluster clears is the WIDER of the row\'s two ends', () => {
+    // The reported overlap, as arithmetic. This reserve was once the trailing
+    // end alone, on the reading that the drawer toggle made the leading end the
+    // narrower one. That holds on the web build from 100% ui-scale up. It is
+    // false on the packaged one at every scale, where the toggle starts 80px
+    // in. Below 100% it is false on both: the trailing term is rem and the
+    // lights reserve is px.
+    const reserve = desktopRule(':root').props.get('--brand-side-reserve')!;
+    expect(reserve.startsWith('max('), `--brand-side-reserve is not a max(): ${reserve}`)
+      .toBe(true);
+    // The leading term names the inset the toggle is actually placed with,
+    // rather than restating 0.5rem or 80px.
+    expect(reserve).toContain('calc(var(--brand-lead-inset) + var(--header-icon-box))');
+    // …and the trailing one is still the actions at their widest.
+    expect(reserve).toContain('3 * var(--header-icon-box)');
+  });
+
+  it('the cluster\'s floor IS its natural width, so the chevrons hug the mark', () => {
+    // Two chevrons and the mark's tap target, touching. Derived rather than
+    // picked. A picked 8rem against a natural 6.6rem leaves 1.4rem of slack.
+    // That slack is what pushed the back chevron onto the toggle at a narrow
+    // Conversation pane. Both centred desktop clusters read this token, so a
+    // literal here silently re-widens the Canvas row's floor too.
+    expect(desktopRule(':root').props.get('--desktop-nav-min-span'))
+      .toBe('calc(2 * var(--header-icon-box) + var(--header-mark-tap))');
   });
 
   it('the content row keeps the reserve as a FLOOR under the divider', () => {

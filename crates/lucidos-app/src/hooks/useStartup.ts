@@ -29,7 +29,7 @@ import {
 } from '../store/actions/backgroundActivity';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
-import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-changes';
+import { refreshChangesState, restoreRestartState } from '../store/actions/chat-changes';
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
@@ -110,12 +110,12 @@ export function useStartup(): void {
       setFocusedThread(savedThreadId);
     }
 
-    // Restore restart-toast state from localStorage BEFORE the first
-    // checkConnection: a reload mid-restart re-shows the progress toast and seeds
-    // engineRestarting + the pre-restart started_at, which checkConnection reads
-    // to detect the restart completion. (Cold start with only a pending restart
-    // re-shows the "restart required" warning.)
-    restoreRestartToast();  // Immediate — show from localStorage before async API
+    // Restore the restart state from localStorage BEFORE the first
+    // checkConnection: a reload mid-restart re-raises the progress dialog and
+    // seeds engineRestarting + the pre-restart started_at, which checkConnection
+    // reads to detect the restart completion. (Cold start with only a pending
+    // restart re-arms the brand badge and the restart confirm dialog.)
+    restoreRestartState();  // Immediate: from localStorage, before the async API
 
     // Initial loads
     checkConnection().then((connected) => {

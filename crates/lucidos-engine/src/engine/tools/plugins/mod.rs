@@ -1221,7 +1221,7 @@ fn validate_plugin_triggers_event_driven(planned: &[PlannedFile]) -> Result<(), 
 
 /// Install a plugin from an already-unpacked directory. Pure orchestration:
 /// takes the workspace path and an event bus, so tests can inject a mock.
-/// Returns the install summary text plus the `data/`-relative paths that
+/// Returns the one-line install summary plus the `data/`-relative paths that
 /// were written; the confirm endpoint uses the file list verbatim (no
 /// re-walk) for the auto-reload decision and the HTTP response.
 pub(crate) async fn install_from_unpacked_with_bus(
@@ -1325,21 +1325,17 @@ pub(crate) async fn install_from_unpacked_with_bus(
     .await
     .map_err(|e| format!("event emit failed: {}", e))?;
 
-    let mut result = format!(
+    // One line, whatever the manifest carries. The receipt panel prints this
+    // as its description. It renders the manifest's `setup` as its own
+    // markdown section below, so setup text here shows the user the same wall
+    // twice. No LLM reads it either: `install_plugin` returns the staging
+    // sentinel, and the confirm reaching here arrives over HTTP.
+    let result = format!(
         "Installed {} v{} ({} files).",
         manifest.name,
         manifest.version,
         installed_files.len()
     );
-    if let Some(setup) = manifest
-        .setup
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        result.push_str("\n\nSetup:\n");
-        result.push_str(setup);
-    }
     Ok((result, installed_files))
 }
 

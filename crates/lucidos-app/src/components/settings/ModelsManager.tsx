@@ -11,6 +11,7 @@ const PROVIDERS = [
   { value: 'vertex', label: 'Vertex' },
   { value: 'openai', label: 'OpenAI' },
   { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'xai', label: 'xAI' },
   { value: 'local', label: 'Local (OpenAI-compatible)' },
 ];
 
@@ -124,7 +125,7 @@ export function ModelsManager() {
                     the field separator (`.claude/rules/frontend.md`). */}
                 <span class="list-row-details list-row-details-prose">
                   Tokens. Left blank, the engine guesses from the model id — and it
-                  has no rule for OpenRouter, Gemini, or local models, so they are
+                  has no rule for OpenRouter, xAI, Gemini, or local models, so they are
                   treated as 200k however large they really are.
                 </span>
               </div>

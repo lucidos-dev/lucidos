@@ -30,10 +30,16 @@ pub(crate) const ANTHROPIC_BETA_1M_CONTEXT: &str = "context-1m-2025-08-07";
 /// Per-chunk timeout for Claude SSE streams (seconds).
 const CLAUDE_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
 
-/// Which transport a request targets — see module docs.
-pub(crate) enum WireTarget {
-    Vertex,
-    Direct,
+/// Which transport a request targets, and the endpoint it resolved to. See
+/// module docs.
+///
+/// The URL rides the target because it is part of the framing the target
+/// names: Vertex puts the model in it, Direct does not. It is never
+/// serialized. Its one reader is the prompt-cache probe, which reports the
+/// host, since the body cannot show it (`llm::cache_probe`).
+pub(crate) enum WireTarget<'a> {
+    Vertex { url: &'a str },
+    Direct { url: &'a str },
 }
 
 /// Strip `[1m]` suffix from model ID, returning (base_model, is_1m_context).
@@ -178,7 +184,7 @@ pub(crate) fn build_claude_request(
     model: &str,
     system_prompt: Option<&str>,
     reasoning_effort: Option<&str>,
-    target: WireTarget,
+    target: WireTarget<'_>,
     provider_tag: &str,
 ) -> (ClaudeRequest, bool) {
     let (base_model, is_1m) = parse_context_suffix(model);
@@ -240,8 +246,9 @@ pub(crate) fn build_claude_request(
 
     let (thinking, output_config, max_tokens) = thinking_config(base_model, reasoning_effort);
 
-    let (anthropic_version, model_field, anthropic_beta) = match target {
-        WireTarget::Vertex => (
+    let (request_url, anthropic_version, model_field, anthropic_beta) = match target {
+        WireTarget::Vertex { url } => (
+            url,
             Some("vertex-2023-10-16".to_string()),
             None,
             if is_1m {
@@ -252,7 +259,7 @@ pub(crate) fn build_claude_request(
         ),
         // Direct API: model goes in the body; `anthropic-version` and betas are
         // HTTP headers supplied by the provider, so the body omits both.
-        WireTarget::Direct => (None, Some(base_model.to_string()), None),
+        WireTarget::Direct { url } => (url, None, Some(base_model.to_string()), None),
     };
 
     let request = ClaudeRequest {
@@ -267,6 +274,8 @@ pub(crate) fn build_claude_request(
         output_config,
         anthropic_beta,
     };
+
+    crate::llm::cache_probe::log_request(&request, model, request_url, provider_tag);
 
     (request, is_1m)
 }
@@ -344,6 +353,8 @@ pub(crate) async fn parse_claude_stream(
             // Ignore event:, comments (:), and empty lines
         }
     }
+
+    crate::llm::cache_probe::log_response(&turn_meta, provider_tag);
 
     // Build LlmResponse from accumulated blocks
     let mut content = None;
@@ -712,6 +723,34 @@ mod tests {
     use super::*;
     use crate::llm::provider::{ContentBlock, MessageContent};
 
+    const VERTEX_TEST_URL: &str = "https://aiplatform.eu.rep.googleapis.com/v1/projects/p\
+                                   /locations/eu/publishers/anthropic/models/m:streamRawPredict";
+
+    /// The prompt-cache probe reads the request URL so it can report the
+    /// resolved host, and nothing else. A URL that leaked into the body would
+    /// be a wire change, which the probe is explicitly not allowed to make.
+    #[test]
+    fn the_probe_url_argument_never_reaches_the_body() {
+        let (req, _) = build_claude_request(
+            vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            }],
+            vec![],
+            "claude-opus-5",
+            Some("system prompt body"),
+            Some("high"),
+            WireTarget::Vertex {
+                url: VERTEX_TEST_URL,
+            },
+            "Vertex",
+        );
+
+        let body = serde_json::to_string(&req).unwrap();
+        assert!(!body.contains("aiplatform"), "URL leaked into body: {body}");
+        assert!(!body.contains("streamRawPredict"));
+    }
+
     #[test]
     fn parse_context_suffix_strips_1m() {
         assert_eq!(
@@ -1020,7 +1059,9 @@ mod tests {
             "claude-opus-4-8@default[1m]",
             Some("system prompt body"),
             Some("high"),
-            WireTarget::Vertex,
+            WireTarget::Vertex {
+                url: VERTEX_TEST_URL,
+            },
             "Vertex",
         );
         assert!(is_1m);
@@ -1044,7 +1085,9 @@ mod tests {
             "claude-fable-5[1m]",
             None,
             Some("high"),
-            WireTarget::Direct,
+            WireTarget::Direct {
+                url: "https://api.anthropic.com/v1/messages",
+            },
             "Anthropic",
         );
         assert!(is_1m);

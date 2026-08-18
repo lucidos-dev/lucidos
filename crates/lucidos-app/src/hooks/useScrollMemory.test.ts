@@ -22,16 +22,19 @@ import { _resetPageVisitForTesting } from '../utils/pageVisit';
 import { USER_ACTION_EVENTS } from '../utils/userAction';
 import { installFakePage } from '../utils/__tests__/fakePage';
 
-/** Un-press the follow toggle after every test in this file.
+/** Pin the *follow seed* off around every test in this file.
  *
- *  The toggle records a *follow seed* that deliberately outlives the thread AND
- *  the press: it is what a thread with NO reading position starts as. So a test
- *  that arms via `setFollowLiveEdge(true)` seeds every later test's fresh
- *  attachment, which is how the two "unarmed reader" cases below started
- *  recording `live-edge`. `stopFollowingBottom()` does not undo it, and must not:
- *  only a press writes the seed, precisely so a scroll cannot cancel a standing
- *  preference. Pressing it off is therefore the honest reset, and it retires the
- *  follow on the way. */
+ *  The toggle records a seed that outlives the thread AND the press: it is what
+ *  a thread with NO reading position starts as. It ships ARMED, and a test that
+ *  arms explicitly leaves it armed for the next one. Either way a fresh
+ *  attachment gets seeded, which is how the two "unarmed reader" cases below
+ *  started recording `live-edge`.
+ *
+ *  BEFORE as well as after, so the baseline does not depend on test ordering.
+ *  `stopFollowingBottom()` cannot do this job, and must not: only a press writes
+ *  the seed, precisely so a scroll cannot cancel a standing preference. Pressing
+ *  it off is the honest reset, and it retires the follow on the way. */
+beforeEach(() => setFollowLiveEdge(false));
 afterEach(() => setFollowLiveEdge(false));
 
 /** And un-say "the agent is running". `setThreadLive` is a module-global

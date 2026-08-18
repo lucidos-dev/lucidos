@@ -26,6 +26,13 @@ impl LucidosEngine {
     /// in-process token, try `end_stale_waiting_session`, then settle any
     /// stuck `running` projection so the Discard button doesn't 404 on
     /// threads whose `spawn_agent_thread` errored before SessionStarted.
+    ///
+    /// That settle is always `SettleTerminal::StuckProjection`, unlike
+    /// `interrupt_agent`'s. Apply / Discard / Archive each carry their own
+    /// terminator (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`), and
+    /// suppressing the otherwise-spurious `ResponseCanceled` is what
+    /// [`StopReason`] exists for. So a cancel-stamped question must not produce
+    /// one here.
     pub async fn stop_agent(
         self: &Arc<Self>,
         reason: StopReason,
@@ -48,8 +55,14 @@ impl LucidosEngine {
                 let stale_result = self
                     .end_stale_waiting_session(tid, discard, actor.clone())
                     .await;
-                let settled =
-                    settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await?;
+                let settled = settle_stuck_running_thread(
+                    &self.pool,
+                    &self.event_bus,
+                    tid,
+                    actor,
+                    SettleTerminal::StuckProjection,
+                )
+                .await?;
                 if settled {
                     Ok(())
                 } else {
@@ -124,9 +137,11 @@ impl LucidosEngine {
     ///      mid-startup, before SessionStarted has registered an agent_session).
     ///      When the cancel lands, `run_session`'s `chat_cancel` arm emits the
     ///      terminal `ResponseCanceled` — skip the settle to avoid double-emit.
-    ///   2. Only if the cancel had no entry to land on (truly stuck — spawn
-    ///      task errored and was lost), settle by emitting `ResponseCanceled`
-    ///      ourselves so the UI unsticks.
+    ///   2. Only if the cancel had no entry to land on, settle so the UI
+    ///      unsticks. `terminal` picks the event: `CanceledQuestion` when this
+    ///      request cancel-stamped a pending question (the caller's own write
+    ///      is what put the row at `running`), `StuckProjection` otherwise.
+    ///      See [`SettleTerminal`].
     ///
     /// Unlike `stop_agent`, interrupt is always a real Cancel/Stop click — the
     /// frontend offers no "interrupt for Apply/Discard/Archive" path.
@@ -143,6 +158,7 @@ impl LucidosEngine {
         &self,
         thread_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
+        terminal: SettleTerminal,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut guard = self.agent_sessions.lock().await;
 
@@ -162,7 +178,7 @@ impl LucidosEngine {
                 if self.cancel_thread(tid, actor.clone()) {
                     return Ok(true);
                 }
-                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor).await
+                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor, terminal).await
             }
         } else {
             if guard.is_empty() {

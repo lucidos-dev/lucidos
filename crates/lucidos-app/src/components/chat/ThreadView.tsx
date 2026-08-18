@@ -19,7 +19,7 @@ import { useScrollMemory, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
-import { forcedSkeletonThreadId, showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
+import { showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
 import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
 import { isIOS } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
@@ -219,11 +219,21 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
  *  slack, so the overlay cannot unmount mid-fade at a slow setting. */
 const SKELETON_FADE_OUT_MS = 200;
 const SKELETON_FADE_SLACK_MS = 50;
+
+/** The overlay's class for one render, pure so both states are testable
+ *  without a DOM. Opaque while shown, transparent on the way out.
+ *
+ *  It carries NO entrance. The delay gate has already decided this wait
+ *  deserves a loader, so the loader has to be legible the moment it lands. */
+export function skeletonOverlayClass(show: boolean): string {
+    return show ? 'thread-skeleton-overlay' : 'thread-skeleton-overlay is-fading';
+}
+
 function ThreadSkeletonOverlay({ show }: { show: boolean }) {
     const mounted = useLingeringFlag(show, scaledDurationMs(SKELETON_FADE_OUT_MS) + SKELETON_FADE_SLACK_MS);
     if (!mounted) return null;
     return (
-        <div class={`thread-skeleton-overlay${show ? '' : ' is-fading'}`} aria-hidden="true">
+        <div class={skeletonOverlayClass(show)} aria-hidden="true">
             <ThreadSkeleton />
         </div>
     );
@@ -562,13 +572,10 @@ export function ThreadView() {
         disconnected: connectionStatus.value === 'disconnected',
     };
     const delayElapsed = useDelayedFlag(threadIsLoadingNow(loadingState));
-    const showThreadSkeleton = showThreadSkeletonNow(
-        loadingState,
-        delayElapsed,
-        threadId !== null && forcedSkeletonThreadId.value === threadId,
-    );
+    const showThreadSkeleton = showThreadSkeletonNow(loadingState, delayElapsed);
     // Remember whether the skeleton was shown for this thread, so the content
     // fade-in below can step aside and let the overlay crossfade do the reveal.
+    // Shown IS covered here, because the overlay is opaque whenever it is up.
     const skeletonShownRef = useRef<string | null>(null);
     if (showThreadSkeleton && threadId) skeletonShownRef.current = threadId;
 
@@ -844,13 +851,24 @@ export function ThreadView() {
         const waitingReason: EmptyReason = connectionStatus.value === 'disconnected'
             ? { kind: 'disconnected', threadId }
             : { kind: 'loading', threadId };
+        // KEYED, and the keys are the whole reason this shape works. The
+        // return below is a DIFFERENT tree: it leads with a header, so an
+        // unkeyed diff matches by index, finds a header where this wrap was,
+        // and rebuilds the subtree. The skeleton overlay is what that costs. A
+        // remounted element cannot run a CSS transition, so its crossfade
+        // becomes a snap, and a cold open is the ONLY way in: the thread is
+        // absent from the map until `loadAllThreads` lands, which on an iOS PWA
+        // is nearly every open and on desktop is nearly none.
+        //
+        // Matched by key instead, the wrap and the overlay survive the switch
+        // and keep animating. Pinned by `thread-view-frame-identity.test.ts`.
         return (
             <div class="thread-view">
-                <div class="thread-content-wrap">
-                    <div class="thread-content visible">
+                <div class="thread-content-wrap" key="wrap">
+                    <div class="thread-content visible" key="content">
                         <ThreadEmptyState key={threadId} reason={waitingReason} />
                     </div>
-                    <ThreadSkeletonOverlay show={showThreadSkeleton} />
+                    <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />
                 </div>
             </div>
         );
@@ -874,11 +892,14 @@ export function ThreadView() {
                 native overlay indicator on this scroller: the suppression is
                 scoped to a wrap that actually carries a replacement, so a
                 transcript can never end up with no scroll feedback at all. */}
-            <div class="thread-content-wrap has-scroll-indicator">
+            {/* Keyed to match the no-thread tree above, so the cold-open switch
+                between them reuses these nodes rather than rebuilding them. See
+                the comment on that return for what the rebuild costs. */}
+            <div class="thread-content-wrap has-scroll-indicator" key="wrap">
                 {/* tabindex makes the transcript a keyboard-focusable scroll
                     region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
                     native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
-                <div class="thread-content visible" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript">
+                <div class="thread-content visible" key="content" ref={areaRef} tabIndex={0} role="region" aria-label="Thread transcript">
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
@@ -887,7 +908,7 @@ export function ThreadView() {
                         renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex)
                     )}
                 </div>
-                <ThreadSkeletonOverlay show={showThreadSkeleton} />
+                <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />
                 {/* Presentational only (aria-hidden): the transcript is already a
                     labelled scroll region and a screen reader announces position
                     from that, not from a decorative bar. */}

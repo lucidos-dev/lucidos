@@ -45,7 +45,8 @@ pub(in crate::api) struct AnswerThreadQuestionBody {
 /// CC-specific resume side-effects (`CodingAgentPromptSent` marker +
 /// `ContinueSignal` spawn).
 ///
-/// Returns 409 when the question is missing or already answered.
+/// Returns 409 when the question is missing or already answered, and 400 for a
+/// `Superseded` body (see below).
 pub(in crate::api) async fn answer_thread_question(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -58,6 +59,26 @@ pub(in crate::api) async fn answer_thread_question(
             Json(serde_json::json!({ "error": "Invalid thread_id" })),
         )
     })?;
+    // `Superseded` is engine-internal and only the message router may write it,
+    // because it asserts something no client can make true: that a follow-up
+    // arrived and replaced this question. A client-supplied one would put that
+    // sentence in the timeline and in the agent's tool result with no message
+    // behind it. The kind sits on the public enum because it rides the same
+    // persisted `UserQuestionAnswered` as every other answer. So the boundary
+    // is here, not in `validate_answer`, which the router shares.
+    if matches!(
+        body.answer,
+        crate::engine::thread_events::AnswerKind::Superseded
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Superseded is engine-internal: it is written only when a follow-up \
+                          replaces the question. Use Canceled to dismiss it, or send the \
+                          follow-up itself."
+            })),
+        ));
+    }
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     use crate::engine::agent_question::{answer_pending_question, AnswerResult};
     match answer_pending_question(

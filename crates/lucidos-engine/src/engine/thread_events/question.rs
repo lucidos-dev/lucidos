@@ -33,4 +33,16 @@ pub enum AnswerKind {
         text: Option<String>,
     },
     Canceled,
+    /// A follow-up arrived that could not be the answer, so it replaced the
+    /// question instead. Two shapes reach here, both on coding-agent threads.
+    /// An agent-driven message (a parent's instruction, a child-completion
+    /// wake) is refused by the `mode == Human` guard. So is any message landing
+    /// on a question the agent already overtook. Resolving it is what unblocks
+    /// the parked agent, which cannot read the follow-up until its question
+    /// call returns.
+    ///
+    /// Distinct from `Canceled`, which means the question was torn down and
+    /// nothing is coming. Here the user did reply, just not to this question,
+    /// and the reply drives the very next turn.
+    Superseded,
 }

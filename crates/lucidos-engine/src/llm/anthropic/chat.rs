@@ -54,19 +54,20 @@ impl AnthropicProvider {
         on_token: Option<TokenCallback>,
         reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
+
         let (request, is_1m) = build_claude_request(
             messages,
             tools,
             model,
             system_prompt,
             reasoning_effort,
-            WireTarget::Direct,
+            WireTarget::Direct { url: &messages_url },
             "Anthropic",
         );
 
         let (auth_name, auth_value) = auth_header(&self.auth);
         let beta = anthropic_beta_header(&self.auth, is_1m);
-        let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
 
         // Retry loop for connection errors, retryable HTTP status codes, and
         // mid-stream overload errors. Content is accumulated internally by

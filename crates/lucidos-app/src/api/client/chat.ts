@@ -26,7 +26,7 @@ export interface HealthInfo {
    *  provider onboarding. Absent on older engines → treated as configured. */
   llm_configured?: boolean;
   /** Provider backends the engine actually has configured
-   *  (`vertex`/`anthropic`/`openai`/`openrouter`/`local`). Used to filter the
+   *  (`vertex`/`anthropic`/`openai`/`openrouter`/`xai`/`local`). Used to filter the
    *  model picker to providers the user has set up. `null`/absent = don't filter
    *  (mock, or an older engine). Reflects a runtime credential swap. */
   configured_providers?: string[] | null;

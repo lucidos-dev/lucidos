@@ -566,3 +566,110 @@ async fn cancel_chat_idle_thread_reports_not_canceled() {
         "a no-op cancel must not emit any event on an idle thread"
     );
 }
+
+/// Poll for one event of `event_type` on `thread_id` and return its payload.
+/// Same 5s budget as the other polls here: every emit is a DB round-trip.
+async fn await_event_payload(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    event_type: &str,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE thread_id = $1 AND event_type = $2 LIMIT 1",
+        )
+        .bind(thread_id)
+        .bind(event_type)
+        .fetch_optional(pool)
+        .await
+        .expect("event lookup");
+        if let Some(payload) = row {
+            return payload;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {event_type} landed on thread {thread_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Regression: cancelling a question card whose coding agent is already gone
+/// must read as the cancel it is, not as engine cleanup of a stuck row.
+///
+/// A card can sit unanswered for hours, long outliving its subprocess. The Stop
+/// handler cancel-stamps it first, and `UserQuestionAnswered` moves the
+/// projection to `running` whatever the answer kind. `interrupt_agent` then
+/// finds nothing live and settles. That settle used to read the cancel's own
+/// write, milliseconds old, as a wedged projection, and stamped
+/// `ResponseAborted{stale_settle}` on it: the transcript said "Settled stuck
+/// response" for a deliberate click. With a live agent the identical click has
+/// always produced `ResponseCanceled{user_stop}`, so the fix is parity.
+#[tokio::test]
+async fn stop_with_pending_question_and_no_live_agent_emits_canceled_not_stale_settle() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!(
+        "tu-stopparked-{}",
+        &Uuid::new_v4().as_simple().to_string()[..8]
+    );
+    // Parked coding-agent thread: a pending question and no live session, which
+    // is what an engine restart or a finished subprocess leaves behind.
+    insert_user_question_asked(&pool, thread_id, &tool_use_id).await;
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/claude-code/stop?thread_id={}",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("stop request failed");
+    assert_eq!(resp.status().as_u16(), 200, "stop should return 200");
+    let body: serde_json::Value = resp.json().await.expect("stop response must be JSON");
+    assert_eq!(
+        body["canceled"], true,
+        "resolving the card is a status-changing effect, so the client keeps its \
+         optimistic canceling state"
+    );
+
+    let canceled_kind: Option<String> = sqlx::query_scalar(
+        "SELECT payload->'answer'->>'kind' FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
+           AND payload->>'tool_use_id' = $2 LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(&tool_use_id)
+    .fetch_one(&pool)
+    .await
+    .expect("answer event must exist");
+    assert_eq!(
+        canceled_kind.as_deref(),
+        Some("Canceled"),
+        "Stop must resolve the pending question with AnswerKind::Canceled"
+    );
+
+    let payload = await_event_payload(&pool, thread_id, "ResponseCanceled").await;
+    assert_eq!(
+        payload["cause"], "user_stop",
+        "the terminal must read as the user's cancel, matching the live-agent path"
+    );
+
+    let aborted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(-1);
+    assert_eq!(
+        aborted, 0,
+        "no stale-settle abort: the cancel's own write is what made the row running"
+    );
+}

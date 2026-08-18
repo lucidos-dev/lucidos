@@ -16,7 +16,7 @@ const cache = new WeakMap<HTMLTextAreaElement, { height: number; len: number }>(
  *  A textarea sizes to its VALUE, so a placeholder that wraps is simply painted
  *  past the bottom edge and clipped (the composer is `overflow-y: hidden`).
  *  Short placeholders always fit; the answering one is the longest of the three
- *  and wraps in a narrowed thread pane (`minThreadPanePx()` is 300px at a 16px
+ *  and wraps in a narrowed thread pane (`minThreadPanePx()` is 338px at a 16px
  *  root, narrower than a phone) and at large UI scales. That is why it is measured rather than
  *  reserved as a CSS floor: the number of lines is a function of the box width,
  *  the user's font family and a UI scale that runs 75%-200%, and no fixed rem

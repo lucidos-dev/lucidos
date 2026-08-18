@@ -983,7 +983,7 @@
     font-size: var(--font-size-md);
 }
 
-/* Box, nominal and correction all come from `.icon-btn.inline-icon`
+/* Target, nominal and correction all come from `.icon-btn.inline-icon`
    (host-components.css): this trash interrupts a line of text rather than
    sitting beside one, which is a band of its own, one step under the trigger
    group heading's pair. It used to be hand-sized here, at 1.25rem around a

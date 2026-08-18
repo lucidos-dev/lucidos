@@ -333,6 +333,9 @@ enum Command {
     },
     /// Manage non-secret environment variables injected into every subprocess
     /// Lucidos spawns — `list`, `set --name N --value V`, or `delete --name N`.
+    /// A subprocess sees a change on its next spawn. The engine loads its own
+    /// process env from the store only at startup, so a variable the engine
+    /// itself reads needs an engine restart.
     /// Generated from the capability parity manifest; routed through the
     /// gateway-safe HTTP client. (For secrets use a credential, not this.)
     #[command(name = "env-vars")]
@@ -350,6 +353,17 @@ enum Command {
     Models {
         #[command(subcommand)]
         action: generated::ModelsCmd,
+    },
+    /// Manage MCP servers: `list` (status, tool manifest and per-request token
+    /// cost), `start --id <id>`, `stop --id <id>`, or `remove --id <id>`.
+    /// Generated from the capability parity manifest; routed through the
+    /// gateway-safe HTTP client. (Registering one is the chat agent's `mcp`
+    /// tool, which needs a command and args this surface does not take.)
+    /// Nothing starts servers at boot, so `list` reports running state for the
+    /// current engine process only.
+    Mcp {
+        #[command(subcommand)]
+        action: generated::McpCmd,
     },
 }
 
@@ -1255,6 +1269,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Models { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_models(&ws, action)?;
+            Ok(0)
+        }
+        Command::Mcp { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_mcp(&ws, action)?;
             Ok(0)
         }
     }

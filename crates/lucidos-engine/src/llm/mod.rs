@@ -1,5 +1,8 @@
 pub mod anthropic;
 pub mod anthropic_wire;
+/// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
+/// `docs/temporary-measures.md`.
+pub(crate) mod cache_probe;
 pub mod image;
 pub mod mock;
 pub mod model_registry;
@@ -50,6 +53,11 @@ use std::time::Duration;
 /// provider (`provider_build`) and the builtin `openrouter` proxy
 /// (`api::proxy_builtin`).
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// xAI's OpenAI-compatible API root, serving the Grok family. Single home
+/// shared by the LLM provider (`provider_build`) and the builtin `xai` proxy
+/// (`api::proxy_builtin`).
+pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 
 /// Direct Anthropic API root (`{base}/messages`). Single home shared by the
 /// LLM provider (`anthropic::chat`) and the builtin `anthropic` proxy

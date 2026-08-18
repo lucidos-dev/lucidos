@@ -1,5 +1,6 @@
 /**
- * The thread filter panel's section headings stand at one height, ticked or not.
+ * The thread filter panel's headings: one height whatever their state, and one
+ * column with the rows each of them heads.
  *
  * "By thread types" grows a checkmark the moment a thread type is ticked, and
  * that mark is a --icon-size-md glyph joining a --font-size-md line. Under a
@@ -24,6 +25,9 @@ import { block, decl, rulesTargeting } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const drawerCss: string = readFileSync(resolve(here, '../drawer.css'), 'utf-8');
+const panelTsx: string = readFileSync(
+  resolve(here, '../../components/layout/ThreadFilterPanel.tsx'), 'utf-8',
+);
 
 describe('the filter heading reserves a glyph row, checkmark or not', () => {
   it('pins the line box to the mark itself, not to a ratio of the text', () => {
@@ -56,5 +60,24 @@ describe('the filter heading reserves a glyph row, checkmark or not', () => {
     expect(pinned.map(r => r.selector), 'one line-height, or the headings disagree in some state')
       .toEqual(['.thread-filter-title']);
     expect(pinned[0].atRules, 'a viewport-conditional copy is a second height in hiding').toBe('');
+  });
+});
+
+describe('the Repos / Apps heading stands on the rows it spans', () => {
+  it('takes the child rows own indent step, not the panel edge', () => {
+    const child = decl(block(drawerCss, '.thread-filter-option-child {'), 'padding-left');
+    expect(child, 'the child rows own column').toBe('calc(var(--drawer-row-inset) + 1rem)');
+
+    // The shorthand's last value is the left one, and `calc(...)` holds spaces,
+    // so match the tail rather than splitting the value into four.
+    const heading = decl(block(drawerCss, '.thread-filter-group-title {'), 'padding');
+    expect(heading?.endsWith(` ${child}`), `"${heading}" must end on that column`).toBe(true);
+  });
+
+  it('is the panel own class, never the change selector dropdown one', () => {
+    // `.dropdown-section-header` stands on a dropdown's left edge, which here is
+    // left of every row the heading spans, parent row included.
+    expect(panelTsx).not.toContain('class="dropdown-section-header"');
+    expect(panelTsx).toContain('class="thread-filter-group-title"');
   });
 });

@@ -201,6 +201,21 @@ fn classify_archive_decision(family: &[FamilyRow], thread_uuid: Uuid) -> Archive
     }
 }
 
+/// Map a reach refusal into this handler's `{reason, message}` body, the same
+/// shape as every other rejection here. Status and slug both come from the
+/// error, so this cannot drift from the taxonomy.
+fn reach_rejection(
+    e: crate::api::thread_reach::ThreadReachError,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        e.status_code(),
+        axum::Json(serde_json::json!({
+            "reason": e.reason(),
+            "message": e.to_string(),
+        })),
+    )
+}
+
 /// Map any error into a JSON 500. Mirrors the `(StatusCode, String)` pattern
 /// used elsewhere in the file, but with a JSON body so the cascade handler's
 /// rejections (also JSON) share a consistent error shape.
@@ -273,6 +288,16 @@ pub(in crate::api) async fn archive_thread(
             axum::Json(serde_json::json!({ "reason": "bad_request", "message": m })),
         )
     })?;
+    // Before the transaction, so a refusal writes nothing at all: no locked
+    // family, no cleared pending change, no cancel-stamped question card.
+    crate::api::thread_reach::refuse_out_of_reach(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        crate::api::thread_reach::ThreadReachVerb::Archive,
+    )
+    .await
+    .map_err(reach_rejection)?;
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     let mut tx = state.engine.pool().begin().await.map_err(internal_json)?;

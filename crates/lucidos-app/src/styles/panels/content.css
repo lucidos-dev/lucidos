@@ -130,12 +130,13 @@
 /* Nav row above the title: prev/next chevrons at the ends with the date
  * centered between them. The date flexes to fill the middle so it stays centered
  * regardless of the chevrons' fade state; align-items:center sits the single-line
- * date vertically against the 2rem chevrons. */
+ * date vertically against the 2rem chevrons. The bottom padding is the whole gap
+ * down to the title, which sets no top padding of its own. */
 .notification-detail-header {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: var(--space-md) var(--space-lg) 0;
+    padding: var(--space-md) var(--space-lg) var(--space-lg);
 }
 
 .notification-detail-date {
@@ -149,7 +150,7 @@
  * markdown body below it (both at 1rem horizontal padding); wraps multi-line. */
 .notification-detail-title {
     margin: 0;
-    padding: var(--space-sm) var(--space-lg) 0;
+    padding: 0 var(--space-lg);
     font-size: var(--font-size-lg);
     font-weight: 600;
     line-height: 1.3;

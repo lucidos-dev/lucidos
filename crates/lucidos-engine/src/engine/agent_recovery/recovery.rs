@@ -1535,6 +1535,7 @@ pub(crate) async fn settle_orphaned_running_coding_agent_threads(
             bus,
             tid,
             Some(MessageOrigin::system()),
+            crate::engine::claude_code::SettleTerminal::StuckProjection,
         )
         .await
         {

@@ -26,7 +26,7 @@ pub struct Model {
     pub id: String,
     pub label: String,
     /// Backend that serves the model:
-    /// "vertex" | "anthropic" | "openai" | "openrouter" | "local".
+    /// "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "local".
     pub provider: String,
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
@@ -35,7 +35,7 @@ pub struct Model {
     /// Declared context window in tokens. `None` = not declared, so
     /// `engine::context::context_window_from_prefix` decides from the id shape.
     /// Only worth setting for ids the prefix map gets wrong — every OpenRouter /
-    /// Gemini / local model, which otherwise takes the 200k fallback.
+    /// xAI / Gemini / local model, which otherwise takes the 200k fallback.
     pub context_window: Option<i32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -400,6 +400,42 @@ mod tests {
         assert_eq!(m.label, "GLM 5.2");
         assert!(m.is_builtin(), "GLM 5.2 must be a builtin (disable-only)");
         assert!(m.enabled, "GLM 5.2 builtin is enabled by default");
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The Grok family is seeded on the xAI provider, with every window
+    /// DECLARED. The id-shape fallback has no rule for a `grok-` id, so an
+    /// undeclared row would budget a 2M model at 200k.
+    #[tokio::test]
+    async fn migration_seeds_the_grok_family_on_xai_with_declared_windows() {
+        let (pool, db_name) = setup_test_db().await;
+        for (id, label, window) in [
+            ("grok-4.6", "Grok 4.6", 500_000),
+            ("grok-4.5", "Grok 4.5", 500_000),
+            ("grok-4.20", "Grok 4.20", 2_000_000),
+            ("grok-4.3", "Grok 4.3", 1_000_000),
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must be seeded"));
+            assert_eq!(m.provider, "xai", "{id}");
+            assert_eq!(m.label, label, "{id}");
+            assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
+            assert!(m.enabled, "{id} is enabled by default");
+            assert_eq!(m.context_window, Some(window), "{id}");
+        }
+
+        // The OpenRouter route for Grok is a different id on a different
+        // provider. Nothing in this seed may claim it.
+        assert!(
+            ModelStore::get(&pool, "x-ai/grok-4.6")
+                .await
+                .unwrap()
+                .is_none(),
+            "the seed must not create an OpenRouter-prefixed row"
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

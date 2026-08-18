@@ -813,25 +813,6 @@
     white-space: nowrap;
 }
 
-/* The placeholder the Workspaces row draws in this slot until the workspace
-   label resolves (`workspacesMenuRow`). It needs re-skinning for the reason
-   `.claude/rules/frontend.md` gives: the pill is `--bg-tertiary`, which is the
-   shared shimmer's own base colour, so an unskinned bar is the pill exactly and
-   only the accent sweep would show through. `--border-color` is the next step
-   from the pill in both themes (lighter on dark, darker on light), so the bar
-   reads as a bar either way. `background-size` is restated because the
-   shorthand above resets it to `auto`, and at higher specificity than the base
-   rule that set it; the `shimmer` animation stays shared. */
-.brand-menu-value .sk-bar {
-    background: linear-gradient(
-        90deg,
-        var(--border-color) 25%,
-        color-mix(in srgb, var(--accent) 18%, var(--border-color)) 50%,
-        var(--border-color) 75%
-    );
-    background-size: 200% 100%;
-}
-
 /* ── The workspace switcher ───────────────────────────────────────────────
  * The Workspaces row unfolds the list of workspaces this gateway serves, so
  * switching costs a tap instead of a trip out to the picker page and back. The

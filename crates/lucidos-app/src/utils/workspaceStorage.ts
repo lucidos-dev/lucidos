@@ -6,7 +6,7 @@
  * is scoped per ORIGIN (scheme + host + port) and ignores the path — so without
  * this wrapper all workspaces share one bucket and clobber each other's
  * content-pane navigation, focused thread, drawer filters, scroll positions,
- * split ratios, restart toast, etc.
+ * split ratios, restart state, etc.
  *
  * `installWorkspaceStorage` overrides `getItem`/`setItem`/`removeItem` on the
  * `localStorage` instance so every key is transparently prefixed with the

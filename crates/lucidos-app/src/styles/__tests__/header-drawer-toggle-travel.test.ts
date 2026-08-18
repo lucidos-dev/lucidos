@@ -34,7 +34,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { cssRules, rulesTargeting, type CssRule } from './css-rule-helpers';
+import { cssRules, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -147,8 +147,11 @@ describe('it travels; nothing dims', () => {
     expect(desktopRule(':root[data-thread-drawer-open] .thread-toggle-slot').props.get('left'))
       .toBe(`calc(${rowWidth} + var(--ddo))`);
     // The inset the travel lands on is the row's own padding, i.e. the sliver
-    // that row bottoms out at, so the arrival point is clear of it too.
-    expect(desktopRule('.thread-toggle-slot').props.get('--thread-toggle-home'))
+    // that row bottoms out at, so the arrival point is clear of it too. It is
+    // declared on :root because --brand-side-reserve reads the same value; see
+    // header-band-centering.test.ts for that half.
+    const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
+    expect(root?.props.get('--brand-lead-inset'))
       .toBe(desktopRule('.threads-header').props.get('padding')!.split(' ')[1]);
   });
 });
@@ -170,7 +173,7 @@ describe('a Conversation-pane collapse shrinks it away on the same track', () =>
     // its Search button. Every state's `left` must therefore be the track or the
     // home inset, both of which are >= the row's right edge by construction.
     const TRACK = 'calc(var(--co) + var(--ddo))';
-    const allowed = new Set([TRACK, 'var(--thread-toggle-home)']);
+    const allowed = new Set([TRACK, 'var(--brand-lead-inset)']);
     const lefts = rulesTargeting(shellCss, 'thread-toggle-slot')
       .map(r => r.props.get('left'))
       .filter((v): v is string => v !== undefined);
@@ -215,10 +218,15 @@ describe('a Conversation-pane collapse shrinks it away on the same track', () =>
     // --header-icon-box is pinned to the button's HEIGHT in
     // header-band-centering.test.ts. The slot declares it as a WIDTH, so the
     // button has to be square or the resting slot clips its own icon.
+    // By selector-list MEMBER, not by the whole selector text. The box is
+    // declared on a rule the button shares with `.icon-btn.row-icon`. An exact
+    // compare lands on the band's nominal rule instead, reads two `undefined`s,
+    // and passes having asserted nothing.
     const iconBox = cssRules(styles('global/host-components.css'))
-      .find(r => r.selector === '.icon-btn.header-icon');
-    expect(iconBox?.props.get('width'), 'the header icon button is no longer square')
-      .toBe(iconBox?.props.get('height'));
+      .find(r => selectorList(r.selector).includes('.icon-btn.header-icon') && r.props.has('width'));
+    expect(iconBox, 'no .icon-btn.header-icon rule declaring a width').toBeDefined();
+    expect(iconBox!.props.get('width'), 'the header icon button is no longer square')
+      .toBe(iconBox!.props.get('height'));
     expect(desktopRule('.thread-toggle-slot').props.get('width')).toBe('var(--header-icon-box)');
   });
 

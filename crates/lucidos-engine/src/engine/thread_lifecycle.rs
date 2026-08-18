@@ -465,11 +465,18 @@ pub struct TransitionResult {
     pub new_section: Option<ArchiveState>,
 }
 
+/// Resolve where an event moves a thread's `archive_state`.
+///
+/// `is_unattended` is the caller's verdict that nobody is watching this run.
+/// `event_bus_projection_thread.rs` computes it, and only a trigger execution
+/// can qualify: one the user neither opted into reviewing nor followed up on.
+/// It suppresses the inbox surfacing an event would otherwise cause, so the
+/// bottom guard below is the only thing that reads it.
 pub fn resolve_transition(
     event_type: &str,
     thread_type: ThreadType,
     current_section: ArchiveState,
-    is_top_level: bool,
+    is_unattended: bool,
 ) -> Result<TransitionResult, LifecycleViolation> {
     let no_change = Ok(TransitionResult { new_section: None });
     let to_inbox = Ok(TransitionResult {
@@ -672,11 +679,18 @@ pub fn resolve_transition(
         _ => violation("Unknown event type"),
     }?;
 
-    // Chat sub-threads and unattended trigger runs hide on terminal events —
-    // agentic-loop children and background trigger executions shouldn't
-    // surface in REVIEW. CC always goes to Inbox regardless of depth
-    // because every Claude Code session needs user action (Apply / Discard / Archive).
-    if !is_top_level
+    // An unattended run hides on its terminal event. Nobody is watching, so
+    // surfacing it would ask for attention on work the user never started.
+    //
+    // Depth is deliberately NOT part of this. A finished sub-thread keeps the
+    // inbox state it ran with. Archiving it here writes a state no
+    // `ThreadArchived` event backs, and the drawer then dims a row nobody
+    // archived. See
+    // `docs/plans/2026-08-17-a-finished-sub-thread-stays-in-the-inbox.md`.
+    //
+    // A coding-agent thread is exempt at every depth, because every session
+    // ends needing Apply, Discard or Archive.
+    if is_unattended
         && thread_type != ThreadType::CodingAgent
         && result.new_section == Some(ArchiveState::Inbox)
     {

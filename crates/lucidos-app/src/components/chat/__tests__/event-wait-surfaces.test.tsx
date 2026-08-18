@@ -246,6 +246,23 @@ describe('EventWaitRow', () => {
     expect(vnodeText(tree)).not.toContain('ChangeProposed');
   });
 
+  /** **A label never says "waiting" twice.** Both subjects here carry the verb,
+   *  and `reason` is the model's free text, which reaches for a gerund as often
+   *  as a noun phrase. An arm-then-stand-down then printed the same sentence on
+   *  two cards, each opening `wait: waiting for`.
+   *
+   *  Fixed at the label rather than by trusting the guidance, so it holds for
+   *  every reason already on disk. `awaitedSubject` carries the rule and its
+   *  edges; these two cases pin that both subjects route through it. */
+  it.each([
+    ['waiting', 'Set up an event wait: the e2e lock to free up'],
+    ['canceled', 'Stopped waiting: the e2e lock to free up'],
+  ] as const)('drops the duplicated verb on a %s row', (state, subject) => {
+    const tree = step(wait_({ state, reason: 'waiting for the e2e lock to free up' }));
+    expect(vnodeText(tree)).toContain(subject);
+    expect(vnodeText(tree)).not.toContain('waiting for the e2e lock');
+  });
+
   /** Every cause reads as what the person actually did, so a stand-down the
    *  agent performed is not reported as the user pressing a button. */
   it.each([

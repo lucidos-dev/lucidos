@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -531,8 +531,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const isChromeless = isUserMessageBubble || isChangePanel;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
-  const isCanceledDivider = isCanceledQuestionDivider(exchange);
-  // Change lifecycle, abort-boundary, cancel-boundary and canceled-question
+  const isUnansweredDivider = questionDividerResolution(exchange) !== null;
+  // Change lifecycle, abort-boundary, cancel-boundary and answer-less question
   // dividers are terminal. They have no response, just the initiator panel with
   // optional actions. The exception is a change banner whose session KEPT
   // WORKING after the apply, folding the continuation into this exchange as
@@ -562,7 +562,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // boundaries it takes no continuation exception: the header line IS the whole
   // turn, and a response panel would be a status badge over an empty body.
   const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -929,10 +929,11 @@ function actionInitiator(label: string, details?: ComponentChildren): InitiatorD
 }
 
 /** Which terminal verdict a divider header carries when the prompt was never
- *  resolved: `'canceled'` only when the USER explicitly dismissed it, `'dropped'`
+ *  resolved: `'canceled'` only when the USER explicitly dismissed it,
+ *  `'superseded'` when their follow-up replaced the question, and `'dropped'`
  *  for every other turn-ended-without-a-response cause (system abort, error, the
  *  agent racing past the prompt). */
-type DividerTerminalKind = 'canceled' | 'dropped';
+type DividerTerminalKind = 'canceled' | 'superseded' | 'dropped';
 
 /** Resolution status for question and permission dividers, shown in the
  *  initiator header. The header describes what happened to the PROMPT, never
@@ -956,6 +957,10 @@ function dividerStatus(
 ): ComponentChildren {
   if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}<span class="exchange-status-check">{'✓'}</span></span>;
   if (terminal === 'canceled') return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x">{'✕'}</span></span>;
+  // Neutral, like a Codex follow-up redirect: the user steered, they did not
+  // dismiss. A "Canceled ✕" here would blame them for a question they replied
+  // past.
+  if (terminal === 'superseded') return <span class="exchange-status-label exchange-status-dropped">{'Superseded'}</span>;
   if (terminal === 'dropped') return <span class="exchange-status-label exchange-status-dropped">{droppedLabel}</span>;
   return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
 }
@@ -1138,20 +1143,20 @@ export function describeInitiator(
       // lives on this exchange's steps as UserQuestionAnswered; matched by
       // tool_use_id so a stale Answered from a different question can't bleed in.
       const answered = findQuestionAnswer(exchange, ev.tool_use_id);
-      // A canceled question resolves via a UserQuestionAnswered{kind:'Canceled'},
-      // which findQuestionAnswer still returns — so exclude it from "Answered"
-      // and route it to the "Canceled" status instead.
-      const canceled = isCanceledQuestionDivider(exchange);
+      // A question resolved WITHOUT an answer still carries a
+      // UserQuestionAnswered, which findQuestionAnswer returns. Exclude those
+      // from "Answered" and let each carry its own status instead.
+      const unanswered = questionDividerResolution(exchange);
       const agent = describeExecutor(threadIsCC, threadCodingAgent);
       return {
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
         status: dividerStatus(
-          !!answered && !canceled,
+          !!answered && !unanswered,
           'Answered',
           'Unanswered',
-          canceled ? 'canceled' : responseTerminated ? 'dropped' : null,
+          unanswered ?? (responseTerminated ? 'dropped' : null),
         ),
         details: (
           <QuestionBody

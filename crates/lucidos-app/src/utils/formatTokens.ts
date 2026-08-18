@@ -1,7 +1,16 @@
-/** Pretty-print a token count, rounding to the nearest k above 1000. */
+/** Pretty-print a token count: `M` at a million, `k` above 1000.
+ *
+ *  A million-token window is the unit the user says out loud ("my default is
+ *  1m"), and the model ids carry it as `[1m]`. Rendering it as `1000k` reads as
+ *  a different, larger number than the marker it came from.
+ *
+ *  The promotion is decided on the ROUNDED k, not on `n`, so `1000k` is not a
+ *  string this can return. Testing `n` directly leaves the band that rounds up
+ *  to 1000k (999,500 and above) below the threshold and printing it. */
 export function formatTokens(n: number): string {
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
+  if (n < 1000) return String(n);
+  const k = Math.round(n / 1000);
+  return k < 1000 ? `${k}k` : `${Math.round(k / 100) / 10}M`;
 }
 
 // There is deliberately NO chars-to-tokens helper here. `estimateTokens`

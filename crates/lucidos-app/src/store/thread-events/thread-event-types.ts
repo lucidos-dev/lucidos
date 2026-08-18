@@ -227,6 +227,28 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
   return event.type === 'EventWaitCanceled' && event.cause === 'user_stop';
 }
 
+/** The wait's `reason` as a bare subject, for a label that already said "wait".
+ *
+ *  Both transcript labels prefix the model's own words with a template carrying
+ *  the verb. A reason opening "waiting for the e2e lock" would otherwise render
+ *  as `Stopped waiting: waiting for the e2e lock`. No template avoids that:
+ *  every label for this concept contains a waiting word.
+ *
+ *  At the label rather than at the stored reason, because the text is the
+ *  model's and belongs on disk as written. The *subscription indicator*
+ *  deliberately does NOT call this: it supplies no verb of its own.
+ *
+ *  Three judgments sit behind the two lines below, and each is a decision
+ *  rather than a gap: `to` is not one of the prepositions, only a LEADING
+ *  phrase goes, and a reason that is nothing else comes back whole. See
+ *  `docs/plans/2026-08-14-a-wait-label-does-not-say-waiting-twice.md`.
+ *
+ *  `core::tool_label` carries the engine-side twin, for the pending step. */
+export function awaitedSubject(reason: string): string {
+  const stripped = reason.replace(/^\s*wait(?:ing)?\s+(?:for|on|until)\s+/i, '');
+  return stripped.trim() ? stripped : reason;
+}
+
 /** Header label for the turn a user's **Stop waiting** opens.
  *
  *  Says what was stopped, in the model's own words, because that is the only
@@ -234,11 +256,11 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  dropped it. A pre-2026-08-07 `EventWaitCanceled` carries no reason, and the
  *  line then says the one thing it knows rather than trailing an empty colon.
  *
- *  Deliberately the same wording as the step-row variant (`eventWaitStepBody`),
- *  which is what a NON-user stop still renders: one phrasing for one concept,
- *  whichever surface it lands on. */
+ *  Deliberately the same wording as the transcript's stop row, which is what a
+ *  NON-user stop renders: one phrasing for one concept, whichever surface it
+ *  lands on. Both therefore inherit `awaitedSubject`. */
 export function eventWaitStoppedSummary(reason: string | undefined): string {
-  return reason ? `Stopped waiting: ${reason}` : 'Stopped waiting for an event';
+  return reason ? `Stopped waiting: ${awaitedSubject(reason)}` : 'Stopped waiting for an event';
 }
 
 /** Header label / preview text for a `ResponseCanceled` turn — always a
@@ -726,7 +748,12 @@ export type AnswerKind =
   | { kind: 'Selected'; option_id: string }
   | { kind: 'FreeText'; text: string }
   | { kind: 'MultiSelected'; option_ids: string[]; text?: string }
-  | { kind: 'Canceled' };
+  | { kind: 'Canceled' }
+  /** A follow-up arrived that could not be this question's answer, so it
+   *  replaced the question. Distinct from `Canceled`: the user did reply, just
+   *  not to this. Resolving it is what releases the agent parked inside the
+   *  call that asked. */
+  | { kind: 'Superseded' };
 
 // Transient events — live SSE only, never stored. All names are past tense
 // (events-only model; T7 renamed every imperative / present-participle variant).

@@ -33,6 +33,8 @@ import type {
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
+import { cancelAppUpdate } from '../utils/tauri';
+import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
@@ -189,7 +191,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -255,6 +257,11 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
 export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   { key: 'models', label: 'Models', group: 'Assistant' },
   { key: 'permissions', label: 'Permissions', group: 'Assistant' },
+  // Beside Permissions, because the two answer the same question from
+  // different ends: which tools the agent is offered, and which of those it
+  // may call without asking. The page also owns the mcp-allowed-tools list,
+  // which is meaningless without the server list next to it.
+  { key: 'mcp', label: 'MCP Servers', group: 'Assistant' },
   // Binary paths plus registered repositories: everything a coding-agent
   // thread needs configured, in one place.
   { key: 'coding-agents', label: 'Coding Agents', short: 'Agents', group: 'Assistant' },
@@ -425,7 +432,7 @@ export const appUpdateCheckError = signal<string | null>(null);
 /** Live phase of a packaged app-update run, or `null` when none is in flight.
  *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts).
  *  The engine has no part in it, so this stays null in a browser, PWA or dev
- *  client. Read by BOTH the progress toast and Settings → System, so the two
+ *  client. Read by BOTH the progress dialog and Settings → System, so the two
  *  cannot disagree about what the update is doing.
  *
  *  Typed to the IN-FLIGHT frames only. `cancelled` and `failed` end a run, and
@@ -1530,7 +1537,8 @@ export const restartRequired = signal(false);
 /** Whether the engine is currently restarting (blocks all user interaction). */
 export const engineRestarting = signal(false);
 /** A thread's contribution to the pending engine restart: its title and the
- *  commit subjects that were merged. Rendered grouped in the restart toast. */
+ *  commit subjects that were merged. Listed grouped in the restart confirm
+ *  dialog, which is what the user answers before the restart begins. */
 export interface RestartGroup {
   threadId: string;
   threadTitle: string;
@@ -1826,17 +1834,43 @@ export const confirmState = signal<ConfirmState>({
   okLabel: 'Delete',
 });
 
-/** The progress-dialog slot, one at a time. Both flows that will write it take
- *  the workspace away, so two at once is not a state that exists.
+/** The WRITABLE progress-dialog slot, for a dialog nothing else derives.
  *
- *  Nothing in the app writes it yet. The surface gallery drives it instead, so
- *  the shape can be judged before a real flow is pointed at it. See
+ *  The two real flows do not write it: each is DERIVED from the signal that
+ *  already says it is running (see `activeProgressDialog`). So the only writer
+ *  left is the surface gallery, which fakes a run to show the shape. See
  *  docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md. */
 export const progressDialog = signal<ProgressDialogState>({
   visible: false,
   title: '',
   message: '',
   progress: null,
+});
+
+/** Whether the restart now in flight delivers a NEW engine version, which is
+ *  the only thing the dialog's two shapes differ on. Set by
+ *  `initiateEngineRestart` before it flips `engineRestarting`, and restored
+ *  from the in-flight marker after a reload mid-restart. Read only while
+ *  `engineRestarting` is true, so it needs no clearing. */
+export const engineRestartNewVersion = signal(false);
+
+/** The progress dialog on screen, or an invisible state when there is none.
+ *
+ *  DERIVED, and that is the whole point: a modal written by hand at each site
+ *  strands the user at the first site that forgets to clear it. Each flow
+ *  already owns a signal that says whether it is running, so the dialog rides
+ *  that signal and every existing clear closes it. Reconnect, the restart
+ *  safety timeout, a spawn failure and each terminal update frame all cost
+ *  nothing here.
+ *
+ *  The restart wins a tie. The two cannot genuinely overlap, since a packaged
+ *  install restarts the whole stack rather than the engine. A precedence makes
+ *  that overlap unrepresentable instead of racy. */
+export const activeProgressDialog = computed<ProgressDialogState>(() => {
+  if (engineRestarting.value) return restartDialogState(engineRestartNewVersion.value);
+  const frame = appUpdateProgress.value;
+  if (frame) return appUpdateDialogState(frame, () => { void cancelAppUpdate(); });
+  return progressDialog.value;
 });
 
 // --- Prompt dialog ---
@@ -2193,7 +2227,7 @@ export function engineNewVersionReady(): boolean {
 // Toast key for the poll-driven Switch info toast
 // (store/actions/engine-update.ts). Lives here rather than there so
 // `initiateEngineRestart` can dismiss it when a switch begins, with no import
-// cycle. The switch progress toast then replaces it as the version surface.
+// cycle. The progress dialog then replaces it as the version surface.
 export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
 
 // Toast key for a failed thread-list refresh. Both surfacing sites share it,
@@ -2266,8 +2300,8 @@ export const HEALTH_PROBE_TIMEOUT_MS = 4500;
 // client in-process, because an engine version change is pending. See
 // engine::frontend_refresh INV-A. Keyed, so repeated frontend-only applies
 // while a Switch is pending coalesce into one toast. Lives here so
-// initiateEngineRestart can collapse it into the switch progress toast with no
-// import cycle, the same pattern as NEW_VERSION_TOAST_KEY.
+// initiateEngineRestart can drop it when the switch begins with no import
+// cycle, the same pattern as NEW_VERSION_TOAST_KEY.
 export const FRONTEND_UPDATE_DEFERRED_TOAST_KEY = 'engine-frontend-update-deferred';
 
 // Sibling of the key above for the STRANDED case: the frontend change rebuilt,

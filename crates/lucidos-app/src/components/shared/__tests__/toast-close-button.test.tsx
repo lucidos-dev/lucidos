@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { ToastList } from '../Toast';
-import { toasts, showToast, engineRestarting } from '../../../store/store';
-import { initiateEngineRestart, RESTART_TOAST_KEY } from '../../../store/actions/chat-changes';
+import { toasts, showToast, engineRestarting, activeProgressDialog } from '../../../store/store';
+import { initiateEngineRestart } from '../../../store/actions/chat-changes';
 
 /** Walk a vnode tree, returning every node whose className contains `cls`. */
 function findByClass(node: ComponentChildren, cls: string, out: VNode[] = []): VNode[] {
@@ -28,13 +28,13 @@ beforeEach(() => {
 
 describe('Toast close button — gated by dismissable flag', () => {
   it('omits .toast-close when dismissable: false', () => {
-    showToast('Restarting engine...', 'info', { key: RESTART_TOAST_KEY, spinning: true, dismissable: false });
+    showToast('Downloading embedding model', 'info', { key: 'model-download', spinning: true, dismissable: false });
     expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
   });
 
   it('renders .toast-close on warning toasts (dismissable defaults to true)', () => {
     showToast('Engine restart required.', 'warning', {
-      key: RESTART_TOAST_KEY,
+      key: 'restart-required',
       action: { label: 'Restart', onClick: () => {} },
     });
     expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
@@ -55,19 +55,14 @@ describe('Toast close button — gated by dismissable flag', () => {
   });
 });
 
-describe('initiateEngineRestart raises a light dismissible status toast', () => {
-  it('the status toast spins but stays dismissible (UI not deactivated during restart)', async () => {
-    // Don't await — restartEngine() will try to hit the network and reject;
-    // we only need the synchronous showToast that runs before the await.
+describe('initiateEngineRestart raises a dialog, not a toast', () => {
+  it('narrates the restart on the modal dialog and adds nothing to the stack', async () => {
+    // Don't await: restartEngine() will try to hit the network and reject. We
+    // only need the synchronous state set before the await.
     void initiateEngineRestart().catch(() => {});
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast).toBeDefined();
-    // No new-version signals are set in this test → a plain respawn, so the
-    // progress toast reads "Restarting engine…", not "Starting new version…".
-    expect(toast!.message).toBe('Restarting engine…');
-    expect(toast!.dismissable).not.toBe(false);
-    expect(toast!.spinning).toBe(true);
-    // And the rendered tree shows the close button so the user can dismiss it.
-    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
+    // No new-version signals are set here, so this is a plain respawn.
+    expect(activeProgressDialog.value.title).toBe('Restarting engine');
+    expect(toasts.value).toHaveLength(0);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
   });
 });

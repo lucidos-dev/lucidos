@@ -158,7 +158,7 @@ window set too low means context is thrown away that the model could have held.
 Each row in the *model registry* may declare its window (Settings → Models →
 Context window). Leave it blank and the engine falls back to guessing from the
 model id — a guess that knows only Claude and GPT-5 ids and treats everything
-else as 200k, so an OpenRouter, Gemini, or local model is under-budgeted until
+else as 200k, so an OpenRouter, xAI, Gemini, or local model is under-budgeted until
 you set it. Every guess errs low deliberately: a window set too low only trims
 early, while one set too high makes the engine build a prompt the provider
 rejects. Builtins ship with theirs declared where it could be verified.
@@ -187,6 +187,23 @@ provider or the mailbox account.) An OAuth Client is the one type NOT injected a
 A secret is never a *preference*.
 See also: *connected account*, *environment variable*, *config*.
 
+### Disabled tool
+One tool on an *MCP* server that the user switched off, so the *Lucidos Agent*
+is never offered it. Distinct from stopping the whole server: the rest of that
+server's tools keep working.
+
+It exists because every enabled tool's definition rides on **every** request. A
+server with forty tools is a permanent per-turn cost even when the agent needs
+two of them. Switching one off removes its definition, and the saving shows as
+the workspace's per-request token total dropping. A call already under way is
+refused too, so the switch takes effect at once rather than next turn.
+
+The selection is stored per server, keyed on the name the agent is shown rather
+than the server's own spelling of it, and survives restarts. Changing it is
+announced, so the timeline records who narrowed the agent's tool surface and
+when. A tool the server later renames is simply no longer matched: a stale entry
+disables nothing rather than the wrong thing.
+
 ### Derived provider
 A provider name that is not itself a service, but a second, separately scoped
 connection to one that is: a health-only connection on Google's endpoints under
@@ -205,12 +222,22 @@ See also: *connected account*, *OAuth provider registry*.
 An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI — anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable except per-token streaming ones — see *scheduler blocklist* (dev).
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/rust.md` § "Apps — Event APIs".
 
+### Endpoint catalog
+The knowhow half of a *derived proxy entry*: a `data/knowhow/<name>-api.md` file cataloguing the endpoints observed on a site. Each one carries its params, response shape and quirks. The `apis.json` entry beside it is pure transport, so it says nothing about which paths exist. Without the catalog the LLM knows only that a proxy exists, so a derivation emitting one and not the other has failed. Never records the user's own rows, only field names and types.
+See also: *derived proxy entry*, `system-knowhow/deriving-an-api-from-a-site.md`.
+
+### Derived proxy entry
+A proxy entry obtained by watching a site's own frontend rather than by reading its documentation. The user drives the site once in a visible browser, and the calls it makes are captured. The result is an `apis.json` entry plus an *endpoint catalog*, for a site with no usable public API. It is replay of the user's own authenticated session, never a bypass: a CAPTCHA or bot wall stops it. Any secret found during capture goes to the engine's credential store, never into either artifact.
+See also: *endpoint catalog*, *credential*, `system-knowhow/deriving-an-api-from-a-site.md`.
+
 ### Engine
 The process serving one *workspace*: it holds the threads, answers the app, runs triggers and scheduled tasks, and talks to its database. One per workspace, started by the *workspace gateway* (dev term) and addressed through it. When the app says "Disconnected from the dev engine" it means this process stopped answering, not that the workspace is gone. The picker and the Lucidos menu's Workspaces row reach the gateway instead, so listing and switching keep working. Settings → System shows its version and is where you restart it.
 Contrast with *Lucidos Engine*, the actor chip on work the engine did without the LLM.
 
 ### Environment variable
 A user-managed, **non-secret** `NAME=value` pair (Settings → System → Environment variables) that Lucidos injects as a real environment variable into every subprocess it spawns — `run_bash`, `run_python`, background tasks, scheduled scripts, *triggers*, and *coding agent* sessions — e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`, build flags, default model names. Stored DB-backed (the `environment_variables` table), editable in Settings or by the *Lucidos Agent* via the grouped `env_vars` tool (`list` / `set` / `delete`; `set_environment_variable` is a back-compat alias for `set`), and applied per-spawn so a change takes effect on the next tool call / agent turn with no engine restart. Deliberately distinct from a *credential*: env vars are non-secret (they appear in tool-call payloads, logs, and the *event* store — that's the point), whereas credentials hold secrets and feed the proxy auth pipeline. Names must be uppercase letters/digits/underscores (not starting with a digit) and may not clobber engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*`); engine-owned vars always win a collision. A credential can also be given a custom env var name so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias, so existing `CRED_<NAME>` references keep working).
+
+The store has a second consumer, and it is the one an engine restart applies to. The engine copies every pair into its own process environment once at startup. So a variable the engine itself reads, rather than a subprocess, picks up a change only on the next engine start.
 
 <!--gloss-event-start-->
 ### Event
@@ -253,6 +280,15 @@ A registered git repository (or GitHub tree URL) that the *Plugins panel* scans 
 ### Max tool calls
 How many tool calls the *Lucidos Agent* may make in a single turn before the engine ends the turn, set under **Settings → Models → Chat & triggers** (default 500). It counts individual calls, not replies, so three calls in one reply spend three of them, and it applies to *trigger* runs exactly as to chat. There is deliberately **no maximum**: a high cap costs time and tokens, which is the user's call to make, and roughly speaking the cap is how long a single turn can run (around 15 seconds per call, so 500 is a couple of hours). The minimum is 1. Reaching it is not an error: the turn ends with a message prefixed `[ENGINE-LIMIT]` that names the limit, links to the setting, and can be continued by sending any message. That prefix is the only trustworthy signal the limit was hit, since the agent cannot observe its own tool-call count and will otherwise invent one. Only the user can change it; the agent is refused, because the cap is the backstop over the agent's own work. Distinct from the *command guard*, which judges whether one command is safe rather than how many run.
 
+### MCP server
+An outside program that offers the *Lucidos Agent* extra tools over the Model Context Protocol: a Slack server, a Jira server, a company's internal catalog. Registered per workspace, and managed under **Settings → MCP Servers**, which lists every one with what it costs.
+
+Two things about that page are easy to misread. **Nothing starts an MCP server when the engine starts.** A server only ever runs for the current session, and a restart switches them all off. That is why the page labels a live one "Running, this session". A **stopped** server still has a cost worth knowing, because its tool list is cached from the last successful connect: the page states that figure conditionally, stamped with when the tools were last seen. A server nobody has ever connected to says so instead of showing zero.
+
+Every enabled tool's definition rides on every request, so a server with forty tools is a permanent per-turn tax. The page gives two levers: switch the whole server off, or switch off a single *disabled tool*. It also holds the allowlist behind the *MCP permission card*, since a pattern there names a server and a tool.
+
+A server whose stored id cannot be used on the wire is shown as unusable and offers only Remove. Nothing on it can ever be called, whatever it is started or stopped. See *wire tool name* in the developer glossary for why an id has that restriction.
+
 ### MCP permission card
 The approval card the *Lucidos Agent* shows when it wants to call a tool on an *MCP* server that isn't already trusted. Same UI as the *command permission card*: Deny, Allow once, Allow for this thread, Always allow this tool, or Always allow this server. "Always allow" choices are remembered in an editable list (`~/.lucidos/mcp-allowed-tools`) — per-tool (`Mcp(<server>:<tool>)`) or whole-server (`Mcp(<server>:*)`). Until answered, the thread waits on the user. A *trigger* fires unattended, so it never shows this card — MCP tool calls in a trigger thread are auto-approved silently (as is any call to a server with auto-approve set).
 
@@ -266,10 +302,18 @@ The *Lucidos Agent* looking through long-term memory itself, mid-turn, with a qu
 The database-backed list of chat models the user manages in **Settings → Models**. It drives the *Lucidos Agent* model picker and tells the engine which *provider* serves each model. Known models are seeded by the engine; the user can add their own (id + label + provider, and optionally the model's *context window*) and enable/disable or delete them (builtins are disable-only). Separate from the *Claude Code* model picker, which keeps its own list.
 
 ### Provider
-The backend that serves a *model*: **Vertex AI**; **Anthropic** (direct, via `api.anthropic.com`: supports a Claude subscription OAuth token or an API key, with the `ANTHROPIC_API_KEY` launch env var as a fallback below the stored credential); **OpenAI** (direct, via `api.openai.com`: an API key, with the `OPENAI_API_KEY` launch env var as a fallback, and below that an auto-detected key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` `apikey` login as a lowest-precedence fallback, the parallel of Vertex reading the gcloud ADC file); **OpenRouter** (via `openrouter.ai/api/v1`: a Bearer API key, with the `LUCIDOS_OPENROUTER_API_KEY` env var as a fallback; serves e.g. GLM 5.2); or **Local** (any OpenAI-compatible server, Ollama / LM Studio / vLLM / llama.cpp, at a configurable base URL, default Ollama `http://localhost:11434/v1`, API key optional). OpenAI, OpenRouter, and Local all speak the OpenAI Chat Completions wire format but are distinct backends. Each entry in the *model registry* names its provider; the provider's credentials are configured once under Settings → Models → Providers. The same Claude model can be offered through more than one provider (e.g. Fable 5 via direct Anthropic, other Claude models via Vertex).
+The backend that serves a *model*. Each entry in the *model registry* names its provider, and that provider's credentials are configured once under Settings → Models → Providers.
+
+**Vertex AI** takes no stored credential: it resolves its project and token from gcloud. **Anthropic** is direct, via `api.anthropic.com`: a Claude subscription OAuth token or an API key, with the `ANTHROPIC_API_KEY` launch env var as a fallback below the stored credential. **OpenAI** is direct, via `api.openai.com`: an API key, with the `OPENAI_API_KEY` launch env var as a fallback. Below that comes a key auto-detected from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` `apikey` login, the parallel of Vertex reading the gcloud ADC file.
+
+**OpenRouter** is `openrouter.ai/api/v1`: a Bearer API key, with the `LUCIDOS_OPENROUTER_API_KEY` env var as a fallback, serving e.g. GLM 5.2. **xAI** is direct, at `api.x.ai/v1`: a Bearer API key, with the `LUCIDOS_XAI_API_KEY` env var as a fallback, serving e.g. Grok 4.6. **Local** is any OpenAI-compatible server (Ollama / LM Studio / vLLM / llama.cpp) at a configurable base URL, default Ollama `http://localhost:11434/v1`, API key optional.
+
+OpenAI, OpenRouter, xAI and Local all speak the OpenAI Chat Completions wire format but are distinct backends. Grok ids are bare on xAI (`grok-4.6`) and prefixed on OpenRouter (`x-ai/grok-4.6`). So the same model can sit in the picker twice, on two providers and two keys. The same Claude model can also be offered through more than one provider (e.g. Fable 5 via direct Anthropic, other Claude models via Vertex).
 
 ### Builtin provider proxy
-A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. When `<name>` matches a *model registry* provider (`vertex`, `openai`, `openrouter`, `anthropic`, `local`) and no `apis.json` entry exists, the engine forwards to that provider's API root and injects the provider's own credential server-side — the same one configured under Settings → Models → Providers — so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first). `vertex` is addressed by the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` URL prefix and mints the access token, so the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. The builtin names are `vertex`, `openai`, `openrouter`, `xai`, `anthropic` and `local`. When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root. It injects the credential configured under Settings → Models → Providers server-side, so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first).
+
+`vertex` is addressed by the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` URL prefix and mints the access token, so the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
 ### OAuth provider registry
 The list of OAuth providers Lucidos knows the endpoints for, stored as
@@ -307,6 +351,12 @@ The notification surface outside the Lucidos UI: an OS-level notification banner
 Both ride the engine's single push-allowed decision (see PresenceCheck protocol), so a given notification reaches a device through exactly one transport and never collides with the *in-app surface* toast. Independent from the *in-app surface*.
 See also: `system-knowhow/notifications.md` §§1, 3, 4.
 
+### Orchestrator
+The role a *parent thread* plays while it runs several *child threads* at once: it scopes their work, rules when they disagree, and is the only thread that can direct any of them. Not a separate kind of thread and not a new relationship, just a name for what a parent is doing. Its children may observe each other freely, with events, artifacts and transcripts all unrestricted, and may never direct each other. A disagreement is therefore settled by the immediate parent reading the shared event record, never by the children negotiating.
+
+The rule recurses: a child that spawns children is their orchestrator. Everything past that rule is the orchestrator's own judgement, and the engine models none of it. Reasoning: `docs/adr/0083-sibling-threads-observe-never-direct.md`.
+See also: `system-knowhow/orchestrating-sub-threads.md`.
+
 ### Parent thread
 The direct ancestor of a *child thread*. Resolved via the child's `parent_thread_id` column. A thread can have at most one parent; a parent can have many children. The edge carries traffic both ways: each child reports its outcome upward when it terminates, and the parent can send a *child follow-up* downward to any child it spawned itself.
 
@@ -331,6 +381,11 @@ The top-level panel for discovering, installing, and managing *plugins* (includi
 
 ### Preference
 A single key→value user setting stored in the `preferences` table — theme, language, timezone, push notifications, the welcome message, chat model, UI scale, font, and so on. The bulk of what the user calls **Settings** (the umbrella also covers *models*, *credentials*, MCP servers, and *repositories*, which live in their own stores). A preference is **global** (workspace-wide) or **device-scoped** (a per-device override that wins over the global value on the device that set it). The *Lucidos Agent* reads/writes the agent-settable ones with `get_preferences` / `set_preference`; the human edits the same values in Settings. A write emits the persisted `PreferencesChanged` event (or `LanguageSet` / `TimezoneSet` for locale), which open pages live-apply. Distinct from *config* (the `data/config/` files like `apis.json`) and from a *credential* (a secret — never stored as a preference). See `system-knowhow/preferences.md`.
+
+### Pseudo-fullscreen
+The *app UI* filling the whole viewport as a CSS overlay, used where the browser's native Fullscreen API is unavailable or refused. That is the iOS path, so it is the usual shape on a phone. Both modes are entered from the same content-header control, and the user sees no difference between them.
+
+What differs is what the host can paint. A natively fullscreen element is painted alone, so the browser supplies Escape and nothing else is drawn. A pseudo-fullscreen panel sits in the normal layer, so the host draws its own chrome over the app iframe. That chrome is an exit button in the top-right corner, plus a transparent guard strip down each screen edge on mobile. Those regions belong to the host, and an app must keep them clear (`system-knowhow/building-an-app.md` § Responsive by default). Source: `.app-ui-fullscreen` in `crates/lucidos-app/src/styles/panels/previews.css`, gated by `isPseudo` in `components/apps/AppUiInline.tsx`.
 
 ### PresenceCheck
 The transient SSE event the *Lucidos Engine* broadcasts on every `NotificationCreated` to ask every connected page for its live presence. A **pure pong trigger** — it carries `notification_id`, `event_id` (so the pong can report `event_in_viewport`), a `deadline_ms` the page reads off the payload (set by `scheduler::push::DEADLINE_MS`, currently 2 s — sized to cover an iOS PWA's first packet after Tailscale wake-from-idle, where Tailscale's userspace WireGuard renegotiation pushes the round-trip into the 1100–1800 ms band), and `sent_at_ms`. It carries NO toast content: the in-app toast is driven separately by *NotificationToastRequested*, so it can no longer race the push decision. Each page answers with a *PresencePong*. The engine collects pongs up to the deadline and uses them to decide whether to send an *OS surface* push. Skipped entirely only when nobody is reachable — no page holds an open SSE connection AND no device has pinged visible within `PRESENCE_STALE_AFTER` (120 s, `core::device_presence`). The live SSE-connection count is the primary gate (`engine.sse_connections`); the heartbeat candidates are secondary (`expected_pong_count` in `scheduler::push`). The SSE count is what makes this robust — iOS suspends the 30 s heartbeat while a PWA is foregrounded, so the heartbeat row goes stale even though the page is connected and would pong; gating on the open connection lets the active page still suppress the push. See `system-knowhow/notifications.md` §3.
@@ -373,6 +428,12 @@ The *thread* that issued the `run_thread` / `run_coding_agent` / `lucidos spawn-
 ### Status filter
 The `--status` flag on `lucidos threads list` / `count`, and the matching `status` parameter on `GET /api/v1/threads/{list,count}`, the `threads` tool and `lucidos.threads`. Names exactly the *thread* statuses to keep, out of `idle`, `running`, `waiting`, `waiting_for_user_answer`, `paused`, `failed`: the same values every returned *thread summary* carries in its `status` field, so a caller filters on what it reads. The precise form of the *Active (thread state)* union. `status=running` is "is the workspace busy?", `status=waiting_for_user_answer` is "is anything waiting on me?", and `active=true` is both at once. Passing `status` together with `active` is refused rather than intersected, as is an unrecognized or empty value.
 See also: `system-knowhow/lucidos-cli.md` § `lucidos threads list`.
+
+### Superseded question
+A *question card* the engine resolved because a follow-up arrived that could not be its answer. Distinct from a canceled one: the user did reply, just not to this question, and their reply drives the very next turn. The card reads "Replaced by your next message" and its buttons are spent; on the wire it is `UserQuestionAnswered { answer: { kind: "Superseded" } }`.
+
+Coding-agent lane only, because it exists to break a deadlock that only that lane has. The agent is parked inside the call that asked, so nothing but an answer releases it. Meanwhile the follow-up's own prompt event has already killed the card. A chat thread keeps its question live instead, queuing such a follow-up as an injection and processing it once the user answers.
+See also: `system-knowhow/coding-agent-events.md` § `UserQuestionAsked`.
 
 ### Style override
 One entry in the `style_overrides` *preference*: a CSS custom property name and the value to paint it with, applied straight onto the app's root element. Writing one repaints every connected client live, over the same `PreferencesChanged` fan-out that carries theme, font and UI scale, so a design value can be retuned on a running Lucidos with no rebuild. Device-scoped like the other appearance preferences, so tuning on a phone leaves a desktop alone. Values only: an override can retune a colour, a size, a duration, never move a control or change what a screen does. Two ways back out if a value makes the UI unusable, **Settings → Appearance → Style overrides → Clear all**, and `?style-reset` on the URL, which clears them before the first pixel is painted and so works when nothing on screen is readable.

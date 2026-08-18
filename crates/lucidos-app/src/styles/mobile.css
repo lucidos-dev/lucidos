@@ -741,9 +741,18 @@
 
            Equivalent at rest and in motion: the row only unsticks at scrollTop 0,
            where the offset is 0, so the translate is never applied to a row
-           sitting in normal flow. */
+           sitting in normal flow.
+
+           The second term undoes the iOS repaint nudge's compensation. That
+           compensation cancels a scroll this sticky row never took, so it
+           displaces the row a pixel per toggle. utils/iosRepaint.ts publishes
+           the shift here, on this element alone. Why, and why the two terms
+           simply add:
+           docs/plans/2026-08-16-the-sticky-title-undoes-the-repaint-nudge-compensation.md */
         top: var(--mobile-header-height, 3rem);
-        transform: translateY(var(--mobile-header-offset, 0rem));
+        transform: translateY(calc(
+            var(--mobile-header-offset, 0rem) - var(--repaint-nudge-shift, 0px)
+        ));
         z-index: 2;
         /* Stretch to full width, cancelling .thread-content's horizontal padding
            (the same token the transcript pads with, so the two can't drift) */

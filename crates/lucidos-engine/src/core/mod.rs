@@ -844,6 +844,60 @@ mod format_byte_size_tests {
     }
 }
 
+/// An *event wait* `reason` with a leading waiting phrase removed, for a label
+/// that already said "wait".
+///
+/// The engine-side twin of `awaitedSubject`
+/// (`store/thread-events/thread-event-types.ts`), which does this for the
+/// transcript's two labels. Two implementations because two layers compose the
+/// text: the pending step's here, the row's there. The three judgments behind
+/// the rule live in
+/// `docs/plans/2026-08-14-a-wait-label-does-not-say-waiting-twice.md`.
+///
+/// The TS twin also eats leading whitespace, which this does not need: the one
+/// caller trims the reason before asking.
+fn awaited_subject(reason: &str) -> &str {
+    // Matched as verb, gap, preposition rather than as six literal phrases.
+    // The TS twin's `\s+` accepts ANY run of whitespace, and the two must not
+    // disagree: a single-space literal list left `waiting  for the lock`
+    // stripped in the transcript and doubled here.
+    for verb in ["waiting", "wait"] {
+        let Some(rest) = strip_word(reason, verb) else {
+            continue;
+        };
+        for preposition in ["for", "on", "until"] {
+            let Some(subject) = strip_word(rest, preposition) else {
+                continue;
+            };
+            // A strip that emptied the reason would leave a dangling colon.
+            return if subject.is_empty() { reason } else { subject };
+        }
+    }
+    reason
+}
+
+/// `s` past a leading `word` and the whitespace after it, or `None` when `s`
+/// does not open on that whole word.
+///
+/// The trailing whitespace is what makes it a WORD match: without it
+/// `waiting form the lock` would strip on `for`. A word ending the string is
+/// still a match, so the caller can tell an empty subject from no match.
+///
+/// `split_at_checked` is the UTF-8 guard. It refuses an index that is not a
+/// char boundary, so a reason opening with a multi-byte character falls
+/// through instead of panicking.
+fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    let (head, tail) = s.split_at_checked(word.len())?;
+    if !head.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let rest = tail.trim_start();
+    if !tail.is_empty() && rest.len() == tail.len() {
+        return None;
+    }
+    Some(rest)
+}
+
 /// Head-truncate `s` to `max` bytes, appending `...` when it actually cuts.
 /// Returns `s` unchanged when it already fits. UTF-8-safe.
 ///
@@ -1418,7 +1472,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             match reason {
-                Some(reason) => format!("Waiting: {}", truncate(reason, 60)),
+                // `awaited_subject`, because this label supplies the verb: a
+                // reason opening "waiting for" would read "Waiting: waiting
+                // for".
+                Some(reason) => format!("Waiting: {}", truncate(awaited_subject(reason), 60)),
                 None => "Waiting for an event...".to_string(),
             }
         }

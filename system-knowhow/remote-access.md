@@ -357,13 +357,13 @@ true before the second buys anything:
 | 1. The machine running Lucidos | Is the engine's machine on a tailnet? | `detected_tailscale_ip` from `GET /api/v1/network-config` in any browser; the fuller `get_connect_info` probe on the packaged desktop app |
 | 2. This device | Has the device reading the page joined that tailnet? | The address this device was served on |
 
-Both sections render **everywhere**, phone browsers and the installed PWA
-included. What varies by platform is how much each can say, never whether it
-appears. Only the **actions** are gated: Connect URLs, Sign in to Tailscale and
-Expose are native commands with no HTTP equivalent, so they exist on the
-packaged desktop app alone. **Get Tailscale** is a link rather than a bridge
-call, so it is offered wherever it can be acted on, and it opens the App Store
-on iOS, the Play Store on Android, and `tailscale.com/download` otherwise.
+All three sections render **everywhere**, phone browsers and the installed PWA
+included, Connect URLs among them. What varies by platform is how much each can
+say, never whether it appears. Only the **actions** are gated: Sign in to
+Tailscale and Expose are native commands with no HTTP equivalent, so they exist
+on the packaged desktop app alone. **Get Tailscale** is a link rather than a
+bridge call, so it is offered wherever it can be acted on. It opens the App
+Store on iOS, the Play Store on Android, and `tailscale.com/download` otherwise.
 
 Do not restore the old shape, where the page chose **one** of the two by
 platform. A browser then saw section 2 alone, and a machine whose gateway is
@@ -413,17 +413,24 @@ desktop browser as often as from a handset, and a desktop browser has no home
 screen, so the "add to home screen" wording is behind an iOS/Android check and
 the neutral phrasing is "install Lucidos".
 
-**Connect URLs** lists the addresses the engine answers on:
+**Connect URLs** lists the addresses that reach **this workspace**:
 
-- **This Mac**: `http://localhost:<port>`. A secure origin, so a full PWA works
-  here, which is Route D.
+- **This Mac**: `http://localhost:<port>/<slug>/`. A secure origin, so a full
+  PWA works here, which is Route D. Packaged desktop app only, since the
+  localhost port comes from the Tauri bridge.
 - **Local network**: shown only when the gateway is bound beyond loopback. Plain
   HTTP, so no PWA install and no push. Bound to loopback (the packaged default)
   the row points at the **Network access** section further down this same page
-  instead of printing a dead URL.
-- **Tailscale**: the tailnet IP over plain HTTP until `serve` is configured, and
-  the `https://...ts.net` URL once it is. See the detection trap below for why
-  the HTTPS one appears only after serving is proven.
+  instead of printing a dead URL. Packaged desktop app only, since detecting a
+  LAN address needs the bridge.
+- **Tailscale**: the tailnet address over plain HTTP until `serve` is verified,
+  and `https://<name>.ts.net/<slug>/` once it is. Rendered **everywhere**,
+  including a phone browser: see § The tailnet-status endpoint.
+
+**Every row carries the `/<slug>/` prefix**, because that is what addresses a
+workspace (ADR 0014). A bare origin reaches the gateway root, which
+307-redirects to the sole workspace or to the picker. On an install with more
+than one workspace that is the wrong address to hand out.
 
 Both plain-HTTP rows obey the network bind, and for the same reason: being on a
 tailnet does not mean the gateway is **listening** on the tailnet address. Under
@@ -431,7 +438,49 @@ the packaged loopback default neither prints, because both URLs would be dead.
 A bind pinned to the tailnet address shows the Tailscale row and reports the LAN
 as off, which is accurate: that bind serves one address, and it is not a LAN one.
 `serve` is unaffected by all of this, since it proxies from this machine to
-`127.0.0.1` and needs no wider bind.
+`127.0.0.1` and needs no wider bind. So the **HTTPS row is never bind-gated**,
+and it is the one row that survives the packaged default.
+
+The bind weighed is the one belonging to whichever process served the page.
+Behind the gateway that is `gateway_bind`. On a direct engine port the origin is
+the engine, which follows the gateway only while `[engine] inherit` is on.
+
+### The tailnet-status endpoint
+
+`GET /api/v1/tailnet-status` is what puts the Tailscale row in a browser. It
+returns two fields, each a string or null:
+
+| Field | Meaning |
+|---|---|
+| `magic_dns_name` | `<machine>.<tailnet>.ts.net`, no scheme. Null off a tailnet, and null with MagicDNS turned off |
+| `workspace_serve_url` | The `https://<name>/<slug>/` URL, published only once verified |
+
+The name is the point. It is a reverse lookup only the machine can run, so a
+browser has no other way to learn it. It is also the address a user copies to
+another device. The plain-HTTP row prefers it over the bare `100.x` address for
+the same reason: it resolves to that address anywhere on the tailnet, and a
+person can retype it.
+
+**`workspace_serve_url` is verified end to end, never inferred from a
+listener.** A TCP probe of 443 proves that something serves HTTPS and says
+nothing about which gateway. Two gateways on one machine is a documented setup:
+443 fronts 5252, 8443 fronts 5251. So a live 443 can belong to a gateway that
+has never heard of this slug. The engine therefore fetches the candidate URL's
+own `api/v1/health` and compares the `workspace_path` it reports with its own.
+
+A same-named workspace on the other gateway lives at a different path, which is
+what makes the comparison a proof. The probe validates TLS normally, because
+Tailscale issues a real certificate for a `.ts.net` name. It costs nothing when
+the machine is off a tailnet, and both halves are bounded.
+
+It is deliberately a separate route from `network-config`. The bind editor
+fetches that one too, and must not pay for a reverse lookup and a network round
+trip.
+
+The packaged app's own `serve_url` (from `get_connect_info`) is a different fact
+and stays where it is. It answers "is this MACHINE serving", which is what the
+Expose row reports. The endpoint above answers "what is the URL for THIS
+workspace".
 
 **Tailnet state is read without the Tailscale CLI.** The page takes the tailnet
 address from the machine's own interface list and the MagicDNS name from a
@@ -531,19 +580,26 @@ The inverse trap exists too: a `serve` mapping that *exists* does not prove it
 works, because the certificate may never have provisioned (the account toggle
 above).
 
-The Access page now follows this rule rather than guessing: it publishes
-the `https://...ts.net` URL only after probing **port 443 on the tailnet
-address** and finding something answering. Before that it shows the plain-HTTP
-tailnet URL, which is honest about what works today. It previously showed the
-HTTPS URL the moment a MagicDNS name resolved, which is well before anything is
-listening on it.
+The Access page follows this rule rather than guessing, in two places, and they
+are not the same probe.
 
-It deliberately does **not** ask `tailscale serve status` instead. That answers
-"does *a* serve mapping exist", which is a different question: with only the
-8443 mapping from the two-gateway setup above, the config is non-empty while
-`https://<name>` on 443 is still dead. The page publishes exactly one URL, so it
-tests exactly that one. Note the probe proves a **listener**, not a working
-certificate, which is the one case where the URL can appear before it loads.
+The **Expose / Serving row** reports this MACHINE's serve state, on the packaged
+desktop app, from `get_connect_info`. It claims it only after probing **port 443
+on the tailnet address** and finding something answering. It previously claimed
+it the moment a MagicDNS name resolved, which is well before anything is
+listening. That probe proves a **listener**, not a working certificate, so the
+row can appear while a first-run cert is still provisioning.
+
+The **Connect URLs Tailscale row** asks the harder question and gets a harder
+answer: see § The tailnet-status endpoint. It fetches the candidate URL's own
+`api/v1/health` with TLS validated, so a listener is not enough and neither is
+a certificate. Until that succeeds the row shows the plain-HTTP tailnet address,
+which is honest about what works today.
+
+Neither asks `tailscale serve status`. That answers "does *a* serve mapping
+exist", which is a different question: with only the 8443 mapping from the
+two-gateway setup above, the config is non-empty while `https://<name>` on 443
+is still dead. Each surface tests exactly the endpoint it is about to name.
 
 **Rule: the port is the source of truth.** Probe it directly before making any
 claim about whether HTTPS works:
@@ -607,7 +663,9 @@ not that an interface is missing).
   (`https://<host>/<slug>/`) rather than the root if they live in one workspace.
 - **The URL to hand over.** The gateway root 307-redirects to the sole workspace
   or to the picker (`/~/`). A direct workspace link is
-  `https://mymac.tailnet-name.ts.net/<slug>/`.
+  `https://mymac.tailnet-name.ts.net/<slug>/`. Settings → Access prints exactly
+  that under Connect URLs, with a Copy button, so point the user there rather
+  than composing it by hand.
 
 ## Quick triage
 

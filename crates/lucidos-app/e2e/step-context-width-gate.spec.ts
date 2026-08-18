@@ -21,9 +21,9 @@ test.use({ viewport: { width: 1280, height: 800 } });
 /** Well clear of the 26rem gate (416px at the desktop 16px root): the row is
  *  the pane minus the transcript gutters, the turn inset and the scrollbar. */
 const WIDE_PANE = 860;
-/** Well under it, and still above the thread pane's own floor (300px at this
+/** Well under it, and still above the thread pane's own floor (338px at this
  *  16px root, `minThreadPanePx`), so the clamp lets the drag land here. */
-const NARROW_PANE = 330;
+const NARROW_PANE = 360;
 
 async function dragDividerTo(page: Page, toX: number): Promise<void> {
   const box = await page.locator('.split-divider').boundingBox();
@@ -74,7 +74,7 @@ test.describe('Step context counter width gate', () => {
     await expect(full).toBeVisible();
     await expect(compact).toBeHidden();
     // The forms are two different sentences about the same number, so the wide
-    // one must actually be the "178k / 1000k (18%)" shape rather than a second
+    // one must actually be the "178k / 1M (18%)" shape rather than a second
     // copy of the percentage.
     await expect(full).toContainText('/');
 

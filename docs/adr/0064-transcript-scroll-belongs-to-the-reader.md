@@ -25,8 +25,9 @@ result of an explicit user action that asks for it, and that list is exhaustive:
 
 - the two chevrons (`scrollToTop` / `scrollToBottomAnimated`),
 - the follow toggle (`setFollowLiveEdge`),
-- the four submits, all through `followSubmit`: sending a message, answering a
-  question card, deciding a permission card, and Continue after an abort,
+- the five submits, all through `followSubmit`: sending a message, answering a
+  question card, deciding a permission card, Continue after an abort, and the
+  prompt row's Cancel (ADR 0080 added the fifth),
 - turn stepping with the arrow chords (`stepThreadTurn`),
 - a notification or Changes deep link (`scrollToEventAndPulse` /
   `scrollToChangeAndPulse`),
@@ -39,6 +40,14 @@ Exactly one of those asks is STANDING rather than one-shot. The follow toggle
 means "take me to the live edge and keep me there". It arms a flag, and that
 flag plus a measured position is the whole condition for following. There is no
 proximity term and no timing term.
+
+> **Amended: the seed ships ARMED.** The toggle's last press is seeded across
+> threads (see Consequences), and its out-of-the-box value is now on rather than
+> off. So a thread with no reading position rides even where the reader has
+> pressed nothing. That is a departure from this section's rule, taken
+> deliberately: the ride is what most readers want from a live thread, and one
+> press opts out for good. Everything else stands, and only a press writes the
+> seed.
 
 ## Rationale
 
@@ -81,16 +90,23 @@ the container with no gesture. Leaving the follow armed there is only half the
 rule: the reader is put back on the live edge they asked for.
 
 **A submit arms nothing.** It is one ask with one reaction, whichever of the
-four shapes it takes. A reader already riding the live edge is taken there,
+five shapes it takes. A reader already riding the live edge is taken there,
 because that is the toggle's standing ask being served. Everyone else gets a
 one-shot landing. It brings the turn they acted on as far up the viewport as the
 transcript can reach.
+
+> **Narrowed by ADR 0080.** The two resting places are one now, the live edge,
+> and the turn-anchored landing is gone. A submit still arms nothing, which is
+> the half of this clause that stands.
 
 **One landing line.** A turn comes to rest in the same place whatever put it
 there, a submit, turn stepping or a deep link. The line is `scroll-margin-top`
 below the container's top edge, clear of the chrome stacked there. Three
 navigations sharing one number is what stops the same turn resting in three
 places.
+
+> **Narrowed by ADR 0080.** Two navigations share the line now, turn stepping
+> and a deep link. A submit rests at the live edge instead.
 
 **The deep link is the one navigation exempt from the liveness term.** The
 others describe a moment, where the reader happens to be looking. A link names
@@ -112,7 +128,8 @@ a thread names the ride's own place, so it ends nothing.
   replay a request the reader made in that thread.
 - The reader's last toggle press is also seeded across threads and reloads,
   device-scoped. A brand-new thread with no reading position of its own can
-  still ride.
+  still ride. The seed ships armed, so a device that has pressed nothing rides
+  too, and only a disarm press stops it. See the amendment above.
 - The transcript's height is a function of its content and nothing else. No
   layout rule reads the follow flag.
 - What the old narrowness protected still holds: a lull between two tool calls
@@ -152,6 +169,10 @@ there is. Three separate reports followed:
 Nothing replaced it. The landing asks for the line only when the turn can reach
 it. Otherwise it asks the modest question: show the turn.
 
+> **Narrowed by ADR 0080.** The reservation is still rejected. What replaced it
+> is the live edge, past the padding the transcript really does reserve, rather
+> than the two-branch measured ask described here.
+
 **Gate the follow's write on the thread being live, not just the disarm.** This
 answered a real report about a reader who had SCROLLED, by applying the fix to
 every reader. A rider who never moved was then left above an arriving question
@@ -182,6 +203,20 @@ changes `scrollHeight` and never `scrollTop`, so the position test is exact for
 growth and only for growth. The keyboard, an app resume and any other
 platform-driven scroll move the container with no gesture. Each retired a follow
 the reader had armed and never touched.
+
+**Read "was the reader on the live edge" from a measurement alone.** The reading
+is taken at the end of each scroll and resize round, so it describes the reader
+before the next event. It has nothing to say about the FIRST round after an
+open, where no round has run yet.
+
+A thread opening onto a recorded ride writes the live edge and is then grown
+past by its own settling. One that finished while the reader was away has no
+liveness to carry them either. So they were stranded at the offset the write
+fell on, with the toggle lit, which on a transcript still arriving is the top.
+The app's own PLACEMENT answers the same question and is the only source
+available there, so it is a second term rather than a replacement. It is retired
+the moment the reader leaves the stamp, a position they came back to being
+indistinguishable from one they never left.
 
 **Retire nothing on a platform scroll, and leave the reader where it put them.**
 Half a rule. The ride survived while the reader sat off the edge, waiting for

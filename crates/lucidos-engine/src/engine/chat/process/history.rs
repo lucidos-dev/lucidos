@@ -48,9 +48,12 @@ impl LucidosEngine {
         is_trigger: bool,
         is_new_thread: bool,
         thread_id: Uuid,
-        thread_id_str: &str,
         user_message: &str,
         memory_model_pref: &str,
+        // This turn's start instant, from `LucidosEngine::turn_started_at`. The
+        // image ages below sit in the message prefix, which the prompt cache
+        // keys on. So they are derived, never read off the wall clock.
+        turn_started_at: chrono::DateTime<Utc>,
     ) -> ChatHistoryLoad {
         // Resume tool blocks: full ToolUse + ToolResult Message pairs for the
         // most recent N tool calls (Phase 3). Pinned `load_knowhow` results
@@ -89,7 +92,11 @@ impl LucidosEngine {
             // also silently swallowed the second call's error, losing
             // procedure context exactly when the bug Phase 3 fixes recurs.
             let messages_result = if !is_new_thread {
-                match self.event_store.get_thread_events(thread_id_str).await {
+                match self
+                    .event_store
+                    .get_thread_events(&thread_id.to_string())
+                    .await
+                {
                     Ok(events) => {
                         // Engine restart loses the per-thread loaded-knowhow set
                         // (in-memory only). Replay this thread's load_knowhow
@@ -212,7 +219,6 @@ impl LucidosEngine {
                     // - Last HISTORY_VERBATIM_TAIL messages: fully verbatim (only 15K safety net)
                     // - Earlier messages: user messages verbatim, assistant messages compacted to ~1500 chars
                     // `msg_idx` indexes into `all_prior` to look up `image_data_included`.
-                    let now = Utc::now();
                     let format_history_msg = |m: &crate::core::store::SessionMessage,
                                               is_verbatim: bool,
                                               img_start: usize,
@@ -251,7 +257,7 @@ impl LucidosEngine {
                                 .map(|d| format!(" [image description: {}]", d))
                                 .unwrap_or_default()
                         } else {
-                            let age = format_relative_age(now - m.created_at);
+                            let age = format_relative_age(turn_started_at - m.created_at);
                             let range = if n <= 1 {
                                 format!("thread:{}", img_start + 1)
                             } else {

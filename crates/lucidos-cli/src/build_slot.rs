@@ -218,7 +218,7 @@ fn wait_for_slot(
                 "lucidos build-slot: no slot after {secs}s, giving up (exit {WAIT_TIMEOUT_EXIT}). \
                  Subscribe instead of retrying on a timer: \
                  `lucidos await-event --on BuildSlotReleased --timeout-secs 3600 \
-                 --reason \"waiting for a build slot\"`, then end your turn."
+                 --reason \"a build slot to free up\"`, then end your turn."
             );
             None
         }

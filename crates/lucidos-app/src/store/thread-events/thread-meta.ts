@@ -44,6 +44,14 @@ export type ThreadAggregate = {
    *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
    *  for why the count is carried separately from `meta.liveEventWaits`. */
   liveEventWaitCount: number;
+  /** The waits themselves. Overlaid onto `meta.liveEventWaits`, which is what
+   *  makes the subscription panel self-healing on EVERY event: this overlay
+   *  runs ahead of `handleEvent`'s seq-dedup guard, so even a re-delivered
+   *  sequence repairs a stranded list.
+   *
+   *  Optional only so a partial test aggregate needn't supply it; the backend
+   *  always sends it. Absence leaves the list alone, `[]` clears it. */
+  liveEventWaits?: EventWaitSummary[];
   /** Whether the CC branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
    *  lifecycle: a thread can have a diff mid-session before CC has formally
@@ -83,6 +91,19 @@ export type ThreadAggregate = {
   state: ThreadComposeState;
 };
 
+/** Do two *event wait* lists name the same waits, in the same order?
+ *
+ *  `wait_id` alone is the identity, because a wait is immutable once armed. Its
+ *  `reason`, `on` and `expires_at` are copies of one `EventWaitStarted` payload,
+ *  and nothing in the family mutates a wait (ADR 0059). So two lists agreeing
+ *  on ids agree on content, and a deep compare would buy nothing.
+ *
+ *  Used only to decide whether the overlay CHANGED anything, which gates a
+ *  `threadMap` flush. */
+function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
+  return a.length === b.length && a.every((w, i) => w.wait_id === b[i].wait_id);
+}
+
 /** Apply an aggregate snapshot to a thread's meta. Used by live SSE (per-event
  *  aggregate) and historical replay (fetchThreadEvents.currentAggregate).
  *  Nullable fields propagate cleared values; trigger/repo fields are omitted
@@ -102,6 +123,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
+  if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
   if (meta.codingAgentHasDiff !== agg.codingAgentHasDiff) { meta.codingAgentHasDiff = agg.codingAgentHasDiff; changed = true; }
   if (meta.codingAgentProposed !== agg.codingAgentProposed) { meta.codingAgentProposed = agg.codingAgentProposed; changed = true; }
   if (meta.codingAgentRequiresRestart !== agg.codingAgentRequiresRestart) { meta.codingAgentRequiresRestart = agg.codingAgentRequiresRestart; changed = true; }
@@ -193,14 +215,11 @@ export type ThreadMeta = {
    *  active children paint: both mean the thread finished its turn and is not
    *  done, because something else will wake it.
    *
-   *  Deliberately NOT derived from `liveEventWaits.length`, even though the
-   *  two agree whenever both are populated. That list is folded from this
-   *  thread's own events, so it is empty for every drawer row whose events
-   *  were never loaded and empty again after a reload, which would make the
-   *  dot vanish exactly when the user is scanning for it. This count arrives
-   *  on the thread list and on every per-event aggregate, so it is right
-   *  everywhere and from the first paint. The list stays the source for the
-   *  subscription indicator, which needs each wait's reason and deadline. */
+   *  Kept as its own field rather than read off `liveEventWaits.length`, even
+   *  though the backend derives one from the other and they always agree. Both
+   *  arrive on the same snapshot, so a local derivation buys nothing. It would
+   *  also re-open the drift this pair exists to close, by leaving a reader of
+   *  one unable to notice that the other was wrong. */
   liveEventWaitCount: number;
   /** Whether the CC branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
@@ -259,14 +278,18 @@ export type ThreadMeta = {
    *  every threadMap flush — see `TodoListIndicator`. */
   latestTodoList: TodoItem[] | null;
   /** Live *event waits* on this thread, oldest first, with each one's reason,
-   *  subscription and deadline. Maintained in `handleEvent`:
-   *  `EventWaitStarted` appends, the three resolutions remove by `wait_id`.
+   *  subscription and deadline. This is what the always-visible subscription
+   *  indicator renders, and the only surface answering "what is this thread
+   *  subscribed to right now" without scrolling the transcript.
    *
-   *  This is what the always-visible subscription indicator renders, and the
-   *  only surface answering "what is this thread subscribed to right now"
-   *  without scrolling the transcript. It is populated only for a thread whose
-   *  events are loaded, which is why the status dot reads the projected
-   *  `liveEventWaitCount` instead of this list's length. */
+   *  **Server-reconciled, on three paths, and that is load-bearing.** Every
+   *  thread-summary snapshot (`upsertThread`) and every per-event aggregate
+   *  (`applyAggregateToMeta`) overwrite it from
+   *  `thread_summaries.live_event_waits`, and `handleEvent` folds each
+   *  `EventWait*` in as it arrives, for immediacy. Folding used to be the ONLY
+   *  source, so one missed `EventWaitDelivered` stranded a resolved wait here
+   *  forever, still counting down. The fold is idempotent by `wait_id`, so it
+   *  and the snapshots converge rather than fight. */
   liveEventWaits: EventWaitSummary[];
 };
 

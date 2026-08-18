@@ -9,7 +9,7 @@
  *  fires exactly once. A neutral module so telemetry plumbing doesn't reach into
  *  action internals; pure + unit-tested.
  *
- *  Strictly best-effort telemetry — see utils/perfQueue.ts and the carve-out in
+ *  Strictly best-effort telemetry: see utils/perfQueue.ts and the carve-out in
  *  .claude/rules/frontend.md. */
 
 import type { PerfBaseline } from './renderPhaseTimers';

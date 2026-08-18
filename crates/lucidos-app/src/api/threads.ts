@@ -1,5 +1,5 @@
 import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
-import type { ThreadSection, ThreadInitiator, ThreadAggregate } from '../store/thread-events';
+import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary } from '../store/thread-events';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
 
 export interface ThreadSummary {
@@ -44,6 +44,16 @@ export interface ThreadSummary {
    *  thread watching for an event is not finished, and this is what says so on
    *  a row whose events were never loaded. */
   live_event_wait_count: number;
+  /** The same waits the count counts, spelled out. This is the whole content of
+   *  the subscription indicator, and carrying it here is what lets a snapshot
+   *  correct it. The client used to build the list ONLY by folding a thread's
+   *  own `EventWait*` events. One missed `EventWaitDelivered` then left a
+   *  resolved wait on screen with a live countdown, permanently.
+   *
+   *  Optional so test mocks needn't supply it, and absence is NOT emptiness:
+   *  `upsertThread` leaves an existing list alone when the field is missing and
+   *  clears it only on an explicit `[]`. */
+  live_event_waits?: EventWaitSummary[];
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: string;
   /** Whether the coding-agent branch has any diff against main on disk — pure git

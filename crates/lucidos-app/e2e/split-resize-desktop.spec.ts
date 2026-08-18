@@ -15,10 +15,12 @@ import { assertHealthy, navigateToApp, openThreadDrawer, DRAWER_TOGGLE_LABEL } f
 // still animates for var(--duration-slow) (300ms).
 const SETTLE_MS = 1200;
 // All three pane floors are derived from the root font size now
-// (store/paneMinimums.ts). These projects run at a 16px root, where the two
-// split-pane floors ARE the 300 / 360 they were written as; the drawer's is not
-// restated at all, since this spec MEASURES where the clamp puts it.
-const MIN_THREAD_PANE = 300;
+// (store/paneMinimums.ts), and these projects run at a 16px root. The Canvas
+// one is still the 360 it was written as. The Conversation one is 338: it is
+// derived from its own header row, which starts after the traffic-lights
+// reserve. The drawer's is not restated at all, since this spec MEASURES where
+// the clamp puts it.
+const MIN_THREAD_PANE = 338;
 const MIN_CONTENT_PANE = 360;
 // Well below the drawer's floor: the clamp must refuse to follow the pointer
 // there rather than land and be corrected.

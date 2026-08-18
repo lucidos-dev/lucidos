@@ -16,10 +16,11 @@ import {
   type ConnectInfo,
   type TailscaleInfo,
 } from '../../utils/tauri';
-import { getNetworkConfig } from '../../api/client';
+import { getNetworkConfig, getTailnetStatus } from '../../api/client';
+import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
-import type { NetworkConfigResponse } from '../../api/types';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import type { NetworkConfigResponse, TailnetStatusResponse } from '../../api/types';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
@@ -115,27 +116,171 @@ export function tailnetIsServed(gatewayBind: string, tailnetIp: string): boolean
   return bind === 'all' || bind === tailnetIp;
 }
 
-/** Pure: the two plain-HTTP direct-access rows, derived TOGETHER so they cannot
- *  both claim the same address.
+/** Pure: the Local network row, silenced when the address it would print is the
+ *  tailnet's.
  *
- *  A bind pinned to the tailnet address serves the tailnet, not the LAN. Derived
- *  separately, `lanRowState` would print that address under "Local network" with
- *  a "same Wi-Fi" hint (it shows whatever specific address is bound, by design)
- *  and the Tailscale row would then print the very same URL again. Reporting the
- *  LAN as off is the honest half of that: with a tailnet-pinned bind, no LAN
- *  address is served. */
-export function directAccessRows(
+ *  A bind pinned to the tailnet address serves the tailnet, not the LAN.
+ *  `lanRowState` shows whatever specific address is bound, by design. So on its
+ *  own it prints that address under "Local network" with a "same Wi-Fi" hint,
+ *  beside a Tailscale row carrying the very same URL. Reporting the LAN as off
+ *  is the honest half: with a tailnet-pinned bind, no LAN address is served.
+ *
+ *  Returns the LAN row alone. It used to hand back the tailnet URL beside it,
+ *  from when both rows were derived here. That ended when the Tailscale row
+ *  moved to {@link tailnetConnectRows}, which any browser can reach. Two
+ *  functions each offering "the tailnet URL" is one more than the page prints. */
+export function lanRowAvoidingTailnet(
   gatewayBind: string,
   lanIp: string | null,
   tailnetIp: string | null,
   port: number,
-): { lan: LanRowState; tailnetUrl: string | null } {
+): LanRowState {
   const lan = lanRowState(gatewayBind, lanIp, port);
   const tailnetUrl = tailnetHttpUrl(gatewayBind, tailnetIp, port);
   if (lan.kind === 'url' && tailnetUrl !== null && lan.url === tailnetUrl) {
-    return { lan: { kind: 'disabled' }, tailnetUrl };
+    return { kind: 'disabled' };
   }
-  return { lan, tailnetUrl };
+  return lan;
+}
+
+/** Pure: the URL that reaches THIS workspace at `origin`.
+ *
+ *  A workspace is addressed by the first path segment of the gateway origin
+ *  (ADR 0014). A bare origin therefore reaches the gateway ROOT, which
+ *  307-redirects to the sole workspace or to the picker. On an install with
+ *  more than one workspace that is the wrong answer, and it is what every row
+ *  on this page used to print.
+ *
+ *  `scope` is `SCOPE_PATH`, taken from the `<base href>` the engine stamps, so
+ *  this stays slug-agnostic: `/<slug>/` behind the gateway, and `/` on a direct
+ *  engine port where there is no prefix to add. */
+export function workspaceUrlAt(origin: string, scope: string): string {
+  const base = origin.replace(/\/+$/, '');
+  return `${base}${scope.startsWith('/') ? scope : `/${scope}`}`;
+}
+
+/** Pure: the reader's own origin with the hostname swapped for `host`.
+ *
+ *  The whole derivation of a remote URL from a local page. Keep the scheme,
+ *  keep the port, change only the host. Whatever server answered this page at
+ *  `<host>:<port>` is the same process answering at `<other>:<port>`, when it
+ *  listens there. The scheme is kept rather than assumed, because the dev
+ *  gateway speaks TLS and a composed `http://` would be dead.
+ *
+ *  `port` is `location.port`, which is `''` on a default port. The origin then
+ *  carries no `:port` either. */
+export function originAtHost(here: { protocol: string; port: string }, host: string): string {
+  return `${here.protocol}//${host}${here.port ? `:${here.port}` : ''}`;
+}
+
+/** Pure: the network bind of whichever process served this page.
+ *
+ *  Behind the gateway this origin IS the gateway, so its bind decides. On a
+ *  direct engine port the origin is the engine, which follows the gateway bind
+ *  only while `inherit` is on. Reading `gateway_bind` unconditionally, which
+ *  this replaces, reports a direct-port page's reachability from a bind that
+ *  governs a different process. */
+export function servingBind(
+  config: { engine_bind: string; inherit: boolean; gateway_bind: string },
+  behindGateway: boolean,
+): string {
+  if (behindGateway) return config.gateway_bind;
+  return config.inherit ? config.gateway_bind : config.engine_bind;
+}
+
+/** One Connect URLs row: a copyable address plus the sentence qualifying it. */
+export type ConnectUrlRow = { label: string; url: string; hint: string };
+
+/** Pure: the tailnet rows of Connect URLs, from facts any browser can hold.
+ *
+ *  This is what ungates the section off the packaged desktop app. Every input
+ *  comes from the reader's own `location`, `GET /api/v1/network-config` or
+ *  `GET /api/v1/tailnet-status`.
+ *
+ *  A verified HTTPS URL wins outright, and is printed verbatim. The engine sets
+ *  it only after a request to it came back from that same engine. It is NOT
+ *  bind-gated, because `serve` proxies to `127.0.0.1` and so survives the
+ *  packaged loopback default. The plain-HTTP row then yields to it, being the
+ *  worse answer to the same question.
+ *
+ *  Otherwise the plain-HTTP row prints only when the address is served, since a
+ *  dead copyable URL is the bug this page was built around. It prefers the
+ *  MagicDNS name, which resolves to that same address for any device on the
+ *  tailnet and is what a person can retype. */
+export function tailnetConnectRows(input: {
+  scope: string;
+  here: { protocol: string; hostname: string; port: string };
+  tailnetIp: string | null;
+  magicDnsName: string | null;
+  workspaceServeUrl: string | null;
+  bind: string;
+}): ConnectUrlRow[] {
+  if (input.workspaceServeUrl) {
+    // Always HTTPS: the engine builds this one, and only from `https://`.
+    return [{ label: 'Tailscale', url: input.workspaceServeUrl, hint: tailnetHint(true) }];
+  }
+  const ip = input.tailnetIp;
+  if (!ip || !tailnetServesThisReader(input.bind, ip, input.here.hostname)) return [];
+  return [
+    {
+      label: 'Tailscale',
+      url: workspaceUrlAt(originAtHost(input.here, input.magicDnsName ?? ip), input.scope),
+      hint: tailnetHint(input.here.protocol === 'https:'),
+    },
+  ];
+}
+
+/** The sentence under a tailnet URL, by what that address can actually do.
+ *
+ *  Browsers gate the installable app and push on a secure origin, so the scheme
+ *  is the whole difference. The hint must READ it rather than assume it from
+ *  which branch above produced the row: this row keeps the reader's own scheme,
+ *  and two ordinary setups reach it over HTTPS. The dev gateway holds a TLS cert
+ *  of its own, and a verification that timed out drops a serve-fronted reader
+ *  here. Assuming plain HTTP told both of them that push was unavailable at an
+ *  origin offering it, under an `https://` address saying otherwise. */
+function tailnetHint(secure: boolean): string {
+  return secure
+    ? 'anywhere on your tailnet · HTTPS, so the app install and push work here'
+    : 'anywhere on your tailnet · plain HTTP, so no app install or push yet';
+}
+
+/** Pure: is the gateway accepting connections AT the tailnet address itself?
+ *
+ *  One specific socket: `<tailnet ip>:<gateway port>`, over plain HTTP. Direct
+ *  evidence outranks the stored bind, and has to. A bind change takes effect
+ *  only on restart, so the config can disagree with the live socket. So the two
+ *  ways to know are that this page arrived at that very address, or that the
+ *  serving process's bind covers it. */
+export function tailnetAddressIsServed(
+  bind: string,
+  tailnetIp: string,
+  readerHostname: string,
+): boolean {
+  return readerHostname.trim() === tailnetIp.trim() || tailnetIsServed(bind, tailnetIp);
+}
+
+/** Pure: is there a live tailnet address to print a URL at for THIS reader?
+ *
+ *  Wider than {@link tailnetAddressIsServed} by exactly one disjunct, and the
+ *  two must not be merged. A row prints the reader's own origin with the host
+ *  swapped. So a reader who arrived over a MagicDNS name is handed the address
+ *  they are already on, which is live by construction.
+ *
+ *  That arrival is NOT evidence for the narrower question. It proves 443 is
+ *  fronted by `serve` and says nothing about the gateway port on the tailnet
+ *  address. Letting it answer both told a phone on the recommended setup that
+ *  the plain-HTTP address was live. That setup is `serve` plus the packaged
+ *  loopback default, where the page had correctly pointed at Network access. */
+export function tailnetServesThisReader(
+  bind: string,
+  tailnetIp: string,
+  readerHostname: string,
+): boolean {
+  return (
+    tailnetAddressIsServed(bind, tailnetIp, readerHostname) ||
+    isTailnetHostname(readerHostname.trim())
+  );
 }
 
 /** Which row the Tailscale section shows for this Mac. */
@@ -341,19 +486,19 @@ function InstallTailscaleRow({ onHost }: { onHost: boolean }) {
     <div class="list-rows">
       <div class="list-row">
         <div class="list-row-info">
-          <div class="title">
-            {onHost ? 'Install Tailscale on this machine' : 'Install Tailscale on this device'}
-          </div>
-          <div class="list-row-details list-row-details-prose">
-            {onHost
-              ? 'Tailscale is a system VPN, so your OS asks for your approval during install. Sign in afterwards to put this machine on a tailnet.'
-              : handset
-                ? 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a VPN, so your phone will ask you to approve a VPN profile.'
-                : 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a system VPN, so your OS asks for your approval during install.'}
-          </div>
+        <div class="title">
+          {onHost ? 'Install Tailscale on this machine' : 'Install Tailscale on this device'}
+        </div>
+        <div class="list-row-details list-row-details-prose">
+          {onHost
+            ? 'Tailscale is a system VPN, so your OS asks for your approval during install. Sign in afterwards to put this machine on a tailnet.'
+            : handset
+              ? 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a VPN, so your phone will ask you to approve a VPN profile.'
+              : 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a system VPN, so your OS asks for your approval during install.'}
+        </div>
         </div>
         <div class="list-row-actions">
-          <button class="action-btn" onClick={openTailscaleDownload}>Get Tailscale</button>
+        <button class="action-btn" onClick={openTailscaleDownload}>Get Tailscale</button>
         </div>
       </div>
     </div>
@@ -370,8 +515,8 @@ function InfoRow({ title, children }: { title: string; children: ComponentChildr
     <div class="list-rows">
       <div class="list-row">
         <div class="list-row-info">
-          <div class="title">{title}</div>
-          <div class="list-row-details list-row-details-prose">{children}</div>
+        <div class="title">{title}</div>
+        <div class="list-row-details list-row-details-prose">{children}</div>
         </div>
       </div>
     </div>
@@ -409,8 +554,8 @@ function HostTailnetRow({
       <InfoRow title="This machine is on a tailnet">
         The machine running Lucidos holds the tailnet address <strong>{state.ip}</strong>.{' '}
         {reachable
-          ? 'It is listening on that address, so any device signed in to the same tailnet can reach it there over plain HTTP.'
-          : 'It is NOT listening on that address though, so nothing off this machine can connect to it there yet: allow it in Network access, which takes effect after a restart.'}{' '}
+        ? 'It is listening on that address, so any device signed in to the same tailnet can reach it there over plain HTTP.'
+        : 'It is NOT listening on that address though, so nothing off this machine can connect to it there yet: allow it in Network access, which takes effect after a restart.'}{' '}
         Adding HTTPS with <code>tailscale serve</code> is what enables the installable app and
         push. That needs the Tailscale command-line tool, and it works whatever the address above
         says, since it proxies from this machine to <code>127.0.0.1</code>.
@@ -465,14 +610,14 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
     return (
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="access:steps">
-          Getting Lucidos onto another device
+        Getting Lucidos onto another device
         </div>
         <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
-          <li>Put this machine on a tailnet, and set up HTTPS for it with <code>tailscale serve</code>.</li>
-          <li>
-            Install Tailscale on the other device and sign in to the <strong>same tailnet</strong>.
-          </li>
-          <li>Open this machine's Tailscale address there, and install Lucidos from that page.</li>
+        <li>Put this machine on a tailnet, and set up HTTPS for it with <code>tailscale serve</code>.</li>
+        <li>
+          Install Tailscale on the other device and sign in to the <strong>same tailnet</strong>.
+        </li>
+        <li>Open this machine's Tailscale address there, and install Lucidos from that page.</li>
         </ol>
       </div>
     );
@@ -483,37 +628,37 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
       <div class="settings-section-title" data-search-anchor="access:steps">{title}</div>
       {state.kind === 'needs-https' && (
         <p class="settings-section-desc">
-          Tailscale is connected and you are on the right address, but this one is plain{' '}
-          <code>http://</code>. Browsers gate the installable app and push notifications on a
-          secure origin, so neither is available here and no amount of asking will offer them.
-          The remaining step is on the machine, not on this device: set up HTTPS for it with{' '}
-          <code>tailscale serve</code>, then open the <code>https://</code> address it gives you.
-          Reading and chatting work fine at this address meanwhile.
+        Tailscale is connected and you are on the right address, but this one is plain{' '}
+        <code>http://</code>. Browsers gate the installable app and push notifications on a
+        secure origin, so neither is available here and no amount of asking will offer them.
+        The remaining step is on the machine, not on this device: set up HTTPS for it with{' '}
+        <code>tailscale serve</code>, then open the <code>https://</code> address it gives you.
+        Reading and chatting work fine at this address meanwhile.
         </p>
       )}
       {state.kind === 'join-tailnet' && (
         <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
-          <li>
-            Install Tailscale here and sign in to the <strong>same tailnet</strong> as the machine
-            running Lucidos.
-          </li>
-          <li>
-            On that machine, open <strong>Settings → Access</strong> and copy the{' '}
-            <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
-          </li>
-          <li>{install}</li>
+        <li>
+          Install Tailscale here and sign in to the <strong>same tailnet</strong> as the machine
+          running Lucidos.
+        </li>
+        <li>
+          On that machine, open <strong>Settings → Access</strong> and copy the{' '}
+          <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
+        </li>
+        <li>{install}</li>
         </ol>
       )}
       {state.kind === 'install-app' && (
         <p class="settings-section-desc">
-          Tailscale is connected and you are already on the right address, so one step is left.{' '}
-          {install}
+        Tailscale is connected and you are already on the right address, so one step is left.{' '}
+        {install}
         </p>
       )}
       {state.kind === 'ready' && (
         <p class="settings-section-desc">
-          Lucidos is installed here and reaches the machine it runs on over Tailscale, so it works
-          off your home network. Nothing left to do.
+        Lucidos is installed here and reaches the machine it runs on over Tailscale, so it works
+        off your home network. Nothing left to do.
         </p>
       )}
     </div>
@@ -552,12 +697,17 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
  * the engine has no inbound API auth.
  */
 export function MobileAccessPage() {
-  // The Connect URLs and the Tailscale ACTIONS need the packaged always-on
-  // service; a dev Tauri build has no gateway on the stable port, so its
-  // connect URLs would be a guess. Reporting is not gated on this.
+  // What still needs the packaged always-on service: the Tailscale ACTIONS, and
+  // the This Mac / Local network rows. Those two addresses come from the bridge,
+  // and a dev Tauri build has no gateway on the stable port, so they would be a
+  // guess. Connect URLs itself is not gated, and neither is any other reporting.
   const showMachineHalf = isTauri() && enginePackaged.value;
   const [connectInfo, setConnectInfo] = useState<Loadable<ConnectInfo>>({ status: 'not-loaded' });
   const [netConfig, setNetConfig] = useState<Loadable<NetworkConfigResponse>>({ status: 'not-loaded' });
+  // The MagicDNS name and this workspace's verified HTTPS URL, on every
+  // platform. Its own request rather than fields on `network-config`, which the
+  // bind editor below also fetches and which must stay a cheap local read.
+  const [tailnetStatus, setTailnetStatus] = useState<Loadable<TailnetStatusResponse>>({ status: 'not-loaded' });
   const [busy, setBusy] = useState<null | 'up'>(null);
   // The Expose run's state lives in the store, not here: a run can spend minutes
   // waiting for a tailnet approval, it narrates itself on the brand badge and the
@@ -565,7 +715,15 @@ export function MobileAccessPage() {
   // the moment the user navigated away and came back to a still-running setup.
   const serveRunning = tailscaleServeRun.value !== null;
   const [authKey, setAuthKey] = useState('');
-  const showLoading = useDelayedLoading(connectInfo);
+  // Connect URLs needs the two HTTP reads on every platform, and the bridge only
+  // where there is one. A `useDelayedLoading(connectInfo)` would sit at
+  // `not-loaded` forever in a browser, which is indistinguishable from a slow
+  // load and would hold the loader up permanently.
+  const connectUrlsReady =
+    netConfig.status === 'loaded' &&
+    tailnetStatus.status === 'loaded' &&
+    (!showMachineHalf || connectInfo.status === 'loaded');
+  const showLoading = useDelayedFlag(!connectUrlsReady);
 
   // Concern 1, from whichever source this platform has. Concern 2 reads the
   // host's address as ONE of its three proofs and is otherwise independent of
@@ -583,16 +741,18 @@ export function MobileAccessPage() {
     hostTailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
   });
   // Reachability is NOT implied by tailnet membership: under a loopback bind
-  // nothing off this machine can connect, however healthy Tailscale is. Two
-  // ways to know it is served, and the first outranks the second, because a
-  // bind change only takes effect on restart and the config can therefore
-  // disagree with the live socket: this very page arrived at that address, or
-  // the configured bind covers it (the same rule `tailnetHttpUrl` applies
-  // before printing a URL).
+  // nothing off this machine can connect, however healthy Tailscale is. This
+  // prose claims the plain-HTTP address specifically, so it takes the NARROWER
+  // predicate and must not borrow the URL row's. The bind it weighs is the
+  // SERVING process's: on a direct engine port the origin is the engine, and
+  // `gateway_bind` governs somebody else.
+  // An unloaded config contributes NO bind rather than blocking the answer: the
+  // empty string is served by nothing, so direct evidence still stands alone.
+  const bind =
+    netConfig.status === 'loaded' ? servingBind(netConfig.data, WORKSPACE_ID !== null) : '';
   const tailnetReachable =
     host.kind === 'on-tailnet' &&
-    (window.location.hostname === host.ip ||
-      (netConfig.status === 'loaded' && tailnetIsServed(netConfig.data.gateway_bind, host.ip)));
+    tailnetAddressIsServed(bind, host.ip, window.location.hostname);
 
   const reload = useCallback(() => {
     // Fetched on EVERY platform: this is the only reading of concern 1 a
@@ -602,6 +762,13 @@ export function MobileAccessPage() {
     getNetworkConfig().then(
       (data) => setNetConfig({ status: 'loaded', data }),
       (e) => setNetConfig(toFailed(e)),
+    );
+    // Also every platform: the MagicDNS name is the address the user copies to
+    // another device, and a browser has no other way to learn it.
+    setTailnetStatus({ status: 'loading' });
+    getTailnetStatus().then(
+      (data) => setTailnetStatus({ status: 'loaded', data }),
+      (e) => setTailnetStatus(toFailed(e)),
     );
     // Not a swallowed error: off the desktop app there is nothing to fetch
     // here, so there is no failure to report. Setting a failed state would
@@ -669,107 +836,143 @@ export function MobileAccessPage() {
     }
   }, [reload]);
 
-  /** The Connect URLs section, plus its loading / failed states. Machine-side.
+  /** The Connect URLs section, plus its loading / failed states.
    *
-   *  Needs BOTH loads: the gateway bind decides whether a LAN or tailnet URL is
-   *  reachable at all (packaged defaults to loopback-only), so the rows cannot
-   *  render honestly without it. Hence one failure branch covering either, which
-   *  is what the single combined fetch used to buy. */
+   *  Rendered on EVERY platform. The tailnet rows come from two plain-HTTP
+   *  reads a browser can make. So the address a user copies to their phone is
+   *  on the page wherever they read it. Only the extra rows are machine-side:
+   *  the localhost and LAN addresses need `lan_ip` and the Tauri bridge.
+   *
+   *  Every row is workspace-scoped. A bare gateway origin reaches the root,
+   *  which redirects to the sole workspace or to the picker. That is the wrong
+   *  address to hand out on a multi-workspace install.
+   *
+   *  All three loads share one failure branch, and the bridge only counts where
+   *  there is one. A `netConfig` that failed cannot be rendered as an empty
+   *  section: the bind it carries decides whether a plain-HTTP row is a live
+   *  address or a dead one. */
   function connectUrlsSection() {
-    const failure =
-      connectInfo.status === 'failed' ? connectInfo.error
-      : netConfig.status === 'failed' ? netConfig.error
-      : null;
-    if (failure !== null) {
-      return (
-        <div class="settings-section">
-          <div class="settings-section-title">Connect URLs</div>
-          <LoadableError noun="connect info" error={failure} />
-        </div>
-      );
-    }
-    if (connectInfo.status !== 'loaded' || netConfig.status !== 'loaded') {
-      if (!showLoading) return null;
-      return (
-        <div class="settings-section">
-          <div class="settings-section-title">Connect URLs</div>
-          <div class="empty-state">Loading…</div>
-        </div>
-      );
-    }
-    const connect = connectInfo.data;
-    const { lan, tailnetUrl } = directAccessRows(
-      netConfig.data.gateway_bind,
-      connect.lan_ip,
-      connect.tailscale.tailnet_ip,
-      connect.port,
-    );
-    return (
+    // The shell and its TITLE render in every state, for the reason
+    // `NetworkAccessPage` records for `access:network`: the anchor is a
+    // navigation target, and `SettingsView` resolves it with ONE `querySelector`
+    // on the mounting commit, then clears the target either way. An anchor that
+    // waits for a fetch is missed on a cold open. Search Everywhere reaches this
+    // one from a browser now, so it has to be there before the two reads land.
+    const shell = (body: ComponentChildren) => (
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="access:urls">
-          Connect URLs
-          <Explainer title="Connect URLs">
-            <p>
-              The engine runs as an always-on background service and is reachable at
-              these addresses.
-            </p>
-            <p>Open one on another device to use Lucidos from your phone.</p>
-          </Explainer>
+        Connect URLs
+        <Explainer title="Connect URLs">
+          <p>
+            The addresses that reach <strong>this workspace</strong>. Each carries the
+            workspace's own path, so it lands here rather than wherever the gateway
+            would send a bare address.
+          </p>
+          <p>Open one on another device to use Lucidos from your phone.</p>
+        </Explainer>
         </div>
-        <div class="list-rows">
-          <UrlRow label="This Mac" url={connect.localhost_url} hint="localhost" />
-          {lan.kind === 'url' && (
-            <UrlRow
-              label="Local network"
-              url={lan.url}
-              hint="same Wi-Fi · plain HTTP — no PWA install or push (use Tailscale for those)"
-            />
-          )}
-          {lan.kind === 'disabled' && (
-            <div class="list-row">
-              <div class="list-row-info">
-                <div class="title">Local network</div>
-                <div class="list-row-details list-row-details-prose">
-                  Off — the gateway only listens on this Mac. Allow LAN access in Network access
-                  (applies after a restart).
-                </div>
-              </div>
-              <div class="list-row-actions">
-                {/* Network access is a section further down THIS page now (both
-                    halves of "reach this engine from elsewhere" live under
-                    Settings → Access), so this scrolls rather than switching
-                    subview. `settingsScrollTarget` drives the scroll-and-mark
-                    effect in SettingsView. */}
-                <button class="action-btn" onClick={() => { settingsScrollTarget.value = 'access:network'; }}>
-                  Network access
-                </button>
-              </div>
-            </div>
-          )}
-          {lan.kind === 'none' && (
-            <div class="list-row">
-              <div class="list-row-info">
-                <div class="title">Local network</div>
-                <div class="list-row-details list-row-details-prose">No LAN address detected</div>
-              </div>
-            </div>
-          )}
-          {/* Only when the gateway actually listens on the tailnet address, and
-              only until serving makes the HTTPS row below the better answer. */}
-          {tailnetUrl && !connect.tailscale.serve_url && (
-            <UrlRow
-              label="Tailscale"
-              url={tailnetUrl}
-              hint="anywhere on your tailnet · plain HTTP, so no PWA install or push yet"
-            />
-          )}
-          {/* Only once serving is PROVEN. Publishing this the moment a MagicDNS
-              name resolves advertised an address with nothing listening on it. */}
-          {connect.tailscale.serve_url && (
-            <UrlRow label="Tailscale" url={connect.tailscale.serve_url} hint="anywhere, HTTPS + push" />
-          )}
-        </div>
+        {body}
       </div>
+    );
+    const failure =
+      netConfig.status === 'failed' ? netConfig.error
+      : tailnetStatus.status === 'failed' ? tailnetStatus.error
+      : showMachineHalf && connectInfo.status === 'failed' ? connectInfo.error
+      : null;
+    if (failure !== null) {
+      return shell(<LoadableError noun="connect info" error={failure} />);
+    }
+    // `connectUrlsReady` is the whole condition. The two status checks beside
+    // it are what narrows the types below, which it cannot do from up there.
+    if (!connectUrlsReady || netConfig.status !== 'loaded' || tailnetStatus.status !== 'loaded') {
+      // Still delay-gated, so a fast load never flashes a loader. The shell
+      // around it is not, per the anchor rule above.
+      return shell(showLoading ? <div class="empty-state">Loading…</div> : null);
+    }
+    const tailnet = tailnetStatus.data;
+    const connect = connectInfo.status === 'loaded' ? connectInfo.data : null;
+    const tailnetRows = tailnetConnectRows({
+      scope: SCOPE_PATH,
+      here: window.location,
+      tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
+      magicDnsName: tailnet.magic_dns_name,
+      workspaceServeUrl: tailnet.workspace_serve_url,
+      bind: servingBind(netConfig.data, WORKSPACE_ID !== null),
+    });
+    // Nothing honest to list. Says so rather than rendering a bare heading, and
+    // rather than vanishing: the anchor is a search destination, so an absent
+    // section drops the reader at the top of the page with no explanation.
+    if (connect === null && tailnetRows.length === 0) {
+      return shell(
+        <div class="settings-section-desc">
+        No address reaches this workspace from another device yet. The Tailscale section
+        below says what is missing.
+        </div>,
+      );
+    }
+    // `null`, not `{kind:'none'}`: off the bridge we cannot see this machine's
+    // interfaces at all, and "No LAN address detected" would be a finding we
+    // never made.
+    const lan: LanRowState | null = connect
+      ? lanRowAvoidingTailnet(
+        netConfig.data.gateway_bind,
+        connect.lan_ip,
+        connect.tailscale.tailnet_ip,
+        connect.port,
+        )
+      : null;
+    return shell(
+      <div class="list-rows">
+        {connect && (
+          <UrlRow
+            label="This Mac"
+            url={workspaceUrlAt(connect.localhost_url, SCOPE_PATH)}
+            hint="localhost"
+          />
+        )}
+        {lan?.kind === 'url' && (
+          <UrlRow
+            label="Local network"
+            url={workspaceUrlAt(lan.url, SCOPE_PATH)}
+            hint="same Wi-Fi · plain HTTP, so no app install or push (use Tailscale for those)"
+          />
+        )}
+        {lan?.kind === 'disabled' && (
+          <div class="list-row">
+            <div class="list-row-info">
+              <div class="title">Local network</div>
+              <div class="list-row-details list-row-details-prose">
+                Off: the gateway only listens on this Mac. Allow LAN access in Network access
+                (applies after a restart).
+              </div>
+            </div>
+            <div class="list-row-actions">
+              {/* Network access is a section further down THIS page now (both
+                  halves of "reach this engine from elsewhere" live under
+                  Settings → Access), so this scrolls rather than switching
+                  subview. `settingsScrollTarget` drives the scroll-and-mark
+                  effect in SettingsView. */}
+              <button class="action-btn" onClick={() => { settingsScrollTarget.value = 'access:network'; }}>
+                Network access
+              </button>
+            </div>
+          </div>
+        )}
+        {lan?.kind === 'none' && (
+          <div class="list-row">
+            <div class="list-row-info">
+              <div class="title">Local network</div>
+              <div class="list-row-details list-row-details-prose">No LAN address detected</div>
+            </div>
+          </div>
+        )}
+        {/* Derived by `tailnetConnectRows`, which owns the whole rule: the
+            verified HTTPS URL when there is one, otherwise the plain-HTTP
+            address, and only while something is listening on it. */}
+        {tailnetRows.map((row) => (
+          <UrlRow key={row.url} label={row.label} url={row.url} hint={row.hint} />
+        ))}
+      </div>,
     );
   }
 
@@ -855,7 +1058,10 @@ export function MobileAccessPage() {
             </div>
             <div class="list-row-details list-row-details-prose">
               {serving
-                ? <>Reachable at <strong>{row.url}</strong> with an auto-renewed cert.</>
+                // Names the machine's HTTPS endpoint, NOT an address to open:
+                // that one carries the workspace path and is in Connect URLs.
+                ? <>Serving at <strong>{row.url}</strong> with an auto-renewed cert. The
+                    address to open is under Connect URLs.</>
                 : row.canRun
                   ? 'Sets up tailnet HTTPS for the engine, which is what enables the installable PWA and push. Setup runs in the background and reports on the Lucidos badge, and it may ask you to enable Serve for your tailnet.'
                   : 'Your phone can already reach the plain-HTTP address above. HTTPS is what adds the installable PWA and push, and it needs `tailscale serve`. Install the Tailscale command-line tool to set it up: use Install CLI in the Tailscale app, or `brew install tailscale`.'}
@@ -879,7 +1085,7 @@ export function MobileAccessPage() {
   // them is TRUE, and conflating those is what this page used to do.
   return (
     <>
-      {showMachineHalf && connectUrlsSection()}
+      {connectUrlsSection()}
 
       {/* The one static paragraph on this page, so the one thing behind an
           explainer. Everything else here is a `state.kind` branch of the setup

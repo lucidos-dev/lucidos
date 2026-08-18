@@ -1,0 +1,227 @@
+/* Settings → MCP Servers: the registered servers, what each costs every
+   request, and the switches for both. See components/settings/McpServersPage.tsx.
+
+   The list follows the Apps / Triggers geometry, like Accounts before it: the
+   rows pull back out through the panel gutter so `.list-row` re-establishes it
+   as its own padding, which is what puts the content at 1rem while the hover
+   wash reaches the pane edges. */
+
+.mcp-cost-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.mcp-cost-headline {
+    font-size: var(--font-size-lg);
+    color: var(--text-primary);
+}
+
+.mcp-cost-share {
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+/* The two conditional figures: what the stopped servers would add, and what the
+   switched-off tools are keeping out. Quieter than the live total, because
+   neither is what the workspace is paying. */
+.mcp-cost-aside {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.mcp-server-list {
+    margin-inline: calc(-1 * var(--space-lg));
+}
+
+/* The block is row + expanded tool list, so the two share one state attribute
+   and the tools inherit the row's left edge. */
+.mcp-server-block {
+    display: flex;
+    flex-direction: column;
+}
+
+.mcp-server-row {
+    align-items: flex-start;
+}
+
+.mcp-server-heading {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+}
+
+/* The state, as a word rather than a colour: "Running, this session" says
+   something a green dot cannot, and it is the whole point of the label. */
+.mcp-state-chip {
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    padding: 0.0625rem 0.375rem;
+    white-space: nowrap;
+}
+
+.mcp-server-block[data-state="running"] .mcp-state-chip {
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+
+.mcp-server-block[data-state="undispatchable"] .mcp-state-chip {
+    color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+}
+
+.mcp-server-id {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+.mcp-server-cost {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-top: 0.125rem;
+}
+
+/* The undispatchable server's own explanation. A raised neutral surface carries
+   the emphasis: no left-accent stripe (.claude/rules/frontend-css.md). */
+.mcp-server-note {
+    margin-top: var(--space-sm);
+    padding: var(--space-sm);
+    background: var(--bg-tertiary);
+    border-radius: 0.375rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    max-width: 40rem;
+}
+
+/* A failed start or stop, on the row that failed. Red for the retryable ones;
+   an unusable id is permanent, so it wears the same tone as its note above
+   rather than inviting another attempt. */
+.mcp-row-error {
+    margin-top: var(--space-sm);
+    padding: var(--space-sm);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    border-radius: 0.375rem;
+    font-size: var(--font-size-sm);
+    color: var(--accent-red);
+    max-width: 40rem;
+}
+
+.mcp-row-error[data-kind="unusable-id"] {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+/* The disclosure for the tool list. A plain button reset, so it reads as the
+   quiet line of metadata it is rather than as a control. */
+.mcp-tools-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-top: var(--space-sm);
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    /* No `font` shorthand: base.css already hands a button the inherited
+       family, and the shorthand would reset font-feature-settings with it
+       (.claude/rules/frontend-css.md). Only the size differs from the body. */
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .mcp-tools-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+.mcp-tools-toggle:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: 0.25rem;
+}
+
+.mcp-tools-toggle svg {
+    flex-shrink: 0;
+}
+
+.mcp-row-actions {
+    align-items: center;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+}
+
+/* A switch and the word for it. Two bare pills side by side say nothing, and
+   the visible word is not a <label> bound to the input, which is why every
+   switch here passes its own aria-label. */
+.mcp-switch {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.mcp-switch-label {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+/* The expanded tool list. Indented under the row's own gutter so a tool reads
+   as belonging to the server above it. */
+.mcp-tool-list {
+    display: flex;
+    flex-direction: column;
+    padding: 0 var(--space-lg) var(--space-sm) calc(var(--space-lg) + var(--space-md));
+}
+
+.mcp-tool-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--space-md);
+    padding: var(--space-sm) 0;
+    border-top: 1px solid var(--border-color);
+}
+
+/* A switched-off tool is still listed, because its cost is what the switch
+   bought back. Dimmed, so the enabled ones read first. */
+.mcp-tool-row[data-state="disabled"],
+.mcp-tool-row[data-state="uncallable"] {
+    opacity: 0.6;
+}
+
+.mcp-tool-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    min-width: 0;
+}
+
+.mcp-tool-name {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.mcp-tool-alias,
+.mcp-tool-cost {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.mcp-tool-desc {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    max-width: 40rem;
+}
+
+.mcp-tool-actions {
+    flex-shrink: 0;
+    padding-top: 0.125rem;
+}

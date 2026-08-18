@@ -11,17 +11,21 @@ use crate::engine::command_permission::{
 };
 use crate::llm::{supported_efforts, ProviderKind};
 
-/// Response/request body for both allowlist editors (`cc-allowed-tools` and
-/// `agent-allowed-commands`) — the raw file text, one pattern per line. The
-/// settings UI parses it into editable rows and reserializes on save.
+/// Response/request body for all three allowlist editors (`cc-allowed-tools`,
+/// `agent-allowed-commands` and `mcp-allowed-tools`): the raw file text, one
+/// pattern per line. The settings UI parses it into editable rows and
+/// reserializes on save.
+///
+/// `pub(super)` on the field, not just the type. `api::mcp` owns the third
+/// editor and reuses this shape, so all three answer with the same wire body.
 #[derive(Serialize)]
 pub(super) struct AllowlistResponse {
-    contents: String,
+    pub(super) contents: String,
 }
 
 #[derive(Deserialize)]
 pub(super) struct AllowlistRequest {
-    contents: String,
+    pub(super) contents: String,
 }
 
 /// GET /api/v1/cc-allowed-tools — return the raw contents of
@@ -464,11 +468,12 @@ pub(super) async fn delete_env_var(
 fn valid_provider(p: &str) -> bool {
     matches!(
         p,
-        "vertex" | "anthropic" | "openai" | "openrouter" | "local"
+        "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "local"
     )
 }
 
-const PROVIDER_ERR: &str = "Provider must be one of: vertex, anthropic, openai, openrouter, local";
+const PROVIDER_ERR: &str =
+    "Provider must be one of: vertex, anthropic, openai, openrouter, xai, local";
 
 const CONTEXT_WINDOW_ERR: &str =
     "context_window must be a positive number of tokens (omit it to infer from the model id)";
@@ -969,6 +974,182 @@ pub(super) async fn put_network_config(
     }
 }
 
+// ===== Tailnet status (this workspace's Tailscale URL) =====
+
+/// Bound on the MagicDNS reverse lookup. The resolver is local (`100.100.100.100`)
+/// whenever we get this far, so this is a stall guard, not a budget. Mirrors
+/// `REVERSE_DNS_TIMEOUT` in `crates/lucidos-app/src/mobile.rs`.
+const MAGIC_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Bound on the round trip that proves the serve URL reaches this workspace.
+/// It leaves on the tailnet interface and comes straight back through the
+/// gateway. So this is a stall guard for a hop that is local in practice.
+const SERVE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long an answer is reused before the probes run again.
+///
+/// The endpoint needs no auth, like every other one here, and each miss costs a
+/// resolver thread plus an outbound TLS connection. `magic_dns_name` ABANDONS
+/// its worker at the deadline rather than joining it. So a caller in a loop
+/// retires threads slower than it creates them, and an app iframe with a
+/// polling bug is enough. This caps that at one probe per window.
+///
+/// Short on purpose. The Access page refetches right after an Expose run, and
+/// that run takes far longer than this, so the refetch still sees the new URL.
+const TAILNET_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The last answer and when it was produced. One engine serves one workspace,
+/// so a process-wide slot is per-workspace by construction. In-memory cache,
+/// which `CLAUDE.md` § Engine Statelessness allows: it is rebuilt by the next
+/// miss and holds nothing a restart would lose.
+static TAILNET_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, TailnetStatusResponse)>> =
+    std::sync::Mutex::new(None);
+
+/// What this machine's tailnet looks like from the engine, for Settings →
+/// Access. Read over plain HTTP, so a phone browser gets the same answer the
+/// packaged desktop app does.
+///
+/// Deliberately NOT folded into [`NetworkConfigResponse`]. Both Access panes
+/// fetch that endpoint separately and read disjoint fields from it. That is
+/// safe only while it stays the cheap local call `SettingsView` documents.
+/// These two fields cost a reverse lookup and a network round trip, and the
+/// bind editor reads neither.
+#[derive(Serialize, Clone)]
+pub(super) struct TailnetStatusResponse {
+    /// `<machine>.<tailnet>.ts.net`, no scheme. `None` off a tailnet. Also
+    /// `None` when MagicDNS is off, a per-tailnet setting that does not mean
+    /// the machine is offline.
+    magic_dns_name: Option<String>,
+    /// The `https://<name>/<slug>/` URL, set **only** once a request to it was
+    /// answered by this very engine. See [`get_tailnet_status`] for why a
+    /// listener on 443 is not enough to publish it.
+    workspace_serve_url: Option<String>,
+}
+
+/// GET /api/v1/tailnet-status: the MagicDNS name, and the HTTPS URL that
+/// reaches THIS workspace over the tailnet.
+///
+/// **The URL is verified end to end, never inferred from a listener.** A TCP
+/// probe of 443 proves that something serves HTTPS and says nothing about
+/// which gateway. `system-knowhow/remote-access.md` documents a two-gateway
+/// install: 443 fronts the packaged gateway, and the dev one takes 8443. So a
+/// live 443 can belong to a gateway that never heard of this slug.
+///
+/// Publishing that URL would hand the user a link to somebody else's
+/// workspace. So we fetch our own `health` through the candidate URL and
+/// compare `workspace_path` with ours. A same-named workspace on the other
+/// gateway lives at a different path.
+///
+/// Free when the machine is off a tailnet, and bounded when it is on one. This
+/// answers a settings pane, and every probe on that path is bounded for the
+/// reasons recorded in `crates/lucidos-app/src/mobile.rs`.
+pub(super) async fn get_tailnet_status(
+    State(state): State<AppState>,
+) -> Json<TailnetStatusResponse> {
+    if let Some(fresh) = cached_tailnet_status() {
+        return Json(fresh);
+    }
+    let Some(addr) = lucidos_tailscale::tailnet_ipv4() else {
+        // Not cached: this branch ran no probe, so repeating it costs nothing,
+        // and a machine that just joined a tailnet answers on the next load.
+        return Json(TailnetStatusResponse {
+            magic_dns_name: None,
+            workspace_serve_url: None,
+        });
+    };
+    // A blocking resolver call, so it never runs on an async worker.
+    let name = tokio::task::spawn_blocking(move || {
+        lucidos_tailscale::magic_dns_name(addr, MAGIC_DNS_TIMEOUT)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let workspace_serve_url = match (&name, super::base_path::workspace_id()) {
+        // No name, or no slug: there is no candidate URL to verify. A slugless
+        // engine is the direct-port dev mode, which no gateway path addresses.
+        (Some(name), Some(slug)) => verified_workspace_serve_url(name, &slug, &state).await,
+        _ => None,
+    };
+    let answer = TailnetStatusResponse {
+        magic_dns_name: name,
+        workspace_serve_url,
+    };
+    *lock_tailnet_cache() = Some((std::time::Instant::now(), answer.clone()));
+    Json(answer)
+}
+
+/// The cached answer while it is inside [`TAILNET_STATUS_TTL`], else `None`.
+fn cached_tailnet_status() -> Option<TailnetStatusResponse> {
+    lock_tailnet_cache()
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < TAILNET_STATUS_TTL)
+        .map(|(_, answer)| answer.clone())
+}
+
+/// Take the cache lock, ignoring poisoning. Nothing under it can be left
+/// half-written: it holds one timestamped answer, replaced whole.
+fn lock_tailnet_cache(
+) -> std::sync::MutexGuard<'static, Option<(std::time::Instant, TailnetStatusResponse)>> {
+    TAILNET_STATUS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The candidate URL, if this engine is what answers at it.
+///
+/// `https` is hardcoded here, and that is not the intra-host scheme question
+/// `.claude/rules/rust.md` governs. This is the tailnet endpoint `tailscale
+/// serve` publishes, and it is HTTPS by construction. TLS is validated
+/// normally for the same reason. Tailscale issues a real certificate for a
+/// `.ts.net` name, and accepting an invalid one would throw away the proof
+/// this function exists to produce.
+async fn verified_workspace_serve_url(
+    magic_dns_name: &str,
+    slug: &str,
+    state: &AppState,
+) -> Option<String> {
+    let url = format!("https://{magic_dns_name}/{slug}/");
+    let client = reqwest::Client::builder()
+        .timeout(SERVE_VERIFY_TIMEOUT)
+        // A system proxy has no business intercepting a tailnet hop, and would
+        // answer for a host it cannot reach.
+        .no_proxy()
+        // The candidate URL is exact, so there is nowhere legitimate to follow.
+        // Left at the default, a hostile responder could bounce this probe at
+        // `127.0.0.1` and make us reach a host it cannot.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{url}api/v1/health"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let own_path = state.workspace_path.to_string_lossy();
+    health_names_this_workspace(&body, &own_path).then_some(url)
+}
+
+/// Pure: does this `health` body prove the probe reached THIS engine?
+///
+/// `workspace_path` is the discriminator rather than `workspace`, which is only
+/// the directory name and collides across gateways by design. Anything we
+/// cannot parse is a no: an unverified URL is never published.
+fn health_names_this_workspace(body: &str, own_workspace_path: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("workspace_path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|path| path == own_workspace_path)
+}
+
 // ===== Pinned App UIs Endpoints =====
 
 #[derive(Deserialize)]
@@ -1401,6 +1582,11 @@ pub(super) fn router() -> Router<AppState> {
             "/network-config",
             get(get_network_config).put(put_network_config),
         )
+        // The MagicDNS name and the verified HTTPS URL for this workspace, for
+        // the Connect URLs on that same page. Its own route rather than fields
+        // on `/network-config`, which the bind editor also fetches and which
+        // must stay a cheap local read.
+        .route("/tailnet-status", get(get_tailnet_status))
         // Model registry — the DB-backed chat model list (Settings → Models).
         // Drives the Lucidos Agent picker + RoutingProvider provider selection.
         .route(
@@ -1450,6 +1636,81 @@ pub(super) fn router() -> Router<AppState> {
         )
         // Email endpoints
         .route("/email/send", post(send_email_confirmed))
+}
+
+#[cfg(test)]
+mod tailnet_status_tests {
+    use super::*;
+
+    /// A `health` body shaped like the real one, for a given workspace path.
+    fn health_body(workspace_path: &str) -> String {
+        serde_json::json!({
+            "status": "ok",
+            "workspace": "dev",
+            "workspace_path": workspace_path,
+            "database_reachable": true,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_url_publishes_only_when_our_own_engine_answered() {
+        let own = "/Users/me/workspaces/dev";
+        assert!(health_names_this_workspace(&health_body(own), own));
+    }
+
+    #[test]
+    fn a_same_named_workspace_on_another_gateway_is_rejected() {
+        // The failure this whole verification exists for. Two gateways can each
+        // hold a workspace whose slug is `dev`, and only one of them is us.
+        // They differ by path, which is why the path is the discriminator.
+        let body = health_body("/Users/me/other-checkout/workspaces/dev");
+        assert!(!health_names_this_workspace(
+            &body,
+            "/Users/me/workspaces/dev"
+        ));
+    }
+
+    #[test]
+    fn a_body_we_cannot_read_is_never_a_match() {
+        // Anything unparseable is a no: an unverified URL is never published.
+        // A 404 page from a gateway that does not know this slug lands here.
+        let own = "/Users/me/workspaces/dev";
+        assert!(!health_names_this_workspace("<html>not found</html>", own));
+        assert!(!health_names_this_workspace("", own));
+        assert!(!health_names_this_workspace("{}", own));
+        assert!(!health_names_this_workspace(
+            r#"{"workspace_path": 42}"#,
+            own
+        ));
+    }
+
+    #[test]
+    fn the_directory_name_alone_does_not_prove_identity() {
+        // `workspace` is only the last path segment, so it collides across
+        // gateways by design. Reading it instead of `workspace_path` would
+        // accept the very case the test above rejects.
+        let body = health_body("/Users/me/other-checkout/workspaces/dev");
+        assert!(!health_names_this_workspace(&body, "dev"));
+    }
+
+    #[test]
+    fn the_verification_probe_never_disables_certificate_checking() {
+        // Tailscale issues a real certificate for a `.ts.net` name, so there is
+        // nothing to work around. Accepting an invalid one would throw away the
+        // proof `verified_workspace_serve_url` exists to produce, and the
+        // loopback carve-out in `.claude/rules/rust.md` does not reach here.
+        let source = include_str!("settings.rs");
+        let start = source
+            .find("async fn verified_workspace_serve_url")
+            .expect("the prober must exist");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("the prober must end");
+        assert!(
+            !body[..end].contains("danger_accept_invalid_certs"),
+            "the tailnet verification probe must validate TLS"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1572,13 +1833,26 @@ mod oauth_access_token_tests {
 mod provider_validation_tests {
     use super::*;
 
-    /// `valid_provider` must accept exactly the five `ProviderKind` values and
-    /// reject anything else — kept in lockstep with
-    /// `crate::llm::model_registry::ProviderKind`.
+    /// `valid_provider` must accept exactly the `ProviderKind` column values and
+    /// reject anything else. The accepted list is spelled through `as_str`.
+    /// Renaming a column value on the enum then fails here, rather than making
+    /// the API reject rows the registry itself writes.
     #[test]
     fn valid_provider_accepts_known_and_rejects_unknown() {
-        for ok in ["vertex", "anthropic", "openai", "openrouter", "local"] {
+        for kind in [
+            ProviderKind::Vertex,
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::OpenRouter,
+            ProviderKind::XAi,
+            ProviderKind::Local,
+        ] {
+            let ok = kind.as_str();
             assert!(valid_provider(ok), "{ok} must be accepted");
+            assert!(
+                PROVIDER_ERR.contains(ok),
+                "the error message must name {ok} as an option"
+            );
         }
         for bad in ["", "Vertex", "openai ", "ollama", "bogus"] {
             assert!(!valid_provider(bad), "{bad:?} must be rejected");

@@ -1,6 +1,30 @@
 use super::*;
 
 impl EventStore {
+    /// When the newest event on a thread was recorded. `Ok(None)` for a thread
+    /// with no events yet.
+    ///
+    /// The one caller is the chat turn resolving its clock
+    /// (`engine::chat::process::turn_clock`). Postgres stamps `created` with
+    /// `NOW()`, so this is the database's own reading, on the same clock as
+    /// every row it will be compared against.
+    ///
+    /// `MAX(created)` rather than the newest row by `sequence`:
+    /// `replay_historical_event` can insert a backdated row at a high
+    /// sequence, and a turn's clock must never run backwards because a
+    /// backfill landed.
+    pub async fn thread_latest_event_created(
+        &self,
+        thread_id: uuid::Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT MAX(created) FROM events WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Get all events for a specific thread, ordered chronologically.
     pub async fn get_thread_events(
         &self,

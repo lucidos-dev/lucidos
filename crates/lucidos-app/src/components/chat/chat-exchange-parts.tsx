@@ -5,7 +5,7 @@ import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-chang
 import { ensureEventTargetResolved, eventHasTarget, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import type { EventWaitCancelCause, Exchange } from '../../store/thread-events';
@@ -739,7 +739,7 @@ function lastLinePreview(text: string, max = 120): string {
 
 /** The context-usage suffix on a step row.
  *
- *  `compact` keeps only the percentage. The full "178k / 1000k (18%)" is wider
+ *  `compact` keeps only the percentage. The full "178k / 1M (18%)" is wider
  *  than a narrow row's remaining space. The row is `nowrap`, so the excess
  *  pushes the description out rather than wrapping. The percentage is the part
  *  read at a glance anyway.
@@ -943,9 +943,13 @@ export function eventWaitRowBody({
   // A colon rather than "for", because `reason` is the model's own words and
   // reaches for a gerund as often as a noun phrase. The colon reads as an
   // introduction either way.
+  //
+  // `awaitedSubject` is what keeps the gerund case from stuttering. Both labels
+  // here carry the verb already, so a reason opening "waiting for" would say it
+  // twice.
   const subject = stopped
     ? eventWaitStoppedSummary(event.reason)
-    : `Set up an event wait: ${event.reason}`;
+    : `Set up an event wait: ${awaitedSubject(event.reason)}`;
   const deadline = event.state === 'waiting' ? waitDeadline(event.expires_at) : undefined;
   return eventRowBody({
     kind: 'wait',

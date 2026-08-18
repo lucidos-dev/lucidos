@@ -14,7 +14,7 @@ import type { CredentialInfo, Loadable } from '../../store/types';
  *
  * This mirrors `CredentialStore::get` in the engine, which excludes
  * `oauth_client` for exactly the same reason and is what resolves these same
- * names (`anthropic`, `openai`, `openrouter`, `local`) at request time. The two
+ * names (`anthropic`, `openai`, `openrouter`, `xai`, `local`) at request time. The two
  * must agree, or the settings UI describes a row the engine never reads.
  */
 export function findProviderCredential(

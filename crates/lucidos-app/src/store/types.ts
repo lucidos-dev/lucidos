@@ -1,5 +1,5 @@
 import { errorDetail } from '../utils/errorDetail';
-import type { EventWaitCancelCause } from './thread-events/thread-event-types';
+import type { AnswerKind, EventWaitCancelCause } from './thread-events/thread-event-types';
 
 // --- Async data loading ---
 // Every piece of async data must be in one of these states.
@@ -206,8 +206,10 @@ export type ResponseEvent =
       tool_use_id: string;
       question: string;
       options: Array<{ id: string; label: string; description?: string }>;
-      /** When set, the user already picked / typed / canceled; the card renders the resolved state instead of action buttons. */
-      resolved?: { kind: 'Selected'; option_id: string } | { kind: 'FreeText'; text: string } | { kind: 'Canceled' };
+      /** When set, the question is resolved and the card renders that state
+       *  instead of action buttons. Either the user picked or typed, or it was
+       *  closed for them: dismissed, or replaced by their next message. */
+      resolved?: AnswerKind;
     }
   | {
       /** CC requested permission for an out-of-cwd / .claude / Bash tool call.

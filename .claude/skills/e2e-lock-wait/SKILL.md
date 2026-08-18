@@ -34,8 +34,12 @@ kill -0 <PID from the file>      # non-zero => the owner is dead, the next run r
 
 ```bash
 lucidos await-event --on E2ELockReleased --timeout-secs 21600 \
-  --reason "waiting for the e2e lock (held by e2e-browser since 14:12)"
+  --reason "the e2e lock to free up (held by e2e-browser since 14:12)"
 ```
+
+**Name what you await, not the fact that you await it.** The transcript labels
+the reason `Set up an event wait: <reason>` and `Stopped waiting: <reason>`, so
+a reason opening "waiting for" reads as `wait: waiting for`.
 
 **3. END THE TURN.** Say what you subscribed to and stop. This is the whole
 point, not a side effect: the command returns immediately and blocks nothing, so
@@ -46,10 +50,12 @@ thread sits plain idle while it watches.
 with the whole conversation behind it, so re-read what you were doing first. If
 the retry is refused again, another waiter won the race: go back to step 1.
 
-**5. Nothing to clean up once you win.** Taking the lock stands your own watch
-for its release down, whether the delivery or something else got you there. What
-still needs you is the case where you never take it at all: see "A watch you no
-longer need is yours to end".
+**5. Nothing to clean up once you win, and nothing to say about it.** Taking the
+lock stands your own watch for its release down, whether the delivery or
+something else got you there. The transcript records that stand-down on its own
+card, so do not narrate it: a line explaining that the lock took care of your
+watch is the third telling of one fact. What still needs you is the case where
+you never take it at all: see "A watch you no longer need is yours to end".
 
 ## The sharp edges
 

@@ -117,6 +117,27 @@ export async function navigateToApp(page: Page): Promise<void> {
   await waitForVisibleInput(page);
 }
 
+/** Start this page with the *follow seed* DISARMED, before the app boots.
+ *
+ *  The seed ships ARMED and every test gets a fresh context. So a spec that
+ *  says nothing rides every thread it opens. One about the toggle's own journey
+ *  has to start from the other side. Otherwise its first `click()` disarms
+ *  where it meant to arm. Every "the reader was left where the landing put
+ *  them" assertion then reads the ride instead.
+ *
+ *  `addInitScript` rather than an `evaluate` after navigating, because
+ *  `scrollState` reads the seed ONCE at module load. A write after boot is a
+ *  write the signal has already gone past.
+ *
+ *  The key is written out, as every other localStorage seed in these specs is:
+ *  `FOLLOW_SEED_KEY` is module-private, and the string runs in the page rather
+ *  than in the test. */
+export async function disarmFollowSeed(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    localStorage.setItem('lucidos-follow-live-edge', 'false');
+  });
+}
+
 /** Wait until the page's SSE event stream is open.
  *  Required before tests emit transient engine events that are delivered only
  *  over SSE, such as `/api/v1/ui/navigate` NavigationRequested events. */

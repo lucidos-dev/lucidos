@@ -14,6 +14,7 @@ use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEve
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
 use crate::llm::{ContentBlock, Message, MessageContent};
+use crate::triggers::{normalize_route_setting, validate_trigger_reasoning_effort};
 
 /// How a thread spawned by `run_thread` / `run_coding_agent` relates to the
 /// thread that issued the spawn. Drives both the spawn linkage (parent /
@@ -91,6 +92,41 @@ pub(crate) fn parse_coding_agent(
             "coding_agent must be \"claude-code\" or \"codex\", got {}",
             other
         )),
+    }
+}
+
+/// Resolve the model and reasoning effort a `run_thread` child runs on: a
+/// caller-supplied pin wins, otherwise the account chat preference. The two
+/// resolve independently, so pinning one leaves the other inherited.
+///
+/// Validation follows the trigger route pins, the other place a chat model and
+/// effort are pinned per spawn. The model id passes through unchecked
+/// (`normalize_route_setting`). A registry row can be disabled long after the
+/// caller read it, and a bad id surfaces as an ordinary thread failure. The
+/// tier vocabulary is ours, so a typo there is rejected by name
+/// (`validate_trigger_reasoning_effort`), never swapped for the default.
+pub(crate) fn resolve_sub_thread_model_and_effort(
+    args: &serde_json::Value,
+    pref_model: Option<String>,
+    pref_effort: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let model = normalize_route_setting(optional_string_arg(args, "model")?).or(pref_model);
+    let effort = validate_trigger_reasoning_effort(optional_string_arg(args, "reasoning_effort")?)?
+        .or(pref_effort);
+    Ok((model, effort))
+}
+
+/// Read an optional string tool argument, rejecting a non-string instead of
+/// reading it as absent. A caller that sent the wrong type must learn its pin
+/// did not apply, rather than silently getting the account default.
+fn optional_string_arg<'a>(
+    args: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(format!("{} must be a string, got {}", key, other)),
     }
 }
 
@@ -614,6 +650,15 @@ impl LucidosEngine {
                             // instead of the user's chat-mode preference.
                             let (chat_model, chat_effort) =
                                 crate::core::PreferenceStore::user_chat_settings(&self.pool).await;
+                            let (model, reasoning_effort) =
+                                match resolve_sub_thread_model_and_effort(
+                                    tool_args,
+                                    chat_model,
+                                    chat_effort,
+                                ) {
+                                    Ok(pins) => pins,
+                                    Err(e) => return Some(format!("Error: {}", e)),
+                                };
                             let caller_title = tool_args["title"].as_str();
                             // The eager MessageReceived (a Child relation child's
                             // active_children_count must increment before the parent
@@ -627,8 +672,8 @@ impl LucidosEngine {
                                     parent_thread_id,
                                     spawning_event_id,
                                     title: caller_title.map(str::to_string),
-                                    model: chat_model,
-                                    reasoning_effort: chat_effort,
+                                    model,
+                                    reasoning_effort,
                                     pre_emitted_origin: None,
                                     origin,
                                 };
@@ -1159,6 +1204,138 @@ mod tests {
         );
         assert!(text.contains("Codex session"), "{text}");
         assert!(!text.contains("Claude Code"), "{text}");
+    }
+
+    // --- run_thread route pins ----------------------------------------------
+
+    /// The account preferences, as `user_chat_settings` hands them over.
+    fn chat_prefs() -> (Option<String>, Option<String>) {
+        (
+            Some("claude-opus-5@default".to_string()),
+            Some("xhigh".to_string()),
+        )
+    }
+
+    fn resolved(args: serde_json::Value) -> (Option<String>, Option<String>) {
+        let (model, effort) = chat_prefs();
+        resolve_sub_thread_model_and_effort(&args, model, effort).expect("valid pins")
+    }
+
+    /// The pre-existing behavior: a spawn that pins nothing runs on the
+    /// account's chat model and effort.
+    #[test]
+    fn run_thread_without_pins_inherits_both_chat_preferences() {
+        assert_eq!(
+            resolved(json!({"prompt": "summarize this"})),
+            (
+                Some("claude-opus-5@default".to_string()),
+                Some("xhigh".to_string())
+            )
+        );
+    }
+
+    /// The two pins resolve independently. Naming the model must not drag the
+    /// effort down to a provider default, and vice versa.
+    #[test]
+    fn run_thread_model_pin_leaves_the_preference_effort_inherited() {
+        assert_eq!(
+            resolved(json!({"prompt": "p", "model": "claude-sonnet-5"})),
+            (
+                Some("claude-sonnet-5".to_string()),
+                Some("xhigh".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn run_thread_effort_pin_leaves_the_preference_model_inherited() {
+        assert_eq!(
+            resolved(json!({"prompt": "p", "reasoning_effort": "low"})),
+            (
+                Some("claude-opus-5@default".to_string()),
+                Some("low".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn run_thread_takes_both_pins_together() {
+        assert_eq!(
+            resolved(json!({
+                "prompt": "p",
+                "model": "claude-sonnet-5",
+                "reasoning_effort": "none",
+            })),
+            (
+                Some("claude-sonnet-5".to_string()),
+                Some("none".to_string())
+            )
+        );
+    }
+
+    /// The tier vocabulary is ours, so a typo is a caller error. Rejecting it
+    /// by name is what stops the spawn quietly running at `xhigh` while the
+    /// caller believes it asked for something cheaper.
+    #[test]
+    fn run_thread_rejects_an_unknown_reasoning_effort_and_names_it() {
+        let err = resolve_sub_thread_model_and_effort(
+            &json!({"prompt": "p", "reasoning_effort": "cheap"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("cheap"), "error names the bad value: {err}");
+        assert!(
+            err.contains("none, low, medium, high, xhigh, max"),
+            "error lists the tiers: {err}"
+        );
+    }
+
+    /// The model id is NOT checked against the registry, matching the trigger
+    /// route pins: a row can be disabled long after the caller read it, and a
+    /// bad id surfaces as an ordinary thread failure instead.
+    #[test]
+    fn run_thread_passes_an_unknown_model_id_through_unchecked() {
+        assert_eq!(
+            resolved(json!({"prompt": "p", "model": "claude-imaginary-9"})).0,
+            Some("claude-imaginary-9".to_string())
+        );
+    }
+
+    /// Blank and null both read as "no pin", the same normalization the trigger
+    /// form's Default option travels through. `Some("")` must never reach the
+    /// provider as a model id.
+    #[test]
+    fn run_thread_reads_a_blank_or_null_pin_as_the_account_default() {
+        assert_eq!(
+            resolved(json!({"prompt": "p", "model": "   "})),
+            chat_prefs()
+        );
+        assert_eq!(
+            resolved(json!({"prompt": "p", "model": null, "reasoning_effort": null})),
+            chat_prefs()
+        );
+        assert_eq!(
+            resolved(json!({"prompt": "p", "reasoning_effort": "  "})),
+            chat_prefs()
+        );
+    }
+
+    /// A wrong-typed pin is refused rather than read as absent: silently
+    /// substituting the account default would tell the caller its pin applied.
+    #[test]
+    fn run_thread_rejects_a_non_string_pin() {
+        for args in [
+            json!({"prompt": "p", "model": 5}),
+            json!({"prompt": "p", "reasoning_effort": ["low"]}),
+        ] {
+            let err = resolve_sub_thread_model_and_effort(&args, None, None)
+                .expect_err("a non-string pin must be refused");
+            assert!(
+                err.contains("must be a string"),
+                "error states the contract: {err}"
+            );
+        }
     }
 
     // --- linkage vs attribution --------------------------------------------

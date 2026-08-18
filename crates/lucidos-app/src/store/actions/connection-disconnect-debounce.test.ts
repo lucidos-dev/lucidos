@@ -37,7 +37,7 @@ vi.mock('./chat-changes', () => ({
   refreshChangesState: vi.fn(),
   clearRestartInFlight: vi.fn(),
   RESTART_LS_KEY: 'lucidos-restart-required',
-  RESTART_TOAST_KEY: 'restart-required',
+  RESTART_FAILURE_TOAST_KEY: 'restart-required',
 }));
 vi.mock('./notifications', () => ({
   loadUnreadNotifications: vi.fn(),

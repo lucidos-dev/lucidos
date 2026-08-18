@@ -916,7 +916,7 @@ EOF
     echo ""
     echo "Do NOT sleep, poll, or write a retry loop. Subscribe and end your turn:"
     echo "  lucidos await-event --on E2ELockReleased --timeout-secs 21600 \\"
-    echo "    --reason \"waiting for the e2e lock\""
+    echo "    --reason \"the e2e lock to free up\""
     echo "The engine re-opens this thread when the holder releases; retry once then."
     echo "Full rules: .claude/skills/e2e-lock-wait/SKILL.md"
     if _e2e_holder_is_another_workspace "$existing_wt"; then

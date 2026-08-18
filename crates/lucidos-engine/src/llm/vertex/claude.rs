@@ -32,7 +32,7 @@ impl VertexProvider {
             model,
             system_prompt,
             reasoning_effort,
-            WireTarget::Vertex,
+            WireTarget::Vertex { url: &url },
             "Vertex",
         );
 

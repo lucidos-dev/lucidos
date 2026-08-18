@@ -229,7 +229,7 @@ for the architecture.
 - **Rust** (stable toolchain)
 - **Docker** (for PostgreSQL + pgvector)
 - **Node.js** (for Vite frontend dev server)
-- **An LLM provider** (Anthropic, OpenAI, OpenRouter, Vertex AI, or a local
+- **An LLM provider** (Anthropic, OpenAI, OpenRouter, xAI, Vertex AI, or a local
   OpenAI-compatible endpoint such as Ollama / LM Studio / vLLM). Configure it in
   **Settings → Models → Providers**, or via the environment variables below.
 
@@ -347,7 +347,7 @@ instead.
 |-----------|--------|
 | Language | Rust |
 | UI | Web frontend, wrapped by Tauri on the desktop |
-| LLM | Anthropic / OpenAI / OpenRouter / Vertex AI / local (configurable) |
+| LLM | Anthropic / OpenAI / OpenRouter / xAI / Vertex AI / local (configurable) |
 | Event Store | PostgreSQL + pgvector |
 | Embeddings | fastembed (in-process, local) |
 | Execution | Lucidos-managed Python |

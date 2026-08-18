@@ -230,7 +230,16 @@ impl LucidosEngine {
                 };
                 if let Some(thread_id) = thread_id {
                     if self.is_agent_running_for(thread_id).await {
-                        if let Err(e) = self.interrupt_agent(Some(thread_id), actor.clone()).await {
+                        // Gated on a live session, so the settle fallback is
+                        // unreachable from here and its variant is moot.
+                        if let Err(e) = self
+                            .interrupt_agent(
+                                Some(thread_id),
+                                actor.clone(),
+                                crate::engine::claude_code::SettleTerminal::StuckProjection,
+                            )
+                            .await
+                        {
                             log!(
                                 "[ApplyAll] cancel: interrupt_agent({}) failed: {}",
                                 thread_id,

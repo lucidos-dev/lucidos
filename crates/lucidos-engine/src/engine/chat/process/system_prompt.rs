@@ -5,7 +5,6 @@
 
 use crate::core::PreferenceStore;
 use crate::engine::LucidosEngine;
-use chrono::Utc;
 use std::path::Path;
 
 use super::super::process_helpers::{
@@ -565,6 +564,10 @@ impl LucidosEngine {
     /// Build the full chat system prompt for this turn plus the mandatory
     /// missing-preference keys and whether an image provider is available
     /// (consumed by the tools list).
+    ///
+    /// Reads no clock, deliberately: the result is a cached prefix tier, so
+    /// anything volatile in it costs a full rewrite per turn. `super::turn_clock`
+    /// owns that rule and the tail block the reading moved to.
     pub(super) async fn build_chat_system_prompt(
         &self,
         user_timezone: &str,
@@ -576,47 +579,10 @@ impl LucidosEngine {
         // so it is the SAME number `run_agentic_loop` enforces.
         max_tool_calls: usize,
     ) -> (String, Vec<&'static str>, bool) {
-        let now = Utc::now();
-        let current_date = now.format("%A, %B %d, %Y").to_string(); // e.g., "Thursday, January 30, 2026"
-        let current_time_utc = now.format("%H:%M UTC").to_string();
-
-        let timezone_section = if user_timezone.is_empty() {
-            format!(r#"CURRENT TIME: {} at {}"#, current_date, current_time_utc)
-        } else {
-            let tz: chrono_tz::Tz = user_timezone.parse().unwrap_or(chrono_tz::UTC);
-            let local_now = now.with_timezone(&tz);
-            let current_time_local = local_now.format("%H:%M").to_string();
-
-            use chrono::Offset;
-            let offset_seconds = local_now.offset().fix().local_minus_utc();
-            let offset_hours = offset_seconds / 3600;
-            let utc_offset_str = if offset_hours >= 0 {
-                format!("+{}", offset_hours)
-            } else {
-                format!("{}", offset_hours)
-            };
-
-            format!(
-                r#"CURRENT TIME: {} at {} (user's local time: {} {})
-USER TIMEZONE: {} (UTC{})
-
-TIMEZONE HANDLING:
-- The user speaks in their LOCAL time ({}).
-- All timestamps are stored as UTC in the database.
-- ALWAYS display times to the user in their local timezone (not UTC).
-- Cron uses 6 fields: second minute hour day-of-month month day-of-week
-- When user says "at 8am", use "0 0 8 * * *" (second=0, minute=0, hour=8).
-- Example: "daily at 8am" → cron "0 0 8 * * *", "at 9:30" → "0 30 9 * * *"
-- The system automatically handles daylight saving time adjustments."#,
-                current_date,
-                current_time_utc,
-                current_time_local,
-                user_timezone,
-                user_timezone,
-                utc_offset_str,
-                user_timezone
-            )
-        };
+        // Timezone RULES only. The reading itself rides at the tail of the user
+        // message, so this whole block stays byte-identical turn to turn and
+        // thread to thread. See `super::turn_clock`.
+        let timezone_section = super::turn_clock::timezone_section(user_timezone);
 
         // (key, instruction, per_device). Any missing key flips this turn into
         // setup mode.
@@ -882,10 +848,11 @@ mod tests {
     /// because this number alone lets one runaway schema hide behind twenty
     /// lean ones.
     ///
-    /// Raised to 106,800 for the `sdk` knowhow description, which gained the
-    /// workspace-address prefix an engine URL built in JS needs. A description
-    /// is the routing signal, so it tracks coverage. Measured total is 106,752.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 106_800;
+    /// Raised to 108,050 after the ceiling drifted over unnoticed. 794 of the
+    /// overage arrived through docs-only diffs, which skipped this suite until
+    /// `/harden` grew a `system-knowhow/**` row. The other 79 are the `env_vars`
+    /// summary naming its second consumer. Measured total is 108,023.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 108_050;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1067,9 +1034,11 @@ mod tests {
         (
             "navigate_ui",
             2_300,
-            "the two frozen enums the SDK is generated from (17 targets, 17 \
-             settings views) are 751 chars before a word of prose; the settings \
-             gloss is routing information available on no other surface",
+            "the two frozen enums the SDK is generated from (17 targets, 18 \
+             settings views) are 758 chars before a word of prose; the settings \
+             gloss is routing information available on no other surface, and \
+             it names only the views whose own value does not (`mcp` is not \
+             glossed, because the value already says what the page is)",
         ),
         (
             "request_credential",
@@ -1985,12 +1954,11 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME must be set to run this test");
         let workspace = PathBuf::from(&home).join("workspaces/myws");
 
-        let section = workspace_identity_section(
-            "myws",
-            &workspace,
-            "CURRENT TIME: now",
-            "USER LANGUAGE: English",
-        );
+        // The real timezone section, so the splice is checked against what
+        // ships rather than a stand-in.
+        let timezone = super::super::turn_clock::timezone_section("Europe/Oslo");
+        let section =
+            workspace_identity_section("myws", &workspace, &timezone, "USER LANGUAGE: English");
 
         // Still identified by name and by the shape of its path, so the agent
         // loses no usable context.
@@ -2002,9 +1970,18 @@ mod tests {
         );
 
         // The surrounding sections are still spliced in.
-        assert!(section.contains("CURRENT TIME: now"));
+        assert!(section.contains("USER TIMEZONE: Europe/Oslo"));
+        assert!(section.contains("TIMEZONE HANDLING:"));
         assert!(section.contains("USER LANGUAGE: English"));
         assert!(section.contains("PERSONAL DATA ACCESS:"));
+
+        // The reading itself moved to the message tail, and the identity
+        // section is the front of a cached tier: a clock here rewrites all of
+        // it every turn. `turn_clock` owns the rule.
+        assert!(
+            !section.contains("CURRENT TIME:"),
+            "the cached identity section must carry no clock reading:\n{section}"
+        );
     }
 
     /// Nothing the user can see is labelled with a change id, so a question

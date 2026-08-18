@@ -62,6 +62,8 @@ This rule has two halves:
 1. **Drift prevention (this file).** Every code change that touches a documented surface MUST update the matching `system-knowhow/*.md` in the same change. Reviewers and `/harden` flag any drift as a hardening failure.
 2. **Recipe maintenance (below).** When you change one system-knowhow file, the *other* recipes that reference it (workspace-audit, workspace-learning) may need to follow.
 
+**Frontmatter is billed on every request.** The engine splices a file's `name` and `description` into the chat agent's routing list, which every thread pays for on every turn. Two Rust tests enforce it: `system_knowhow_descriptions_stay_routing_sized` caps each description at 400 chars, and `always_loaded_context_stays_under_budget` caps the total against a ratchet. A docs-only diff still runs them, per `/harden` Phase 4.5's `system-knowhow/**` row. Write a description that carries coverage plus the phrases that should route here, and leave the detail to the body.
+
 ## Drift prevention — required updates by surface
 
 When you touch any of the surfaces in the left column, you MUST update the file in the right column **in the same commit / branch**. Failing to do so is a `/harden` failure: the diff makes a promise the docs don't keep, and any LLM that loads the stale knowhow afterwards will be wrong.

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { restartRequired, restartGroups, toasts } from '../store';
 import { RESTART_LS_KEY, RESTART_GROUPS_LS_KEY } from '../actions/chat-changes';
 
-const RESTART_TOAST_KEY = 'restart-required';
+const RESTART_FAILURE_TOAST_KEY = 'restart-required';
 
 const mockFetchChanges = vi.fn();
 vi.mock('../../api/client', async () => {
@@ -59,7 +59,7 @@ describe('refreshChangesState backfills restart_groups from API', () => {
     // No toast is surfaced — the engine "New version available" toast is owned by
     // the poll (engine-update.ts) once the rebuild is `ready`. Backfill's job is to
     // populate the groups signal so the restart confirm dialog has data to show.
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
+    expect(toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY)).toBeFalsy();
   });
 
   it('clears restartGroups when API returns empty restart_groups', async () => {

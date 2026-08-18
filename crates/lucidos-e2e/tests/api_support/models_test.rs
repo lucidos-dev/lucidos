@@ -3,7 +3,7 @@
 //!
 //! Why this matters: the window is only inferred from the model id when the row
 //! doesn't declare one, and that fallback recognises just `claude-*` and
-//! `gpt-5*`. Every OpenRouter / Gemini / local model is treated as 200k until
+//! `gpt-5*`. Every OpenRouter / xAI / Gemini / local model is treated as 200k until
 //! this field is set, which trims their context far earlier than needed. So the
 //! HTTP surface has to carry the value in both directions and has to keep the
 //! absent-vs-explicit-null distinction that lets a caller clear it.
@@ -161,6 +161,8 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
         ("gpt-5.5", vec!["none", "low", "medium", "high", "xhigh"]),
         // A third-party OpenAI-compatible server: no xhigh, no max.
         ("z-ai/glm-5.2", vec!["none", "low", "medium", "high"]),
+        // xAI is the same shape: OpenAI-compatible, but not OpenAI.
+        ("grok-4.6", vec!["none", "low", "medium", "high"]),
     ] {
         let m = find_model(&client, &api, id)
             .await
@@ -200,6 +202,76 @@ async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
     );
 
     delete_model(&client, &api, &id).await;
+}
+
+/// The Grok family is seeded on the xAI provider, and every row declares its
+/// real window over the wire. The id-shape fallback has no rule for a `grok-`
+/// id, so an undeclared row would budget the 2M model at 200k.
+#[tokio::test]
+async fn seeded_grok_models_report_xai_and_their_declared_windows() {
+    let client = http_client();
+    let api = base_url();
+
+    for (id, window) in [
+        ("grok-4.6", 500_000),
+        ("grok-4.5", 500_000),
+        ("grok-4.20", 2_000_000),
+        ("grok-4.3", 1_000_000),
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert_eq!(m["provider"], "xai", "{id}");
+        assert_eq!(m["source"], "builtin", "{id}");
+        assert_eq!(m["enabled"], true, "{id}");
+        assert_eq!(m["context_window"], window, "{id}");
+    }
+}
+
+/// Grok reaches the registry two ways at once, and the two must not collide.
+/// The bare id is xAI direct; OpenRouter prefixes the same model. Adding the
+/// xAI provider must leave an existing OpenRouter Grok row routing where it
+/// always did, which is what this asserts at the HTTP surface.
+#[tokio::test]
+async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
+    let client = http_client();
+    let api = base_url();
+    let prefixed = "x-ai/grok-4.6";
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({
+            "id": prefixed,
+            "label": "Grok 4.6 (OpenRouter)",
+            "provider": "openrouter",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    // The models API answers a rejected create with 200 and `success: false`.
+    // The status alone would let a failed create reach the row assertions
+    // below, which would then fail for the wrong reason.
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true,
+        "creating the OpenRouter-prefixed Grok row must succeed"
+    );
+
+    let bare = find_model(&client, &api, "grok-4.6")
+        .await
+        .expect("the seeded bare id must still be listed");
+    let via_openrouter = find_model(&client, &api, prefixed)
+        .await
+        .expect("the prefixed id must list as its own row");
+    assert_eq!(bare["provider"], "xai");
+    assert_eq!(via_openrouter["provider"], "openrouter");
+
+    delete_model(&client, &api, prefixed).await;
+    assert!(
+        find_model(&client, &api, "grok-4.6").await.is_some(),
+        "removing the OpenRouter row must not touch the xAI one"
+    );
 }
 
 /// A model added without the field is simply undeclared — the engine infers a

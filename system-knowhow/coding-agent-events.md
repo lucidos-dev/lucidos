@@ -202,6 +202,15 @@ All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated
 - `{ "kind": "FreeText", "text": "..." }`
 - `{ "kind": "MultiSelected", "option_ids": [...], "text": "..."? }`
 - `{ "kind": "Canceled" }` — user closed the question without picking
+- `{ "kind": "Superseded" }`: a follow-up arrived that could not be the answer, so it replaced the question
+
+**Why `Superseded` exists.** The coding agent is parked *inside* the call that asked, and only an answer makes that call return. So a follow-up that cannot be routed as the answer has to resolve the question anyway. That releases the agent, which then reaches a turn boundary and reads the follow-up. Leaving it open deadlocked the thread. The follow-up's own `CodingAgentPromptSent` killed the card's buttons and the typed-answer route, so nobody could answer it.
+
+Two shapes qualify, both coding-agent-lane only. An agent-driven message (a parent's instruction, a child-completion wake) is refused by the `mode == Human` guard. So is any message landing on a question already overtaken. The tool result tells the agent its question was replaced. It also says the replacement arrives as the agent's next input.
+
+The card reads "Replaced by your next message", never "Canceled". Like `Canceled`, a supersede emits no resume marker and no `ContinuationRequested`. The follow-up drives the next turn itself. Full reasoning and the rejected alternatives: ADR 0082.
+
+**Only the engine writes it.** `POST /api/v1/threads/{thread_id}/answer-question` refuses a `Superseded` body with a 400 and leaves the question pending. The kind asserts that a follow-up arrived and replaced the question, which only the message router can know. Use `Canceled` to dismiss a card, or just send the follow-up.
 
 **An engine restart alone does NOT orphan a pending question.** A thread whose newest event is an unanswered `UserQuestionAsked` is a *preserved checkpoint*: every teardown and recovery path consults one shared predicate (`agent_recovery::thread_has_unanswered_question`) and leaves it strictly alone. No boundary `ResponseAborted`, no synthetic `CodingAgentIdled`, no Continue button, and specifically no graceful interrupt to the subprocess (Claude Code's Esc would cancel the pending `AskUserQuestion` and make the agent race past it). The card stays answerable across the restart, and answering resumes the thread through `ContinuationRequested` then `--resume`. "Preserved" holds only while the question really is the last thing that happened: anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` landing after it means the agent moved on, the card is dead, and the thread recovers as an ordinary interrupted turn (abort plus Continue) instead.
 
@@ -209,10 +218,13 @@ All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated
 
 The resume cannot instead rely on the resumed agent re-running its hook. On teardown Claude Code closes the pending `AskUserQuestion` in its OWN session transcript with a `tool_result` reading *"The user doesn't want to proceed with this tool use. The tool use was rejected... STOP what you are doing"* (`toolDenialKind: "user-rejected"`, `interruptedByShutdown: true`). That text lives inside the CC binary and inside CC's private JSONL, so it is outside the engine's reach, and because the tool call is closed the hook never re-fires on `--resume`. The engine's own event stream stays clean either way (that is the preserve contract above); what the resume message adds is the other half, telling the agent in words that an interrupted or rejected question call is a teardown artifact rather than a user decision: **the user declined nothing, and approved nothing.** Without it the resumed model reads "card closed" plus a bare "continue" as consent (2026-08-10: it announced *"you declined the card and said continue, so I am treating that as approval"* and ran `lucidos planned approve` against a plan the user had not approved).
 
+**Cancelling one is the mirror case, and it ends the turn.** The cancel stamps the card `Canceled`, and that `UserQuestionAnswered` moves the projection to `running`. With no agent left to interrupt, the Stop handler's settle fallback writes the terminal itself: `ResponseCanceled { user_stop }`. That is what a live agent's interrupt emits, so a Cancel does not read differently because a subprocess survived. `ResponseAborted { stale_settle }` stays for a `running` row nothing in the request explains. Apply / Discard / Archive keep it too, each carrying its own terminator.
+
 **Pairing guarantee.** A `UserQuestionAnswered` is emitted exactly once per `UserQuestionAsked` it answers, enforced by a unique DB index on `(thread_id, tool_use_id)`. The pair can be left unbalanced in real life:
 
 - The agent process dies before the user answers, the engine restarts, and the question is never revisited from the coding-agent side. The `Asked` row stays in the DB without a matching `Answered`. There is **no engine-side timeout that auto-emits `Answered`** for the AskUserQuestion path. (The MCP permission path, `CodingAgentPermissionRequest`, does have an orphan-recovery sweep that emits a `CodingAgentPermissionResolved { allowed: false, reason: "Coding agent terminated before answering — request expired" }` — but that's a different event family.)
 - The user closes the popover via the cancel control — that fires `UserQuestionAnswered { answer: { kind: "Canceled" } }`, which still counts as a pair.
+- A follow-up lands that cannot be the answer. That fires `UserQuestionAnswered { answer: { kind: "Superseded" } }`, which is a pair too, so watch for both kinds before concluding a question went unanswered.
 
 So a workspace listening for `UserQuestionAsked → UserQuestionAnswered` should treat a long-pending `Asked` with no matching `Answered` as "the user is still being prompted" rather than as a guaranteed-future event.
 
@@ -370,7 +382,7 @@ This is NOT the user typing into a coding agent. User-typed input fires `CodingA
 
 - merge-conflict explanation injected after `MergeConflictDetected`,
 - `MissingHardeningDetected` recovery prompt asking the coding agent to run `/harden`,
-- the empty `CodingAgentPromptSent` emitted right after `UserQuestionAnswered` so the timeline shows a "thinking" placeholder while the coding agent processes the answer. Skipped when `answer.kind == "Canceled"` — the cancel-stamp path (`claude_code_stop`, `archive_thread`) tears the coding agent down right after, so no resume turn ever runs and the marker would strand as an empty `Thinking ✓` step under the QuestionCard's own `✓ Cancel` state. See `emit_resume_marker_for_cc_answer` in `crates/lucidos-engine/src/engine/agent_question.rs`.
+- the empty `CodingAgentPromptSent` emitted right after `UserQuestionAnswered` so the timeline shows a "thinking" placeholder while the coding agent processes the answer. Skipped for two answer kinds, both because no turn of its own follows. `Canceled`: the cancel-stamp path (`claude_code_stop`, `archive_thread`) tears the coding agent down right after, so the marker would strand as an empty step. `Superseded`: the follow-up that replaced the question emits its own `CodingAgentPromptSent` moments later, and that is the placeholder. See `emit_resume_marker_for_cc_answer` in `crates/lucidos-engine/src/engine/agent_question.rs`.
 
 Distinguishable on the wire by `origin: Some(MessageOrigin::Engine { reason: ... })`. Workspaces should generally not need to subscribe to this — it's an audit trail event, not a lifecycle signal.
 

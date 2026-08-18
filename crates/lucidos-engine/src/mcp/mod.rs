@@ -6,7 +6,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::core::{McpServer, McpServerStore};
-use crate::engine::thread_events::ActorMode;
+use crate::engine::context::{estimate_tokens_from_chars, tool_definitions_chars};
+use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::llm::provider::ToolDefinition;
 use client::McpClient;
 use types::McpTool;
@@ -14,6 +15,10 @@ use types::McpTool;
 /// Running server state.
 struct RunningServer {
     client: McpClient,
+    /// The registry row as it stood when the process started, kept in step for
+    /// the fields the request path reads: `auto_approve` and `disabled_tools`.
+    /// `tools` on it is NOT maintained, because a running server's tools are
+    /// read off `client` and a stopped one's off a fresh DB row.
     server_config: McpServer,
 }
 
@@ -29,15 +34,153 @@ pub struct McpManager {
     event_bus: crate::engine::event_bus::EventBus,
 }
 
+/// Where the tool list in an [`McpServerStatus`] came from.
+///
+/// `Cache` and `NeverObserved` are deliberately distinct. A server nobody has
+/// connected to has an empty manifest. Reporting that as a zero-cost server
+/// states something the engine does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpToolsSource {
+    /// Read off the running process.
+    Live,
+    /// The manifest cached at the last successful connect. Its age is
+    /// [`McpServerStatus::tools_observed_at`].
+    Cache,
+    /// No manifest has ever been observed, so the tool list is unknown.
+    NeverObserved,
+}
+
+/// One tool of one server, with what it costs the request that carries it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpToolStatus {
+    /// The server's own spelling, which is not always what the model is shown.
+    pub name: String,
+    /// The name the model is offered. `None` when no usable one exists, so the
+    /// tool can never be called and costs nothing.
+    pub wire_name: Option<String>,
+    pub description: Option<String>,
+    /// Switched off by the user, so it is absent from every request.
+    pub disabled: bool,
+    pub chars: usize,
+    pub tokens: usize,
+}
+
 /// Status of an MCP server for display.
+///
+/// `chars` and `tokens` are what the ENABLED tools cost, whether or not the
+/// server is currently up: for a stopped one that answers "what would this cost
+/// if I switched it on". Whether the workspace is paying it right now is
+/// `running`, and [`McpCostTotals`] splits the two.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerStatus {
     pub id: String,
     pub name: String,
     pub running: bool,
     pub auto_approve: bool,
-    pub tool_count: usize,
-    pub tools: Vec<String>,
+    /// False when the stored id cannot ride a wire tool name, so no tool on
+    /// this server can ever be called. Starting it is refused, and Remove is
+    /// the only thing to offer.
+    pub dispatchable: bool,
+    pub tools_source: McpToolsSource,
+    pub tools_observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub tools: Vec<McpToolStatus>,
+    pub chars: usize,
+    pub tokens: usize,
+    /// What the switched-off tools would add back.
+    pub disabled_chars: usize,
+    pub disabled_tokens: usize,
+}
+
+/// What the registered MCP servers cost the workspace, split by whether the
+/// workspace is paying it.
+///
+/// Every token figure is [`estimate_tokens_from_chars`] of the matching char
+/// figure, never a sum of per-tool tokens: the ratio is integer division, so
+/// summing rounded parts drifts from the whole.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct McpCostTotals {
+    pub servers: usize,
+    pub running_servers: usize,
+    /// Tools in every request right now.
+    pub tools: usize,
+    pub chars: usize,
+    pub tokens: usize,
+    /// What the stopped servers would add if switched on. Excludes servers
+    /// whose id cannot dispatch, since those can never be switched on.
+    pub stopped_tools: usize,
+    pub stopped_chars: usize,
+    pub stopped_tokens: usize,
+    /// What the switched-off tools would add back, across every server.
+    pub disabled_tools: usize,
+    pub disabled_chars: usize,
+    pub disabled_tokens: usize,
+}
+
+impl McpCostTotals {
+    /// Roll a status list up. Kept beside the per-server figures so the header
+    /// and the rows can never disagree about one workspace.
+    pub fn of(servers: &[McpServerStatus]) -> Self {
+        let mut totals = Self {
+            servers: servers.len(),
+            ..Self::default()
+        };
+        for server in servers {
+            // A stopped server whose id cannot ride the wire contributes to no
+            // figure here. It can never be started, so neither its enabled
+            // tools nor its disabled ones are cost anyone could ever pay back.
+            // It is still counted in `servers`, because it is still registered
+            // and the page still has to show it a Remove button.
+            if !server.running && !server.dispatchable {
+                continue;
+            }
+
+            let enabled_count = server
+                .tools
+                .iter()
+                .filter(|t| !t.disabled && t.wire_name.is_some())
+                .count();
+            if server.running {
+                totals.running_servers += 1;
+                totals.tools += enabled_count;
+                totals.chars += server.chars;
+            } else {
+                totals.stopped_tools += enabled_count;
+                totals.stopped_chars += server.chars;
+            }
+            totals.disabled_tools += server.tools.iter().filter(|t| t.disabled).count();
+            totals.disabled_chars += server.disabled_chars;
+        }
+        totals.tokens = estimate_tokens_from_chars(totals.chars);
+        totals.stopped_tokens = estimate_tokens_from_chars(totals.stopped_chars);
+        totals.disabled_tokens = estimate_tokens_from_chars(totals.disabled_chars);
+        totals
+    }
+}
+
+/// What a start attempt resolved to. Starting an already-running server is not
+/// an error, and the two read differently to the user, so the caller is told
+/// which happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpStartOutcome {
+    AlreadyRunning { tool_count: usize },
+    Started { tool_count: usize },
+}
+
+impl McpStartOutcome {
+    pub fn tool_count(self) -> usize {
+        match self {
+            Self::AlreadyRunning { tool_count } | Self::Started { tool_count } => tool_count,
+        }
+    }
+}
+
+/// What a stop attempt resolved to. Stopping something already stopped is not
+/// an error, so this is a fact about the process, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpStopOutcome {
+    Stopped { name: String },
+    WasNotRunning,
 }
 
 impl McpManager {
@@ -91,40 +234,52 @@ impl McpManager {
         }
     }
 
-    /// Start a registered server.
+    /// Start a registered server by id.
     pub async fn start_server(
         &self,
         id: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let server = McpServerStore::get(&self.pool, id)
             .await?
             .ok_or_else(|| format!("MCP server '{}' not found", id))?;
+        self.start_loaded(&server).await
+    }
 
-        // Check if already running
+    /// Start a server whose row the caller already has.
+    ///
+    /// The HTTP routes load the row first so they can answer 404 and "this id
+    /// cannot ride the wire" separately from a connect failure. Re-reading it
+    /// here would let a removal between the two turn a 404 into a 502.
+    pub async fn start_loaded(
+        &self,
+        server: &McpServer,
+    ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
         {
             let running = self.running.lock().await;
-            if let Some(entry) = running.get(id) {
-                return Ok(format!(
-                    "MCP server '{}' is already running with {} tools.",
-                    server.name,
-                    entry.client.tools.len()
-                ));
+            if let Some(entry) = running.get(&server.id) {
+                return Ok(McpStartOutcome::AlreadyRunning {
+                    tool_count: entry.client.tools.len(),
+                });
             }
         }
 
-        let tool_count = self.start_server_internal(&server).await?;
-        Ok(format!(
-            "MCP server '{}' started with {} tools available.",
-            server.name, tool_count
-        ))
+        let tool_count = self.start_server_internal(server).await?;
+        Ok(McpStartOutcome::Started { tool_count })
     }
 
-    /// Internal: spawn and connect to an MCP server.
+    /// Internal: spawn and connect to an MCP server, then cache what it
+    /// advertised.
     ///
     /// Validates the id here and not only at registration, because a stored row
     /// is not proof that it passed. Only a running server advertises tools, so
     /// this is the gate that keeps every advertised tool dispatchable. Letting
     /// an unusable id run gives the model tools no call can reach.
+    ///
+    /// The manifest is cached only once `connect` has returned, which is what
+    /// leaves a failed start reporting the LAST good manifest instead of
+    /// nothing. It emits no event: a cache refresh is an observation, and the
+    /// row's `tools_observed_at` stamp is the freshness signal the settings
+    /// page reads. See `core::announced_surfaces`.
     async fn start_server_internal(
         &self,
         server: &McpServer,
@@ -136,6 +291,16 @@ impl McpManager {
             McpClient::connect(&server.command, &server.args, &server.env, ActorMode::Agent)
                 .await?;
         let tool_count = client.tools.len();
+
+        if let Err(e) = McpServerStore::set_tools(&self.pool, &server.id, &client.tools).await {
+            // The server IS up, so this is not a start failure. It only means
+            // the page will keep quoting the previous manifest.
+            log!(
+                "[MCP] Failed to cache the tool manifest for '{}': {}",
+                server.id,
+                e
+            );
+        }
 
         let mut running = self.running.lock().await;
         running.insert(
@@ -153,25 +318,31 @@ impl McpManager {
     pub async fn stop_server(
         &self,
         id: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<McpStopOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let mut running = self.running.lock().await;
-        if let Some(mut entry) = running.remove(id) {
-            entry.client.shutdown().await;
-            Ok(format!(
-                "MCP server '{}' stopped.",
-                entry.server_config.name
-            ))
-        } else {
-            Ok(format!("MCP server '{}' is not running.", id))
+        match running.remove(id) {
+            Some(mut entry) => {
+                entry.client.shutdown().await;
+                Ok(McpStopOutcome::Stopped {
+                    name: entry.server_config.name,
+                })
+            }
+            None => Ok(McpStopOutcome::WasNotRunning),
         }
     }
 
-    /// Remove a server (stop + delete from DB).
+    /// Remove a server: stop the process first, then delete the row.
+    ///
+    /// Returns whether a row was actually deleted. The caller needs that fact:
+    /// reporting "removed" for an id that never existed is a silent success,
+    /// and behind a DELETE route it is a 200 that did nothing.
     pub async fn remove_server(
         &self,
         id: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Stop if running
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Stop first. Deleting the row while the process runs would leave it
+        // orphaned, with nothing left that names it.
         {
             let mut running = self.running.lock().await;
             if let Some(mut entry) = running.remove(id) {
@@ -179,42 +350,65 @@ impl McpManager {
             }
         }
 
-        if McpServerStore::unregister(&self.pool, &self.event_bus, id, None).await? {
-            Ok(format!("MCP server '{}' removed.", id))
-        } else {
-            Ok(format!("MCP server '{}' not found.", id))
-        }
+        McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await
     }
 
-    /// List all configured servers with their status.
+    /// Replace which of a server's tools are switched off, by wire name.
+    /// Returns the stored set, or `None` when no such server exists.
+    pub async fn set_disabled_tools(
+        &self,
+        id: &str,
+        disabled_tools: &[String],
+        actor: Option<MessageOrigin>,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        let stored = McpServerStore::set_disabled_tools(
+            &self.pool,
+            &self.event_bus,
+            id,
+            disabled_tools,
+            actor,
+        )
+        .await?;
+
+        // Mirror it onto the running snapshot, which is what the per-request
+        // `get_tool_definitions` reads. Without this a tool switched off while
+        // the server is up keeps riding every request until the next restart.
+        if let Some(stored) = &stored {
+            let mut running = self.running.lock().await;
+            if let Some(entry) = running.get_mut(id) {
+                entry.server_config.disabled_tools = stored.clone();
+            }
+        }
+
+        Ok(stored)
+    }
+
+    /// List all configured servers with their status and what they cost.
+    ///
+    /// Tools come from the running process when there is one and from the
+    /// cached manifest when there is not, and `tools_source` says which. A
+    /// stopped server used to report zero tools, which reads identically to a
+    /// server that genuinely has none.
     pub async fn list_servers(
         &self,
     ) -> Result<Vec<McpServerStatus>, Box<dyn std::error::Error + Send + Sync>> {
         let servers = McpServerStore::list(&self.pool).await?;
         let running = self.running.lock().await;
 
-        let mut statuses = Vec::new();
-        for server in servers {
-            let running_entry = running.get(&server.id);
-            let (tool_count, tools) = if let Some(entry) = running_entry {
-                let names: Vec<String> =
-                    entry.client.tools.iter().map(|t| t.name.clone()).collect();
-                (names.len(), names)
-            } else {
-                (0, Vec::new())
-            };
-
-            statuses.push(McpServerStatus {
-                id: server.id,
-                name: server.name,
-                running: running_entry.is_some(),
-                auto_approve: server.auto_approve,
-                tool_count,
-                tools,
-            });
-        }
-
-        Ok(statuses)
+        Ok(servers
+            .into_iter()
+            .map(|server| {
+                let running_entry = running.get(&server.id);
+                let (tools, tools_source) = match running_entry {
+                    Some(entry) => (entry.client.tools.as_slice(), McpToolsSource::Live),
+                    None if server.tools_observed_at.is_none() => {
+                        (&[][..], McpToolsSource::NeverObserved)
+                    }
+                    None => (server.tools.as_slice(), McpToolsSource::Cache),
+                };
+                server_status(&server, tools, tools_source, running_entry.is_some())
+            })
+            .collect())
     }
 
     /// Set auto_approve for a server.
@@ -265,6 +459,22 @@ impl McpManager {
         let server_name = entry.server_config.name.clone();
         let auto_approve = entry.server_config.auto_approve;
 
+        // Dispatch is the gate, not the definition list. Omitting a disabled
+        // tool from the next request is what makes the switch cheap. It is not
+        // what enforces it: a call the model already generated is still in
+        // flight, and a resumed turn carries the old definitions. Refusing here
+        // makes switching a tool off take effect on the call.
+        let wire_name = format!("mcp__{}__{}", server_id, tool_name);
+        if entry.server_config.disabled_tools.contains(&wire_name) {
+            return Err(format!(
+                "MCP tool '{}' is switched off for server '{}' and was NOT run. \
+                 Do not retry it. Tell the user it is disabled, and let them \
+                 re-enable it in Settings if they want it back.",
+                wire_name, server_id
+            )
+            .into());
+        }
+
         // `tool_name` is the wire name the model was shown, which is not always
         // what the server calls the tool. Resolve before dispatching.
         let target = resolve_wire_tool_name(server_id, &entry.client.tools, tool_name)
@@ -293,21 +503,23 @@ impl McpManager {
         let mut tools = Vec::new();
 
         for (server_id, entry) in running.iter() {
-            let wire_names = wire_tool_names(server_id, &entry.client.tools);
-            for (wire_name, mcp_tool) in wire_names.into_iter().zip(&entry.client.tools) {
-                let Some(wire_name) = wire_name else {
+            for offer in tool_offers(
+                server_id,
+                &entry.server_config.name,
+                &entry.client.tools,
+                &entry.server_config.disabled_tools,
+            ) {
+                if offer.wire_name.is_none() {
                     log!(
                         "[MCP] Tool '{}' on server '{}' has no name that fits the tool-name limit, not offering it",
-                        mcp_tool.name,
+                        offer.tool.name,
                         server_id
                     );
                     continue;
-                };
-                tools.push(mcp_tool_to_definition(
-                    wire_name,
-                    &entry.server_config.name,
-                    mcp_tool,
-                ));
+                }
+                if let Some(definition) = offer.into_offered() {
+                    tools.push(definition);
+                }
             }
         }
 
@@ -350,6 +562,118 @@ impl McpManager {
             return None;
         }
         Some((server_id.to_string(), tool_name.to_string()))
+    }
+}
+
+/// One tool of one server, resolved against everything that decides whether a
+/// request carries it.
+///
+/// The single place the request path and the cost report agree on what a server
+/// contributes. Two functions answering that separately is how a header total
+/// starts disagreeing with what was actually sent.
+struct ToolOffer<'a> {
+    tool: &'a McpTool,
+    wire_name: Option<String>,
+    /// Switched off by the user.
+    disabled: bool,
+    /// What this tool WOULD add to a request under its wire name, disabled or
+    /// not. `None` when it has no usable name, so it can never be offered and
+    /// costs nothing either way.
+    definition: Option<ToolDefinition>,
+}
+
+impl ToolOffer<'_> {
+    /// The definition a request actually carries, if any.
+    ///
+    /// Consuming rather than borrowing, because the request path is the hot
+    /// caller: `get_tool_definitions` runs per LLM call over every tool of
+    /// every running server, and handing back a reference would make it clone
+    /// each one.
+    fn into_offered(self) -> Option<ToolDefinition> {
+        if self.disabled {
+            return None;
+        }
+        self.definition
+    }
+
+    /// Chars this tool contributes when it is offered.
+    fn chars(&self) -> usize {
+        self.definition
+            .as_ref()
+            .map_or(0, |d| tool_definitions_chars(std::slice::from_ref(d)))
+    }
+}
+
+/// Resolve every tool of one server into an offer.
+fn tool_offers<'a>(
+    server_id: &str,
+    server_name: &str,
+    tools: &'a [McpTool],
+    disabled_tools: &[String],
+) -> Vec<ToolOffer<'a>> {
+    wire_tool_names(server_id, tools)
+        .into_iter()
+        .zip(tools)
+        .map(|(wire_name, tool)| {
+            let disabled = wire_name
+                .as_ref()
+                .is_some_and(|n| disabled_tools.iter().any(|d| d == n));
+            let definition = wire_name
+                .clone()
+                .map(|n| mcp_tool_to_definition(n, server_name, tool));
+            ToolOffer {
+                tool,
+                wire_name,
+                disabled,
+                definition,
+            }
+        })
+        .collect()
+}
+
+/// Build a server's status from the tool list `tools_source` says to use.
+fn server_status(
+    server: &McpServer,
+    tools: &[McpTool],
+    tools_source: McpToolsSource,
+    running: bool,
+) -> McpServerStatus {
+    let offers = tool_offers(&server.id, &server.name, tools, &server.disabled_tools);
+
+    let chars: usize = offers
+        .iter()
+        .filter(|o| !o.disabled)
+        .map(ToolOffer::chars)
+        .sum();
+    let disabled_chars: usize = offers
+        .iter()
+        .filter(|o| o.disabled)
+        .map(ToolOffer::chars)
+        .sum();
+
+    McpServerStatus {
+        id: server.id.clone(),
+        name: server.name.clone(),
+        running,
+        auto_approve: server.auto_approve,
+        dispatchable: crate::core::mcp_servers::validate_server_id(&server.id).is_ok(),
+        tools_source,
+        tools_observed_at: server.tools_observed_at,
+        tools: offers
+            .iter()
+            .map(|o| McpToolStatus {
+                name: o.tool.name.clone(),
+                wire_name: o.wire_name.clone(),
+                description: o.tool.description.clone(),
+                disabled: o.disabled,
+                chars: o.chars(),
+                tokens: estimate_tokens_from_chars(o.chars()),
+            })
+            .collect(),
+        chars,
+        tokens: estimate_tokens_from_chars(chars),
+        disabled_chars,
+        disabled_tokens: estimate_tokens_from_chars(disabled_chars),
     }
 }
 
@@ -729,5 +1053,535 @@ mod tests {
         assert!(
             resolve_wire_tool_name("backstage", &tools, "catalog.get-catalog-entity").is_none()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Context cost
+    // -----------------------------------------------------------------------
+
+    /// A tool with a real description and schema, so the cost figures are not
+    /// all the flat per-definition overhead.
+    fn priced_tools(names: &[&str]) -> Vec<McpTool> {
+        names
+            .iter()
+            .map(|n| McpTool {
+                name: n.to_string(),
+                description: Some(format!("Does {n}, at some length, for the model to read.")),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "target": { "type": "string", "description": n } },
+                    "required": ["target"],
+                })),
+            })
+            .collect()
+    }
+
+    fn server_row(id: &str, disabled: &[&str]) -> McpServer {
+        McpServer {
+            id: id.to_string(),
+            name: format!("{id} server"),
+            command: "cmd".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_approve: false,
+            created_at: chrono::Utc::now(),
+            tools: Vec::new(),
+            tools_observed_at: None,
+            disabled_tools: disabled.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The number the page shows must be the number the request pays. Both come
+    /// from `tool_definitions_chars` over the same definitions, and this is the
+    /// guard against a second ratio appearing on the reporting side.
+    #[test]
+    fn per_server_cost_equals_tool_definitions_chars_over_the_same_definitions() {
+        let tools = priced_tools(&["alpha", "beta", "gamma"]);
+        let server = server_row("srv", &[]);
+        let status = server_status(&server, &tools, McpToolsSource::Live, true);
+
+        // Independently: the definitions this server actually contributes.
+        let definitions: Vec<ToolDefinition> = tool_offers("srv", &server.name, &tools, &[])
+            .into_iter()
+            .filter_map(|o| o.definition)
+            .collect();
+        assert_eq!(definitions.len(), 3);
+        assert_eq!(status.chars, tool_definitions_chars(&definitions));
+        assert_eq!(status.tokens, estimate_tokens_from_chars(status.chars));
+        assert!(status.chars > 0, "a real schema is not free");
+
+        // Per tool, against the same helper over one definition.
+        for (tool_status, definition) in status.tools.iter().zip(&definitions) {
+            assert_eq!(
+                tool_status.chars,
+                tool_definitions_chars(std::slice::from_ref(definition))
+            );
+            assert_eq!(
+                tool_status.tokens,
+                estimate_tokens_from_chars(tool_status.chars)
+            );
+        }
+        // The parts sum to the whole in chars. Tokens deliberately do not: the
+        // ratio is integer division, so the server figure is computed from the
+        // server's chars rather than by adding rounded per-tool figures.
+        assert_eq!(
+            status.tools.iter().map(|t| t.chars).sum::<usize>(),
+            status.chars
+        );
+    }
+
+    /// The disabled set is the lever, so it has to move cost out of the
+    /// per-request total AND out of the definitions the request carries.
+    #[test]
+    fn a_disabled_tool_leaves_the_definitions_and_moves_to_its_own_subtotal() {
+        let tools = priced_tools(&["alpha", "beta"]);
+        let all_on = server_status(&server_row("srv", &[]), &tools, McpToolsSource::Live, true);
+
+        let server = server_row("srv", &["mcp__srv__beta"]);
+        let status = server_status(&server, &tools, McpToolsSource::Live, true);
+
+        assert_eq!(
+            status.tools.iter().filter(|t| t.disabled).count(),
+            1,
+            "only the named tool is off"
+        );
+        assert!(
+            status.tools[0].wire_name.as_deref() == Some("mcp__srv__alpha")
+                && !status.tools[0].disabled
+        );
+        assert!(status.tools[1].disabled);
+
+        // The cost moved rather than vanishing, so the switch visibly pays.
+        assert_eq!(status.chars + status.disabled_chars, all_on.chars);
+        assert_eq!(status.disabled_chars, all_on.tools[1].chars);
+        assert!(status.chars < all_on.chars);
+
+        // And the definition itself is gone from what a request would carry.
+        let offered: Vec<String> = tool_offers("srv", &server.name, &tools, &server.disabled_tools)
+            .into_iter()
+            .filter_map(|o| o.into_offered().map(|d| d.name))
+            .collect();
+        assert_eq!(offered, vec!["mcp__srv__alpha".to_string()]);
+    }
+
+    /// "Never observed" and "observed, and it has nothing" both show an empty
+    /// tool list. Reporting the first as zero cost states something the engine
+    /// does not know.
+    #[test]
+    fn a_never_observed_server_is_not_a_zero_cost_one() {
+        let unobserved = server_status(
+            &server_row("a", &[]),
+            &[],
+            McpToolsSource::NeverObserved,
+            false,
+        );
+        let mut row = server_row("b", &[]);
+        row.tools_observed_at = Some(chrono::Utc::now());
+        let empty = server_status(&row, &[], McpToolsSource::Cache, false);
+
+        assert_eq!(unobserved.tools_source, McpToolsSource::NeverObserved);
+        assert!(unobserved.tools_observed_at.is_none());
+        assert_eq!(empty.tools_source, McpToolsSource::Cache);
+        assert!(empty.tools_observed_at.is_some());
+
+        // Both report zero, which is exactly why the source has to be carried.
+        assert_eq!(unobserved.chars, 0);
+        assert_eq!(empty.chars, 0);
+
+        // Neither counts toward what switching servers on would cost.
+        let totals = McpCostTotals::of(&[unobserved, empty]);
+        assert_eq!(totals.servers, 2);
+        assert_eq!(totals.running_servers, 0);
+        assert_eq!(totals.stopped_tokens, 0);
+    }
+
+    /// A server whose stored id cannot ride a wire tool name can never be
+    /// started, so its tools must not be counted as available.
+    #[test]
+    fn an_undispatchable_server_is_excluded_from_the_switch_on_total() {
+        let tools = priced_tools(&["alpha", "beta"]);
+        let mut bad = server_row("back.stage", &["mcp__back.stage__beta"]);
+        bad.tools_observed_at = Some(chrono::Utc::now());
+        let bad = server_status(&bad, &tools, McpToolsSource::Cache, false);
+
+        let mut good = server_row("slack", &[]);
+        good.tools_observed_at = Some(chrono::Utc::now());
+        let good = server_status(&good, &tools, McpToolsSource::Cache, false);
+
+        assert!(!bad.dispatchable);
+        assert!(good.dispatchable);
+        assert!(
+            bad.disabled_chars > 0,
+            "the row itself still reports what it holds"
+        );
+
+        let totals = McpCostTotals::of(&[bad.clone(), good.clone()]);
+        assert_eq!(totals.servers, 2, "it is still a registered server");
+        assert_eq!(
+            totals.stopped_chars, good.chars,
+            "only the server that CAN be switched on is counted"
+        );
+        assert_eq!(totals.stopped_tools, 2);
+        assert_eq!(
+            totals.disabled_chars, 0,
+            "re-enabling a tool on an unusable server gives nothing back, so it \
+             is not in the disabled subtotal either"
+        );
+        assert_eq!(totals.disabled_tools, 0);
+    }
+
+    /// A running server pays now; a stopped one only would. The header splits
+    /// them, and a disabled tool is in neither.
+    #[test]
+    fn totals_split_what_is_paid_from_what_would_be() {
+        let tools = priced_tools(&["alpha", "beta"]);
+        let up = server_status(
+            &server_row("up", &["mcp__up__beta"]),
+            &tools,
+            McpToolsSource::Live,
+            true,
+        );
+        let mut down_row = server_row("down", &[]);
+        down_row.tools_observed_at = Some(chrono::Utc::now());
+        let down = server_status(&down_row, &tools, McpToolsSource::Cache, false);
+
+        let totals = McpCostTotals::of(&[up.clone(), down.clone()]);
+        assert_eq!(totals.servers, 2);
+        assert_eq!(totals.running_servers, 1);
+        assert_eq!(totals.tools, 1, "one enabled tool on the running server");
+        assert_eq!(totals.chars, up.chars);
+        assert_eq!(totals.tokens, estimate_tokens_from_chars(up.chars));
+        assert_eq!(totals.stopped_tools, 2);
+        assert_eq!(totals.stopped_chars, down.chars);
+        assert_eq!(totals.disabled_tools, 1);
+        assert_eq!(totals.disabled_chars, up.disabled_chars);
+    }
+
+    // -----------------------------------------------------------------------
+    // Against a live server
+    //
+    // `McpClient::connect` spawns a real process, so "running" is only testable
+    // with one. The stub is a shell script answering the two handshake calls,
+    // the same shape as the Codex driver stubs in `runtime/codex_tests`.
+    // -----------------------------------------------------------------------
+
+    const STUB_SERVER: &str = r#"#!/bin/sh
+echo $$ > "$STUB_PID_FILE"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"stub","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$STUB_TOOLS"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"stub ran"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    struct StubServer {
+        _dir: tempfile::TempDir,
+        command: String,
+        env: HashMap<String, String>,
+        pid_file: std::path::PathBuf,
+    }
+
+    impl StubServer {
+        fn new(tools: &[McpTool]) -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let script = dir.path().join("mcp-stub.sh");
+            std::fs::write(&script, STUB_SERVER).expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let pid_file = dir.path().join("stub.pid");
+            let env = HashMap::from([
+                (
+                    "STUB_TOOLS".to_string(),
+                    serde_json::to_string(tools).unwrap(),
+                ),
+                ("STUB_PID_FILE".to_string(), pid_file.display().to_string()),
+            ]);
+            Self {
+                _dir: dir,
+                command: script.display().to_string(),
+                env,
+                pid_file,
+            }
+        }
+
+        /// Whether the spawned process is still alive. `kill -0` only probes.
+        fn is_alive(&self) -> bool {
+            let Ok(pid) = std::fs::read_to_string(&self.pid_file) else {
+                return false;
+            };
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    async fn manager_with(
+        pool: &sqlx::PgPool,
+        id: &str,
+        stub: &StubServer,
+    ) -> (McpManager, crate::engine::event_bus::EventBus) {
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        McpServerStore::register(pool, &bus, id, "Stub", &stub.command, &[], &stub.env, None)
+            .await
+            .unwrap();
+        (McpManager::new(pool.clone(), bus.clone()), bus)
+    }
+
+    /// The round trip the whole feature rests on: connect, cache what the
+    /// server said, stop it, and still answer what it costs.
+    #[tokio::test]
+    async fn a_stopped_server_still_reports_the_manifest_it_last_advertised() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+
+        // Before any connect, the tool list is unknown rather than empty.
+        let before = &manager.list_servers().await.unwrap()[0];
+        assert_eq!(before.tools_source, McpToolsSource::NeverObserved);
+        assert!(!before.running);
+        assert!(before.tools.is_empty());
+
+        let outcome = manager.start_server("stub").await.unwrap();
+        assert_eq!(outcome, McpStartOutcome::Started { tool_count: 2 });
+
+        let live = manager.list_servers().await.unwrap().remove(0);
+        assert!(live.running);
+        assert_eq!(live.tools_source, McpToolsSource::Live);
+        assert_eq!(live.tools.len(), 2);
+        assert!(live.chars > 0);
+        assert!(live.tools_observed_at.is_some());
+
+        // Starting again is idempotent and reports so.
+        assert_eq!(
+            manager.start_server("stub").await.unwrap(),
+            McpStartOutcome::AlreadyRunning { tool_count: 2 }
+        );
+
+        assert!(matches!(
+            manager.stop_server("stub").await.unwrap(),
+            McpStopOutcome::Stopped { .. }
+        ));
+        assert_eq!(
+            manager.stop_server("stub").await.unwrap(),
+            McpStopOutcome::WasNotRunning
+        );
+
+        let cached = manager.list_servers().await.unwrap().remove(0);
+        assert!(!cached.running);
+        assert_eq!(
+            cached.tools_source,
+            McpToolsSource::Cache,
+            "the manifest outlives the process"
+        );
+        assert_eq!(cached.tools.len(), 2);
+        assert_eq!(
+            cached.chars, live.chars,
+            "cost is the same whether it is read live or from the cache"
+        );
+        assert_eq!(cached.tools_observed_at, live.tools_observed_at);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A start that cannot spawn must not wipe what the page knows. A broken
+    /// server that reads as costing nothing is worse than a stale figure.
+    #[tokio::test]
+    async fn a_failed_start_leaves_the_previous_manifest_intact() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+
+        manager.start_server("stub").await.unwrap();
+        manager.stop_server("stub").await.unwrap();
+        let good = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
+        assert_eq!(good.tools.len(), 1);
+
+        // Re-register the same id onto a command that does not exist.
+        McpServerStore::register(
+            &pool,
+            &bus,
+            "stub",
+            "Stub",
+            "/nonexistent/mcp-server",
+            &[],
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(manager.start_server("stub").await.is_err());
+
+        let after = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
+        assert_eq!(after.tools.len(), 1, "the last good manifest survives");
+        assert_eq!(after.tools_observed_at, good.tools_observed_at);
+
+        let status = manager.list_servers().await.unwrap().remove(0);
+        assert!(!status.running);
+        assert_eq!(status.tools_source, McpToolsSource::Cache);
+        assert!(status.chars > 0, "a broken server is not a free one");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Switching a tool off has to reach the definitions the NEXT request
+    /// carries, not just the DB. The running snapshot is what that path reads.
+    #[tokio::test]
+    async fn disabling_a_tool_removes_it_from_a_running_server_s_definitions() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        let offered = |defs: Vec<ToolDefinition>| -> Vec<String> {
+            let mut names: Vec<String> = defs.into_iter().map(|d| d.name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            offered(manager.get_tool_definitions().await),
+            vec![
+                "mcp__stub__alpha".to_string(),
+                "mcp__stub__beta".to_string()
+            ]
+        );
+
+        manager
+            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .await
+            .unwrap()
+            .expect("the server exists");
+
+        assert_eq!(
+            offered(manager.get_tool_definitions().await),
+            vec!["mcp__stub__alpha".to_string()],
+            "a disabled tool must leave the request without a restart"
+        );
+
+        let status = manager.list_servers().await.unwrap().remove(0);
+        assert!(status.tools.iter().any(|t| t.disabled));
+        assert!(status.disabled_chars > 0);
+
+        // Clearing the set brings it straight back.
+        manager
+            .set_disabled_tools("stub", &[], None)
+            .await
+            .unwrap()
+            .expect("the server exists");
+        assert_eq!(manager.get_tool_definitions().await.len(), 2);
+
+        assert!(manager
+            .set_disabled_tools("missing", &[], None)
+            .await
+            .unwrap()
+            .is_none());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Dropping a tool from the definitions is not enforcement. A call made
+    /// before the switch is still in flight, and a resumed turn carries the old
+    /// definitions, so dispatch has to refuse it too.
+    #[tokio::test]
+    async fn a_disabled_tool_is_refused_at_dispatch_not_only_omitted() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        manager
+            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .await
+            .unwrap()
+            .expect("the server exists");
+
+        // Calling it the way an in-flight tool call would, by the wire name the
+        // model was shown before the switch.
+        let refused = manager
+            .call_tool("stub", "beta", serde_json::json!({}))
+            .await
+            .expect_err("a disabled tool must not dispatch");
+        let message = refused.to_string();
+        assert!(message.contains("mcp__stub__beta"), "{message}");
+        assert!(message.contains("switched off"), "{message}");
+        assert!(
+            message.contains("NOT run"),
+            "the model has to be told it did not happen: {message}"
+        );
+
+        // The refusal is about the switch, not the server: its sibling still
+        // reaches the process and runs.
+        let (result, server_name, _auto_approve) = manager
+            .call_tool("stub", "alpha", serde_json::json!({}))
+            .await
+            .expect("an enabled tool still dispatches");
+        assert_eq!(result, "stub ran");
+        assert_eq!(server_name, "Stub");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Remove stops the process before deleting the row. The other order leaves
+    /// a live MCP server with nothing left that names it.
+    #[tokio::test]
+    async fn removing_a_running_server_stops_the_process_first() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+        assert!(stub.is_alive(), "the stub should be up before removal");
+
+        assert!(manager.remove_server("stub", None).await.unwrap());
+
+        assert!(!stub.is_alive(), "the process must not outlive its row");
+        assert!(McpServerStore::get(&pool, "stub").await.unwrap().is_none());
+        assert!(
+            manager.get_tool_definitions().await.is_empty(),
+            "a removed server must not keep offering tools"
+        );
+        assert!(manager.list_servers().await.unwrap().is_empty());
+
+        // Removing again removes nothing, which is what the route turns into a
+        // 404 rather than a silent success.
+        assert!(!manager.remove_server("stub", None).await.unwrap());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A tool with no usable wire name is never offered, so it costs nothing
+    /// and cannot be disabled. Reporting a price for it would inflate a total
+    /// no request ever pays.
+    #[test]
+    fn a_tool_with_no_wire_name_costs_nothing() {
+        let server_id = "a".repeat(crate::core::mcp_servers::MAX_SERVER_ID_LEN);
+        let tools = priced_tools(&["one.tool", "two.tool", "three.tool"]);
+        let status = server_status(
+            &server_row(&server_id, &[]),
+            &tools,
+            McpToolsSource::Live,
+            true,
+        );
+
+        assert!(status.tools[0].wire_name.is_some());
+        assert!(status.tools[0].chars > 0);
+        for nameless in &status.tools[1..] {
+            assert!(nameless.wire_name.is_none());
+            assert_eq!(nameless.chars, 0);
+            assert!(!nameless.disabled);
+        }
+        assert_eq!(status.chars, status.tools[0].chars);
     }
 }

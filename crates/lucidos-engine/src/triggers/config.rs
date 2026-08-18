@@ -159,11 +159,12 @@ pub fn is_valid_reasoning_effort(effort: &str) -> bool {
     crate::core::preference_catalog::REASONING_EFFORTS.contains(&effort)
 }
 
-/// Normalize a submitted or stored trigger model / reasoning effort: trim, and
+/// Normalize a submitted or stored model / reasoning effort pin: trim, and
 /// read blank as "Default" (`None`). Blank is exactly how the form's Default
 /// option travels, and `Some("")` must never be stored: the chat route resolver
 /// reads any `Some` as a genuine override and would hand an empty model id to
-/// the provider.
+/// the provider. Shared with the `run_thread` spawn pins, so a trigger and a
+/// chat-spawned child read the same value the same way.
 ///
 /// Deliberately does NOT check the model against the registry, matching the
 /// `chat_model` preference (`PrefValue::Text`) and `ChatRequest.model`. A model
@@ -180,8 +181,8 @@ pub fn normalize_route_setting(raw: Option<&str>) -> Option<String> {
 /// Normalize a submitted reasoning effort and check membership of the closed
 /// tier set. Unlike the model, this vocabulary is ours, so a typo is a user
 /// error worth rejecting rather than a value to pass through. Shared by the
-/// HTTP handlers and the LLM tool so the two cannot disagree about what a valid
-/// tier is.
+/// HTTP handlers, the triggers LLM tool and the `run_thread` spawn pins, so no
+/// two of them can disagree about what a valid tier is.
 pub fn validate_trigger_reasoning_effort(raw: Option<&str>) -> Result<Option<String>, String> {
     match normalize_route_setting(raw) {
         Some(effort) if !is_valid_reasoning_effort(&effort) => Err(format!(

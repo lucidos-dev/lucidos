@@ -27,7 +27,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     },
                     "html_content": {
                         "type": "string",
-                        "description": "Initial HTML for index.html. The app must inherit the Lucidos theme, style with the theme CSS variables rather than hardcoded colors, REUSE the shared component classes rather than bare elements, and SIZE EVERYTHING IN rem, NOT px, since the user's UI-scale preference is the root font-size. load_knowhow('system-knowhow/building-an-app') for the scaffold, the token list and the component table before writing it. Opt out only for an app shipping its own complete visual identity."
+                        "description": "Initial HTML for index.html. Make it native to Lucidos: inherit the theme, theme CSS vars NOT hardcoded colors, shared component classes NOT bare elements, rem NOT px, and a fluid layout holding at PHONE WIDTH (one column first, no fixed px width, nothing top-right, where the host draws its fullscreen exit). load_knowhow('system-knowhow/building-an-app') for the scaffold, tokens, components and responsive rules. Opt out only for an app with its own complete visual identity."
                     }
                 },
                 "required": ["id", "name", "description", "html_content"]

@@ -18,7 +18,7 @@ use super::propagation::{
     reconcile_parent_active_children_count, reconcile_proposal_lifecycle_end,
     reincrement_parent_active_count_if_revived,
 };
-use crate::core::store::LegacyInitiator;
+use crate::core::store::{EventWaitSummary, LegacyInitiator};
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
@@ -61,6 +61,60 @@ fn compose_cleared_broadcast(thread_id: Uuid, compose_epoch: i64) -> BusEvent {
         },
     )
 }
+
+/// `live_event_waits` with the wait bound as `$2` removed, as a scalar
+/// expression over the row being updated. Shared by all four `EventWait*` arms:
+/// the arm filters before appending, so a replayed start replaces rather than
+/// duplicates, and each resolution is exactly this filter on its own.
+const EVENT_WAIT_WITHOUT: &str = "COALESCE((SELECT jsonb_agg(w) \
+     FROM jsonb_array_elements(live_event_waits) w \
+     WHERE w->>'wait_id' <> $2), '[]'::jsonb)";
+
+/// One `EventWait*` projection statement. `waits` is the new array expression;
+/// `extra_set` is whatever timestamp this arm owns beyond `last_activity`.
+///
+/// **`live_event_wait_count` is DERIVED from the array's length, never
+/// incremented or decremented.** That is what makes the count and the list
+/// unable to disagree, which is the whole reason the list is stored at all. Two
+/// arithmetic expressions kept side by side would still drift. A resolution
+/// naming an absent `wait_id` used to decrement the count alone, putting the
+/// Waiting dot out under a panel still showing a wait. Deriving also retires
+/// the old `GREATEST(0, ...)` floor, since an array length cannot go negative.
+///
+/// **`waits` is interpolated TWICE on purpose, and a CTE here would be a
+/// lost-update bug.** Both copies read the row's own `live_event_waits`, so
+/// Postgres evaluates them against one row version and they always agree.
+/// Reading the array into a CTE and joining it back instead pins it to the
+/// statement's snapshot, which a `SET` expression re-read never is: under READ
+/// COMMITTED the second writer re-evaluates its `SET` list against the row the
+/// first writer left, exactly as `count + 1` used to. Losing that would let an
+/// expiry racing an arm write back an array still holding the expired wait.
+fn event_wait_sql(waits: &str, extra_set: &str) -> String {
+    format!(
+        "UPDATE thread_summaries SET last_activity = NOW(), {extra_set}\
+         live_event_waits = {waits}, \
+         live_event_wait_count = jsonb_array_length({waits}) \
+         WHERE thread_id = $1"
+    )
+}
+
+/// Arm a wait: drop any entry with the same `wait_id`, then append `$3`.
+static EVENT_WAIT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    event_wait_sql(
+        &format!("({EVENT_WAIT_WITHOUT} || jsonb_build_array($3::jsonb))"),
+        "last_agent_action = NOW(), ",
+    )
+});
+
+/// Resolve a wait by delivery or expiry. Neither is a user action, so only
+/// `last_activity` moves.
+static EVENT_WAIT_DROP_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| event_wait_sql(EVENT_WAIT_WITHOUT, ""));
+
+/// The same drop, plus `last_user_action`: every cancel cause is a person
+/// pressing something.
+static EVENT_WAIT_CANCEL_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| event_wait_sql(EVENT_WAIT_WITHOUT, "last_user_action = NOW(), "));
 
 impl EventBus {
     /// Returns side-effect events to emit after the main transaction commits,
@@ -1113,24 +1167,36 @@ impl EventBus {
             // `last_user_action` is untouched too, since nothing is being asked
             // of anyone.
             //
-            // `live_event_wait_count` is the one durable fact the three
-            // resolution arms below mirror: it is how a thread that finished
-            // its turn while still watching reads as Waiting rather than as
-            // finished, on a drawer row whose events were never loaded and
-            // across a reload. Read as `count > 0` by the frontend's
-            // `resolveVisualStatus`, and by nothing else. No backend predicate
-            // consumes it, so a subscribed thread stays non-blocking,
-            // non-attention-needing and archivable (ADR 0049).
-            ThreadEvent::EventWaitStarted { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     last_agent_action = NOW(), \
-                     live_event_wait_count = live_event_wait_count + 1 \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
+            // `live_event_waits` and `live_event_wait_count` are the durable
+            // facts the three resolution arms below mirror. They are how a
+            // thread still watching after its turn ended reads as Waiting
+            // rather than as finished. That has to hold on a drawer row whose
+            // events were never loaded, and across a reload. The count is read
+            // as `count > 0` by the frontend's `resolveVisualStatus`; the list
+            // is the whole content of the subscription indicator. No backend
+            // predicate consumes either, so a subscribed thread stays
+            // non-blocking, non-attention-needing and archivable (ADR 0049).
+            //
+            // See `event_wait_sql` for why the two move as one.
+            ThreadEvent::EventWaitStarted {
+                wait_id,
+                on,
+                reason,
+                expires_at,
+                ..
+            } => {
+                let entry = EventWaitSummary {
+                    wait_id: *wait_id,
+                    on: on.clone(),
+                    reason: reason.clone(),
+                    expires_at: *expires_at,
+                };
+                sqlx::query(EVENT_WAIT_UPSERT_SQL.as_str())
+                    .bind(thread_id)
+                    .bind(wait_id.to_string())
+                    .bind(sqlx::types::Json(&entry))
+                    .execute(&mut **tx)
+                    .await?;
                 Vec::new()
             }
             // **No resolution moves the status.** A subscription never held the
@@ -1145,35 +1211,27 @@ impl EventBus {
             // cancel IS a user action, because every cancel cause is a person
             // pressing something.
             //
-            // All three DO decrement `live_event_wait_count`: the wait is gone
-            // either way, and the count is what the Waiting dot reads. The
-            // `GREATEST(0, ...)` floor is not defensive dressing. A resolution
-            // is emittable without a matching start (a test fixture, a
-            // hand-emitted row, a wait whose `EventWaitStarted` predates the
-            // column's backfill), and an unsigned count that went negative
-            // would strand the dot on forever, which is the exact failure this
-            // whole change exists to remove.
-            ThreadEvent::EventWaitDelivered { .. } | ThreadEvent::EventWaitExpired { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     live_event_wait_count = GREATEST(0, live_event_wait_count - 1) \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
+            // All three DROP the wait from `live_event_waits`, by `wait_id`,
+            // and the count follows from the array's new length. The wait is
+            // gone either way, so both the dot and the panel have to let go of
+            // it. A resolution with no matching entry (a test fixture, a
+            // hand-emitted row) leaves both columns exactly as they were,
+            // which is what `event_wait_sql` explains.
+            ThreadEvent::EventWaitDelivered { wait_id, .. }
+            | ThreadEvent::EventWaitExpired { wait_id } => {
+                sqlx::query(EVENT_WAIT_DROP_SQL.as_str())
+                    .bind(thread_id)
+                    .bind(wait_id.to_string())
+                    .execute(&mut **tx)
+                    .await?;
                 Vec::new()
             }
-            ThreadEvent::EventWaitCanceled { .. } => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), \
-                     last_user_action = NOW(), \
-                     live_event_wait_count = GREATEST(0, live_event_wait_count - 1) \
-                     WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
+            ThreadEvent::EventWaitCanceled { wait_id, .. } => {
+                sqlx::query(EVENT_WAIT_CANCEL_SQL.as_str())
+                    .bind(thread_id)
+                    .bind(wait_id.to_string())
+                    .execute(&mut **tx)
+                    .await?;
                 Vec::new()
             }
             // A question answer can RESUME a session that already idled: answering
@@ -1425,29 +1483,33 @@ impl EventBus {
         // This runs after metadata updates so upsert events have created the row.
         let thread_type = Self::get_thread_type(tx, &thread_id).await;
         let current = Self::get_current_section(tx, &thread_id).await;
-        let (depth, source, trigger_go_to_review): (i32, Option<String>, bool) = sqlx::query_as(
-            "SELECT COALESCE(depth, 0), source, COALESCE(trigger_go_to_review, FALSE) \
+        let (source, trigger_go_to_review): (Option<String>, bool) = sqlx::query_as(
+            "SELECT source, COALESCE(trigger_go_to_review, FALSE) \
              FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_optional(&mut **tx)
         .await
         .unwrap_or(None)
-        .unwrap_or((0, None, false));
-        // Trigger executions run unattended — don't surface in REVIEW. But
-        // user followups on trigger threads ARE attended (latest start =
-        // user-driven MessageReceived), and triggers with `go_to_review=true`
-        // opt back in for reports/alerts the user is meant to read.
+        .unwrap_or((None, false));
+        // A trigger execution runs unattended, so its terminal event must not
+        // surface it in REVIEW. Two things make one attended again, and both
+        // are the trigger's own. `trigger_go_to_review` ("Send to Review on
+        // completion") covers reports the user is meant to read. A user
+        // follow-up covers the rest: the latest start is a human
+        // `MessageReceived`.
+        //
+        // Depth takes no part. A sub-thread of any kind keeps the section it
+        // ran with, so a finished child stays under its parent rather than
+        // being archived by nobody.
         //
         // Engine- and agent-driven `MessageReceived` events MUST NOT count as
-        // a user follow-up — they're automated. The mode filter defaults to
+        // a user follow-up: they are automated. The mode filter defaults to
         // Human to mirror `default_mode_human` on `ThreadEvent::MessageReceived`,
         // so legacy rows persisted before the field existed still read as
         // user messages.
-        let is_top_level = if depth > 0 {
+        let is_unattended = if source.as_deref() != Some("trigger") || trigger_go_to_review {
             false
-        } else if source.as_deref() != Some("trigger") || trigger_go_to_review {
-            true
         } else {
             let human = ActorMode::Human.as_str();
             let latest_start: Option<String> = sqlx::query_scalar(
@@ -1461,9 +1523,9 @@ impl EventBus {
             .bind(human)
             .fetch_optional(&mut **tx)
             .await?;
-            latest_start.as_deref() == Some("MessageReceived")
+            latest_start.as_deref() != Some("MessageReceived")
         };
-        match resolve_transition(event.event_type(), thread_type, current, is_top_level) {
+        match resolve_transition(event.event_type(), thread_type, current, is_unattended) {
             Ok(mut transition) => {
                 // CodingAgentIdled(has_changes=false) after apply/discard is a housekeeping
                 // event — the section is already 'inbox' so setting it again is redundant.

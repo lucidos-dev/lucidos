@@ -21,7 +21,7 @@ import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
-import { followAnsweredQuestion, followSentMessage } from './scrollState';
+import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
@@ -805,6 +805,15 @@ export function PromptInput() {
     }
     setCanceledQuestion(targetId, targetQuestionId);
     setCanceledWhileAwaiting(targetId, canceledWhileAwaiting);
+    // A submit like the other four, and taken BEFORE the awaited POST because
+    // it is the button's own tap. Past the queued-upload return above, so a
+    // cancel that sent the agent nothing moves nobody.
+    //
+    // The id is passed only while the thread is ACTUALLY awaiting an answer.
+    // `findLatestPendingQuestion` has no liveness term, so it still answers with
+    // a card the agent raced past or an abort stranded. Handed that, the landing
+    // would hold on a turn that will never draw again. See `followCanceledTurn`.
+    followCanceledTurn(canceledWhileAwaiting ? targetQuestionId : undefined);
     void handleCancelExchange(targetId);
   }
 

@@ -41,9 +41,10 @@
     /* This row used to carry a `scroll-margin-bottom`, the clearance a submit's
        landing left under it when the landing rested it on the transcript's
        bottom edge (over the prompt dissolve, which would otherwise have painted
-       over the very row the landing existed to show). A submit brings its turn
-       UP now, as far as the transcript reaches, so nothing rests here and the
-       clearance had no reader left. See `landOnOwnTurn` in scrollState.ts. */
+       over the very row the landing existed to show). A submit rests on the
+       LIVE EDGE now, which the transcript's own `padding-bottom` already holds
+       clear of that dissolve, so the property has no reader. See
+       `landAtLiveEdge` in scrollState.ts, and ADR 0080. */
 }
 
 .response-executor-icon {
@@ -476,9 +477,9 @@
    it arrived mid-turn in one step either way, because a queued follow-up grows
    no reply and only qualified once the agent picked it up.
 
-   The landing measures instead of reserving: it asks for the line only when the
-   turn genuinely has a screenful under it, and otherwise asks to SHOW the turn.
-   See `landOnOwnTurn` in components/chat/scrollState.ts. */
+   What IS reserved is this container's `padding-bottom`, the room the composer
+   dissolve paints over, and a submit rests past it on the live edge. See
+   `landAtLiveEdge` in components/chat/scrollState.ts, and ADR 0080. */
 
 /* scrollToEventAndPulse lands the event at the scroll-container top, which would
    sit behind the fixed/sticky chrome stacked there ("covered a bit"). The scroll
@@ -891,6 +892,11 @@
         var(--thread-pane-gutter);
     background: var(--bg-primary);
     pointer-events: none;
+    /* OPAQUE while shown. It only ever mounts once the delay gate has decided
+       the wait is long enough to deserve a loader, so it must be readable the
+       moment it arrives. An entrance fade here is a second gate on top of that
+       one: on a wait of a few hundred ms the skeleton never reaches a legible
+       opacity, and the user sees the bare pane through it instead. */
     opacity: 1;
     transition: opacity var(--duration-normal) ease;
 }
@@ -1406,6 +1412,16 @@
    stacked alongside on the same button. */
 .question-cancel-picked.action-btn:disabled {
     align-self: flex-end;
+}
+
+/* Superseded resolution note. Deliberately quiet and unbuttoned: nobody picked
+   this outcome, so it reads as a statement of what happened, not an option
+   somebody chose. Right-aligned to sit where the Cancel affordance would. */
+.question-superseded-note {
+    align-self: flex-end;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-style: italic;
 }
 
 /* CC permission divider — body of a CodingAgentPermissionRequest initiator

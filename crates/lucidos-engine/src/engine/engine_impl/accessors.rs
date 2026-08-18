@@ -378,7 +378,7 @@ impl LucidosEngine {
     ///
     /// Every context-budget and `ContextCaptured` site goes through here rather
     /// than calling the prefix map directly — the prefix map has no rule for
-    /// OpenRouter / Gemini / local ids and silently hands them 200k, which is
+    /// OpenRouter / xAI / Gemini / local ids and silently hands them 200k, which is
     /// what made the trim loop evict context at ~8% of kimi-k3's real 1M window.
     pub(crate) fn context_window_for(&self, model: &str) -> usize {
         crate::llm::model_registry::context_window_for(&self.model_registry, model)
@@ -395,7 +395,7 @@ impl LucidosEngine {
     }
 
     /// Which provider backends are actually configured (`vertex`/`anthropic`/
-    /// `openai`/`openrouter`/`local`), or `None` to mean "don't filter" (mock /
+    /// `openai`/`openrouter`/`xai`/`local`), or `None` to mean "don't filter" (mock /
     /// no routing). Reflects a runtime swap (reads the live provider). Surfaced
     /// by `/health` as `configured_providers` so the frontend filters the model
     /// picker to providers the user has set up.

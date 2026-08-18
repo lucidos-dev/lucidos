@@ -17,6 +17,8 @@ pub struct RoutingProvider {
     anthropic: Option<Arc<AnthropicProvider>>,
     /// OpenRouter — an [`OpenAiProvider`] pointed at `openrouter.ai/api/v1`.
     openrouter: Option<Arc<OpenAiProvider>>,
+    /// xAI, an [`OpenAiProvider`] pointed at `api.x.ai/v1`, serving Grok.
+    xai: Option<Arc<OpenAiProvider>>,
     /// A generic OpenAI-compatible local server — an [`OpenAiProvider`] pointed
     /// at the configured local base URL (default Ollama).
     local: Option<Arc<OpenAiProvider>>,
@@ -25,11 +27,13 @@ pub struct RoutingProvider {
 }
 
 impl RoutingProvider {
+    #[allow(clippy::too_many_arguments)] // one argument per backend, plus the registry and default
     pub fn new(
         vertex: Option<VertexProvider>,
         openai: Option<OpenAiProvider>,
         anthropic: Option<AnthropicProvider>,
         openrouter: Option<OpenAiProvider>,
+        xai: Option<OpenAiProvider>,
         local: Option<OpenAiProvider>,
         registry: ModelRegistry,
         default_model: String,
@@ -39,6 +43,7 @@ impl RoutingProvider {
             openai: openai.map(Arc::new),
             anthropic: anthropic.map(Arc::new),
             openrouter: openrouter.map(Arc::new),
+            xai: xai.map(Arc::new),
             local: local.map(Arc::new),
             registry,
             default_model,
@@ -94,6 +99,9 @@ impl RoutingProvider {
             }),
             ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set".into()
+            }),
+            ProviderKind::XAi => self.xai.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
+                "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set".into()
             }),
             ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)".into()
@@ -155,6 +163,9 @@ impl LlmProvider for RoutingProvider {
         if self.openrouter.is_some() {
             kinds.push(ProviderKind::OpenRouter);
         }
+        if self.xai.is_some() {
+            kinds.push(ProviderKind::XAi);
+        }
         if self.local.is_some() {
             kinds.push(ProviderKind::Local);
         }
@@ -191,6 +202,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             registry,
             "claude-opus-5@default".to_string(),
         )
@@ -208,6 +220,10 @@ mod tests {
             ("gpt-5.4", ProviderKind::OpenAi),
             ("muse-glimmer:30b-mlx", ProviderKind::Local),
             ("z-ai/glm-5.2", ProviderKind::OpenRouter),
+            ("grok-4.6", ProviderKind::XAi),
+            // Grok through OpenRouter is a different row on a different
+            // backend, and must keep resolving there.
+            ("x-ai/grok-4.6", ProviderKind::OpenRouter),
         ]);
         for (model, expected) in [
             ("claude-opus-5@default", "max"),
@@ -216,6 +232,8 @@ mod tests {
             ("gpt-5.4", "xhigh"),
             ("muse-glimmer:30b-mlx", "high"),
             ("z-ai/glm-5.2", "high"),
+            ("grok-4.6", "high"),
+            ("x-ai/grok-4.6", "high"),
         ] {
             assert_eq!(
                 router.effort_for_model(model, Some("max")),
@@ -225,14 +243,21 @@ mod tests {
         }
     }
 
-    /// The regression, at the layer that prevents it. A local model's turn must
-    /// never carry `xhigh`, whichever tier the caller asked for.
+    /// The regression, at the layer that prevents it. A turn on a server that is
+    /// not OpenAI's must never carry the OpenAI-proprietary `xhigh`, whichever
+    /// tier the caller asked for. The local model is the case that failed; xAI
+    /// is the same shape, an OpenAI-compatible third party.
     #[test]
-    fn a_local_model_never_leaves_the_chokepoint_carrying_xhigh() {
-        let router = router(&[("muse-glimmer:30b-mlx", ProviderKind::Local)]);
-        for effort in crate::llm::reasoning::EFFORT_LADDER {
-            let sent = router.effort_for_model("muse-glimmer:30b-mlx", Some(effort));
-            assert_ne!(sent, Some("xhigh"), "asked for {effort}");
+    fn a_third_party_model_never_leaves_the_chokepoint_carrying_xhigh() {
+        let router = router(&[
+            ("muse-glimmer:30b-mlx", ProviderKind::Local),
+            ("grok-4.6", ProviderKind::XAi),
+        ]);
+        for model in ["muse-glimmer:30b-mlx", "grok-4.6"] {
+            for effort in crate::llm::reasoning::EFFORT_LADDER {
+                let sent = router.effort_for_model(model, Some(effort));
+                assert_ne!(sent, Some("xhigh"), "{model} asked for {effort}");
+            }
         }
     }
 

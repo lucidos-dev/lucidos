@@ -1,4 +1,4 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
@@ -11,31 +11,34 @@ import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { focusThread } from './threads';
 import type { Change } from '../../api/client';
 
-/** Shared key for the engine-restart PROGRESS toast (initiateEngineRestart) and
- *  the restart FAILURE toast. It NO LONGER carries a pre-switch "New version
- *  available" warning — that surface is owned solely by the poll-driven
+/** Key of the restart FAILURE toast, and of nothing else now.
+ *
+ *  The progress it used to share the key with is a dialog, and a pre-switch
+ *  "New version available" warning belongs solely to the poll-driven
  *  engine-new-version toast (engine-update.ts), which fires only once the
  *  background rebuild is actually `ready`. */
-export const RESTART_TOAST_KEY = 'restart-required';
+export const RESTART_FAILURE_TOAST_KEY = 'restart-required';
 export const RESTART_LS_KEY = 'lucidos-restart-required';
 
 export const RESTART_GROUPS_LS_KEY = 'lucidos-restart-groups';
 const LEGACY_RESTART_REASONS_LS_KEY = 'lucidos-restart-reasons';
 
-/** Marks that an engine restart is IN FLIGHT (vs. merely pending). `engineRestarting`
- *  and the two-phase progress toast are in-memory only, so a page reload mid-restart
- *  would otherwise lose them and `restoreRestartToast` would wrongly fall back to the
- *  pre-restart "Engine restart required" warning. This key lets restore re-show the
- *  PROGRESS toast instead. Payload: the engine's `started_at` BEFORE the restart (so
- *  completion can be detected as a `started_at` change after reload — restore seeds
- *  it back into engineStartedAt) and `packaged` (so the restored phase matches the
- *  live initial message: packaged has no build step). */
+/** Marks that an engine restart is IN FLIGHT (vs. merely pending).
+ *  `engineRestarting` is in-memory, so a page reload mid-restart would otherwise
+ *  lose it and `restoreRestartState` would wrongly fall back to the pre-restart
+ *  "Engine restart required" warning. This key lets restore re-raise the
+ *  PROGRESS DIALOG instead.
+ *
+ *  It carries the `started_at` from BEFORE the restart. Completion is then still
+ *  detectable as a change to it after the reload, since restore seeds it back
+ *  into engineStartedAt. It carries `newVersion` too, so the restored dialog
+ *  keeps the title the restart started with. */
 export const RESTART_IN_FLIGHT_LS_KEY = 'lucidos-restart-in-flight';
 
 interface RestartInFlight {
   startedAt: string | null;
-  /** Whether this restart delivers a new engine version — restores the correct
-   *  progress-toast wording (new-version vs. plain) on a mid-restart reload. */
+  /** Whether this restart delivers a new engine version, which restores the
+   *  correct dialog title (new-version vs. plain) on a mid-restart reload. */
   newVersion: boolean;
 }
 
@@ -50,7 +53,7 @@ function markRestartInFlight(newVersion: boolean): void {
 
 /** Clear the in-flight marker. MUST be called at every site where
  *  `engineRestarting` flips back to false (reconnect success, restart timeout,
- *  spawn-failure revert) so a restored progress toast can never hang. Exported
+ *  spawn-failure revert) so a restored progress dialog can never hang. Exported
  *  for connection.ts's completion/timeout paths. */
 export function clearRestartInFlight(): void {
   localStorage.removeItem(RESTART_IN_FLIGHT_LS_KEY);
@@ -73,7 +76,7 @@ function readRestartInFlight(): RestartInFlight | null {
 }
 
 /** Record an applied change as part of a thread group, mark the engine as
- *  needing a restart, and refresh the toast. Merges into the existing group
+ *  needing a restart, and re-sync that state. Merges into the existing group
  *  for `threadId` (concat new commits, dedupe, refresh title) or appends.
  *  Empty commits are kept so the user still sees that the thread contributed. */
 export function addRestartGroup(group: RestartGroup): void {
@@ -93,7 +96,7 @@ export function addRestartGroup(group: RestartGroup): void {
   }
   persistRestartGroups();
   restartRequired.value = true;
-  syncRestartToast();
+  syncRestartState();
 }
 
 function dedupePreservingOrder(items: string[]): string[] {
@@ -118,22 +121,7 @@ function persistRestartGroups(): void {
   }
 }
 
-/** Progress text for the in-flight restart status toast. The restart only respawns
- *  (Apply rebuilt the binary in the background / the updater already installed it),
- *  so there is no build phase at restart time and the message stays stable for the
- *  whole window. Its wording depends on whether the restart actually delivers a NEW
- *  engine version vs. a plain respawn of the running one — a plain restart (the
- *  reload glyph / SystemPage "Restart engine?" with nothing pending) must NOT claim
- *  "Starting new version…". */
-const RESTART_NEW_VERSION_MESSAGE = 'Starting new version…';
-const RESTART_PLAIN_MESSAGE = 'Restarting engine…';
-
-/** The progress message for a restart, chosen by whether it delivers a new version. */
-function restartProgressMessage(newVersion: boolean): string {
-  return newVersion ? RESTART_NEW_VERSION_MESSAGE : RESTART_PLAIN_MESSAGE;
-}
-
-/** Set restarting state, show info toast, and trigger the engine restart.
+/** Set restarting state, raise the progress dialog, and trigger the restart.
  *
  *  Routing by mode (the `packaged` signal comes from /health):
  *   - packaged + Tauri  → `restart_service` Tauri command runs
@@ -147,11 +135,11 @@ function restartProgressMessage(newVersion: boolean): string {
  *  `engineRestarting` on reconnect (started_at change). */
 export async function initiateEngineRestart(): Promise<void> {
   // Single version surface: the switch replaces the poll-driven "New version
-  // available → Switch to new version" toast with the progress toast below.
-  // Remove it here (the canonical switch entry point) so every path (the toast's
-  // own button, the menu's Refresh row, the SystemPage dialog) collapses
-  // to one toast instead of stacking "Starting new version…" on top of the
-  // still-visible "New version available." toast. Use removeToast (structural),
+  // available → Switch to new version" toast with the progress dialog. Remove
+  // it here, at the canonical switch entry point, so every path collapses to
+  // one surface: the toast's own button, the menu's Refresh row, and the
+  // SystemPage dialog. Otherwise "New version available." sits behind the modal
+  // that supersedes it. Use removeToast (structural),
   // NOT dismissToast: clicking Switch is ACTING on the prompt, not deferring it,
   // so it must not mark this on-disk build dismissed (which would suppress the
   // toast for a build still sitting on disk if the switch then FAILS). The badge
@@ -160,38 +148,36 @@ export async function initiateEngineRestart(): Promise<void> {
   // affordance regardless. A successful switch clears the signal via
   // connection.ts's engineRestarted path anyway.
   removeToast(NEW_VERSION_TOAST_KEY);
-  // Same collapse for the "frontend change applies on Switch" hint — the switch
-  // the user just started IS what delivers that queued change, so fold it into
-  // the progress toast rather than leaving it stacked. removeToast (structural),
-  // not dismissToast, for the same acting-not-deferring reason as above.
+  // Same collapse for the "frontend change applies on Switch" hint: the switch
+  // the user just started IS what delivers that queued change, so it goes with
+  // the rest. removeToast (structural), not dismissToast, for the same
+  // acting-not-deferring reason as above.
   removeToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY);
-  // Decide the progress wording from the SAME predicate that drives the switch
-  // badge (engineNewVersionReady) — so the toast can never disagree with the badge,
-  // and can only claim a new version when the engine's own version check says the
+  // Decide the wording from the SAME predicate that drives the switch badge
+  // (engineNewVersionReady), so the dialog can never disagree with the badge. It
+  // claims a new version only when the engine's own version check says the
   // running binary and the one we'll respawn onto actually differ: in dev the
   // running build-id vs the on-disk build-id (version-status `update_available`,
-  // once the rebuild is ready); packaged, the installed vs latest release. A plain
-  // restart (reload glyph / SystemPage with nothing newer) reads "Restarting
-  // engine…"; a genuine switch reads "Starting new version…". No lies.
+  // once the rebuild is ready); packaged, the installed vs latest release. A
+  // plain restart (reload glyph / SystemPage with nothing newer) reads
+  // "Restarting engine"; a genuine switch reads "Starting new version". No lies.
   const newVersion = engineNewVersionReady();
+  // Set BEFORE the flag the dialog rides, so its first render already has the
+  // right title rather than flashing the plain one.
+  engineRestartNewVersion.value = newVersion;
   engineRestarting.value = true;
   // Persist the in-flight state so a page reload mid-restart restores the
-  // PROGRESS toast (restoreRestartToast) instead of the pre-restart warning.
+  // PROGRESS DIALOG (restoreRestartState) instead of the pre-restart warning.
   // Records the pre-restart started_at so reconnect detection still fires after
   // the reload (the everOrRestarting gate in connection.ts), plus `newVersion` so
-  // the restored toast keeps the correct wording. Cleared at every engineRestarting
+  // the restored dialog keeps its title. Cleared at every engineRestarting
   // flip-false site below + in connection.ts.
   markRestartInFlight(newVersion);
-  // Light, dismissible status toast — the UI is NOT deactivated during a restart
-  // anymore (the gateway boot splash + GET-gate + SSE reconnect make it a
-  // recoverable non-event), so this is just a "why is it briefly unresponsive"
-  // hint the user can dismiss. It carries a spinner (spinning: true) to signal
-  // ongoing work. The wording is stable for the whole window (no build phase at
-  // restart time) and is chosen by `newVersion` above. showWhileUnavailable: true
-  // keeps it visible past the central suppression in showToast (which still eats
-  // read-path / SW-update noise during the window); the key de-dupes and lets
-  // started_at detection dismiss it on reconnect.
-  showToast(restartProgressMessage(newVersion), 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
+  // No toast: the restart takes the workspace away, so it owns the modal
+  // progress dialog instead (docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md).
+  // Nothing raises it here either. It is derived from `engineRestarting` above,
+  // which is what makes it impossible to leave up: every path that clears the
+  // flag closes it, including the ones this function never reaches.
   try {
     if (enginePackaged.value && isTauri()) {
       // Drive launchd directly from the desktop shell — works even if the
@@ -207,7 +193,7 @@ export async function initiateEngineRestart(): Promise<void> {
       // Revert the indicator so the UI doesn't freeze on "Restarting…".
       engineRestarting.value = false;
       clearRestartInFlight();
-      showToast(`Restart failed: ${e.reason}`, 'error', { key: RESTART_TOAST_KEY });
+      showToast(`Restart failed: ${e.reason}`, 'error', { key: RESTART_FAILURE_TOAST_KEY });
       return;
     }
     if (typeof e === 'string') {
@@ -215,7 +201,7 @@ export async function initiateEngineRestart(): Promise<void> {
       // still alive — revert the indicator and surface the reason.
       engineRestarting.value = false;
       clearRestartInFlight();
-      showToast(`Restart failed: ${e}`, 'error', { key: RESTART_TOAST_KEY });
+      showToast(`Restart failed: ${e}`, 'error', { key: RESTART_FAILURE_TOAST_KEY });
       return;
     }
     // Network rejection after a 2xx: the engine is being killed.
@@ -273,11 +259,11 @@ function isEngineOutdated(): boolean {
  *  (client-update.ts holds a client refresh until after the engine switch), which
  *  is a separate concern from that visible badge.
  *
- *  An in-flight restart owns RESTART_TOAST_KEY via the two-phase progress toast
- *  (initiateEngineRestart / restoreRestartToast) — leave it untouched here so a
- *  re-sync (SSE reconnect, startup/resume refreshChangesState, a freshly-applied
- *  ChangeApplied → addRestartGroup) can't wipe the progress toast. */
-export function syncRestartToast(): void {
+ *  An in-flight restart owns the progress dialog, which is derived from
+ *  `engineRestarting`. This function must not touch that flag, so a re-sync (SSE
+ *  reconnect, startup/resume refreshChangesState, a freshly-applied
+ *  ChangeApplied → addRestartGroup) cannot close a dialog mid-restart. */
+export function syncRestartState(): void {
   if (engineRestarting.value) {
     if (restartRequired.value) localStorage.setItem(RESTART_LS_KEY, 'true');
     return;
@@ -288,10 +274,9 @@ export function syncRestartToast(): void {
     localStorage.removeItem(RESTART_LS_KEY);
     restartGroups.value = [];
     persistRestartGroups();
-    // Clear any lingering keyed toast (e.g. a stale restart-failure toast) once
-    // the pending state resolves; the progress toast is excluded by the
-    // engineRestarting guard above.
-    dismissToast(RESTART_TOAST_KEY);
+    // Clear a lingering restart-failure toast once the pending state resolves.
+    // An in-flight restart never reaches here: it returns at the guard above.
+    dismissToast(RESTART_FAILURE_TOAST_KEY);
   }
 }
 
@@ -305,27 +290,30 @@ function restoreRestartGroupsFromStorage(): void {
   }
 }
 
-/** Restore the restart toast from localStorage on startup. Called before the
- *  async refreshChangesState() so the toast is visible immediately, even if the
- *  API call is slow or fails.
+/** Restore the restart state from localStorage on startup. Called before the
+ *  async refreshChangesState() so the dialog is up immediately, even if the API
+ *  call is slow or fails.
  *
  *  Two cases, in priority order:
  *   1. A restart was IN FLIGHT when the page unloaded (the user reloaded
- *      mid-restart). Restore the PROGRESS toast + `engineRestarting`, and resume
- *      completion detection so checkConnection still fires "Engine restarted" on
- *      reconnect. This takes precedence — re-showing the pre-restart warning here
- *      would nag the user to start a restart already underway.
+ *      mid-restart). Restore `engineRestarting`, which raises the PROGRESS
+ *      DIALOG, and resume completion detection so checkConnection still fires
+ *      "Engine restarted" on reconnect. This takes precedence, since re-showing
+ *      the pre-restart warning would nag about a restart already underway.
  *   2. A restart is merely PENDING (`RESTART_LS_KEY`). Restore `restartRequired`
- *      + the restart groups so the brand badge and restart confirm dialog
- *      reappear. No toast — the engine "New version available" toast is owned by
- *      the poll (engine-update.ts) once the rebuild is `ready`. */
-export function restoreRestartToast(): void {
+ *      and the restart groups so the brand badge and restart confirm dialog
+ *      reappear. Nothing is surfaced: the engine "New version available" toast
+ *      is owned by the poll (engine-update.ts) once the rebuild is `ready`. */
+export function restoreRestartState(): void {
   localStorage.removeItem(LEGACY_RESTART_REASONS_LS_KEY);
 
   const inFlight = readRestartInFlight();
   if (inFlight) {
     restoreRestartGroupsFromStorage();
     restartRequired.value = true;
+    // Restore the title the restart started with, before the flag the dialog
+    // rides, so the reloaded page never shows the wrong one for a frame.
+    engineRestartNewVersion.value = inFlight.newVersion;
     engineRestarting.value = true;
     // Seed the pre-restart started_at so checkConnection's completion check sees
     // the new engine's started_at as a genuine restart (and NOT the dev build
@@ -334,18 +322,17 @@ export function restoreRestartToast(): void {
     // (see the everOrRestarting gate in connection.ts), so completion still fires
     // and the flag can't hang.
     engineStartedAt.value = inFlight.startedAt;
-    // Restore the same stable progress wording initiateEngineRestart chose (from
-    // the persisted `newVersion`); checkConnection clears it all on reconnect.
-    // syncRestartToast is intentionally NOT called — the engineRestarting guard
-    // would suppress it anyway.
-    showToast(restartProgressMessage(inFlight.newVersion), 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
+    // Nothing else to raise: the dialog follows `engineRestarting`, and
+    // checkConnection clears it all on reconnect. syncRestartState is
+    // intentionally NOT called, since its engineRestarting guard would return
+    // immediately anyway.
     return;
   }
 
   if (localStorage.getItem(RESTART_LS_KEY) === 'true') {
     restoreRestartGroupsFromStorage();
     restartRequired.value = true;
-    syncRestartToast();
+    syncRestartState();
   }
 }
 
@@ -458,7 +445,7 @@ export function refreshChangesState(): void {
       // served /sw.js. Lighting it from "a frontend change was applied since page
       // load" led the real update (the rebuilt bundle may not be served yet) and
       // could disagree with the toast.
-      syncRestartToast();
+      syncRestartState();
     })
     .catch(e => {
       // Browser-cancelled fetch (AbortError) OR a transport-layer TypeError

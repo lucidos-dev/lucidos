@@ -1,6 +1,6 @@
 import type { Ref, VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { progressDialog } from '../../store/store';
+import { activeProgressDialog } from '../../store/store';
 import type { ProgressDialogState } from '../../store/types';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
@@ -65,7 +65,7 @@ export function progressDialogBody(props: {
  *  the dismiss was a no-op. That keeps the user's click from being swallowed on
  *  a surface that cannot be dismissed anyway. */
 export function ProgressDialog() {
-  const state = progressDialog.value;
+  const state = activeProgressDialog.value;
   const panelRef = useRef<HTMLDivElement>(null);
 
   useHidePanelWebviewWhile(state.visible);

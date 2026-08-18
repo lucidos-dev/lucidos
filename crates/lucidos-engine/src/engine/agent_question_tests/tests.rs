@@ -234,6 +234,30 @@ async fn ensure_resume_skips_emit_for_canceled_answer() {
     teardown_test_db(&db_name).await;
 }
 
+/// The follow-up that superseded the question is itself mid-flight through
+/// `process_message_with_steps_internal`, and it spawns its own `--resume` when
+/// the subprocess is dead. A `ContinuationRequested` here would race that.
+#[tokio::test]
+async fn ensure_resume_skips_emit_for_superseded_answer() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let emitted =
+        ensure_resume_after_answer(&bus, &sessions, thread_id, &AnswerKind::Superseded, None).await;
+    assert!(
+        !emitted,
+        "the follow-up drives the next turn, so a Continue here would race it"
+    );
+    assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Live subprocess answer: arm the run-loop resume signal so the turn CC
 /// continues (via the PreToolUse hook, off the `msg_tx` path) re-arms emission
 /// instead of dropping its output as post-terminal stragglers.
@@ -329,6 +353,34 @@ async fn arm_question_resume_skips_canceled_even_when_live() {
     );
 }
 
+/// Superseded is the one ending kind that DOES arm. The session is not being
+/// torn down: it wakes, finishes the turn it was in, and reads the follow-up
+/// after that. Its post-answer events need the same re-arming a real answer's
+/// do, or the run loop drops them as post-terminal stragglers.
+#[tokio::test]
+async fn arm_question_resume_arms_superseded_on_live_session() {
+    let thread_id = Uuid::new_v4();
+    let mut map = HashMap::new();
+    let (session, _msg_rx) = make_session(false);
+    map.insert(thread_id, session); // live
+    let sessions = Arc::new(tokio::sync::Mutex::new(map));
+
+    let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Superseded).await;
+    assert!(
+        armed,
+        "a superseded session keeps running, so it must be armed"
+    );
+    assert!(
+        sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .unwrap()
+            .question_resume_pending,
+        "without the flag the turn's post-answer output is dropped as stragglers"
+    );
+}
+
 /// Cancel-stamp path (HTTP `claude_code_stop`, `archive_thread`) always
 /// follows the Canceled answer with `stop_agent`, so the marker would
 /// strand on the timeline as an empty `Thinking ✓` placeholder under
@@ -355,6 +407,35 @@ async fn emit_resume_marker_skips_emit_for_canceled_answer() {
     assert!(
         !emitted,
         "Canceled answer must not emit a resume marker — no CC turn follows"
+    );
+    assert_eq!(count_coding_agent_prompt_sent(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The follow-up that superseded the question emits its own
+/// `CodingAgentPromptSent` moments later, and that is the Thinking placeholder.
+/// A marker here would leave two of them for one turn.
+#[tokio::test]
+async fn emit_resume_marker_skips_emit_for_superseded_answer() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    let emitted = emit_resume_marker_for_cc_answer(
+        &bus,
+        thread_id,
+        &AnswerKind::Superseded,
+        None,
+        crate::runtime::CodingAgent::ClaudeCode,
+    )
+    .await;
+    assert!(
+        !emitted,
+        "the follow-up's own prompt is the placeholder, so this one would double up"
     );
     assert_eq!(count_coding_agent_prompt_sent(&pool, thread_id).await, 0);
 
@@ -643,6 +724,46 @@ fn canceled_returns_explicit_marker_not_empty_object() {
     assert_eq!(out, serde_json::json!({"Fav color?": "(canceled)"}));
 }
 
+/// A superseded question must not read as canceled, and must not read as empty.
+/// The model has to learn two things from one string: nobody answered, and the
+/// reply it should work from is arriving as its next input.
+#[test]
+fn superseded_tells_the_model_the_reply_arrives_as_its_next_input() {
+    let answer = serde_json::json!({"kind": "Superseded"});
+    let out = build_hook_answers(&[answer], &questions());
+    let value = out["Fav color?"].as_str().expect("string answer");
+    assert!(
+        value.starts_with("(superseded)"),
+        "must be marked superseded, got {value:?}"
+    );
+    assert!(
+        value.contains("next input"),
+        "must point at the message that replaced the question, got {value:?}"
+    );
+    assert_ne!(value, "(canceled)");
+}
+
+/// The trailing cards of a superseded batch are resolved by padding rows, and
+/// `walk_question_batch` carries that padding into the returned kinds. So the
+/// agent reads "superseded" for every card, never `build_hook_answers`'
+/// `(canceled)` gap-filler, which would say the user abandoned them.
+#[test]
+fn a_superseded_batch_reads_superseded_for_every_card() {
+    let two = serde_json::json!([
+        {"question": "Fav color?", "options": [{"label": "Red"}]},
+        {"question": "Fav animal?", "options": [{"label": "Cat"}]},
+    ]);
+    let superseded = serde_json::json!({"kind": "Superseded"});
+    let out = build_hook_answers(&[superseded.clone(), superseded], &two);
+    for key in ["Fav color?", "Fav animal?"] {
+        let value = out[key].as_str().expect("string answer");
+        assert!(
+            value.starts_with("(superseded)"),
+            "{key} must read superseded, got {value:?}"
+        );
+    }
+}
+
 #[test]
 fn missing_label_falls_back_to_option_id() {
     let answer = serde_json::json!({"kind": "Selected", "option_id": "opt-9"});
@@ -802,13 +923,22 @@ fn synth_question_id_format_is_outer_hash_q_index() {
 }
 
 #[test]
-fn is_canceled_answer_only_matches_explicit_canceled_kind() {
-    assert!(is_canceled_answer(&serde_json::json!({"kind": "Canceled"})));
-    assert!(!is_canceled_answer(
-        &serde_json::json!({"kind": "Selected", "option_id": "opt-0"})
-    ));
-    assert!(!is_canceled_answer(&serde_json::json!({})));
-    assert!(!is_canceled_answer(&serde_json::Value::Null));
+fn batch_ending_answer_matches_only_the_two_ending_kinds() {
+    assert_eq!(
+        batch_ending_answer(&serde_json::json!({"kind": "Canceled"})),
+        Some(AnswerKind::Canceled)
+    );
+    assert_eq!(
+        batch_ending_answer(&serde_json::json!({"kind": "Superseded"})),
+        Some(AnswerKind::Superseded),
+        "a follow-up that replaced the question ends the whole batch, not just this card"
+    );
+    assert_eq!(
+        batch_ending_answer(&serde_json::json!({"kind": "Selected", "option_id": "opt-0"})),
+        None
+    );
+    assert_eq!(batch_ending_answer(&serde_json::json!({})), None);
+    assert_eq!(batch_ending_answer(&serde_json::Value::Null), None);
 }
 
 #[test]

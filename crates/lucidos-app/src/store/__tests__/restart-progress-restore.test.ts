@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { connectionStatus, toasts, restartRequired, restartGroups, engineStartedAt, engineRestarting, updateAvailable } from '../store';
-import { restoreRestartToast, syncRestartToast, RESTART_LS_KEY, RESTART_IN_FLIGHT_LS_KEY, RESTART_GROUPS_LS_KEY } from '../actions/chat-changes';
+import { connectionStatus, toasts, restartRequired, restartGroups, engineStartedAt, engineRestarting, engineRestartNewVersion, activeProgressDialog, updateAvailable } from '../store';
+import { restoreRestartState, syncRestartState, RESTART_LS_KEY, RESTART_IN_FLIGHT_LS_KEY, RESTART_GROUPS_LS_KEY } from '../actions/chat-changes';
 
 // Mock dependencies so checkConnection runs in isolation. Mirrors
 // restart-toast-reconnect.test.ts, but this file deliberately NEVER calls an
@@ -38,11 +38,10 @@ vi.mock('../actions/notifications', () => ({
 
 const { checkConnection } = await import('../actions/connection');
 
-const RESTART_TOAST_KEY = 'restart-required';
 const STARTED_AT = '2026-06-28T06:00:00Z';
 const RESTARTED_AT = '2026-06-28T07:00:00Z';
-const NEW_VERSION_MESSAGE = 'Starting new version…';
-const PLAIN_MESSAGE = 'Restarting engine…';
+const NEW_VERSION_TITLE = 'Starting new version';
+const PLAIN_TITLE = 'Restarting engine';
 
 function loadedHealth(overrides: Record<string, unknown> = {}) {
   return {
@@ -54,19 +53,20 @@ const unreachable = { status: 'failed', error: 'Failed to fetch' };
 
 /** Seed localStorage as if a restart was in flight when the page unloaded, then
  *  reset the signals to fresh-reload defaults and run the startup restore.
- *  `newVersion` mirrors what initiateEngineRestart persisted — whether the restart
- *  delivers a new engine version (→ "Starting new version…") or is a plain respawn
- *  (→ "Restarting engine…"). */
+ *  `newVersion` mirrors what initiateEngineRestart persisted: whether the
+ *  restart delivers a new engine version (→ "Starting new version") or is a
+ *  plain respawn (→ "Restarting engine"). */
 function reloadMidRestart(newVersion: boolean): void {
-  // syncRestartToast set RESTART_LS_KEY; initiateEngineRestart set the in-flight marker.
+  // syncRestartState set RESTART_LS_KEY; initiateEngineRestart set the in-flight marker.
   localStorage.setItem(RESTART_LS_KEY, 'true');
   localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify({ startedAt: STARTED_AT, newVersion }));
   connectionStatus.value = 'connecting';
   engineStartedAt.value = null;
   engineRestarting.value = false;
+  engineRestartNewVersion.value = false;
   restartRequired.value = false;
   toasts.value = [];
-  restoreRestartToast();
+  restoreRestartState();
 }
 
 beforeEach(() => {
@@ -74,6 +74,7 @@ beforeEach(() => {
   connectionStatus.value = 'connecting';
   engineStartedAt.value = null;
   engineRestarting.value = false;
+  engineRestartNewVersion.value = false;
   restartRequired.value = false;
   restartGroups.value = [];
   updateAvailable.value = false;
@@ -83,18 +84,18 @@ beforeEach(() => {
   localStorage.removeItem(RESTART_GROUPS_LS_KEY);
 });
 
-describe('restart progress toast survives a reload (in-flight marker)', () => {
-  it('restores the PROGRESS toast (not the warning) and re-arms restart state', () => {
+describe('restart progress dialog survives a reload (in-flight marker)', () => {
+  it('restores the PROGRESS DIALOG (not the warning) and re-arms restart state', () => {
     reloadMidRestart(true);
 
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
-    expect(toast!.spinning).toBe(true);
-    // NOT the pre-restart "Engine restart required" warning — that one carries a
-    // Restart action; the progress toast has none.
-    expect(toast!.action).toBeUndefined();
-    expect(toast!.type).toBe('info');
+    const dialog = activeProgressDialog.value;
+    expect(dialog.visible).toBe(true);
+    expect(dialog.title).toBe(NEW_VERSION_TITLE);
+    // A restart cannot be called back, so the dialog offers no way out of it.
+    expect(dialog.cancel).toBeUndefined();
+    // No toast either: the pre-restart "Engine restart required" warning would
+    // nag the user to start a restart already underway.
+    expect(toasts.value).toHaveLength(0);
 
     // State re-armed so checkConnection can detect the completion across the reload.
     expect(engineRestarting.value).toBe(true);
@@ -102,13 +103,13 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     expect(restartRequired.value).toBe(true);
   });
 
-  it('restores the plain "Restarting engine…" wording when no new version is delivered', () => {
+  it('restores the plain "Restarting engine" title when no new version is delivered', () => {
     reloadMidRestart(false);
 
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(PLAIN_MESSAGE);
+    expect(activeProgressDialog.value.title).toBe(PLAIN_TITLE);
   });
 
-  it('carries the restored toast to "Engine restarted" on reconnect with a new started_at', async () => {
+  it('carries the restored dialog to "Engine restarted" on reconnect with a new started_at', async () => {
     reloadMidRestart(true);
     expect(engineRestarting.value).toBe(true);
 
@@ -118,33 +119,32 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     await checkConnection();
 
     expect(engineRestarting.value).toBe(false);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
+    expect(activeProgressDialog.value.visible).toBe(false);
     expect(toasts.value.find(t => t.message === 'Engine restarted')).toBeTruthy();
-    // Both markers cleared so a later reload won't restore a stale progress toast.
+    // Both markers cleared so a later reload won't restore a stale dialog.
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
     expect(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)).toBeNull();
   });
 
-  it('keeps the restored progress toast up (unchanged) when the old engine goes unreachable', async () => {
+  it('keeps the restored dialog up (unchanged) when the old engine goes unreachable', async () => {
     reloadMidRestart(true);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(NEW_VERSION_MESSAGE);
+    expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
 
-    // Old engine killed → a /health failure must NOT dismiss or reword the toast
-    // (there is no build→swap phase transition); it stays with its spinner.
+    // Old engine killed. A /health failure must NOT close or reword the dialog,
+    // since there is no build to swap phase transition.
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
-    expect(toast!.spinning).toBe(true);
-    // Still restarting — the flag must NOT clear on a mere disconnect.
+    expect(activeProgressDialog.value.visible).toBe(true);
+    expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
+    // Still restarting: the flag must NOT clear on a mere disconnect.
     expect(engineRestarting.value).toBe(true);
   });
 
   it('does not hang: even a stale marker self-heals on the next connect', async () => {
     // The clear was somehow missed: the restart already finished, but the marker
-    // survived. Restore shows the toast, then the first poll sees a different
-    // started_at and completes — engineRestarting can never hang.
+    // survived. Restore raises the dialog, then the first poll sees a different
+    // started_at and completes. engineRestarting can never hang.
     reloadMidRestart(false);
 
     mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
@@ -154,36 +154,36 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
     expect(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)).toBeNull();
   });
 
-  it('a re-sync that flips restartRequired false does NOT dismiss the restored progress toast', () => {
+  it('a re-sync that flips restartRequired false does NOT close the restored dialog', () => {
     // After restore, the startup refreshChangesState resolves with the applied
-    // change no longer pending (restart_required=false) and calls syncRestartToast.
-    // While engineRestarting is true, that must leave the progress toast alone —
-    // otherwise the user reloaded mid-restart and the toast vanishes.
+    // change no longer pending (restart_required=false) and calls
+    // syncRestartState. While engineRestarting is true that must leave the
+    // dialog alone, or a user who reloaded mid-restart watches it vanish.
     reloadMidRestart(true);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)!.message).toBe(NEW_VERSION_MESSAGE);
+    expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
 
     restartRequired.value = false; // backend: applied change dropped out of pending
-    syncRestartToast();
+    syncRestartState();
 
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toBe(NEW_VERSION_MESSAGE);
+    expect(activeProgressDialog.value.visible).toBe(true);
+    expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
     expect(engineRestarting.value).toBe(true);
   });
 
-  it('cold start with only a PENDING restart (no in-flight marker) restores state, not a toast', () => {
-    // No in-flight marker — a restart is merely pending, not underway. There is no
-    // pre-switch toast anymore; restore re-arms restartRequired so the
-    // brand badge + restart confirm dialog reappear. The engine "New
-    // version available → Switch" toast is owned by the poll (engine-update.ts).
+  it('cold start with only a PENDING restart (no in-flight marker) surfaces nothing', () => {
+    // No in-flight marker: a restart is merely pending, not underway. Restore
+    // re-arms restartRequired so the brand badge and the restart confirm dialog
+    // reappear. The engine "New version available → Switch" toast is owned by
+    // the poll (engine-update.ts).
     localStorage.setItem(RESTART_LS_KEY, 'true');
     engineRestarting.value = false;
     toasts.value = [];
 
-    restoreRestartToast();
+    restoreRestartState();
 
     expect(restartRequired.value).toBe(true);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
+    expect(activeProgressDialog.value.visible).toBe(false);
+    expect(toasts.value).toHaveLength(0);
     expect(engineRestarting.value).toBe(false);
   });
 });

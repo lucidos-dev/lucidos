@@ -32,6 +32,15 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "enum": ["child", "top"],
                         "description": "'child' (default): this thread resumes with the result. 'top': fire-and-forget, for work the user will read rather than you. ('sub' is an alias.)"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Chat model id, e.g. 'claude-sonnet-5'. Omit for the account default; a mechanical subtask wants a cheaper one and less thinking."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": crate::llm::EFFORT_LADDER,
+                        "description": "Thinking budget. Omit for the account default."
                     }
                 },
                 "required": ["prompt"]
@@ -281,6 +290,37 @@ mod tests {
                 "{name}'s title description must state what the title is FOR:\n{title}"
             );
         }
+    }
+
+    /// Both route pins are optional and neither may join `required`: a caller
+    /// that names only one still inherits the account default for the other.
+    /// The effort enum is the ladder itself rather than a copy, so the schema
+    /// cannot offer a tier `validate_trigger_reasoning_effort` would reject.
+    #[test]
+    fn run_thread_offers_optional_model_and_reasoning_effort_pins() {
+        let tools = spawn_tools();
+        let run_thread = tools
+            .iter()
+            .find(|tool| tool.name == tn::RUN_THREAD)
+            .expect("run_thread tool must be registered");
+
+        assert_eq!(
+            run_thread.parameters["properties"]["model"]["type"],
+            "string"
+        );
+        let effort = &run_thread.parameters["properties"]["reasoning_effort"];
+        assert_eq!(effort["type"], "string");
+        assert_eq!(
+            effort["enum"],
+            serde_json::json!(crate::llm::EFFORT_LADDER),
+            "the offered tiers must be the unified ladder"
+        );
+        assert_eq!(
+            run_thread.parameters["required"],
+            serde_json::json!(["prompt"]),
+            "only the prompt is required: both route pins fall back to the \
+             account preference"
+        );
     }
 
     /// The `folder`-less form means "edit Lucidos itself", which only exists on

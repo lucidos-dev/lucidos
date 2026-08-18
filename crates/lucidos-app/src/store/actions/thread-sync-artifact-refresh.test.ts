@@ -28,7 +28,7 @@ vi.mock('./compose', () => ({
 vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow: vi.fn() }));
 vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsent: vi.fn() }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
-vi.mock('./chat-changes', () => ({ syncRestartToast: vi.fn(), addRestartGroup: vi.fn() }));
+vi.mock('./chat-changes', () => ({ syncRestartState: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // `./devices` is pulled in during the static import phase (via `../store`), so

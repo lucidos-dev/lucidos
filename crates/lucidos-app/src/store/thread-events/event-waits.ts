@@ -20,8 +20,16 @@ export const AWAIT_EVENT_TOOL = 'await_event';
  *  0049). The `await_event` `ToolResult` that used to *detach* a wait here is
  *  now just the call's own result and carries no meaning for this list.
  *
- *  Pure and total over the event stream, so replay reconstructs exactly the
- *  same set that live SSE built incrementally. */
+ *  **The fold is for immediacy, not for truth.** The server carries the same
+ *  list on every thread summary and every per-event aggregate, and both
+ *  overwrite `meta.liveEventWaits` wholesale. This is what applies an arm or a
+ *  resolution the instant its event lands.
+ *
+ *  Idempotent by `wait_id`, so it converges with those snapshots rather than
+ *  fighting them: an append replaces a same-id entry in place, and a
+ *  resolution filters, which is a no-op once the snapshot already dropped it.
+ *  Pure and total over the event stream too, so replay reconstructs exactly
+ *  the same set that live SSE built incrementally. */
 export function eventWaitProjection(
   meta: ThreadMeta,
   event: ThreadEvent | TransientEvent,

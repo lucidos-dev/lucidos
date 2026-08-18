@@ -34,9 +34,12 @@
 //!   would show tiers that send an identical request.
 //! - **OpenAI**: GPT-5.6 (Sol / Terra / Luna) accepts a distinct `max`; earlier
 //!   families top out at `xhigh`.
-//! - **OpenRouter / Local**: an arbitrary third-party server sits behind these,
-//!   so only the tiers that are universal to the OpenAI-compatible wire format
-//!   are offered. `xhigh` is OpenAI-proprietary and is never sent.
+//! - **OpenRouter / xAI / Local**: a server other than OpenAI's sits behind
+//!   these, so only the tiers universal to the OpenAI-compatible wire format
+//!   are offered. `xhigh` is OpenAI-proprietary and is never sent. xAI accepts
+//!   a `reasoning_effort` on the same wire format, but which level names it
+//!   validates is unverified here, so it takes the conservative set: the clamp
+//!   only ever narrows, and an unsupported level is what earns a 400.
 
 use crate::llm::anthropic_wire::requires_adaptive_thinking;
 use crate::llm::model_registry::ProviderKind;
@@ -58,7 +61,7 @@ const ALL_TIERS: &[&str] = EFFORT_LADDER;
 const NO_XHIGH: &[&str] = &["none", "low", "medium", "high", "max"];
 /// OpenAI before GPT-5.6: tops out at `xhigh`.
 const THROUGH_XHIGH: &[&str] = &["none", "low", "medium", "high", "xhigh"];
-/// Gemini, OpenRouter and local servers: nothing above `high` is distinct
+/// Gemini, OpenRouter, xAI and local servers: nothing above `high` is distinct
 /// (Gemini) or universally accepted (the OpenAI-compatible third parties).
 const THROUGH_HIGH: &[&str] = &["none", "low", "medium", "high"];
 
@@ -84,7 +87,7 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
                 THROUGH_XHIGH
             }
         }
-        ProviderKind::OpenRouter | ProviderKind::Local => THROUGH_HIGH,
+        ProviderKind::OpenRouter | ProviderKind::XAi | ProviderKind::Local => THROUGH_HIGH,
     }
 }
 
@@ -226,12 +229,17 @@ mod tests {
     /// case: the rule that made this fail keyed on the id alone.
     #[test]
     fn third_party_openai_compatible_servers_never_see_xhigh() {
-        for provider in [ProviderKind::OpenRouter, ProviderKind::Local] {
+        for provider in [
+            ProviderKind::OpenRouter,
+            ProviderKind::XAi,
+            ProviderKind::Local,
+        ] {
             for model in [
                 "muse-glimmer:30b-mlx",
                 "z-ai/glm-5.2",
                 "moonshotai/kimi-k3",
                 "llama3.1",
+                "grok-4.6",
                 // A local server is free to serve an OpenAI-shaped id; the
                 // server, not the id, decides the vocabulary.
                 "gpt-5.6-sol",
@@ -349,6 +357,7 @@ mod tests {
             (ProviderKind::OpenAi, "gpt-5.6-sol"),
             (ProviderKind::OpenAi, "gpt-5.4"),
             (ProviderKind::OpenRouter, "z-ai/glm-5.2"),
+            (ProviderKind::XAi, "grok-4.6"),
             (ProviderKind::Local, "muse-glimmer:30b-mlx"),
         ];
         for (provider, model) in cases {

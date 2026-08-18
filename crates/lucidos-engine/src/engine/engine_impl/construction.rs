@@ -391,6 +391,7 @@ impl LucidosEngine {
                                     &engine.event_bus,
                                     thread_id,
                                     Some(settle_actor),
+                                    crate::engine::claude_code::SettleTerminal::StuckProjection,
                                 )
                                 .await
                                 {

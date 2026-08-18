@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use crate::mcp::{McpStartOutcome, McpStopOutcome};
 use std::collections::HashMap;
 
 impl LucidosEngine {
@@ -61,15 +62,62 @@ impl LucidosEngine {
                 for s in &statuses {
                     let status = if s.running { "running" } else { "stopped" };
                     let approve = if s.auto_approve { ", auto-approve" } else { "" };
+                    let unusable = if s.dispatchable {
+                        ""
+                    } else {
+                        ", id cannot be used on the wire (remove it)"
+                    };
                     output.push_str(&format!(
-                        "\n- {} (id: {}) — {}{}\n",
-                        s.name, s.id, status, approve
+                        "\n- {} (id: {}): {}{}{}\n",
+                        s.name, s.id, status, approve, unusable
                     ));
-                    if s.running && !s.tools.is_empty() {
+
+                    // Wire names, because that is what a call has to use. The
+                    // server's own spelling is shown only where it differs.
+                    let prefix = format!("mcp__{}__", s.id);
+                    let offered: Vec<String> = s
+                        .tools
+                        .iter()
+                        .filter(|t| !t.disabled)
+                        .filter_map(|t| {
+                            let wire = t.wire_name.as_deref()?;
+                            Some(match wire.strip_prefix(&prefix) {
+                                Some(part) if part != t.name => format!("{} ({})", wire, t.name),
+                                _ => wire.to_string(),
+                            })
+                        })
+                        .collect();
+                    if !offered.is_empty() {
+                        // A stopped server pays nothing today, so its figure is
+                        // conditional and has to read that way. The source says
+                        // how old the list is, since a cached one can be stale.
+                        let cost = if s.running {
+                            format!("live, ~{} tokens per request", s.tokens)
+                        } else {
+                            format!("last observed, ~{} tokens if started", s.tokens)
+                        };
                         output.push_str(&format!(
-                            "  Tools ({}): {}\n",
-                            s.tool_count,
-                            s.tools.join(", ")
+                            "  Tools ({}, {}): {}\n",
+                            offered.len(),
+                            cost,
+                            offered.join(", ")
+                        ));
+                    } else if s.tools_source == crate::mcp::McpToolsSource::NeverObserved {
+                        output.push_str("  Tools: never observed, start it to find out\n");
+                    }
+
+                    let disabled: Vec<&str> = s
+                        .tools
+                        .iter()
+                        .filter(|t| t.disabled)
+                        .filter_map(|t| t.wire_name.as_deref())
+                        .collect();
+                    if !disabled.is_empty() {
+                        output.push_str(&format!(
+                            "  Disabled ({}, ~{} tokens saved): {}\n",
+                            disabled.len(),
+                            s.disabled_tokens,
+                            disabled.join(", ")
                         ));
                     }
                 }
@@ -81,10 +129,17 @@ impl LucidosEngine {
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                self.mcp_manager
-                    .start_server(id)
-                    .await
-                    .map_err(|e| format!("Failed to start MCP server: {}", e).into())
+                match self.mcp_manager.start_server(id).await {
+                    Ok(McpStartOutcome::AlreadyRunning { tool_count }) => Ok(format!(
+                        "MCP server '{}' is already running with {} tools.",
+                        id, tool_count
+                    )),
+                    Ok(McpStartOutcome::Started { tool_count }) => Ok(format!(
+                        "MCP server '{}' started with {} tools available.",
+                        id, tool_count
+                    )),
+                    Err(e) => Err(format!("Failed to start MCP server: {}", e).into()),
+                }
             }
 
             "stop_mcp_server" => {
@@ -92,10 +147,15 @@ impl LucidosEngine {
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                self.mcp_manager
-                    .stop_server(id)
-                    .await
-                    .map_err(|e| format!("Failed to stop MCP server: {}", e).into())
+                match self.mcp_manager.stop_server(id).await {
+                    Ok(McpStopOutcome::Stopped { name }) => {
+                        Ok(format!("MCP server '{}' stopped.", name))
+                    }
+                    Ok(McpStopOutcome::WasNotRunning) => {
+                        Ok(format!("MCP server '{}' is not running.", id))
+                    }
+                    Err(e) => Err(format!("Failed to stop MCP server: {}", e).into()),
+                }
             }
 
             "remove_mcp_server" => {
@@ -103,10 +163,14 @@ impl LucidosEngine {
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                self.mcp_manager
-                    .remove_server(id)
-                    .await
-                    .map_err(|e| format!("Failed to remove MCP server: {}", e).into())
+                // No actor: this handler is not given the calling thread, the
+                // same as every other mutation in this file. The HTTP route
+                // stamps the device.
+                match self.mcp_manager.remove_server(id, None).await {
+                    Ok(true) => Ok(format!("MCP server '{}' removed.", id)),
+                    Ok(false) => Ok(format!("MCP server '{}' not found.", id)),
+                    Err(e) => Err(format!("Failed to remove MCP server: {}", e).into()),
+                }
             }
 
             _ => Ok(format!("Unknown MCP management tool: {}", name)),

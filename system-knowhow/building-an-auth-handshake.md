@@ -18,6 +18,12 @@ Four layer types are supported:
 
 For a single static header (Bearer token, API key, basic auth) reach for `static_credential` — see `system-knowhow/lucidos-cli.md` § `lucidos proxy`. The other three layers cost more (a Python interpreter, a per-request crypto compute, or a WASM instance), so don't pick them when a static header would do.
 
+**Don't know the API's shape yet?** If it is a site the user is logged into and
+there is no public API to read, derive one: drive it once in the browser, watch
+what the page calls, and turn that into an entry plus an endpoint catalog. See
+`system-knowhow/deriving-an-api-from-a-site.md`, then come back here to pick the
+layer.
+
 ## Decision tree
 
 1. **Single header that doesn't rotate** → `static_credential` (bearer / api_key / basic / query_param). Done.

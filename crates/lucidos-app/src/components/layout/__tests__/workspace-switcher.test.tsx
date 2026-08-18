@@ -135,20 +135,36 @@ describe('the Workspaces row', () => {
     expect(text).not.toContain('brand-menu-value-chevron');
   });
 
-  it('holds the pill, marker included, before the workspace label lands', () => {
+  it('keeps the pill and its chevron before the workspace label lands', () => {
     // The chevron rides INSIDE the pill, so dropping the pill dropped the only
-    // thing saying the row expands, and the row then grew both under the user's
-    // finger the moment /health answered.
+    // thing saying the row expands, and the row grew both at once when /health
+    // answered.
     const text = row({ workspaceName: null });
-    expect(text).toContain('brand-menu-value-name');
-    expect(text).toContain('sk-bar');
+    expect(text).toContain('brand-menu-value');
     expect(text).toContain('brand-menu-value-chevron');
   });
 
-  it('holds it on the link-out row too, where the marker is the check', () => {
+  it('keeps it on the link-out row too, where the marker is the check', () => {
     const text = row({ canList: false, workspaceName: null });
-    expect(text).toContain('sk-bar');
+    expect(text).toContain('brand-menu-value');
     expect(text).toContain('brand-menu-value-check');
+  });
+
+  it('draws no placeholder in the empty pill, on either row', () => {
+    // An iOS PWA is evicted constantly, so the pre-/health window is the common
+    // case and a shimmer there fired on almost every launch.
+    expect(row({ workspaceName: null })).not.toContain('sk-bar');
+    expect(row({ canList: false, workspaceName: null })).not.toContain('sk-bar');
+  });
+
+  it('trails the marker, so a late label cannot drag it sideways', () => {
+    // The pill is right-anchored and grows leftward, so a LEADING marker moves
+    // by the whole name width when the label lands. That is the shift the empty
+    // pill exists to avoid, and the check shape used to reintroduce it.
+    const chevron = row();
+    expect(chevron.indexOf('dev')).toBeLessThan(chevron.indexOf('brand-menu-value-chevron'));
+    const check = row({ canList: false });
+    expect(check.indexOf('dev')).toBeLessThan(check.indexOf('brand-menu-value-check'));
   });
 
   it('stays a static label with no gateway at all', () => {

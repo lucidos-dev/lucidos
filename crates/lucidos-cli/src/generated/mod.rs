@@ -728,7 +728,7 @@ pub fn dispatch_thread_queue(ws: &Workspace, cmd: ThreadQueueCmd) -> Result<(), 
     }
 }
 
-/// Non-secret environment variables injected into every subprocess Lucidos spawns, effective on the next one with no restart. They appear in logs and events, so use request_credential for an API key, token or password.
+/// Non-secret environment variables. A subprocess Lucidos spawns sees a change on its next spawn, no restart. The engine's own env gets them only at startup, so an engine-read var needs an engine restart. They appear in logs and events, so use request_credential for an API key, token or password.
 #[derive(clap::Subcommand)]
 pub enum EnvVarsCmd {
     /// Every variable with its value.
@@ -798,7 +798,7 @@ pub enum ModelsCmd {
         /// Lower sorts first; user models default to 1000.
         #[arg(long)]
         sort_order: Option<i64>,
-        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
     },
@@ -819,7 +819,7 @@ pub enum ModelsCmd {
         /// Whether the model is enabled (shown in the picker).
         #[arg(long)]
         enabled: Option<bool>,
-        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
     },
@@ -903,6 +903,57 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
                 .delete(&url)
                 .query(&query)
                 .json(&serde_json::json!({}));
+            send_and_print("DELETE", &url, req)
+        }
+    }
+}
+
+/// Manage MCP (Model Context Protocol) servers. web_search first for the right package and command.
+#[derive(clap::Subcommand)]
+pub enum McpCmd {
+    /// List all configured MCP servers with their status (running/stopped) and available tools.
+    List,
+    /// Start a stopped MCP server by its id. (requires: id)
+    Start {
+        /// MCP server id, as shown by `list`.
+        #[arg(long)]
+        id: String,
+    },
+    /// Stop a running MCP server by its id. (requires: id)
+    Stop {
+        /// MCP server id, as shown by `list`.
+        #[arg(long)]
+        id: String,
+    },
+    /// Remove an MCP server configuration (stops it first if running). (requires: id)
+    Remove {
+        /// MCP server id, as shown by `list`.
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// Execute a `lucidos mcp <op>` command against the parent workspace.
+pub fn dispatch_mcp(ws: &Workspace, cmd: McpCmd) -> Result<(), BoxError> {
+    match cmd {
+        McpCmd::List => {
+            let url = format!("{}/api/v1/mcp/servers", ws.base_url());
+            let req = client()?.get(&url);
+            send_and_print("GET", &url, req)
+        }
+        McpCmd::Start { id } => {
+            let url = format!("{}/api/v1/mcp/servers/{}/start", ws.base_url(), id);
+            let req = client()?.post(&url).json(&serde_json::json!({}));
+            send_and_print("POST", &url, req)
+        }
+        McpCmd::Stop { id } => {
+            let url = format!("{}/api/v1/mcp/servers/{}/stop", ws.base_url(), id);
+            let req = client()?.post(&url).json(&serde_json::json!({}));
+            send_and_print("POST", &url, req)
+        }
+        McpCmd::Remove { id } => {
+            let url = format!("{}/api/v1/mcp/servers/{}", ws.base_url(), id);
+            let req = client()?.delete(&url).json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }

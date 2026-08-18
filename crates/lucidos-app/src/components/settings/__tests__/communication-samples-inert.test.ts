@@ -20,9 +20,17 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const samples = readFileSync(resolve(here, '../communicationSamples.ts'), 'utf-8');
 const page = readFileSync(resolve(here, '../CommunicationSurfacesPage.tsx'), 'utf-8');
 
-/** Every module the samples are allowed to reach. Anything else is either an
- *  action or a route, and neither belongs on a preview page. */
-const ALLOWED_IMPORTS = ['../../store/store', '../shared/Dropdown'];
+/** Every module the samples are allowed to reach at RUNTIME. Anything else is
+ *  either an action or a route, and neither belongs on a preview page.
+ *
+ *  `progressDialogCopy` is on the list because it is pure copy, reaching no
+ *  action at all. That is what lets a sample render the shipped wording rather
+ *  than a hand-written imitation of it. */
+const ALLOWED_IMPORTS = [
+  '../../store/store',
+  '../../store/progressDialogCopy',
+  '../shared/Dropdown',
+];
 
 /** Names that perform the operations the gallery only depicts. Matched as whole
  *  words so a sample's own `sampleRestartDialog` is not read as a restart. */
@@ -41,8 +49,12 @@ const FORBIDDEN = [
   'fetch',
 ];
 
+/** The modules the samples pull IN AT RUNTIME. An `import type` line is
+ *  skipped, since types are erased at compile time. Such a line carries no code
+ *  a sample could call, and a shape a sample builds must be named from
+ *  somewhere. */
 function importedModules(source: string): string[] {
-  return [...source.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]);
+  return [...source.matchAll(/(^|\n)import\s+(?!type\s)[^;]*?from\s+'([^']+)'/g)].map((m) => m[2]);
 }
 
 describe('the communication-surface gallery is inert', () => {

@@ -1,7 +1,7 @@
 import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, hasContentEvents, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -16,8 +16,6 @@ import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { forcedSkeletonThreadId, releaseForcedSkeleton, shouldHoldForSkeleton } from '../../components/chat/threadSkeletonGate';
-import { nextPaint } from '../../utils/nextPaint';
 import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads. Hundreds of
@@ -78,7 +76,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgent: info.coding_agent || undefined,
       state: info.state,
       latestTodoList: null,
-      liveEventWaits: [],
+      liveEventWaits: info.live_event_waits ?? [],
     },
     events: new Map(),
     streamingBuffer: '',
@@ -208,6 +206,20 @@ export function upsertThread(
     existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
     existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
     existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
+    // The *event wait* list, under the SAME staleness guard as status, and for
+    // the same reason: both directions lose real state. A GET fired before a
+    // wait was armed would blank it. One fired before its delivery would
+    // resurrect a dead wait, countdown and all.
+    //
+    // The guard is exact here. All four `EventWait*` projection arms bump
+    // `last_activity`, and all four are 'activity' in `EVENT_CLASSIFICATION`.
+    // So an arm or a resolution applied over SSE has already advanced
+    // `meta.updatedAt` past this snapshot's `apiTime`.
+    //
+    // Absence is not emptiness: an older engine or a partial test fixture
+    // omits the field, and must leave a populated list alone. Only an explicit
+    // `[]` clears it, which is the reported bug's repair.
+    if (info.live_event_waits && !statusSnapshotStale) existing.meta.liveEventWaits = info.live_event_waits;
     existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
     existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
     existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
@@ -864,21 +876,11 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         const fetchStart = performance.now();
         const snapshot = await fetchThreadEvents(threadId);
         const fetchMs = performance.now() - fetchStart;
-        // Put the skeleton on screen before a big snapshot is applied, and let
-        // the browser paint it. The write below triggers the fold and the
-        // markdown pass in ONE synchronous render, and nothing paints while
-        // that runs. A snapshot landing inside `SPINNER_DELAY_MS` would
-        // otherwise cancel a skeleton that never got a frame, leaving the pane
-        // blank for the whole render (see `shouldHoldForSkeleton`). The flag is
-        // released in this function's `finally`, on every exit.
-        if (shouldHoldForSkeleton({
-          focused: threadId === focusedThreadId.value,
-          snapshotEventCount: snapshot.events.length,
-          hasContent: hasContentEvents(thread.events) || thread.pendingUserMessages.length > 0,
-        })) {
-          forcedSkeletonThreadId.value = threadId;
-          await nextPaint();
-        }
+        // The rows are applied straight through, and nothing here may raise
+        // the skeleton ahead of the delay gate. Doing so shows a loader
+        // instantly and then blocks the paint with the fold, which is how it
+        // gets reported. ADR 0081 carries the whole decision.
+        //
         // Re-read from current map — the map reference may have changed
         // during the async fetch (other threads loaded/updated).
         const current = threadMap.value.get(threadId);
@@ -973,10 +975,6 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   } finally {
     // Only while this attempt still owns the slot (see `fetchAttemptSeq`).
     if (loadingThreads.get(threadId) === attemptToken) loadingThreads.delete(threadId);
-    // The one guaranteed exit, so a forced skeleton cannot outlive the load
-    // that raised it: a success, a failure, a retry giving up, and the
-    // restarting-engine bail all pass through here.
-    releaseForcedSkeleton(threadId);
   }
 }
 

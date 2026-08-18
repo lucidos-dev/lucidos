@@ -51,6 +51,7 @@ mod settings;
 pub mod sse_connections;
 pub(crate) mod target_workspace;
 mod thread_queue;
+pub(crate) mod thread_reach;
 mod threads;
 mod threads_compose;
 mod trigger_groups;
@@ -65,7 +66,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{any, get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -616,14 +617,14 @@ pub struct CreateModelRequest {
     #[serde(default)]
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
-    /// "openrouter" | "local". Validated by `settings::valid_provider`.
+    /// "openrouter" | "xai" | "local". Validated by `settings::valid_provider`.
     pub provider: String,
     /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
     pub sort_order: Option<i32>,
     /// Context window in tokens. Omit to let the engine infer it from the model
     /// id — only worth setting for ids the id-shape fallback gets wrong (every
-    /// OpenRouter / Gemini / local model, which otherwise takes 200k).
+    /// OpenRouter / xAI / Gemini / local model, which otherwise takes 200k).
     #[serde(default)]
     pub context_window: Option<i32>,
 }

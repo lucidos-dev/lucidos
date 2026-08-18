@@ -6,11 +6,11 @@ import { contextViewer } from '../../../store/store';
 import type { ContextCapture, ResponseEvent } from '../../../store/types';
 
 /** The context counter on a step row. In a narrow row the full
- *  "178k / 1000k (18%)" does not fit beside the description, and the row is
+ *  "178k / 1M (18%)" does not fit beside the description, and the row is
  *  `nowrap`, so the compact form keeps only the percentage. */
 describe('contextLabel', () => {
   it('full: used, window and percent', () => {
-    expect(contextLabel(178_000, 1_000_000, null, false)).toBe('178k / 1000k (18%)');
+    expect(contextLabel(178_000, 1_000_000, null, false)).toBe('178k / 1M (18%)');
   });
 
   it('compact: the percentage alone', () => {
@@ -56,7 +56,7 @@ describe('InlineStep context suffix', () => {
 
   it('renders both forms, each under the class the width gate keys on', () => {
     const rendered = text();
-    expect(rendered).toContain('<span class="step-context-full">178k / 1000k (18%)</span>');
+    expect(rendered).toContain('<span class="step-context-full">178k / 1M (18%)</span>');
     expect(rendered).toContain('<span class="step-context-compact">18%</span>');
   });
 });

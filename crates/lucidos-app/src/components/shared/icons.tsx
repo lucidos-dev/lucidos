@@ -204,26 +204,32 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
-/** An arrow coming down onto a LINE it cannot pass: the *standing follow*'s
- *  toggle, in the prompt area. The line is the live edge and the arrow is the
- *  reader being held against it, which is the conventional stick-to-the-end mark.
+/** A horseshoe MAGNET, poles UP: the *standing follow*'s toggle, in the
+ *  prompt area. It says stick to the live edge, where the chevron beside it
+ *  says go there once.
  *
- *  Deliberately NOT `ChevronDownIcon`, which the scroll button keeps. The two
- *  controls do two different things and stopped being one button precisely
- *  because they cannot be: the chevron NAVIGATES to the bottom, this one STAYS
- *  there. Sharing a glyph would say they are the same act.
+ *  It was an arrow coming down onto a line, and that glyph is `DownloadIcon`.
+ *  The two are not far apart: Download wears it on the thread header's
+ *  "Download thread" row, one row above this composer. A labelled menu item can
+ *  carry a shared mark. An icon-only toggle cannot, so the toggle is the one
+ *  that moved.
  *
- *  No inline size, unlike the two chevrons above: this renders inside `.icon-btn`,
- *  whose class sizes the svg and whose rule bans an inline size for that reason
- *  (see `FullResponseIcon`). Drawn with the shaft short and the line full width,
- *  so at `--icon-size-md` the two marks stay separate rather than smudging, which
- *  is the failure `CollapseTurnIcon` records for three horizontal marks. */
+ *  Deliberately NOT `ChevronDownIcon`, which the scroll button keeps. Those two
+ *  stopped being one button precisely because they cannot be: the chevron
+ *  NAVIGATES to the bottom, this one STAYS there.
+ *
+ *  No inline size, unlike the two chevrons above. This renders inside
+ *  `.icon-btn`, whose class sizes the svg and whose rule bans an inline size
+ *  for that reason (see `FullResponseIcon`). Poles UP is a legibility call.
+ *  Inverted, the bands land beside the leg ends and smudge into one foot,
+ *  the failure `CollapseTurnIcon` records. Up, they sit against open space
+ *  and stay separate down to 14px. */
 export function FollowLiveEdgeIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="12" y1="4" x2="12" y2="13"/>
-      <polyline points="7 9 12 14 17 9"/>
-      <line x1="5" y1="19" x2="19" y2="19"/>
+      <path d="M4 4v8a8 8 0 0 0 16 0V4h-5v8a3 3 0 0 1-6 0V4z"/>
+      <path d="M4 8h5"/>
+      <path d="M15 8h5"/>
     </svg>
   );
 }

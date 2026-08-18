@@ -709,6 +709,21 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// Which of a server's tools are switched off changed. `disabled_tools` is
+    /// the resulting set in full, by WIRE name, not a delta: the user picks a
+    /// selection, and one event that states it is easier to read back than a
+    /// pair of added/removed lists.
+    ///
+    /// Its own variant rather than a field on `McpServerUpdated`, which is an
+    /// auto-approve change. A disabled tool leaves every request, so this moves
+    /// the agent's tool surface the way `McpServerRemoved` does for a whole
+    /// server.
+    McpServerDisabledToolsChanged {
+        server_id: String,
+        disabled_tools: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// An MCP server was unregistered and its tools left the agent's surface.
     McpServerRemoved {
         server_id: String,
@@ -1022,6 +1037,7 @@ impl SystemEvent {
                 | Self::ModelDeleted { .. }
                 | Self::McpServerRegistered { .. }
                 | Self::McpServerUpdated { .. }
+                | Self::McpServerDisabledToolsChanged { .. }
                 | Self::McpServerRemoved { .. }
                 | Self::OAuthAccountConnected { .. }
                 | Self::OAuthAccountDeleted { .. }
@@ -1120,6 +1136,7 @@ impl SystemEvent {
             Self::ModelDeleted { .. } => "ModelDeleted",
             Self::McpServerRegistered { .. } => "McpServerRegistered",
             Self::McpServerUpdated { .. } => "McpServerUpdated",
+            Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
             Self::McpServerRemoved { .. } => "McpServerRemoved",
             Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
@@ -1220,6 +1237,7 @@ impl SystemEvent {
         "ModelDeleted",
         "McpServerRegistered",
         "McpServerUpdated",
+        "McpServerDisabledToolsChanged",
         "McpServerRemoved",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
@@ -1314,6 +1332,7 @@ impl SystemEvent {
             }
             Self::McpServerRegistered { .. }
             | Self::McpServerUpdated { .. }
+            | Self::McpServerDisabledToolsChanged { .. }
             | Self::McpServerRemoved { .. } => "mcp_server",
             Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
                 "oauth_account"
@@ -1426,6 +1445,7 @@ impl SystemEvent {
             | Self::ModelDeleted { id, .. } => id.clone(),
             Self::McpServerRegistered { server_id, .. }
             | Self::McpServerUpdated { server_id, .. }
+            | Self::McpServerDisabledToolsChanged { server_id, .. }
             | Self::McpServerRemoved { server_id, .. } => server_id.clone(),
             Self::OAuthAccountConnected { account_id, .. }
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),

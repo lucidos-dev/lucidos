@@ -85,14 +85,14 @@ describe('the transcript fades leave the scroll gutter alone', () => {
     expect(decl(block(contentCss, '.prompt-area {'), 'box-shadow')).toBeNull();
   });
 
-  it('parks nothing AT that dissolve: the send landing goes to the top instead', () => {
-    // `.response-header` used to declare a `scroll-margin-bottom`, because
-    // `landOnOwnTurn` (components/chat/scrollState.ts) rested a turn's agent
-    // status line on the transcript's bottom edge, which is under the band above
-    // and would have painted over the very row the landing existed to show.
-    // A submit lands its turn's TOP on the line at the other end now, so nothing
-    // is parked against the dissolve and the clearance has no reader. Pinned so
-    // it cannot come back without the landing that needs it.
+  it('parks nothing AT that dissolve: the send landing clears it by the padding', () => {
+    // `.response-header` used to declare a `scroll-margin-bottom`. The landing
+    // rested a turn's agent status line on the transcript's bottom edge, which
+    // is under the band above. It would have painted over the very row the
+    // landing existed to show. A submit rests on the LIVE EDGE now
+    // (`landAtLiveEdge`, ADR 0080), which the transcript's own padding-bottom
+    // already holds clear of the band. So the clearance has no reader. Pinned
+    // so it cannot come back without the landing that needs it.
     expect(decl(block(responseCss, '.response-header {'), 'scroll-margin-bottom')).toBeNull();
   });
 });

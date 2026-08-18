@@ -170,6 +170,34 @@ async fn test_section_inbox_on_child_complete() {
         "parent should be 'inbox' after child completes"
     );
 
+    // The child keeps the inbox state it ran with. Archiving it here would
+    // write a value no event produced, and the drawer would then dim the row
+    // as if the user had archived it.
+    let child_status: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        child_status, "inbox",
+        "a finished chat sub-thread must not be archived by the contract layer"
+    );
+
+    // The projection has to be derivable from the events, so assert the
+    // absence directly: no archive event exists to justify an archived row.
+    let archive_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1::text AND event_type = 'ThreadArchived'",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        archive_events, 0,
+        "nothing archived the child, so nothing may record that it did"
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

@@ -46,6 +46,11 @@ What you get by default is **native to Lucidos**, not a bare HTML form. Every ne
   `.action-btn-confirm` / `.action-btn-danger` / `.action-btn-secondary` variants),
   `.list-row`, `.label`, and friends, so controls match the host shell.
 - **Sizes in `rem`**, so it respects your font-size / UI-scale preference.
+- **Works on your phone**, not just at desk width. The layout starts as one column
+  and grows into more where there is room. Rows of controls wrap rather than
+  overflow, and wide tables stack into cards. The agent also keeps the top-right
+  corner free, because that is where Lucidos draws the exit button when you send an
+  app fullscreen.
 
 A minimal app the agent might start from looks like this:
 
@@ -54,6 +59,7 @@ A minimal app the agent might start from looks like this:
 <html>
   <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Habit Tracker</title>
     <script src="/api/v1/sdk-prefs.js"></script>
     <link rel="stylesheet" href="/api/v1/sdk-iframe.css">

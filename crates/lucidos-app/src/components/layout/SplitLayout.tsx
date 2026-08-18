@@ -1,7 +1,7 @@
-import { useRef, useCallback } from 'preact/hooks';
+import { useRef, useCallback, useLayoutEffect } from 'preact/hooks';
 import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
 import { focusPane } from '../../store/actions/pane';
-import { setSplitRatio, clampSplitRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
+import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
 import { splitBounds } from '../../store/paneMinimums';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import type { ComponentChildren } from 'preact';
@@ -16,6 +16,29 @@ const dividerDblGate = createDblClickGate();
 export function SplitLayout({ threadPane, contentPane }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
+
+  // Bring a persisted ratio that is no longer legal up to the floor, ONCE, as
+  // soon as the split has a width. `migratedSplitRatio` explains why nothing
+  // else would. A ResizeObserver rather than a bare layout-effect read: the
+  // first frame can measure 0 while the shell is still sizing, and a migration
+  // that silently skips itself there is no migration at all. It disconnects on
+  // the first usable width, so a later window resize is untouched.
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const migrate = (width: number) => {
+      if (width <= 2) return false;
+      const next = migratedSplitRatio(splitRatio.value, width, splitBounds());
+      if (next !== null) setSplitRatio(next);
+      return true;
+    };
+    if (migrate(container.getBoundingClientRect().width)) return;
+    const observer = new ResizeObserver(() => {
+      if (migrate(container.getBoundingClientRect().width)) observer.disconnect();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
 
   const onDividerDown = useCallback((e: PointerEvent) => {
     dividerDblGate.record();

@@ -50,6 +50,7 @@ const NAVIGATE_TARGETS: &[&str] = &[
 const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "models",
     "permissions",
+    "mcp",
     "coding-agents",
     "accounts",
     "locale",

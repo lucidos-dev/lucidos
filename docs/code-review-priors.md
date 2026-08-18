@@ -347,8 +347,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `20260805134838_drop_credential_name_prefixes_use_auth_type.sql`, `oauth_client`
   is the ONE type permitted to shadow a `service_name` (partial unique index), so
   an unfiltered bare-name `get` would return either row arbitrarily, and the five
-  bare-name readers all want the other one: the four provider keys in
-  `llm/provider_build.rs` (`anthropic`, `openai`, `openrouter`, `local`) and the
+  bare-name readers all want the other one: the provider keys in
+  `llm/provider_build.rs` (`anthropic`, `openai`, `openrouter`, `xai`, `local`) and the
   `apis.json` resolvers. And an OAuth client registration's `auth_value` is a
   `{client_id, client_secret, ...}` JSON blob that is never a usable auth header,
   so `find_by_url` handing one to an outbound request could only leak the secret
@@ -597,6 +597,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   that leaves the path behind on a name-taken abort.
   (`agent_session/spawn.rs`, `git_ops/branch_name.rs`.)
 
+- **A Stop that cancel-stamps a question and hits `SESSION_ALREADY_WAITING`
+  cannot strand the row at `running`** (2026-08-16). `claude_code_stop`
+  (`api/claude_code.rs`) resolves the pending card first, and
+  `UserQuestionAnswered` moves the projection to `running` whatever the answer
+  kind. `interrupt_agent` then returns that `Err` for an idle session, without
+  settling. A reviewer reasonably reads a permanent `running` row out of the
+  pair.
+
+  The state it needs is unreachable. A pending card means the asking call is
+  still blocked, in the PreToolUse hook for Claude Code or the MCP call for
+  Codex. That block is what stops the turn completing, so the session cannot be
+  `is_waiting`. Every other route resolves the card first, a follow-up
+  superseding it and the preserve contract withholding Continue from a
+  question-parked thread. Re-flag only if a backend gains a way to finish a turn
+  with its question call still open.
+  (`api/claude_code.rs`, `engine/claude_code/control.rs`,
+  `engine/agent_question.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -646,7 +664,50 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if something starts reading the applied value back.
   (`lucidos-app/src/desktop.rs`, the macOS unread-indicator thread in `launch`.)
 
+- **The function-key text guard runs unconditionally on purpose, and gating it
+  on Tauri does not buy what a reviewer expects.** `installNoFunctionKeyText`
+  (`utils/noFunctionKeyText.ts`) cancels a `beforeinput` whose data is entirely
+  AppKit function-key codepoints, and it installs in the web build too. Codex
+  flagged that twice in one hardening run, once against the original
+  0xF700-0xF8FF bound and again after the narrowing: a browser client can no
+  longer type a private-use glyph in the range through an IME.
+
+  The mechanism is real and the trigger is remote. The insertion has to be
+  ENTIRELY function-key codepoints, and a paste puts its content on
+  `dataTransfer` and leaves `data` null, so pasting one is untouched. What is
+  left is an IME or a Character Viewer committing a lone glyph in a 72-codepoint
+  window Apple assigns to keys.
+
+  The gate is not the remedy for that. A Character Viewer glyph is likeliest on
+  macOS, so a Tauri-only guard keeps the collateral where it hurts and drops the
+  protection everywhere else. Whether the fallthrough is Tauri-only was never
+  verified either, and the same WebKit lives in the iOS PWA. Narrowing the bound
+  to the last assigned constant was the real answer, and it is already applied.
+  Re-flag only with a client that demonstrably types such a glyph, or with
+  evidence the fallthrough cannot reach a browser.
+
 ## Frontend
+
+- **The iOS repaint toggle's `entry.restoreTop!` is guarded by the
+  `nudgedTop !== undefined` test beside it, in both readers.** A reviewer sees a
+  bare non-null assertion in `utils/iosRepaint.ts` and asks what happens when
+  `restoreTop` is unset. One synchronous block in rAF1 writes both fields, and
+  nothing else writes either. So `nudgedTop` being set is exactly the proof
+  `restoreTop` is. Both readers ask that question first: `restoreNudge` guards
+  its restore on it, and `nudgedTransform` returns a zero delta without touching
+  `restoreTop`. Re-flag only if a second site starts setting `nudgedTop`, which
+  would break the pairing.
+
+- **A browser clamping the nudge write is a pre-existing yield, not a drift.**
+  Fractional layout can leave a container scrollable by less than a pixel. The
+  write then lands short, and `restoreNudge` finds a value it did not write. It
+  DECLINES, by design: it never clobbers a concurrent writer, and it cannot tell
+  a clamp from the reader.
+
+  A reviewer reads that decline as a stranded offset. The alternative, reading
+  `scrollTop` back to learn the true delta, costs a forced layout between the
+  two writes for a sub-pixel case. Re-flag only with a report of a container
+  left visibly off.
 
 - **A new deep-link claim clearing `_pendingEventScrollLandedOffEdge` cannot
   resurrect a ride, because the thread's RECORD is the durable guard.** The flag
@@ -2390,19 +2451,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   without the reader, or that a path arms the observers without arming the
   watch. (`hooks/useScrollMemory.ts`, `utils/userAction.ts`.)
 
-- **The reduced-motion send landing evaluating its anchor ONCE is not a reader
-  stranded one row short** (2026-08-10, Codex). `landOnOwnTurn`
-  (`components/chat/scrollState.ts`) re-asks for the turn's agent status line on
-  every frame of its tween, so an animated landing extends to the row when the
-  response panel mounts late; the reduced-motion branch above it writes once and
-  returns, which reads as the same case left unhandled. It is not, because that
-  branch runs no tween and the growth branch only stands down FOR a tween: the
-  response panel mounting is itself a growth round, and by then the landing has
-  been consumed, so `followTheLiveEdge` writes the live edge and the reader ends
-  below the status line rather than above it. The armed follow is what covers
-  the gap, and it can only be reached by a reader the send armed. Re-flag only
-  if the reduced-motion path starts arming no follow, or if a landing can be
-  consumed without a growth round following it.
+- **The submit landing's FREEZING glide standing down for a same-owner tween is
+  unreachable, not a missed supersede.** `glideToLiveEdge`
+  (`components/chat/scrollState.ts`) leaves an in-flight glide of the same owner
+  alone. A reviewer reasonably asks whether the hold's frozen last glide should
+  outrank that, since a live-target tween is the chase the freeze exists to end.
+
+  It cannot arise. A freeze is only ever asked for by `honourLanding`, and its
+  three callers each exclude a running tween. `honourGrowth` returns on
+  `_scrollAnimRaf !== null`. `animateScroll`'s `onDone` runs after
+  `endScrollAnim`. And `followSubmit`'s direct call installs a landing whose
+  resolver cannot answer on that same round: `awaitsNewTurn` needs a CHANGE from
+  the snapshot it just took, and a card resolver's `drawnAtStart` equals its own
+  reading.
+
+  So the bypass is dead defensive code. A test for it cannot be written without
+  driving the freeze from a path production has not got. Re-flag only if a
+  freeze gains a caller that can run during a tween.
   (`components/chat/scrollState.ts`.)
 
 - **The trash's optical correction reaching the queued-message trash too is the
@@ -2460,3 +2525,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   remove an affordance on its own.
   (`crates/lucidos-engine/src/engine/engine_version.rs`,
   `crates/lucidos-app/src/store/actions/engine-update.ts`.)
+
+- **`arm_question_resume_if_live` guards on `Canceled` alone while its three
+  neighbours share `answer_resolves_without_resume`** (2026-08-15). It reads as
+  an inconsistency somebody forgot to sweep, and it is deliberate.
+
+  The shared predicate answers "does the engine owe this answer a follow-on
+  turn?", and `Canceled` and `Superseded` both answer no. This function asks a
+  different question: "is a live subprocess about to keep running?" A canceled
+  thread is being torn down, so there is nothing to arm. A superseded one is
+  not: it wakes, finishes the turn it was in, and reads the follow-up after
+  that. Arming it is what stops those post-answer events being dropped as
+  post-terminal stragglers.
+
+  Re-flag only if `Superseded` stops implying a live continuing session, or if
+  a third answer-less kind appears and needs sorting into the two groups.
+  (`crates/lucidos-engine/src/engine/agent_question.rs`, ADR 0082.)

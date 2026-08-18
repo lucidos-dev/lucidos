@@ -42,7 +42,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
-import { SkeletonProvider, SkText, SkBlock, SkBar } from '../shared/Skeleton';
+import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ChevronDownIcon, PopOutIcon } from '../shared/icons';
 import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
@@ -137,25 +137,24 @@ export function workspacesMenuRow({
   const marker = canList
     ? <span class="brand-menu-value-chevron" aria-hidden="true"><ChevronDownIcon /></span>
     : <CheckIcon className="brand-menu-value-check" />;
-  // Until the label resolves the pill used to be dropped whole, and that cost
-  // more than the name: the expander's chevron rides INSIDE the pill, so the
-  // row did not look like an expander at all, and then grew a pill and a marker
-  // under the user's finger the moment /health answered. A bar in the name's
-  // own slot holds the box and keeps the marker on screen.
+  // The pill renders whether or not the label has resolved. Dropping it whole
+  // dropped the marker with it, so the row carried no marker until /health
+  // answered, and then grew both at once.
   //
-  // Drawn immediately, with no `useDelayedFlag` gate, and that is not an
-  // exception to the delay rule so much as the case it does not describe: the
-  // gate exists so a load STARTED BY THIS RENDER cannot flash a placeholder,
-  // and this one started at boot, long before the menu was opened. A gate keyed
-  // on the menu opening would just reinstate the blank pill for its first 300ms.
-  const name = workspaceName
-    ? <span class="brand-menu-value-name">{workspaceName}</span>
-    : <span class="brand-menu-value-name"><SkBar w="3.5rem" /></span>;
+  // What is held is the MARKER, and the empty name slot draws nothing: no
+  // placeholder, no shimmer. See `.claude/rules/frontend.md` on a single value
+  // inside real markup.
+  //
+  // None is owed, but only because the marker TRAILS the name. The pill is
+  // `margin-left: auto`, so it is anchored on the right and grows leftward. A
+  // leading marker would be dragged left by the whole name when it lands, which
+  // is the shift this avoids. Trailing also puts the check on the side the
+  // unfolded list gives the current workspace's check. One rule in
+  // header-mark.css covers both, being the same mark doing the same job.
   const value = (
     <span class="brand-menu-value">
-      {!canList && marker}
-      {name}
-      {canList && marker}
+      {workspaceName && <span class="brand-menu-value-name">{workspaceName}</span>}
+      {marker}
     </span>
   );
   const body = (

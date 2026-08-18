@@ -196,10 +196,19 @@ describe('formatContextWindow', () => {
     expect(formatContextWindow(null)).toBe('context window: inferred');
   });
 
-  it('abbreviates declared windows to k', () => {
-    expect(formatContextWindow(1048576)).toBe('context window: 1049k');
+  it('abbreviates declared windows to M and k', () => {
+    // A million-token row reads as the marker its id carries, not as 1049k.
+    expect(formatContextWindow(1048576)).toBe('context window: 1M');
+    expect(formatContextWindow(1000000)).toBe('context window: 1M');
+    expect(formatContextWindow(1050000)).toBe('context window: 1.1M');
     expect(formatContextWindow(200000)).toBe('context window: 200k');
     expect(formatContextWindow(512)).toBe('context window: 512');
+  });
+
+  it('never prints 1000k, whichever side of a million the value falls', () => {
+    // Rounds up to 1000k, so a threshold on the raw value would print it.
+    expect(formatContextWindow(999_999)).toBe('context window: 1M');
+    expect(formatContextWindow(999_400)).toBe('context window: 999k');
   });
 });
 

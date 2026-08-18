@@ -2,6 +2,7 @@
 //! tools → repeat. A single cohesive `loop` with labeled control flow and
 //! interdependent mutable state; left as one method.
 
+use crate::engine::inline_question_repair::InlineQuestionLeak;
 use crate::llm::provider::LlmResponse;
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -407,14 +408,24 @@ impl LucidosEngine {
 
             let call_tools = tools.to_vec();
 
-            // Race LLM call against cancel token so stop button works immediately
-            let llm_future = provider.chat(
-                messages.clone(),
-                call_tools,
-                model_override,
-                Some(system_prompt),
-                token_cb,
-                reasoning_effort,
+            // Race LLM call against cancel token so stop button works immediately.
+            // Scoped for the prompt-cache probe, which reads the correlation off
+            // the task rather than through the provider trait (see
+            // `llm::cache_probe`); inert unless `LUCIDOS_CACHE_PROBE` is set.
+            let llm_future = crate::llm::cache_probe::scope(
+                crate::llm::cache_probe::ProbeCall {
+                    thread_id,
+                    turn_id: origin_id,
+                    round: rounds,
+                },
+                provider.chat(
+                    messages.clone(),
+                    call_tools,
+                    model_override,
+                    Some(system_prompt),
+                    token_cb,
+                    reasoning_effort,
+                ),
             );
             let cancel_future = cancel_token.cancelled();
 
@@ -617,39 +628,58 @@ impl LucidosEngine {
                 )
                 .await;
 
-            // Post-response repair: Opus 4.7 sometimes emits
+            // Post-response repair: the model sometimes emits
             // `<ask_user_question>...</ask_user_question>` as inline text
-            // instead of a structured tool call. Detect that case BEFORE
-            // the final flush so the cleaned text (tag removed) is what
-            // streams to the frontend AND persists. The synthesised tool
-            // call is appended further down so the existing tool-execution
-            // branch takes over from `if response.tool_calls.is_empty()`.
-            // See `inline_question_repair` for the detection contract and
-            // why the prompt-side rule alone is insufficient.
+            // instead of a structured tool call, and sometimes emits the bare
+            // payload with no tag at all. Detect that case BEFORE the final
+            // flush so the cleaned text is what streams to the frontend AND
+            // persists. A dispatchable payload becomes a synthesised tool call,
+            // appended here so the existing tool-execution branch takes over
+            // from `if response.tool_calls.is_empty()`. A degenerate one keeps
+            // its prose and forces a bounded re-ask further down. See
+            // `inline_question_repair` for the detection contract and why the
+            // prompt-side rule alone is insufficient.
             let inline_repair = response
                 .content
                 .as_deref()
                 .and_then(crate::engine::inline_question_repair::detect_inline_ask_user_question);
             let mut response = response;
-            if let Some(ref d) = inline_repair {
-                response.content = if d.cleaned_text.is_empty() {
-                    None
-                } else {
-                    Some(d.cleaned_text.clone())
+            if let Some(ref leak) = inline_repair {
+                let cleaned_text = match leak {
+                    InlineQuestionLeak::Dispatch { cleaned_text, .. } => cleaned_text,
+                    InlineQuestionLeak::Degenerate { cleaned_text } => cleaned_text,
                 };
-                let synth_id = format!("synth-aq-{}", uuid::Uuid::new_v4());
-                response.tool_calls.push(crate::llm::ToolCall {
-                    id: synth_id.clone(),
-                    name: tn::ASK_USER_QUESTION.to_string(),
-                    arguments: serde_json::json!({ "questions": d.questions_json }),
-                    thought_signature: None,
-                });
-                crate::log!(
-                    "[InlineQuestionRepair] thread={} synthesised tool call from inline <ask_user_question> tag (synth_id={})",
-                    thread_id,
-                    synth_id,
-                );
+                response.content = (!cleaned_text.is_empty()).then(|| cleaned_text.clone());
             }
+            match inline_repair {
+                Some(InlineQuestionLeak::Dispatch {
+                    ref questions_json, ..
+                }) => {
+                    let synth_id = format!("synth-aq-{}", uuid::Uuid::new_v4());
+                    response.tool_calls.push(crate::llm::ToolCall {
+                        id: synth_id.clone(),
+                        name: tn::ASK_USER_QUESTION.to_string(),
+                        arguments: serde_json::json!({ "questions": questions_json }),
+                        thought_signature: None,
+                    });
+                    crate::log!(
+                        "[InlineQuestionRepair] thread={} synthesised tool call from leaked ask_user_question payload (synth_id={})",
+                        thread_id,
+                        synth_id,
+                    );
+                }
+                Some(InlineQuestionLeak::Degenerate { .. }) => {
+                    crate::log!(
+                        "[InlineQuestionRepair] thread={} stripped a leaked <ask_user_question> tag with no dispatchable payload, forcing a re-ask",
+                        thread_id,
+                    );
+                }
+                None => {}
+            }
+            // Whether THIS iteration stripped a degenerate tag. Read by the
+            // re-ask guard in the termination branch below.
+            let question_leaked_as_text =
+                matches!(inline_repair, Some(InlineQuestionLeak::Degenerate { .. }));
             // Post-response repair (generic tool call): the model sometimes
             // emits a tool call as inline `<invoke name="...">...</invoke>` XML
             // text instead of a structured tool_use block — the same leak class
@@ -804,19 +834,30 @@ impl LucidosEngine {
                 // classifier below. Requiring `Some(answer)` also keeps
                 // alternation valid: the assistant message is always pushed
                 // before the forcing user message, never a lone user-after-user.
-                let reask_prose = should_force_question_reask(
+                //
+                // Two causes reach here, sharing one budget. A rejected call is
+                // the case above. The other is a tag the model typed as text
+                // whose body carried no dispatchable payload: no call was made
+                // at all, so the user would read the question as prose and get
+                // no card. Claude Code already redirects its own plaintext
+                // questions back to the tool, from the Stop hook in
+                // `cc_stop_reminder.rs`. This is the chat-side equivalent. It
+                // keys on the leaked tag rather than on a trailing `?`, which
+                // is the stronger signal the engine has and the hook does not.
+                let reask = question_reask_cause(
                     question_ask_failed_last_iter,
+                    question_leaked_as_text,
                     question_reask_forced,
                 )
-                .then(|| {
+                .and_then(|cause| {
                     response
                         .content
                         .as_deref()
                         .map(|c| self.clean_response(c))
                         .filter(|c| !c.is_empty())
-                })
-                .flatten();
-                if let Some(answer) = reask_prose {
+                        .map(|answer| (cause, answer))
+                });
+                if let Some((cause, answer)) = reask {
                     question_reask_forced += 1;
                     // Mirror the injection-continue path's message handling.
                     // Preserve the drafted prose as assistant context so the
@@ -827,16 +868,22 @@ impl LucidosEngine {
                     });
                     messages.push(Message {
                         role: "user".to_string(),
-                        content: MessageContent::Text(QUESTION_REASK_INSTRUCTION.to_string()),
+                        content: MessageContent::Text(cause.instruction().to_string()),
                     });
+                    let reason = match cause {
+                        QuestionReaskCause::CallRejected => {
+                            "ask_user_question had no question text, forcing re-ask"
+                        }
+                        QuestionReaskCause::LeakedAsText => {
+                            "ask_user_question was typed as text, forcing re-ask"
+                        }
+                    };
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::LlmCallRetried {
-                                    reason:
-                                        "ask_user_question had no question text, forcing re-ask"
-                                            .to_string(),
+                                    reason: reason.to_string(),
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },

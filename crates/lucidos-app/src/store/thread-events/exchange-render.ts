@@ -1051,18 +1051,28 @@ export function isEmptyContinuedExchange(
   );
 }
 
-/** A `UserQuestionAsked` divider exchange whose question card was
- *  cancel-stamped, by the user clicking Cancel or by `archive_thread`
- *  resolving the pending question. No resume is coming, since
- *  `ensure_resume_after_answer` short-circuits on `AnswerKind::Canceled`, so
- *  the response panel would otherwise strand as an empty "Working" badge. The
- *  QuestionCard's disabled Cancel button and struck-through options already
- *  tell the story. */
-export function isCanceledQuestionDivider(exchange: Exchange): boolean {
-  if (exchange.userEvent.type !== 'UserQuestionAsked') return false;
-  return exchange.steps.some(({ event }) =>
-    event.type === 'UserQuestionAnswered' && event.answer.kind === 'Canceled'
-  );
+/** How a `UserQuestionAsked` divider was resolved WITHOUT the user answering
+ *  it, or `null` when it was answered or is still open.
+ *
+ *  `canceled` is the cancel stamp, from the user clicking Cancel or from
+ *  `archive_thread` clearing the pending question. `superseded` is a follow-up
+ *  that could not be the answer and replaced the question instead.
+ *
+ *  Either way no response body follows in THIS exchange, so the panel stays
+ *  hidden rather than stranding as an empty "Working" badge.
+ *  `ensure_resume_after_answer` short-circuits on both kinds, and a superseded
+ *  question's next turn belongs to the follow-up's own exchange. The card's own
+ *  resolved state already tells the story. */
+export function questionDividerResolution(
+  exchange: Exchange,
+): 'canceled' | 'superseded' | null {
+  if (exchange.userEvent.type !== 'UserQuestionAsked') return null;
+  for (const { event } of exchange.steps) {
+    if (event.type !== 'UserQuestionAnswered') continue;
+    if (event.answer.kind === 'Canceled') return 'canceled';
+    if (event.answer.kind === 'Superseded') return 'superseded';
+  }
+  return null;
 }
 
 /** Change-lifecycle banner exchanges whose body may carry a post-boundary CC

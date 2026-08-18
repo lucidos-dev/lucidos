@@ -55,9 +55,11 @@ interface HeaderMetrics {
   boxRight: number;
   boxWidth: number;
   rowCentre: number;
+  rowWidth: number;     // the box's containing block, which its 100% resolves against
   navRight: number;     // the hamburger's inner edge
   actionsLeft: number;  // the trailing cluster's inner edge
   minSpan: number;      // --desktop-nav-min-span, resolved to px
+  sideReserve: number;  // --content-side-reserve, resolved to px
   titleText: string;    // the box's rendered text, ellipsis excluded (it is CSS)
   hasOverflow: boolean;
   trailingIcons: number;
@@ -86,11 +88,16 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
     // number here: it is a rem token, so a literal would be right at exactly
     // one ui-scale. Probed on a detached-from-flow div appended to <body>, the
     // token being declared on :root, so nothing in the header is disturbed.
-    const probe = document.createElement('div');
-    probe.style.cssText = 'position:absolute;visibility:hidden;width:var(--desktop-nav-min-span)';
-    document.body.appendChild(probe);
-    const minSpan = probe.getBoundingClientRect().width;
-    probe.remove();
+    const resolve = (token: string) => {
+      const probe = document.createElement('div');
+      probe.style.cssText = `position:absolute;visibility:hidden;width:var(${token})`;
+      document.body.appendChild(probe);
+      const px = probe.getBoundingClientRect().width;
+      probe.remove();
+      return px;
+    };
+    const minSpan = resolve('--desktop-nav-min-span');
+    const sideReserve = resolve('--content-side-reserve');
     return {
       backX: back.getBoundingClientRect().left,
       forwardX: forward.getBoundingClientRect().right,
@@ -98,9 +105,11 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
       boxRight: b.right,
       boxWidth: b.width,
       rowCentre: r.left + r.width / 2,
+      rowWidth: r.width,
       navRight: nav.getBoundingClientRect().right,
       actionsLeft: a.left,
       minSpan,
+      sideReserve,
       titleText: (box.querySelector('.pane-header-title-text')?.textContent ?? '').trim(),
       hasOverflow: actions.querySelectorAll('.content-header-more').length > 0,
       trailingIcons: actions.querySelectorAll('.icon-btn.header-icon').length,
@@ -256,10 +265,10 @@ test.describe('the desktop content title holds its position across views', () =>
   });
 
   test('the box still clears the cluster with the Canvas pane near its floor', async ({ page }) => {
-    // The clamp's min-span arm, the one regime where the box stops giving way
-    // and the cluster would reach it. There the collapse measurement takes
-    // over and folds the actions into ⋯ instead: the reason it survives the
-    // centring at all.
+    // The narrowest this pane legally gets, where the box has given up the most
+    // width to the two side reserves. The collapse measurement is the other
+    // half here, folding the actions into ⋯: the reason the centring survives
+    // at all.
     //
     // The pane width is SEEDED, not dragged. `splitRatio` is read straight out
     // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
@@ -271,8 +280,8 @@ test.describe('the desktop content title holds its position across views', () =>
     //
     // 0.7 of this 1280 viewport leaves the Canvas pane ~381px: above its
     // MIN_CONTENT_PANE_REM floor (22.5rem = 360px at these projects' 16px
-    // root), so it is a width a drag could also stop at, and far enough into
-    // the clamp's floor that the box is pinned there (asserted, not assumed).
+    // root), so it is a width a drag could also stop at, and the narrowest
+    // regime the clamp has to hold this box clear in.
     await page.addInitScript((id) => {
       localStorage.setItem('lucidos-split-ratio', '0.7');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
@@ -287,11 +296,22 @@ test.describe('the desktop content title holds its position across views', () =>
     );
     expect(paneWidth, 'the seeded ratio did not narrow the Canvas pane').toBeLessThan(400);
     expect(paneWidth, 'the seeded ratio went under the Canvas pane floor').toBeGreaterThan(360);
-    // On the floor arm, so this really is the regime the test names.
+    // On the RESERVE arm, all the way down to the pane's floor, which is the
+    // shape that makes the clearance structural. The min-span arm is what the
+    // box would fall back to, and it cannot be reached above this floor:
+    // `2 * --content-side-reserve + --desktop-nav-min-span` is 22.1rem, inside
+    // MIN_CONTENT_PANE_REM. So assert the arm rather than the number, and
+    // assert the floor stays under it (store/__tests__/conversation-pane-floor
+    // .test.ts owns that inequality at every ui-scale).
     expect(
       narrow.boxWidth,
-      `the box is ${narrow.boxWidth.toFixed(1)} wide, off its ${narrow.minSpan} min-span floor`,
-    ).toBeCloseTo(narrow.minSpan, 0);
+      `the box is ${narrow.boxWidth.toFixed(1)} wide, not the reserve arm's `
+        + `${(narrow.rowWidth - 2 * narrow.sideReserve).toFixed(1)}`,
+    ).toBeCloseTo(narrow.rowWidth - 2 * narrow.sideReserve, 0);
+    expect(
+      narrow.boxWidth,
+      `the box fell to its ${narrow.minSpan} min-span floor above the pane's own floor`,
+    ).toBeGreaterThan(narrow.minSpan);
     // And the fold is what keeps them apart there: the app view's three context
     // actions are in the ⋯ menu, leaving ⋯ + the bell.
     expect(narrow.hasOverflow, 'the app view folds its three actions whole').toBe(true);

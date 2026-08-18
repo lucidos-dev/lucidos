@@ -1526,12 +1526,32 @@ pub(super) struct CancelChatQuery {
     thread_id: Option<String>,
 }
 
+/// `ApiError` rather than a bare `StatusCode`, so the reach refusal can say
+/// why: a bodyless 403 reaches an agent as nothing at all, since `statusText`
+/// is always empty over HTTP/2.
+///
+/// The malformed-uuid 400 rides along through `From<StatusCode>` and keeps its
+/// status, but its body changes from empty to `{"error": "Bad Request"}`. That
+/// is what the conversion is for, per `api::error`: adopt `ApiError` for the
+/// one branch with something to say, and let the rest carry the canonical
+/// reason phrase instead of nothing.
 pub(super) async fn cancel_chat(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CancelChatQuery>,
-) -> Result<Json<super::CancelResponse>, StatusCode> {
+) -> Result<Json<super::CancelResponse>, ApiError> {
     let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
+    // Before the question card is cancel-stamped, so a refusal writes nothing.
+    // A thread-bound caller with no `thread_id` is refused rather than reread
+    // as "cancel yourself": the unscoped form stops the whole workspace.
+    crate::api::thread_reach::refuse_out_of_reach(
+        &state.pool,
+        &headers,
+        thread_id,
+        crate::api::thread_reach::ThreadReachVerb::Cancel,
+    )
+    .await
+    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
     // Resolve the actor once and reuse it for the question-card resolution, the
     // cancel-thread call, and the settle fallback. It stamps
     // `ResponseCanceled.actor` / `ResponseAborted.actor`, so the timeline
@@ -1568,13 +1588,23 @@ pub(super) async fn cancel_chat(
                 // No live handle: the projection may still be stuck at
                 // `running` (the client raced the terminal broadcast on load,
                 // or a spawn errored before emitting one). Settle it so a
-                // `ResponseAborted(StaleSettle)` lands and the thread stops
-                // looking mid-turn — parity with the CC interrupt path.
+                // terminal event lands and the thread stops looking mid-turn,
+                // parity with the CC interrupt path.
+                //
+                // A cancel-stamped question above is what set the row to
+                // `running`, so that case is no wedge at all: it settles as the
+                // `ResponseCanceled` a live loop would have emitted. See
+                // `SettleTerminal`.
                 match crate::engine::claude_code::settle_stuck_running_thread(
                     &state.pool,
                     &state.engine.event_bus,
                     uuid,
                     actor,
+                    if question_resolved {
+                        crate::engine::claude_code::SettleTerminal::CanceledQuestion
+                    } else {
+                        crate::engine::claude_code::SettleTerminal::StuckProjection
+                    },
                 )
                 .await
                 {

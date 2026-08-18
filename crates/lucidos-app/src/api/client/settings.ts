@@ -7,7 +7,7 @@ import type {
   Notification,
   OAuthAccountInfo,
 } from '../../store/types';
-import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
+import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -97,6 +97,14 @@ export function setNetworkConfig(body: { engine_bind: string }): Promise<ApiResu
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+/** The MagicDNS name and this workspace's verified HTTPS URL (Settings →
+ *  Access → Connect URLs). Separate from `getNetworkConfig` because it probes:
+ *  a reverse lookup and a round trip through the tailnet, which the bind editor
+ *  must not pay for. */
+export function getTailnetStatus(): Promise<TailnetStatusResponse> {
+  return json(`${API}/tailnet-status`);
 }
 
 export interface EmailAccountSettings {

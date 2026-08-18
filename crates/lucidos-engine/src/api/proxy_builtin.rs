@@ -3,7 +3,7 @@
 //! An app calls `lucidos.proxy(<name>).fetch(path, init)` → the engine's
 //! `/api/v1/proxy/<name>/<path>` route. When `<name>` has no entry in
 //! `data/config/apis.json` but matches one of the model-registry providers
-//! (`vertex`, `openai`, `openrouter`, `anthropic`, `local`), the engine
+//! (`vertex`, `openai`, `openrouter`, `xai`, `anthropic`, `local`), the engine
 //! synthesizes the upstream target here — the provider's API base URL plus a
 //! server-side auth layer sourced from the engine's OWN provider auth, resolved
 //! exactly as the LLM providers resolve it (a stored credential first, then the
@@ -16,7 +16,7 @@
 //! § `lucidos.proxy`.
 //!
 //! **What is injected.** Only the credential/token the iframe must never see —
-//! `Authorization: Bearer …` (openai / openrouter / local / vertex /
+//! `Authorization: Bearer …` (openai / openrouter / xai / local / vertex /
 //! anthropic-OAuth) or `x-api-key: …` (anthropic API key). Content-Type,
 //! `anthropic-version`, and attribution headers stay app-owned.
 //!
@@ -34,7 +34,7 @@ use crate::core::{
 use crate::llm::vertex::{self, TokenCache};
 use crate::llm::{
     resolve_anthropic_auth, resolve_bearer_key, resolve_openai_api_key, AnthropicAuth,
-    ANTHROPIC_API_BASE_URL, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL,
+    ANTHROPIC_API_BASE_URL, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL, XAI_BASE_URL,
 };
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
@@ -58,6 +58,7 @@ pub(crate) async fn resolve_builtin_provider(
     match name {
         "openai" => resolve_openai(engine.pool()).await.map(Some),
         "openrouter" => resolve_openrouter(engine.pool()).await.map(Some),
+        "xai" => resolve_xai(engine.pool()).await.map(Some),
         "anthropic" => resolve_anthropic(engine.pool()).await.map(Some),
         "local" => resolve_local(engine.pool()).await.map(Some),
         "vertex" => resolve_vertex(engine).await.map(Some),
@@ -125,6 +126,20 @@ async fn resolve_openrouter(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Statu
     };
     let layer = StaticHeaderLayer::bearer("openrouter".to_string(), key);
     Ok((OPENROUTER_BASE_URL.to_string(), vec![Arc::new(layer)]))
+}
+
+async fn resolve_xai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
+    let cred = credential_pair(pool, "xai").await?;
+    let key = resolve_bearer_key(cred, std::env::var("LUCIDOS_XAI_API_KEY").ok());
+    let Some(key) = key else {
+        return Err(unconfigured_msg(
+            "xai",
+            "an xAI API key",
+            "add an 'xai' credential in Settings → Models → Providers, set LUCIDOS_XAI_API_KEY",
+        ));
+    };
+    let layer = StaticHeaderLayer::bearer("xai".to_string(), key);
+    Ok((XAI_BASE_URL.to_string(), vec![Arc::new(layer)]))
 }
 
 async fn resolve_anthropic(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
@@ -478,6 +493,23 @@ mod tests {
         assert_eq!(
             injected_headers(&target).await,
             vec![("authorization".to_string(), "Bearer sk-or-test".to_string())]
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// A seeded `xai` credential resolves to xAI's API root with a `Bearer`
+    /// header. So an app calls Grok through the proxy, and the workspace never
+    /// re-enters the key in `apis.json`.
+    #[tokio::test]
+    async fn resolve_xai_injects_bearer_from_credential() {
+        let (pool, db) = setup_test_db().await;
+        seed_credential(&pool, "xai", XAI_BASE_URL, AuthType::ApiKey, "xai-test").await;
+
+        let target = resolve_xai(&pool).await.expect("xai resolves");
+        assert_eq!(target.0, XAI_BASE_URL);
+        assert_eq!(
+            injected_headers(&target).await,
+            vec![("authorization".to_string(), "Bearer xai-test".to_string())]
         );
         teardown_test_db(&db).await;
     }

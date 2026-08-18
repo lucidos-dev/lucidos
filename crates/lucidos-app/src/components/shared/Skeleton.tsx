@@ -24,19 +24,11 @@ export function SkeletonProvider({ children }: { children: ComponentChildren }) 
 }
 
 /** The shimmer bar itself: the one place `.sk-bar` and its two shape modifiers
- *  are spelled. HOOK-FREE on purpose, which is the only reason it is exported
- *  separately from the two wrappers below.
- *
- *  Reach for it only where a placeholder has to be drawn OUTSIDE a
- *  {@link SkeletonProvider}, i.e. where the surrounding markup is real content
- *  and a single value inside it is the thing still loading. The Workspaces row
- *  in the Lucidos menu is the case it exists for: its builder is a pure function
- *  with no hooks (so its every branch stays flattenable in a unit test), so it
- *  cannot read the context, and only the name inside its value pill is missing.
- *  Anywhere a whole row / list / tree is standing in for loaded content, use
- *  {@link SkText} / {@link SkBlock} under a provider instead, so the placeholder
- *  is the real markup and cannot drift from it. */
-export function SkBar({
+ *  are spelled, shared by the two context-driven wrappers below. Deliberately
+ *  NOT exported. A placeholder belongs under a {@link SkeletonProvider}, drawn
+ *  from the real markup through {@link SkText} / {@link SkBlock}. That is what
+ *  keeps it from drifting from what it stands in for. */
+function SkBar({
   w,
   h,
   circle,

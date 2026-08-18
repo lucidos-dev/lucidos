@@ -1,6 +1,19 @@
 import { describe, it, expect } from 'vitest';
+import { skeletonOverlayClass } from '../ThreadView';
 import { ThreadSkeleton, THREAD_SKELETON_EXCHANGES } from '../ThreadSkeleton';
 import { vnodeToText } from './vnodeToText';
+
+describe('skeletonOverlayClass', () => {
+  it('is opaque while shown, so the loader the gate asked for is legible', () => {
+    // No entrance. The gate has already decided this wait earns a loader.
+    // A second ramp on top of it leaves the skeleton unreadable.
+    expect(skeletonOverlayClass(true)).toBe('thread-skeleton-overlay');
+  });
+
+  it('fades out to reveal the content underneath', () => {
+    expect(skeletonOverlayClass(false)).toBe('thread-skeleton-overlay is-fading');
+  });
+});
 
 describe('ThreadSkeleton', () => {
   it('renders the skeleton container with placeholder exchanges', () => {

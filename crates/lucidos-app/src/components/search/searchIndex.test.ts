@@ -135,3 +135,28 @@ describe('settings search: packaged-only rows', () => {
     expect(entry?.anchor).toBe('debugging:restart-engine');
   });
 });
+
+describe('settings search: the Access connect URLs row', () => {
+  it('is offered in a plain browser, where the section now renders', () => {
+    // It carried `tauriOnly` + `packagedOnly` from when Connect URLs existed
+    // only inside the packaged desktop app. The section renders everywhere now,
+    // deriving its tailnet rows from two plain-HTTP reads. Gating the search
+    // entry hid the address a browser user came looking for, behind the very
+    // section showing it.
+    enginePackaged.value = false;
+    const hits = getSettingsSearchResults('connect url', 20);
+    expect(hits.some((r) => r.id === 'access:urls')).toBe(true);
+  });
+
+  it('is findable by the word the user is actually after', () => {
+    enginePackaged.value = false;
+    expect(getSettingsSearchResults('magicdns', 20).some((r) => r.id === 'access:urls')).toBe(true);
+    expect(getSettingsSearchResults('tailnet', 20).some((r) => r.id === 'access:urls')).toBe(true);
+  });
+
+  it('resolves to the Access subview and its anchor', () => {
+    const entry = findSettingsEntry('access:urls');
+    expect(entry?.subview).toBe('access');
+    expect(entry?.anchor).toBe('access:urls');
+  });
+});

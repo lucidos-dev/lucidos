@@ -54,6 +54,8 @@ fn run_build(
         setup_reminder,
         thread_depth_context,
         user_message,
+        "[CURRENT TIME]\nNow: Monday, August 17, 2026 at 15:02 Europe/Oslo (UTC+2).\n\
+         The same instant in UTC: Monday, August 17, 2026 at 13:02.\n[END CURRENT TIME]",
         loaded,
         resume,
         false,
@@ -617,7 +619,12 @@ fn build_capture_sections_filters_empty_sections() {
         &[],
     );
     let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["System Instructions", "User Message"]);
+    // Current Time is unconditional: `turn_clock::current_time_block` always
+    // renders, so unlike the fifteen filtered rows it can never be empty.
+    assert_eq!(
+        names,
+        vec!["System Instructions", "User Message", "Current Time"]
+    );
 }
 
 /// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
@@ -807,6 +814,7 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "user",
+        "clock",
         &docs,
         &[],
         true,
@@ -828,6 +836,7 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "user",
+        "clock",
         &docs,
         &[],
         false,
@@ -1346,4 +1355,38 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
         ActorMode::Human,
         None,
     ));
+}
+
+/// Where the question supersede sits IS the rule, so pin it. Both halves are
+/// load-bearing, and neither has any other seam to test through.
+///
+/// Below the answer fast-path: a message that could answer the question already
+/// did and returned, so anything still open here is a question this follow-up
+/// cannot answer. Inside the coding-agent block: a chat thread queues such a
+/// follow-up as an injection and keeps its question live, which is right there.
+///
+/// The bug this pins is a deadlock. The agent is parked inside the call that
+/// asked. The follow-up's own `CodingAgentPromptSent` then kills the card, and
+/// nothing is left that can release the agent.
+#[test]
+fn the_question_supersede_is_wired_below_the_answer_fast_path() {
+    let source = include_str!("process/run.rs");
+    let fast_path = source
+        .find("lookup_active_question_tool_use_id")
+        .expect("the FreeText answer fast-path must still run first");
+    let permission_supersede = source
+        .find("resolve_pending_permissions_as_superseded")
+        .expect("the coding-agent-only supersede block must still exist");
+    let question_supersede = source
+        .find("resolve_pending_question_as_superseded")
+        .expect("the message router must supersede an unanswerable open question");
+
+    assert!(
+        fast_path < question_supersede,
+        "a message that can answer the question must answer it, never supersede it"
+    );
+    assert!(
+        permission_supersede < question_supersede,
+        "the question supersede belongs in the coding-agent-only block, beside the permission one"
+    );
 }

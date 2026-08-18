@@ -7,11 +7,11 @@ import { clientRefreshing } from '../../hooks/sw-update';
  *  mid-reload. The toast container stays interactive so the "Refreshing…" status
  *  toast remains visible.
  *
- *  Engine restart deliberately does NOT block here: the gateway boot splash, the
- *  GET-gate (`awaitEngineReady`), and SSE auto-reconnect make a restart a
- *  recoverable non-event, so the initiating tab stays interactive and only shows
- *  a light dismissible "Restarting engine…" toast. The restart safety-timeout
- *  that used to live in this effect now rides `engineRestarting` directly in
+ *  Engine restart does NOT come through here. It blocks with the *progress
+ *  dialog* instead, which is a modal in its own right and states what is
+ *  happening while it holds the app. This overlay is the bare blocker for a
+ *  refresh that has nothing to say. The restart safety-timeout that used to
+ *  live in this effect now rides `engineRestarting` directly in
  *  `store/effects.ts`. */
 export function UiBlockingOverlay() {
   const active = clientRefreshing.value;
@@ -43,7 +43,8 @@ export function UiBlockingOverlay() {
 
     // Mark every sibling of the overlay inert so panels, drawers, and modals
     // stop receiving clicks, focus, and input. The toast container stays
-    // interactive so the user can dismiss the restart toast.
+    // interactive, so a toast raised during the refresh is still readable and
+    // dismissable.
     const inerted: HTMLElement[] = [];
     const root = overlay.parentElement;
     if (root) {

@@ -22,7 +22,7 @@ Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `
 - Skip Phase 2 Agent 1 (no code logic to bug-check).
 - Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
 - Phase 2.5 auto-skips for docs-only via its own packaged-runtime gate.
-- Phase 4.5 already auto-skips for docs-only via its test-selection table.
+- Phase 4.5 skips the suites for docs-only, with ONE carve-out: a diff touching `system-knowhow/**` still runs the always-loaded budget tests. See its test-selection table.
 
 Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
 
@@ -396,8 +396,22 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
 - `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
-- Docs-only → skip
+- `system-knowhow/**` → `./scripts/test-engine.sh -- -- always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized` (subsumed by `make test` when the diff also touches Rust)
+- Docs-only → skip, EXCEPT the `system-knowhow/**` row above
 - Mixed → run both **in parallel**
+
+**A `system-knowhow/**` edit is not a docs-only skip.** Its frontmatter `name`
+and `description` are spliced into the chat agent's routing list, which is
+billed on every request of every thread. Two Rust tests own that cost:
+`system_knowhow_descriptions_stay_routing_sized` caps each description, and
+`always_loaded_context_stays_under_budget` caps the total against the
+`ALWAYS_LOADED_BUDGET_CHARS` ratchet. Neither runs when the suites are skipped.
+
+Until 2026-08-17 this table skipped them, so a knowhow file added or reworded by
+a docs-only diff paid nothing at review time. The ceiling drifted 794 chars over
+that way, and the next branch to touch a `.rs` file inherited a red suite it did
+not cause. The filtered run costs one compile of an already-warm crate, against a
+budget breach nobody sees until it lands on somebody else.
 
 **CSS is not a skip.** Until 2026-08-05 this table said "CSS-only → skip", and
 nothing else in the gate parses CSS: `tsc` ignores it, Vitest never built it.

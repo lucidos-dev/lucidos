@@ -64,6 +64,38 @@ export function clampSplitRatio(pointerPx: number, totalPx: number, bounds: Spli
   return clampToRange(threadPx, 1, totalPx - 1) / totalPx;
 }
 
+/** The ratio a PERSISTED one has to migrate to at mount. Null when it is
+ *  already legal, and must be left exactly where the user put it.
+ *
+ *  A stored ratio is a fraction while the floors are px. One legal in the
+ *  window it was saved in can be illegal in this one. Raising a floor does the
+ *  same to every stored ratio between the old value and the new. Nothing else
+ *  re-clamps: `splitRatio` is read straight out of localStorage (`store.ts`),
+ *  and only a drag or a keyboard step consults the bounds. So a user upgrades
+ *  INTO whatever layout they last left, floors or not. That is how a header
+ *  overlap survives the change that fixed it.
+ *
+ *  A MIGRATION, not a resize policy. It runs once, when the split first has a
+ *  width, and it corrects only a ratio the clamp would already have refused.
+ *  Re-clamping on every container resize is a different decision, and a larger
+ *  one: it would hold the Conversation floor by squeezing the Canvas pane under
+ *  its own, on every window the two no longer fit.
+ *
+ *  Null rather than the unchanged ratio, so the caller writes (and persists)
+ *  nothing in the ordinary case. */
+export function migratedSplitRatio(
+  ratio: number, totalPx: number, bounds: SplitBounds,
+): number | null {
+  // No layout yet, so no width to clamp against. `clampSplitRatio` answers the
+  // DEFAULT ratio here, which as a migration would be a silent reset.
+  if (totalPx <= 2) return null;
+  if (!Number.isFinite(ratio)) return DEFAULT_SPLIT_RATIO;
+  // A collapsed pane is a settled state the user chose, not an illegal width.
+  if (ratio <= 0 || ratio >= 1) return null;
+  const next = clampSplitRatio(ratio * totalPx, totalPx, bounds);
+  return Math.abs(next - ratio) < 1e-6 ? null : next;
+}
+
 /** Next ratio for a thread-pane visibility toggle: collapsed (0) restores the
  *  default split, anything else collapses. Shared by the toggleThreadPane
  *  intent and the content-side header double-click. */

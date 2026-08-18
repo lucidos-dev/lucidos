@@ -572,40 +572,86 @@ pub use crate::engine::types::StopReason;
 /// the private `control` submodule) so the API handler can reference it.
 pub(crate) const SESSION_ALREADY_WAITING: &str = "Session is already waiting";
 
-/// Emit a terminal `ResponseAborted` event for a thread the projection still
-/// considers `running` but for which no live agent session or in-process loop
-/// remains. Both callers (`stop_agent`, `interrupt_agent`) are user buttons
-/// (Stop / Apply / Discard / Archive / Interrupt) — but no live response
-/// exists to *cancel*, so this is system-driven cleanup of stuck projection
-/// state. The user's actor flows onto the event so the chip reads "You" (the
-/// user *did* push the button); the cause is `StaleSettle` so the summary
-/// reads "Settled stuck response" rather than "Paused by restart" or
-/// "Response interrupted".
+/// Which terminal event [`settle_stuck_running_thread`] emits, i.e. what ended
+/// the turn it is settling. The caller knows. The helper must not guess: both
+/// shapes look identical from the projection.
+///
+/// `pub` because [`LucidosEngine::interrupt_agent`] takes one, same as
+/// [`StopReason`] on its `stop_agent` sibling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleTerminal {
+    /// Nothing this request did explains the `running` row: it was already
+    /// wedged when the button was pressed. A spawn that errored before
+    /// `SessionStarted`, a client that raced a terminal broadcast, the startup
+    /// sweep, the zombie watchdog. Engine cleanup, so `ResponseAborted`.
+    StuckProjection,
+    /// This request cancel-stamped a pending question. That
+    /// `UserQuestionAnswered` is what set the row to `running` milliseconds
+    /// ago. The status table maps the event to `Running` whatever the answer
+    /// kind. So there is no wedge to clean up: the user ended the turn.
+    ///
+    /// On a sub-thread this also reports to the parent, where the abort only
+    /// decremented its child counter (`parent_callback::should_callback`).
+    /// Deliberate: a parent waiting on a child the user just cancelled has to
+    /// hear about it. A live child's cancel has always said so.
+    CanceledQuestion,
+}
+
+/// Emit the terminal event for a thread the projection still considers
+/// `running` but with no live agent session or in-process loop behind it.
+/// Every caller is a user button. `terminal` says which of the two things that
+/// button did, per [`SettleTerminal`]. The user's actor flows onto either
+/// event so the chip reads "You".
+///
+/// `StuckProjection` emits `ResponseAborted { StaleSettle }`, so the summary
+/// reads "Settled stuck response" rather than "Paused by restart" or "Response
+/// interrupted". No live response existed to *cancel*.
+///
+/// `CanceledQuestion` emits `ResponseCanceled { UserStop }`, what the
+/// live-agent path emits. A Cancel must not read differently because a
+/// subprocess happened to survive. The settle used to read the cancel's own
+/// `running` write as a wedge: see
+/// `docs/plans/2026-08-16-a-canceled-question-is-a-cancel-not-a-stale-settle.md`.
 ///
 /// Returns `Ok(true)` if an event was emitted, `Ok(false)` if the thread was
-/// already settled (or doesn't exist).
-///
-/// Direct emit (rather than `emit_response_aborted`) so the caller can
+/// already settled (or doesn't exist). Direct emit (rather than
+/// `emit_response_aborted` / `emit_response_canceled`) so the caller can
 /// observe `Err` and propagate to the HTTP handler.
 pub(crate) async fn settle_stuck_running_thread(
     pool: &sqlx::PgPool,
     bus: &super::event_bus::EventBus,
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
+    terminal: SettleTerminal,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     if !thread_is_running(pool, thread_id).await? {
         return Ok(false);
     }
 
+    let event = match terminal {
+        SettleTerminal::StuckProjection => {
+            crate::engine::thread_events::ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+                cause: crate::engine::thread_events::AbortCause::StaleSettle,
+            }
+        }
+        SettleTerminal::CanceledQuestion => {
+            crate::engine::thread_events::ThreadEvent::ResponseCanceled {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+                cause: crate::engine::thread_events::CancelCause::UserStop,
+            }
+        }
+    };
+
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
-        event: crate::engine::thread_events::ThreadEvent::ResponseAborted {
-            text: String::new(),
-            images: vec![],
-            model: None,
-            reasoning_effort: None,
-            cause: crate::engine::thread_events::AbortCause::StaleSettle,
-        },
+        event,
         meta: crate::engine::thread_events::EventMeta::with_actor(actor),
     })
     .await?;

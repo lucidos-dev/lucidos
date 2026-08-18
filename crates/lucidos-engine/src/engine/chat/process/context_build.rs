@@ -88,6 +88,7 @@ pub(crate) fn build_capture_sections(
     setup_reminder: &str,
     thread_depth_context: &str,
     user_message: &str,
+    current_time_block: &str,
     loaded_knowhow_docs: &[LoadedKnowhow],
     resume_tool_blocks: &[crate::llm::Message],
     capture_body: bool,
@@ -109,7 +110,7 @@ pub(crate) fn build_capture_sections(
         })
     };
 
-    let labeled: [LabeledSection; 16] = [
+    let labeled: [LabeledSection; 17] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -203,6 +204,15 @@ pub(crate) fn build_capture_sections(
         LabeledSection {
             name: "User Message",
             content: user_message,
+            role: ContextRole::User,
+            group: Some("The request"),
+        },
+        // Last, mirroring where it rides on the wire. It is the one section
+        // that moves every turn, and it is here rather than in the system
+        // prompt for exactly that reason (`super::turn_clock`).
+        LabeledSection {
+            name: "Current Time",
+            content: current_time_block,
             role: ContextRole::User,
             group: Some("The request"),
         },

@@ -128,6 +128,28 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
 
     expect(awayFromBottom.value).toBe(false);
   });
+
+  it('rests the turn on the landing line, clear of the chrome above it', () => {
+    // The transcript's top edge is not clear space: the desktop fade band and
+    // the floating up-chevron sit over it, and on mobile the app header and the
+    // sticky thread-title row do. A turn landed flush against that edge would
+    // be half under them. The turn names the room it needs as
+    // `scroll-margin-top` (chat/response.css), and `turnLandingClearancePx`
+    // reads the resolved px.
+    //
+    // Turn stepping and a deep link are the two navigations sharing that line.
+    // A SUBMIT rests on the live edge and reads nothing here (ADR 0080), which
+    // is why this is pinned from the turn-nav side.
+    const styles = () => ({ scrollMarginTop: '24px', display: 'block' });
+    (globalThis as any).getComputedStyle = styles;
+    const { el, turns } = makeContainer({ scrollTop: 0, scrollHeight: 4000, clientHeight: 500 });
+    turns.push(makeTurn(0, el), makeTurn(800, el), makeTurn(1600, el));
+    setActiveScrollElement(el);
+
+    stepThreadTurn(1);
+
+    expect(el.scrollTop).toBe(776); // 800 (the turn's top) - the 24px it asked for
+  });
 });
 
 /**

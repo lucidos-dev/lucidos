@@ -21,7 +21,8 @@ import {
   workspacePath,
 } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
-import { appUpdateNarration, checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
+import { checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
+import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
@@ -151,10 +152,10 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   // One derivation, shared with the button's action so the label and what the
   // click does can never disagree.
   const tauriHasUpdate = !!packagedUpdateVersion();
-  // An update in flight OWNS this control: the same derivation the progress toast
-  // renders, so the persistent surface and the transient one can never disagree
-  // about what the update is doing. Terminal frames clear the signal, so this is
-  // non-null exactly while a run is live.
+  // An update in flight OWNS this control: the same derivation the progress
+  // dialog renders, so the persistent surface and the transient one can never
+  // disagree about what the update is doing. Terminal frames clear the signal,
+  // so this is non-null exactly while a run is live.
   const updateRun = appUpdateProgress.value;
   const updateNarration = updateRun ? appUpdateNarration(updateRun) : null;
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;

@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { AppUpdateProgress, AppUpdateRunning } from '../../utils/tauri';
+// The real copy module, not a mock: these tests are about what the user reads,
+// and it is pure, so there is nothing to stub.
+import { appUpdateNarration, appUpdateDialogState } from '../progressDialogCopy';
 
 const mocks = vi.hoisted(() => ({
   isTauri: vi.fn(() => true),
@@ -52,7 +55,6 @@ vi.mock('../store', () => ({
 }));
 
 const {
-  appUpdateNarration,
   checkForAppUpdate,
   installAppUpdate,
   recheckAppUpdateOnResume,
@@ -199,43 +201,58 @@ describe('appUpdateNarration', () => {
   });
 });
 
+// The run is narrated by the progress dialog, which is DERIVED from
+// `appUpdateProgress` in store.ts. So what this module owes the user is the
+// FRAME: record it and the dialog draws, clear it and the dialog closes. These
+// assert the frame, then run it through the shipped builder to read what the
+// dialog says. The derivation itself is pinned by
+// store/__tests__/progress-dialog-source.test.ts.
 describe('update progress narration', () => {
+  const dialogNow = () => appUpdateDialogState(
+    storeSignals.appUpdateProgress.value as AppUpdateRunning,
+    () => {},
+  );
+
   // The bug this whole surface exists to fix: the click used to produce nothing
   // visible until the update was over.
   it('narrates on the click rather than waiting for the first event', async () => {
     storeSignals.latestTauriAppVersion.value = '2026.7.30';
-    mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
+    // Read the frame from INSIDE the invoke: the dialog has to be up before the
+    // IPC hop, which is the whole point. The resolve then ends the run.
+    let atInvoke: AppUpdateProgress | null = null;
+    mocks.installAppUpdateAndRestart.mockImplementation(() => {
+      atInvoke = storeSignals.appUpdateProgress.value;
+      return Promise.resolve(undefined);
+    });
     await installAppUpdate();
-    const first = mocks.showToast.mock.calls[0];
-    expect(first[0]).toBe('Checking for updates…');
-    expect((first[2] as Record<string, unknown>).spinning).toBe(true);
+    expect(appUpdateDialogState(atInvoke as unknown as AppUpdateRunning, () => {}).message)
+      .toBe('Checking for updates…');
   });
 
-  it('drives a spinning toast with a determinate bar while downloading', () => {
+  it('records a determinate frame, which the dialog paints as a bar', () => {
     startAppUpdateChecks();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 50, total: 200 });
-    const { message, opts } = lastToast();
-    expect(message).toContain('Downloading Lucidos 2026.7.30');
-    expect(opts.spinning).toBe(true);
-    expect(opts.progress).toBeCloseTo(0.25);
-    // The gateway dies under the page in the last phases; without this opt-in the
-    // narration would be suppressed by the disconnection it is explaining.
-    expect(opts.showWhileUnavailable).toBe(true);
-    expect((opts.secondaryAction as { label: string }).label).toBe('Cancel');
+    const dialog = dialogNow();
+    expect(dialog.message).toContain('Downloading Lucidos 2026.7.30');
+    expect(dialog.progress).toBeCloseTo(0.25);
+    expect(dialog.cancel!.label).toBe('Cancel');
+  });
+
+  it('raises no toast for a running frame, and clears the offer behind it', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 50, total: 200 });
+    expect(mocks.showToast).not.toHaveBeenCalled();
+    // The offer would otherwise sit behind the modal, inviting a second click on
+    // an update already running.
+    expect(mocks.removeToast).toHaveBeenCalledWith('app-update-available');
   });
 
   it('drops the cancel affordance once the run has committed', () => {
     startAppUpdateChecks();
     emitProgress({ version: '2026.7.30', phase: 'installing' });
-    expect(lastToastOpts().secondaryAction).toBeUndefined();
-    expect(lastToastOpts().progress).toBeNull();
-  });
-
-  it('routes the cancel button to the Rust command', () => {
-    startAppUpdateChecks();
-    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
-    (lastToastOpts().secondaryAction as { onClick: () => void }).onClick();
-    expect(mocks.cancelAppUpdate).toHaveBeenCalledTimes(1);
+    const dialog = dialogNow();
+    expect(dialog.cancel).toBeUndefined();
+    expect(dialog.progress).toBeNull();
   });
 
   // A failure must end the run AND say why — this one runs on a click, so the
@@ -293,18 +310,19 @@ describe('update progress narration', () => {
     expect(storeSignals.appUpdateProgress.value).toBeNull();
   });
 
-  it('keeps one toast for the whole run instead of stacking a new one per phase', () => {
+  it('keeps one surface for the whole run, whatever the phase', () => {
     startAppUpdateChecks();
     emitProgress({ version: '2026.7.30', phase: 'checking' });
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
     emitProgress({ version: '2026.7.30', phase: 'installing' });
-    const keys = new Set(mocks.showToast.mock.calls.map((c) => (c[2] as { key: string }).key));
-    expect(keys).toEqual(new Set(['app-update-available']));
+    // One dialog, updated in place by the frame, and nothing stacked beside it.
+    expect(storeSignals.appUpdateProgress.value).toEqual({ version: '2026.7.30', phase: 'installing' });
+    expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   // A rejected invoke (ACL denial, dead bridge) is the one failure Rust can't
   // announce for itself.
-  it('never leaves the toast spinning when the invoke itself rejects', async () => {
+  it('never leaves the dialog up when the invoke itself rejects', async () => {
     storeSignals.latestTauriAppVersion.value = '2026.7.30';
     mocks.installAppUpdateAndRestart.mockRejectedValue('ipc unavailable');
     await installAppUpdate();
@@ -314,8 +332,8 @@ describe('update progress narration', () => {
     expect(storeSignals.appUpdateProgress.value).toBeNull();
   });
 
-  // Both surfaces share one key; a poll firing mid-download would otherwise
-  // replace the live readout with a stale "available" offer.
+  // A poll firing mid-download would otherwise raise a stale "available" offer
+  // behind the dialog narrating the run it is offering.
   it('does not let the periodic check clobber a live run', async () => {
     storeSignals.appUpdateProgress.value = { version: '2026.7.30', phase: 'installing' };
     await checkForAppUpdate();

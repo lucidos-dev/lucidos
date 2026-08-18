@@ -6,13 +6,13 @@ import { findProviderCredential } from './providerCredential';
 import { Explainer } from '../shared/Explainer';
 
 /** Shared block for a provider that authenticates with a single API key stored
- *  as an `api_key` credential (OpenAI, OpenRouter). The secret is write-only —
- *  once set we show "configured", never the value. Renders only the provider
+ *  as an `api_key` credential (OpenAI, OpenRouter, xAI). The secret is
+ *  write-only: once set we show "configured", never the value. Renders only the provider
  *  rows; the enclosing "Providers" `settings-section` is owned by
  *  `SettingsView`. Providers with extra knobs (Anthropic's auth kind, Local's
  *  base URL) keep their own components. */
 export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, note }: {
-  /** Credential service name the engine reads (`openai`, `openrouter`). */
+  /** Credential service name the engine reads (`openai`, `openrouter`, `xai`). */
   service: string;
   baseUrl: string;
   /** Row label, e.g. "OpenAI (direct)". */

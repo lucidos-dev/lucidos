@@ -208,6 +208,15 @@ file). The class names are the contract:
 Prefer these over hand-rolling buttons and rows — a plain unclassed `<button>`
 gets a neutral default that does **not** match Lucidos's primary blue button.
 
+**Four of those rows are the overflow half of a wider rule.** `.button-group`,
+`.table-scroll-wrapper`, `.image-scroll-wrapper` and `data-stack` each contain
+one thing that would otherwise widen the page, and that is all they do. They do
+not make an app responsive. `data-stack` is one of the stylesheet's two width
+breakpoints and the other only tightens markdown-table type, so every other
+width decision is yours to write. The rules, and the three regions the host
+paints over a fullscreen app, are in `system-knowhow/building-an-app.md`
+§ Responsive by default.
+
 Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`); when the screenshot fails for any reason the capture degrades to **DOM-only** — it returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes) prefixed with the failure reason, rather than throwing. The agent still sees the rendered layout instead of going blind.
 
 External-host apps point `baseUrl` at the Lucidos instance with `lucidos.configure`:
@@ -515,6 +524,7 @@ The engine already holds working credentials + routing for every model provider 
 |---|---|---|---|
 | `openai` | `https://api.openai.com/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions`, `/images/generations` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
+| `xai` | `https://api.x.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
 | `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages` — set your own `anthropic-version` header |
 | `local` | your configured local base (Ollama default `http://localhost:11434/v1`) | `Authorization: Bearer <key>` (omitted if keyless) | path as-is, e.g. `/chat/completions` |
 | `vertex` | `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>` (engine-owned prefix) | `Authorization: Bearer <access-token>` (minted + refreshed server-side) | ONLY the suffix, e.g. `/publishers/anthropic/models/claude-opus-4-8@default:rawPredict` |
@@ -545,7 +555,7 @@ const res = await lucidos.proxy('vertex').fetch(
 |---|---|
 | Read/write workspace files | `lucidos.data.*` |
 | Emit a domain event, or query the event store (domain AND engine events) | `lucidos.events.*` |
-| Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'anthropic' \| 'local').fetch(...)` — no `apis.json` needed |
+| Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'xai' \| 'anthropic' \| 'local').fetch(...)`, no `apis.json` needed |
 | Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
 | Hit an engine endpoint no SDK method covers | `fetch(lucidos.apiUrl('/<suffix>'))`. Same origin, no proxy needed, but the URL **must** be built with `apiUrl`: a hand-written `/api/v1/…` is a 404. See § `lucidos.apiUrl` directly below. |
 

@@ -232,12 +232,43 @@ fn test_describe_tool_await_event_leads_with_the_reason() {
     let args = serde_json::json!({
         "on": [{ "event_type": "ChangeProposed" }],
         "timeout_secs": 3600,
-        "reason": "waiting for the release build to finish"
+        "reason": "the release build to finish"
     });
     assert_eq!(
         describe_tool("await_event", &args),
-        "Waiting: waiting for the release build to finish"
+        "Waiting: the release build to finish"
     );
+}
+
+/// This label supplies the verb. `reason` is the model's free text, and it
+/// opens with "waiting for" often enough that four guidance surfaces taught it.
+///
+/// The row that normally REPLACES this step strips the same phrase. A refused
+/// `await_event` emits no `EventWaitStarted`, so nothing replaces the step, and
+/// this label is then what the user is left reading.
+#[test]
+fn test_describe_tool_await_event_does_not_say_waiting_twice() {
+    let label = |reason: &str| {
+        describe_tool(
+            "await_event",
+            &serde_json::json!({ "on": [{ "event_type": "E2ELockReleased" }], "reason": reason }),
+        )
+    };
+    assert_eq!(label("waiting for the e2e lock"), "Waiting: the e2e lock");
+    assert_eq!(label("Waiting until tonight"), "Waiting: tonight");
+    // Any run of whitespace, matching the TS twin's `\s+`. A literal
+    // single-space phrase list stripped in the transcript and doubled here,
+    // for the same reason, which is the hazard of having two implementations.
+    assert_eq!(label("waiting  for  the lock"), "Waiting: the lock");
+    // Only a LEADING phrase goes, and a reason that is nothing else is kept
+    // whole rather than emptied into a dangling colon.
+    assert_eq!(
+        label("the lock another run is waiting for"),
+        "Waiting: the lock another run is waiting for"
+    );
+    assert_eq!(label("waiting for"), "Waiting: waiting for");
+    // The preposition must be a whole word.
+    assert_eq!(label("waiting formally"), "Waiting: waiting formally");
 }
 
 #[test]

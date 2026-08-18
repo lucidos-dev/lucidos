@@ -145,8 +145,12 @@ message when a matching event lands, or tells you the deadline passed. Wraps
 $ lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
     --title "Run the e2e suite" --message "Run ./scripts/e2e.sh and report."
 $ lucidos await-event --on ChildThreadCompleted --timeout-secs 5400 \
-    --reason "waiting for the e2e sidequest"
+    --reason "the e2e sidequest to report"
 ```
+
+`--reason` names **what** you await, not the fact that you await it. The
+transcript labels it `Set up an event wait: <reason>`, so a reason opening with
+a waiting word says it twice.
 
 **Use it instead of a sleep-and-recheck loop.** A `while sleep 60; do lucidos
 events query ...; done` for anything the engine emits burns a tool call per

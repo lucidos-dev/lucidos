@@ -143,6 +143,9 @@ mod backup_schedule_test;
 #[path = "api_support/network_config_test.rs"]
 mod network_config_test;
 
+#[path = "api_support/tailnet_status_test.rs"]
+mod tailnet_status_test;
+
 #[path = "api_support/embedding_model_status_test.rs"]
 mod embedding_model_status_test;
 
@@ -154,3 +157,6 @@ mod coding_agent_binaries_test;
 
 #[path = "api_support/frontend_preview_test.rs"]
 mod frontend_preview_test;
+
+#[path = "api_support/mcp_servers_test.rs"]
+mod mcp_servers_test;

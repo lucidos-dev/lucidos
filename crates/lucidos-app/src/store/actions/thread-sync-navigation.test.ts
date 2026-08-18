@@ -70,7 +70,7 @@ vi.mock('../../api/client', () => ({
   postMcpConsent: vi.fn(),
 }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
-vi.mock('./chat-changes', () => ({ syncRestartToast: vi.fn(), addRestartGroup: vi.fn() }));
+vi.mock('./chat-changes', () => ({ syncRestartState: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // Default device id for this page; device-scoping tests vary the event's actor

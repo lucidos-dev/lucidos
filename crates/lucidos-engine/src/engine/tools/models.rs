@@ -12,7 +12,14 @@ use crate::core::models::ModelStore;
 
 /// Providers the registry accepts — kept in lockstep with
 /// `api::settings::valid_provider` / `llm::model_registry::ProviderKind`.
-const VALID_PROVIDERS: &[&str] = &["vertex", "anthropic", "openai", "openrouter", "local"];
+const VALID_PROVIDERS: &[&str] = &[
+    "vertex",
+    "anthropic",
+    "openai",
+    "openrouter",
+    "xai",
+    "local",
+];
 
 impl LucidosEngine {
     pub(crate) async fn execute_manage_models(
@@ -46,7 +53,7 @@ impl LucidosEngine {
         for m in &models {
             // Surface the declared context window so the agent can see which
             // models are still relying on the id-shape guess — that fallback
-            // gives every OpenRouter / Gemini / local id 200k regardless of its
+            // gives every OpenRouter / xAI / Gemini / local id 200k whatever its
             // real window, which silently shrinks the context budget.
             let window = match m.context_window {
                 Some(w) => format!("{w} tokens"),

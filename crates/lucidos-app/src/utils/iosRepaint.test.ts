@@ -21,7 +21,7 @@ vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => 
 let userScrolling = false;
 vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
 
-import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS } from './iosRepaint';
+import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR } from './iosRepaint';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
   it('starts with an immediate (0ms) attempt', () => {
@@ -79,12 +79,51 @@ afterEach(() => {
   (globalThis as any).cancelAnimationFrame = origCancelRaf;
 });
 
+/** A `style` stub that records custom-property writes, so a test can tell WHICH
+ *  element a published value landed on. `transform` stays a plain field, since
+ *  the code sets it by assignment. */
+function styleStub(transform = ''): any {
+  const props = new Map<string, string>();
+  return {
+    transform,
+    props,
+    setProperty(name: string, value: string) { props.set(name, value); },
+    removeProperty(name: string) { props.delete(name); },
+  };
+}
+
+/** A scrollport-pinned child: a direct child carrying the marker, and what the
+ *  compensation counter is published onto. */
+function fakePinnedChild(): any {
+  return { style: styleStub(), hasAttribute: (name: string) => name === SCROLLER_PINNED_ATTR };
+}
+
+/** An ordinary direct child of the scroller, carrying no marker. */
+function fakePlainChild(): any {
+  return { style: styleStub(), hasAttribute: () => false };
+}
+
+/** The pixels a pinned child was told to undo, or `null` when it holds no
+ *  counter at all. */
+function pinnedShiftPx(child: any): number | null {
+  const raw = child.style.props.get(PINNED_SHIFT_PROP);
+  return raw === undefined ? null : Number(raw.replace('px', ''));
+}
+
 /** A fake element. Pass `scroll` to make it scrollable (the scroll-nudge path);
- *  omit it for the transform-only cases (a non-scrollable element). `offsetHeight`
- *  is a counting getter so a test can assert the forced synchronous layout read
- *  actually happens. */
-function fakeEl(transform = '', scroll?: { scrollTop: number; scrollHeight: number; clientHeight: number }): any {
-  const el: any = { isConnected: true, style: { transform }, offsetReads: 0 };
+ *  omit it for the transform-only cases (a non-scrollable element). Pass
+ *  `pinned` to give it a scrollport-pinned child. `offsetHeight` is a counting
+ *  getter so a test can assert the forced synchronous layout read actually
+ *  happens. */
+function fakeEl(
+  transform = '',
+  scroll?: { scrollTop: number; scrollHeight: number; clientHeight: number },
+  ...pinned: any[]
+): any {
+  const el: any = { isConnected: true, style: styleStub(transform), offsetReads: 0 };
+  // The publish scans the scroller's own children for the marker, so the fake
+  // hands back a `children` list and each child answers `hasAttribute`.
+  el.children = pinned;
   if (scroll) {
     el.scrollTop = scroll.scrollTop;
     el.scrollHeight = scroll.scrollHeight;
@@ -95,6 +134,20 @@ function fakeEl(transform = '', scroll?: { scrollTop: number; scrollHeight: numb
     configurable: true,
   });
   return el;
+}
+
+/** The `translateY` pixels a transform carries, 0 when it carries none. */
+function translateYPx(transform: string): number {
+  const m = /translateY\((-?\d+(?:\.\d+)?)px\)/.exec(transform);
+  return m ? Number(m[1]) : 0;
+}
+
+/** How far the painted content moved since it sat at `from`. The container's
+ *  `translateY` pushes it down, and a larger `scrollTop` pulls it up by the same
+ *  measure. It reads arithmetic rather than a transform string, so it pins the
+ *  rule and not the format. */
+function paintedShiftPx(el: any, from: number): number {
+  return translateYPx(el.style.transform) - (el.scrollTop - from);
 }
 
 describe('forceIOSRepaint', () => {
@@ -319,6 +372,210 @@ describe('forceIOSRepaint', () => {
     flushFrame();
     expect(el.scrollTop).toBe(500);
     expect(el.offsetReads).toBe(0);
+  });
+
+  // --- the nudge is invisible: a matching translateY cancels its displacement ---
+
+  it('cancels the nudge with a matching translateY, so the painted content never moves', () => {
+    // The nudge's mechanism is a PAINTED offset change, and every caller fires
+    // it: the open burst, the resume, the settle probe, and the streaming
+    // throttle at five a second. Uncompensated that is a 1px flick per toggle,
+    // which the reader saw on the iOS PWA as a rapid small shake. The layer
+    // still gets its offset change; the reader must not see it.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: nudged to 499, compensated by translateY(-1px)
+    expect(el.scrollTop).toBe(499); // the offset change the re-tile needs
+    expect(paintedShiftPx(el, 500)).toBe(0); // and nothing the reader can see
+    expect(el.style.transform).toContain('translateZ(0.1px)'); // the other lever survives
+
+    flushFrame(); // frame 2: the compensation leaves with the nudge it cancelled
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('cancels a downward nudge too (at scrollTop 0, where the direction flips)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // frame 1: can't go below 0, so nudge +1 and compensate +1
+    expect(el.scrollTop).toBe(1);
+    expect(paintedShiftPx(el, 0)).toBe(0);
+
+    flushFrame();
+    expect(el.scrollTop).toBe(0);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('leads with the compensation, so a scaling baseline cannot magnify it', () => {
+    // Transform functions apply left to right, each in the coordinate system the
+    // ones before it established. Behind this `scale(2)` the compensation would
+    // move two viewport pixels and over-cancel a one-pixel scroll. Leading keeps
+    // it the pixel the scroll took, and leaves the caller's own transform alone.
+    const el = fakeEl('scale(2)', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateY(-1px) scale(2) translateZ(0.1px)');
+    expect(paintedShiftPx(el, 500)).toBe(0);
+
+    flushFrame();
+    expect(el.style.transform).toBe('scale(2)');
+  });
+
+  it('drops the compensation when the restore YIELDS to a concurrent scroll write', () => {
+    // The restore declines when something else moved the container, so the
+    // position it was compensating is gone. Leaving the translateY behind would
+    // offset the pane by a pixel for as long as the element lives.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame();
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
+    flushFrame(); // frame 2: the scroll restore yields, the transform still resets
+    expect(el.scrollTop).toBe(2000);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('leaves no compensation stranded when a supersede undoes a dropped restore', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame(); // nudged and compensated
+    expect(translateYPx(el.style.transform)).toBe(-1);
+    rafQueue = []; // the page freezes, so the restore frame is dropped
+
+    forceIOSRepaint(el); // a supersede restores the true baseline of BOTH
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+    flushFrame();
+    expect(paintedShiftPx(el, 500)).toBe(0); // the fresh toggle is invisible too
+  });
+
+  it('leaves no compensation stranded when the cleanup runs mid-toggle', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const cleanup = forceIOSRepaint(el)!;
+    flushFrame(); // nudged and compensated
+    cleanup();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  // --- a scrollport-pinned child undoes that compensation ----------------------
+  //
+  // The compensation is exact for content the SCROLL moved. A position:sticky
+  // child paints at its own `top` whatever scrollTop says. So the scroll leg
+  // passes it by, and the transform leg displaces it by the full delta. That was
+  // the mobile thread title flicking a pixel five times on every thread open.
+
+  it('hands a pinned child exactly the shift the container moved it by', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceIOSRepaint(el);
+
+    flushFrame(); // frame 1
+    expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+
+    flushFrame(); // frame 2: it leaves with the compensation it undoes
+    expect(pinnedShiftPx(pinned)).toBeNull();
+  });
+
+  it('hands the shift to EVERY marked child, and to no unmarked one', () => {
+    // The marker is a role, not a name, so a second pinned row is a thing the
+    // design invites. Serving one and displacing the rest would say nothing.
+    // The turns between them scroll normally and are already compensated.
+    const first = fakePinnedChild();
+    const turn = fakePlainChild();
+    const second = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, first, turn, second);
+    forceIOSRepaint(el);
+
+    flushFrame();
+    expect(pinnedShiftPx(first)).toBe(-1);
+    expect(pinnedShiftPx(second)).toBe(-1);
+    expect(pinnedShiftPx(turn)).toBeNull();
+
+    flushFrame();
+    expect(pinnedShiftPx(first)).toBeNull();
+    expect(pinnedShiftPx(second)).toBeNull();
+  });
+
+  it('hands over a downward shift too (at scrollTop 0, where the direction flips)', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceIOSRepaint(el);
+
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
+    expect(pinnedShiftPx(pinned)).toBe(1);
+  });
+
+  it('writes the counter on the CHILD, never on the scroller', () => {
+    // A custom property inherits. A write one level up would invalidate style
+    // for the whole transcript per nudge, five a second while streaming.
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceIOSRepaint(el);
+    flushFrame();
+    expect(el.style.props.has(PINNED_SHIFT_PROP)).toBe(false);
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+  });
+
+  it('hands over nothing wherever the nudge is skipped', () => {
+    // No scroll leg means no compensation, so a counter here would displace the
+    // row by exactly the pixel nothing moved it.
+    const unscrollable = fakePinnedChild();
+    forceIOSRepaint(fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 }, unscrollable));
+    flushFrame();
+    expect(pinnedShiftPx(unscrollable)).toBeNull();
+
+    pendingEventScroll = true;
+    const claimed = fakePinnedChild();
+    forceIOSRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, claimed));
+    flushFrame();
+    expect(pinnedShiftPx(claimed)).toBeNull();
+    pendingEventScroll = false;
+
+    userScrolling = true;
+    const dragging = fakePinnedChild();
+    forceIOSRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, dragging));
+    flushFrame();
+    expect(pinnedShiftPx(dragging)).toBeNull();
+    userScrolling = false;
+  });
+
+  it('retires the counter when the restore YIELDS to a concurrent scroll write', () => {
+    // The transform still resets, so the displacement it caused is gone and the
+    // counter has nothing left to undo.
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceIOSRepaint(el);
+    flushFrame();
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    expect(pinnedShiftPx(pinned)).toBeNull();
+  });
+
+  it('retires the counter when a supersede undoes a dropped restore', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceIOSRepaint(el);
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+    rafQueue = []; // the page freezes, so the restore frame is dropped
+
+    forceIOSRepaint(el); // the supersede restores the baseline of all three
+    expect(el.style.transform).toBe('');
+    expect(pinnedShiftPx(pinned)).toBeNull();
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(-1); // and the fresh toggle publishes again
+  });
+
+  it('retires the counter when the cleanup runs mid-toggle', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    const cleanup = forceIOSRepaint(el)!;
+    flushFrame();
+    cleanup();
+    expect(pinnedShiftPx(pinned)).toBeNull();
   });
 
   // --- deep-link claim gate (don't fight a notification deep-link's scroll) -----

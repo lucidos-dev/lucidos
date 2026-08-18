@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   clampToRange,
   clampSplitRatio,
+  migratedSplitRatio,
   computeStepRatio,
   computeDrawerStepWidth,
+  DEFAULT_SPLIT_RATIO,
   KEYBOARD_RESIZE_STEP_PX,
 } from './splitHelpers';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../../store/paneMinimums';
@@ -11,7 +13,7 @@ import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../../store/p
 const TOTAL = 1000;
 // The pane floors are derived from the root font size now (paneMinimums.ts), so
 // read them rather than restating the retired 300 / 360 constants. The harness
-// answers a 16px root, where they ARE 300 and 360.
+// answers a 16px root, where they are 338 and 360.
 const MIN_THREAD = minThreadPanePx();
 const MIN_CONTENT = minContentPanePx();
 const BOUNDS = { minThreadPx: MIN_THREAD, minContentPx: MIN_CONTENT };
@@ -28,6 +30,52 @@ describe('clampToRange', () => {
     // min-then-max would answer `hi` and hand the space to the trailing pane.
     expect(clampToRange(0, 300, 200)).toBe(300);
     expect(clampToRange(1000, 300, 200)).toBe(300);
+  });
+});
+
+describe('migratedSplitRatio: a persisted ratio the floors have outgrown', () => {
+  // The upgrade path. Raising the Conversation floor made every stored ratio
+  // between the old value and the new illegal, and nothing re-clamps on load.
+  // Without this, a user opens straight back into the overlapping header the
+  // floor was raised to prevent.
+
+  it('leaves a legal ratio exactly where the user put it', () => {
+    // Null, not the same number: the caller must write and persist nothing.
+    expect(migratedSplitRatio(0.5, TOTAL, BOUNDS)).toBeNull();
+    expect(migratedSplitRatio(MIN_THREAD / TOTAL, TOTAL, BOUNDS)).toBeNull();
+    expect(migratedSplitRatio((TOTAL - MIN_CONTENT) / TOTAL, TOTAL, BOUNDS)).toBeNull();
+  });
+
+  it('raises one that is under the Conversation floor to exactly the floor', () => {
+    // 300px was the old floor, and is the width the reported overlap sat at.
+    expect(migratedSplitRatio(300 / TOTAL, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
+    expect(migratedSplitRatio(0.01, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
+  });
+
+  it('pulls one back off the Canvas pane at the other end', () => {
+    expect(migratedSplitRatio(0.99, TOTAL, BOUNDS)).toBe((TOTAL - MIN_CONTENT) / TOTAL);
+  });
+
+  it('leaves a COLLAPSED pane alone: that is a state, not an illegal width', () => {
+    // The toggles and the maximize shortcut put the ratio at exactly 0 or 1 on
+    // purpose, and a drag cannot reach either (ADR 0056). Migrating one would
+    // silently un-collapse a pane the user collapsed.
+    expect(migratedSplitRatio(0, TOTAL, BOUNDS)).toBeNull();
+    expect(migratedSplitRatio(1, TOTAL, BOUNDS)).toBeNull();
+  });
+
+  it('does nothing before the split has a width', () => {
+    // `clampSplitRatio` answers DEFAULT_SPLIT_RATIO for an unmeasurable
+    // container, which as a migration would be a silent reset of the layout.
+    for (const total of [0, 1, 2]) {
+      expect(migratedSplitRatio(0.01, total, BOUNDS), `total ${total}`).toBeNull();
+    }
+  });
+
+  it('repairs a stored value that is not a number at all', () => {
+    // `parseFloat` of a corrupt localStorage entry is NaN, and every comparison
+    // against NaN is false, so it would otherwise flow through as a ratio.
+    expect(migratedSplitRatio(NaN, TOTAL, BOUNDS)).toBe(DEFAULT_SPLIT_RATIO);
   });
 });
 

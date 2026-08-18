@@ -790,8 +790,11 @@ function foldEvent(
         target.steps.push({ seq, event });
         touched?.add(target);
         if (target.userEvent.type === 'UserQuestionAsked') {
+          // A question dismissed, or replaced by a follow-up, already says so
+          // on its own card. A standalone "Response canceled" panel under it
+          // would be a second telling.
           const answered = findQuestionAnswer(target, target.userEvent.tool_use_id);
-          if (answered?.answer.kind === 'Canceled') {
+          if (answered?.answer.kind === 'Canceled' || answered?.answer.kind === 'Superseded') {
             return;
           }
         }

@@ -135,6 +135,22 @@ export interface NetworkConfigResponse {
   detected_tailscale_ip: string | null;
 }
 
+/** GET /api/v1/tailnet-status, mirroring the engine `TailnetStatusResponse`.
+ *  What this machine's tailnet looks like, over plain HTTP, so a phone browser
+ *  gets the same answer the packaged desktop app does.
+ *
+ *  `magic_dns_name` carries no scheme (`<machine>.<tailnet>.ts.net`), and is
+ *  null off a tailnet or with MagicDNS turned off.
+ *
+ *  `workspace_serve_url` is the full `https://<name>/<slug>/` URL, and the
+ *  engine sets it ONLY after a request to it came back from that same engine.
+ *  Print it verbatim: reassembling it here would let the two disagree about a
+ *  string the engine verified and this side did not. */
+export interface TailnetStatusResponse {
+  magic_dns_name: string | null;
+  workspace_serve_url: string | null;
+}
+
 /** One coding agent's effective CLI binary resolution — mirrors the engine
  *  `runtime::AgentBinaryStatus`. Live detection: `override` = the
  *  `coding_agent_*_path` preference, `detected` = probe-list hit, `path` =
@@ -161,7 +177,7 @@ export interface AgentBinariesResponse {
 
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
  *  engine `core::models::Model`. `provider` is the backend that serves it
- *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'local'); `source` is
+ *  ('vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local'); `source` is
  *  'builtin' (disable-only) or 'user' (deletable). */
 export interface ModelInfo {
   id: string;
@@ -172,7 +188,7 @@ export interface ModelInfo {
   enabled: boolean;
   /** Context window in tokens, or null when the engine infers it from the model
    *  id. The id-shape fallback only knows Claude and GPT-5, so every OpenRouter
-   *  / Gemini / local model is treated as 200k until this is set. */
+   *  / xAI / Gemini / local model is treated as 200k until this is set. */
   context_window: number | null;
   created_at: string;
   /** Reasoning tiers this model actually supports, derived by the engine from

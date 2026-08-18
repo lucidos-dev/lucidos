@@ -115,6 +115,244 @@ async fn long_poll_returns_answer_when_user_responds() {
         .ok();
 }
 
+/// An answer-less resolution releases the agent parked inside this endpoint,
+/// and ends the whole batch rather than just its own card.
+///
+/// That release is the whole point of the supersede path: a coding agent asking
+/// a question blocks here, so only a resolution lets it read anything else.
+/// `Canceled` and `Superseded` share the code that does it
+/// (`batch_ending_answer`, `answer_resolves_without_resume`), and `Canceled` is
+/// the one a client may post, so it drives the test. The Superseded-specific
+/// half (the string the agent reads) is unit-covered in `agent_question.rs`.
+///
+/// Two questions, because the untouched card is resolved by a padding row
+/// alone. Without it a restart would re-fire the walk and re-ask it.
+#[tokio::test]
+async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
+    let client = http_client();
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_batch_end_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+    let q1_id = format!("{tool_use_id}#q1");
+
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    let client_bg = client.clone();
+    let q0_id_bg = q0_id.clone();
+    let pool_bg = pool.clone();
+    let resolver = tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
+                 AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
+            )
+            .bind(thread_id)
+            .bind(&q0_id_bg)
+            .fetch_one(&pool_bg)
+            .await
+            .unwrap_or(false);
+            if exists {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("UserQuestionAsked never persisted by the hook endpoint");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let resp = client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_id_bg,
+                "answer": { "kind": "Canceled" }
+            }))
+            .send()
+            .await
+            .expect("resolution post");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "an answer-less resolution must resolve the pending question"
+        );
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-batch-end",
+                "questions": [
+                    {
+                        "question": "Fav color?",
+                        "header": "color",
+                        "multiSelect": false,
+                        "options": [{"label": "Red", "description": ""}]
+                    },
+                    {
+                        "question": "Fav animal?",
+                        "header": "animal",
+                        "multiSelect": false,
+                        "options": [{"label": "Cat", "description": ""}]
+                    }
+                ]
+            }))
+            .send(),
+    )
+    .await
+    .expect("the parked hook must be released, not left blocked")
+    .expect("hook post");
+
+    resolver.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["answers"]["Fav color?"], "(canceled)",
+        "the agent must learn the card it was blocked on is resolved"
+    );
+    assert_eq!(
+        body["answers"]["Fav animal?"], "(canceled)",
+        "the untouched card ends the same way, never as unanswered"
+    );
+
+    // The second card was never asked, so only the padding row resolves it.
+    // Without that row a restart would re-fire the walk and re-ask it.
+    let padded_kind: Option<String> = sqlx::query_scalar(
+        "SELECT payload->'answer'->>'kind' FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
+           AND payload->>'tool_use_id' = $2 LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(&q1_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("padding query")
+    .flatten();
+    assert_eq!(
+        padded_kind.as_deref(),
+        Some("Canceled"),
+        "the padding must record the kind that ended the batch"
+    );
+
+    // A supersede leaves the next turn to the follow-up that caused it.
+    for event_type in ["CodingAgentPromptSent", "ContinuationRequested"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2",
+        )
+        .bind(thread_id)
+        .bind(event_type)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "{event_type} must not fire for an answer-less resolution: no turn follows it"
+        );
+    }
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// `Superseded` asserts something no client can make true: that a follow-up
+/// arrived and replaced this question. Only the message router knows that, so
+/// the endpoint refuses the kind and leaves the question pending.
+///
+/// It is on the public enum because it rides the same persisted
+/// `UserQuestionAnswered` as every other answer. That is exactly why the
+/// refusal has to be tested rather than assumed from the type.
+#[tokio::test]
+async fn answer_question_refuses_a_client_supplied_superseded() {
+    let client = http_client();
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let q0_id = format!("toolu_client_superseded_{}#q0", thread_id.simple());
+
+    seed_cc_thread_summary(&pool, thread_id, "waiting_for_user_answer").await;
+    sqlx::query(
+        "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
+         VALUES ($1, $2, 'UserQuestionAsked', $3, NOW(), 'thread', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({
+        "tool_use_id": q0_id,
+        "cc_session_id": "sid-client-superseded",
+        "question": "Pick one",
+        "options": [{"id": "opt-0", "label": "Red"}],
+        "channel": "claude_code",
+    }))
+    .bind(thread_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert UserQuestionAsked");
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        ))
+        .json(&json!({
+            "tool_use_id": q0_id,
+            "answer": { "kind": "Superseded" }
+        }))
+        .send()
+        .await
+        .expect("answer post");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "an engine-internal kind must be refused, not persisted"
+    );
+    let body: serde_json::Value = resp.json().await.expect("standard error body");
+    let msg = body["error"].as_str().expect("error is a string");
+    assert!(
+        msg.contains("engine-internal"),
+        "the refusal must say why, got: {msg}"
+    );
+
+    let answered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE thread_id = $1 \
+         AND event_type = 'UserQuestionAnswered'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(
+        answered, 0,
+        "a refused answer must leave the question pending and answerable"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
 #[tokio::test]
 async fn multi_select_question_returns_joined_answer() {
     let client = http_client();

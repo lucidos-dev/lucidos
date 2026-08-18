@@ -107,11 +107,10 @@ async fn spawn_idle_parent(bus: &EventBus) -> Uuid {
 
 /// Spawn a CC child of `parent_id`. `bring_to_idle` controls whether the
 /// child is left in Running (true = emit `CodingAgentIdled` so the
-/// projection drops status to idle). CC is used instead of Chat because
-/// chat sub-threads' terminal events route to `archive_state='archived'`
-/// by `resolve_transition` design — agentic-loop children don't surface
-/// in REVIEW — so the cascading-archive test scenarios need CC
-/// descendants to model the surfacing path.
+/// projection drops status to idle). CC is used because it reaches every
+/// state the cascade gate reads, pending changes included. A chat child
+/// holds `archive_state='inbox'` on its own terminal event too, covered by
+/// `archive_cascade_carries_an_idle_chat_child`.
 async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -267,6 +266,48 @@ async fn spawn_cc_child(bus: &EventBus, parent_id: Uuid, with_pending_changes: b
     child_id
 }
 
+/// Spawn an agent-driven chat child of `parent_id` and finish it. Its
+/// `ResponseGenerated` leaves the row at `archive_state='inbox'`, which is
+/// the state the cascade then has to carry.
+async fn spawn_idle_chat_child(bus: &EventBus, parent_id: Uuid) -> Uuid {
+    let child_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::MessageReceived {
+            text: "delegated task".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: Some(parent_id),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    child_id
+}
+
 /// Emit `ThreadArchived` so the row's archive_state flips to 'archived'.
 async fn archive_via_event(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
@@ -304,6 +345,43 @@ async fn archive_with_no_descendants_archives_parent() {
     };
     assert_eq!(to_archive, vec![parent_id]);
     assert!(external_repo_pending.is_empty());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn archive_cascade_carries_an_idle_chat_child() {
+    // A finished chat child sits at `archive_state='inbox'` now, so the
+    // cascade is the only thing that can archive it. Two ways this breaks:
+    // the child blocks the parent's Archive button, or it is dropped from
+    // `to_archive` and stranded in the inbox with its parent gone.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let parent_id = spawn_idle_parent(&bus).await;
+    let child_id = spawn_idle_chat_child(&bus, parent_id).await;
+
+    let child_section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        child_section, "inbox",
+        "a finished chat child keeps the inbox state it ran with",
+    );
+
+    let family = load_family(&pool, parent_id).await;
+    let ArchiveDecision::Proceed { to_archive, .. } = classify_archive_decision(&family, parent_id)
+    else {
+        panic!("an idle chat child must not block its parent's archive");
+    };
+    assert!(
+        to_archive.contains(&child_id),
+        "the cascade must carry the child, or it is stranded in the inbox",
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

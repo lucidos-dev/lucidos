@@ -19,6 +19,8 @@ pub struct ProviderSelectionInputs {
     pub has_anthropic: bool,
     /// An OpenRouter provider is configured.
     pub has_openrouter: bool,
+    /// A direct xAI provider is configured (stored credential or env key).
+    pub has_xai: bool,
     /// A local OpenAI-compatible provider (base URL) is configured.
     pub has_local: bool,
     /// `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
@@ -32,6 +34,7 @@ impl ProviderSelectionInputs {
             || self.has_openai
             || self.has_anthropic
             || self.has_openrouter
+            || self.has_xai
             || self.has_local
     }
 }
@@ -81,6 +84,7 @@ mod tests {
             has_openai: false,
             has_anthropic: false,
             has_openrouter: false,
+            has_xai: false,
             has_local: false,
             boot_without_provider: false,
         }
@@ -114,6 +118,7 @@ mod tests {
             |i: &mut ProviderSelectionInputs| i.has_openai = true,
             |i: &mut ProviderSelectionInputs| i.has_anthropic = true,
             |i: &mut ProviderSelectionInputs| i.has_openrouter = true,
+            |i: &mut ProviderSelectionInputs| i.has_xai = true,
             |i: &mut ProviderSelectionInputs| i.has_local = true,
         ] {
             let mut i = none();

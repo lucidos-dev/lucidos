@@ -16,11 +16,27 @@ import { isUserScrolling } from './scrollActivity';
  *    2. A forced layout read, which flushes the pending layout so the nudged
  *       frame paints instead of being swallowed.
  *    3. A 1px `scrollTop` nudge, taken from the LIVE scrollTop at nudge time
- *       so streaming growth cannot make it stale.
+ *       so streaming growth cannot make it stale. It rides out on a matching
+ *       `translateY`, so the layer gets the offset change and the reader sees
+ *       nothing move (see `nudgedTransform`).
  *
  *  No-op off iOS and for detached nodes. Returns a cleanup that cancels the
  *  pending frames AND restores both baselines, so a caller can hand it
  *  straight back from a `useEffect`. */
+
+/** Marks a DIRECT child the scroll does NOT move: one pinned to the scrollport
+ *  by `position: sticky`. The mobile thread title bar is the only one today.
+ *  A role marker rather than a class, so this shared recovery lever never names
+ *  a component.
+ *
+ *  Direct is the contract, not an accident of today's tree: only the scroller's
+ *  own children are scanned, so nesting the row one level deeper would stop the
+ *  publish silently. Pinned by styles/__tests__/sticky-title-nudge-counter-guard.test.ts. */
+export const SCROLLER_PINNED_ATTR = 'data-scroller-pinned';
+
+/** How far the container's compensation moved a pinned child, in px. The child
+ *  subtracts it in its own `transform`. See `publishPinnedShift`. */
+export const PINNED_SHIFT_PROP = '--repaint-nudge-shift';
 
 /** Per-element in-flight toggle. Tracks the scheduled frames and the transform
  *  baseline (captured once on the first call of a burst) plus this toggle's own
@@ -40,6 +56,9 @@ interface InFlightToggle {
    *  nudged, so `restoreNudge` is a no-op until then. */
   restoreTop: number | undefined;
   nudgedTop: number | undefined;
+  /** The pinned children this toggle published its shift onto, so the clear
+   *  cannot miss an element the publish hit. Empty until rAF1 has published. */
+  pinned: HTMLElement[];
 }
 const inFlight = new WeakMap<object, InFlightToggle>();
 
@@ -76,6 +95,76 @@ export function isRepaintNudging(now: number = performance.now()): boolean {
 function writeNudgedScrollTop(el: HTMLElement, top: number) {
   lastNudgeAt = performance.now();
   el.scrollTop = top;
+}
+
+/** The transform for the nudged frame: this toggle's scroll compensation, the
+ *  caller's own baseline, and the `translateZ` that is the only lever a
+ *  non-scrollable element has.
+ *
+ *  A scroll of `d` paints the content `d` higher, so translating the container
+ *  by `d` puts it back where the reader is looking. The layer still gets the
+ *  offset change that re-tiles it, and nothing appears to move. Without the
+ *  compensation every toggle is a painted 1px flick, and the callers fire up to
+ *  five a second while a reply streams. It cancels only what the scroll moved,
+ *  so a scrollport-pinned child undoes it again: see `publishPinnedShift`.
+ *
+ *  The compensation LEADS, because transform functions apply left to right in
+ *  each other's coordinate systems. Behind a `scale(2)` it would move two
+ *  viewport pixels rather than one.
+ *
+ *  A toggle that did not nudge compensates nothing, so a non-scrollable element
+ *  gets the bare `translateZ` it has always had. Why the one-frame shift of the
+ *  container's own box is invisible:
+ *  docs/plans/2026-08-15-the-repaint-nudge-stops-shaking-the-transcript.md */
+function nudgedTransform(prev: string, entry: InFlightToggle): string {
+  const delta = nudgeDelta(entry);
+  const compensation = delta === 0 ? '' : `translateY(${delta}px) `;
+  return `${compensation}${prev ? `${prev} ` : ''}translateZ(0.1px)`;
+}
+
+/** How far this toggle moved the scroll, and therefore how far its compensation
+ *  moves the container. Zero where the nudge was skipped. One reading, shared by
+ *  the transform and the pinned child's counter, so the two cannot disagree. */
+function nudgeDelta(entry: InFlightToggle): number {
+  return entry.nudgedTop === undefined ? 0 : entry.nudgedTop - entry.restoreTop!;
+}
+
+/** Hand a scrollport-pinned child the shift it has to undo.
+ *
+ *  The compensation above cancels the scroll for everything the scroll MOVED. A
+ *  `position: sticky` child is not that: it paints at its own `top` whatever
+ *  `scrollTop` says, so the scroll leg passes it by and the transform leg is an
+ *  uncancelled displacement. It reads this property and subtracts it in its own
+ *  `transform` (the mobile thread title bar, styles/mobile.css). Left alone it
+ *  flicks a pixel per toggle, which is five times on a thread open and a
+ *  continuous shimmer while a reply streams.
+ *
+ *  Written on the CHILD, never on the scroller or the root. A custom property
+ *  inherits, so a write one level up would invalidate style for the whole
+ *  transcript on every nudge. `useHideOnScroll`'s `bindOffsetConsumers` carries
+ *  the same reasoning, and asks a third consumer to opt in here rather than
+ *  reinstate that recalc. */
+function publishPinnedShift(el: HTMLElement, entry: InFlightToggle) {
+  const delta = nudgeDelta(entry);
+  if (delta === 0) return;
+  // The scroller's OWN children, scanned directly. A `:scope > [attr]` query
+  // has no fast path in either engine, since the rightmost compound is an
+  // attribute selector. It would walk the whole transcript on a frame that then
+  // forces layout. Every marked child, not the first: the marker invites a
+  // second one, and serving only one would displace the rest silently.
+  entry.pinned = Array.from(el.children).filter(
+    child => child.hasAttribute(SCROLLER_PINNED_ATTR),
+  ) as HTMLElement[];
+  for (const pinned of entry.pinned) pinned.style.setProperty(PINNED_SHIFT_PROP, `${delta}px`);
+}
+
+/** Retire the counter. Called wherever the container's transform goes back to
+ *  its baseline, which is the displacement the counter exists to undo. That is
+ *  deliberately NOT tied to the scroll restore: `restoreNudge` yields to a
+ *  concurrent writer, and the transform returns to the baseline regardless. */
+function clearPinnedShift(entry: InFlightToggle) {
+  for (const pinned of entry.pinned) pinned.style.removeProperty(PINNED_SHIFT_PROP);
+  entry.pinned = [];
 }
 
 /** Undo a toggle's OWN scroll nudge: restore the value it nudged FROM, only if
@@ -123,10 +212,11 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     // prior toggle's nudged-FROM value keeps the next raf1 reading a clean live
     // position, with no 1px-per-burst drift.
     if (el.style.transform !== prev) el.style.transform = prev;
+    clearPinnedShift(existing);
     restoreNudge(el, existing);
   }
 
-  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev, nudgeScroll, restoreTop: undefined, nudgedTop: undefined };
+  const entry: InFlightToggle = { raf1: 0, raf2: undefined, prev, nudgeScroll, restoreTop: undefined, nudgedTop: undefined, pinned: [] };
   inFlight.set(el, entry);
   // Only clear the slot if it is still ours: a later superseding call may have
   // replaced the entry, and a dropped-then-resumed stale frame must not evict
@@ -134,7 +224,6 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
   const done = () => { if (inFlight.get(el) === entry) inFlight.delete(el); };
   entry.raf1 = requestAnimationFrame(() => {
     if (!el.isConnected) { done(); return; }
-    el.style.transform = prev ? `${prev} translateZ(0.1px)` : 'translateZ(0.1px)';
     // A real scrollTop change forces WKWebView to re-commit the frozen layer
     // tree, the way a manual scroll recovers the blank.
     //
@@ -147,20 +236,25 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     // timer-driven and this write is deferred a frame, so a fling beginning
     // after an idle burst decision would otherwise be cancelled. Skipping here
     // leaves `nudgedTop` unset, so the rAF2 restore is a no-op.
+    //
+    // Decide the nudge BEFORE the transform, which carries its compensation.
     if (nudgeScroll && !isUserScrolling()) {
       const live = el.scrollTop;
       // Direction-safe so it never clamps to a no-op at either extreme.
-      const nudged = live > 0 ? live - 1 : live + 1;
       entry.restoreTop = live;
-      entry.nudgedTop = nudged;
-      writeNudgedScrollTop(el, nudged);
+      entry.nudgedTop = live > 0 ? live - 1 : live + 1;
     }
+    el.style.transform = nudgedTransform(prev, entry);
+    publishPinnedShift(el, entry);
+    if (entry.nudgedTop !== undefined) writeNudgedScrollTop(el, entry.nudgedTop);
     // Force a synchronous layout flush so the nudged state paints this frame
-    // rather than being coalesced with the restore on the next one.
+    // rather than being coalesced with the restore on the next one. Both writes
+    // above are in it, so the compensation lands on the frame it cancels.
     void el.offsetHeight;
     entry.raf2 = requestAnimationFrame(() => {
       if (el.isConnected) {
         el.style.transform = prev;
+        clearPinnedShift(entry);
         restoreNudge(el, entry);
       }
       done();
@@ -172,6 +266,7 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     // Restore both baselines so an explicit cleanup mid-toggle never leaves a
     // stale nudge behind (which the next call would otherwise read as baseline).
     if (el.style.transform !== prev) el.style.transform = prev;
+    clearPinnedShift(entry);
     restoreNudge(el, entry);
     done();
   };

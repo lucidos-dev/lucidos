@@ -166,16 +166,18 @@ describe('clampThreadDrawerWidth', () => {
 describe('the two split-pane floors', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('equal the px constants they replace at a 16px root', () => {
-    // Derived, not re-tuned: a default-scale layout must be untouched by the
-    // move off `MIN_THREAD_PANE_PX = 300` / `MIN_CONTENT_PANE_PX = 360`.
-    expect(minThreadPanePx()).toBe(300);
+  it('are what their own rows need at a 16px root', () => {
+    // The Canvas floor is still the 360px constant it always was. The
+    // Conversation one is not: it was 300, and its row needs 338, which is the
+    // gap the reported header overlap fell through. See
+    // `conversation-pane-floor.test.ts` for where the 338 comes from.
+    expect(minThreadPanePx()).toBe(338);
     expect(minContentPanePx()).toBe(360);
   });
 
   it('scale with the root, which is the whole point of deriving them', () => {
     vi.stubGlobal('getComputedStyle', () => ({ fontSize: '20px', getPropertyValue: () => '' }));
-    expect(minThreadPanePx()).toBe(375);
+    expect(minThreadPanePx()).toBe(382);
     expect(minContentPanePx()).toBe(450);
   });
 

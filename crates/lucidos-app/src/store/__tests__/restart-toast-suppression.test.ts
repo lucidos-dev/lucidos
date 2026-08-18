@@ -3,17 +3,19 @@ import { engineRestarting, toasts, showToast } from '../store';
 
 // While the engine is restarting, in-flight read requests fail as the engine
 // goes down (a GET already past the awaitEngineReady gate, SSE, health poll).
-// showToast suppresses the resulting noise so only the "Restarting engine..."
-// status is visible; it opts in via `showWhileUnavailable`. See the central
-// guard in store.ts, `workspaceUnavailable()`, which covers a restart plus the
-// two other windows with the same shape (a committed packaged update, and an
-// unreachable database, covered by database-unreachable-surface.test.ts).
+// showToast suppresses the resulting noise, so the restart's own progress
+// dialog is the only account of it on screen. The central guard is
+// `workspaceUnavailable()` in store.ts. It covers a restart plus the two other
+// windows of the same shape: a committed packaged update, and an unreachable
+// database (see database-unreachable-surface.test.ts).
 //
 // These pin the screenshot regression: the SW "New version available" refresh
 // prompt and the "Failed to fetch changes" error must NOT show during a restart.
-// (The UI is no longer deactivated during a restart, but this read-noise
-// suppression is unchanged. User-initiated write failures surface elsewhere,
-// e.g. a send's inline ResponseFailed, not via this path.)
+// User-initiated write failures surface elsewhere, e.g. a send's inline
+// ResponseFailed, not via this path.
+//
+// `showWhileUnavailable` survives the restart moving to a dialog: it is the opt
+// out for any status toast raised inside one of those windows.
 
 beforeEach(() => {
   engineRestarting.value = false;
@@ -58,15 +60,15 @@ describe('toast suppression while engine is restarting', () => {
     expect(toast?.message).toBe('Before');
   });
 
-  it('lets the restart status toast through via showWhileUnavailable', () => {
+  it('lets an opted-in status toast through via showWhileUnavailable', () => {
     engineRestarting.value = true;
-    showToast('Restarting engine...', 'info', {
-      key: 'restart-required',
+    showToast('Downloading embedding model', 'info', {
+      key: 'model-download',
       spinning: true,
       dismissable: false,
       showWhileUnavailable: true,
     });
-    const toast = toasts.value.find(t => t.message === 'Restarting engine...');
+    const toast = toasts.value.find(t => t.message === 'Downloading embedding model');
     expect(toast).toBeTruthy();
     expect(toast?.spinning).toBe(true);
   });
@@ -76,7 +78,7 @@ describe('toast suppression while engine is restarting', () => {
     showToast('Suppressed', 'error');
     expect(toasts.value).toHaveLength(0);
 
-    // connection.ts / UiBlockingOverlay clear the flag before emitting their toasts.
+    // connection.ts clears the flag before emitting its toasts.
     // The real "Engine restarted" toast carries no action (the refresh prompt is
     // owned solely by the build-id staleness check).
     engineRestarting.value = false;

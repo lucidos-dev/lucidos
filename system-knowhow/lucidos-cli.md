@@ -437,9 +437,12 @@ yourself a few minutes ago.
 - `--timeout-secs` is required and capped at 86400 (24 h). There is no unbounded
   subscription. Giving up early costs one turn; giving up too late costs the
   user the whole wait.
-- `--reason` is one short line in the user's language. They read it in the
-  subscription indicator, and it is how they tell a sleeping thread from a
-  stalled one.
+- `--reason` is one short line in the user's language, naming **what** you await
+  rather than the fact that you await it. They read it in the subscription
+  indicator, and it is how they tell a sleeping thread from a stalled one.
+  Write `"the e2e lock to free up"`, not `"waiting for the e2e lock"`: the
+  transcript labels it `Set up an event wait: <reason>`, so a reason opening
+  with a waiting word says it twice.
 
 Refusals arrive as a `400` carrying the reason, and are worth reading rather
 than retrying: a per-token streaming event (`TextStreamed` and friends) or an
@@ -452,11 +455,11 @@ from the user is the loop cap.
 # Wait for a domain event the workspace's own scripts emit, then stop. The
 # engine re-opens this thread with the payload when it lands.
 $ lucidos await-event --on E2ETestsPassed --timeout-secs 3600 \
-    --reason "waiting for tonight's e2e run to report"
+    --reason "tonight's e2e run to report"
 
 # Narrow it: only a change that actually touched files.
 $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}}' \
-    --timeout-secs 1800 --reason "waiting for the refactor to propose its change"
+    --timeout-secs 1800 --reason "the refactor to propose its change"
 ```
 
 ### `lucidos build-slot [--label <T>] [--max-wait <SECS>] -- <command>` / `--status` / `--set-capacity <N>`
@@ -500,7 +503,7 @@ you set one and hit it, do not retry on a timer: subscribe and end your turn.
 
 ```bash
 $ lucidos await-event --on BuildSlotReleased --timeout-secs 3600 \
-    --reason "waiting for a build slot before running the test suite"
+    --reason "a build slot before running the test suite"
 ```
 
 Notes that matter:
@@ -540,7 +543,7 @@ both ages spelled out:
 ```bash
 $ lucidos event-waits list
 {"count":1,"event_waits":[{"wait_id":"3f2b…","subscription":"ChangeProposed",
-  "reason":"waiting for the refactor to propose its change",
+  "reason":"the refactor to propose its change",
   "armed_at":"2026-08-07T09:14:22Z","armed_ago":"7m",
   "expires_at":"2026-08-07T09:44:22Z","expires_in":"22m"}]}
 ```
@@ -828,7 +831,10 @@ it does not have is `stats` and `entries`, which are operator reads.
 ### `lucidos env-vars list | set --name <NAME> --value <V> | delete --name <NAME>`
 
 Manage **non-secret** environment variables injected into every subprocess
-Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents).
+Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents). A
+subprocess sees a change on its next spawn, with no restart. The engine loads
+its own process environment from the same store only at startup. So a variable
+the engine itself reads needs an engine restart.
 
 ```bash
 $ lucidos env-vars list
@@ -859,13 +865,14 @@ $ lucidos models update --id z-ai/glm-5.2 --enabled false   # disable
 $ lucidos models delete --id z-ai/glm-5.2                   # user models only
 ```
 
-`provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `local`.
+`provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `xai`,
+`local`.
 
 **`--context-window` is worth setting on every model you add.** It's the model's
 context window in tokens, and it sizes the engine's context budget. Omit it and
 the engine falls back to guessing from the model id (`claude-*` → 200k unless the
 id carries `[1m]`, `gpt-5*` → 400k, anything else → 200k). That guess has no rule
-at all for OpenRouter, Gemini, or local ids, so they are treated as 200k however
+at all for OpenRouter, xAI, Gemini, or local ids, so they are treated as 200k however
 large they really are — a 1M model gets its context trimmed at a fifth of what it
 could hold.
 
@@ -887,6 +894,46 @@ their identity is engine-owned. To
 change the **default** chat model for new threads, set the `chat_model`
 preference instead (a thread that's already running reuses its own last-used
 model — see `preferences.md`). Mirrors the chat agent's `manage_models` tool.
+
+### `lucidos mcp list | start --id <id> | stop --id <id> | remove --id <id>`
+
+Manage MCP servers: which are running, what tools they offer, and what those
+tools cost in context.
+
+```bash
+$ lucidos mcp list
+$ lucidos mcp start --id slack
+$ lucidos mcp stop --id slack
+$ lucidos mcp remove --id backstage
+```
+
+`list` returns `servers`, `totals`, `model` and `context_window`. Every server
+carries its tools with a `wire_name` (the name a call must use), `chars` and
+`tokens`. The token figures are the engine's own estimate, the same one the
+Context Viewer shows, so a script must never recompute them from chars.
+
+`tools_source` says where the tool list came from. `live` means the process
+answered just now. `cache` means the manifest observed at the last successful
+start, and `tools_observed_at` stamps when. `never-observed` means the server
+has never connected, so its tool list is unknown: that is NOT the same as a
+server with no tools, and a script must not report it as costing nothing.
+
+`totals` splits the cost. `tokens` is what running servers add to every request
+right now. `stopped_tokens` is what the stopped ones would add if started, and
+`disabled_tokens` what the switched-off tools would add back. Divide by
+`context_window` for the share of the resolved model's window.
+
+**Nothing starts MCP servers at boot.** A server is running only if something
+started it in the current engine process, so `running` resets on every restart.
+
+A server whose id cannot ride a wire tool name reports `dispatchable: false`.
+None of its tools can ever be called, `start` refuses it with a 422, and
+`remove` is the only useful verb. Registering a server is the chat agent's `mcp`
+tool, which takes the command and args this surface does not.
+
+Switching individual tools off is `PUT /api/v1/mcp/servers/<id>/disabled-tools`
+with `{"disabled_tools": ["<wire name>", ...]}`, a full replacement rather than a
+delta. No CLI flag for it: the set is a selection, not a scalar.
 
 ### `lucidos changes list`
 

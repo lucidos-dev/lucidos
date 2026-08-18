@@ -159,6 +159,17 @@ describe('Settings leaf-setting reachability', () => {
     expect(anchors.has(anchor)).toBe(true);
   });
 
+  it('keeps the MCP allowlist on the MCP page, cross-linked from Permissions', () => {
+    // The allowlist is meaningless without the server list beside it: a
+    // pattern names a server and a tool. Permissions therefore points at the
+    // page rather than holding a third editor. The pointer is a real
+    // navigation, not a sentence telling the user to go looking.
+    expect(anchors.has('mcp:allowed-tools')).toBe(true);
+    expect(anchors.has('permissions:mcp')).toBe(true);
+    expect(functionBody(SETTINGS_VIEW, 'function permissionsSection()'))
+      .toContain("openSettingsSubview('mcp')");
+  });
+
   it('resolves every search entry to a live subview and a rendered anchor', () => {
     for (const id of settingsSearchEntryIds()) {
       const entry = findSettingsEntry(id)!;

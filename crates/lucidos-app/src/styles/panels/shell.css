@@ -594,13 +594,29 @@
            token for it; there is one now, so a change to the button's box moves
            everything sized off it instead of leaving three copies behind. */
         --header-icon-box: 2.25rem;
+        /* Where the Conversation row's leading control rests, from the row's
+           own leading edge. ONE declaration for the two readers that have to
+           agree on it: .thread-toggle-slot, which sits there, and
+           --brand-side-reserve below, which has to clear it. The overlay build
+           steps it past the traffic lights (see the override below), and a
+           second copy of that 80px is the drift --titlebar-lights-reserve was
+           registered to stop. */
+        --brand-lead-inset: 0.5rem;
         /* Room kept at EACH end of the thread pane's header for the centred
-           brand cluster to clear, sized to the WIDER of the two ends: the
-           trailing actions (setup + compose + search, 3 buttons and 2 gaps,
-           plus the row's padding). The leading end is narrower now that it is
-           the drawer toggle alone, and spending that difference on the cluster
-           is exactly what would stop the cluster being centred on the pane. */
-        --brand-side-reserve: calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem);
+           brand cluster to clear. Sized to the WIDER of the two ends and paid
+           at both, because the cluster is centred on the PANE. Spending the
+           difference on one side is what would stop it being centred.
+           - leading: the drawer toggle, wherever it rests.
+           - trailing: the actions at their widest, which is setup + compose +
+             search, 3 buttons and 2 gaps, plus the row's padding.
+           The leading term is not decoration. The packaged macOS build starts
+           the toggle 80px in, and below 100% ui-scale that end is the wider one
+           on every build. Reading it as "the drawer toggle alone, so narrower"
+           is what let the back chevron land on the toggle. */
+        --brand-side-reserve: max(
+            calc(var(--brand-lead-inset) + var(--header-icon-box)),
+            calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem)
+        );
         /* The content pane's copy of the reserve above, and the same rule: room
            kept at EACH end of the row for the centred title cluster to clear,
            sized to the WIDER of the two ends. The leading end is one hamburger;
@@ -633,11 +649,19 @@
            point is that they hold still: a cluster sized to its contents put
            them wherever the current title or workspace name happened to leave
            them, so they moved under the pointer on every navigation. Same idea
-           as --header-nav-span on mobile, at a desktop distance. The floor is
-           the cluster's own natural width, so a narrow pane squeezes the span
-           rather than the controls in it. */
+           as --header-nav-span on mobile, at a desktop distance. A narrow pane
+           squeezes the span rather than the controls in it, down to the floor
+           below. */
         --desktop-nav-span: 20rem;
-        --desktop-nav-min-span: 8rem;
+        /* The floor, and it IS the cluster's natural width: two chevrons and
+           the mark's tap target, touching. This is what "the chevrons hug the
+           mark" resolves to, and it is derived rather than picked. A picked
+           8rem against a natural 6.6rem left 1.4rem of slack, and that slack is
+           what pushed the back chevron onto the drawer toggle at a narrow pane.
+           The Canvas row shares this token and holds a title rather than a
+           mark. It never reaches the floor: its own pane floor keeps it on the
+           clamp's middle arm (store/paneMinimums.ts). */
+        --desktop-nav-min-span: calc(2 * var(--header-icon-box) + var(--header-mark-tap));
         /* Half the reclaimed macOS title-bar band. A header region centered on
            the header alone (translateY(-50%)) reads as sitting LOW on the
            packaged macOS build: .titlebar-strip paints --titlebar-inset of the
@@ -770,6 +794,20 @@
        the bar, so a future cut to --desktop-bar-height has to clear it. */
     :root[data-titlebar-overlay] {
         --app-header-height: calc(var(--desktop-bar-height) - var(--titlebar-inset, 0px));
+        /* The Conversation row's leading control steps past the lights on this
+           build. NOTHING in the row is left at 0.5rem here. The toggle's box
+           still reaches up into the reclaimed band. That costs nothing, since
+           nothing clips between .titlebar-strip and .app-header and both paint
+           the same blue. The overlap is exactly why the sideways step is needed.
+
+           Declared on :root, not on .thread-toggle-slot, for two reasons. The
+           reserve that has to clear the toggle reads the same value the toggle
+           is placed with. And a rule of its own would restate the drawer-open
+           geometry below, which is identical on both builds. There the toggle
+           sits at the Conversation pane's leading edge, well clear of the
+           lights, because the drawer's own floor starts after this same reserve
+           (store/paneMinimums.ts, ADR 0058). */
+        --brand-lead-inset: var(--titlebar-lights-reserve);
     }
 
     :root[data-thread-drawer-open] {
@@ -959,7 +997,7 @@
        is why NOTHING here transitions opacity.
 
        Both settled positions are exactly where the pair used to sit, so no
-       static layout moved: --thread-toggle-home while the drawer is shut, and
+       static layout moved: --brand-lead-inset while the drawer is shut, and
        the Conversation pane header's leading edge while it is open (below). The
        travel between them rides `left` on the same --duration-slow ease the
        drawer body's width takes, which is what keeps the icon just outside the
@@ -971,26 +1009,32 @@
        z-index must beat .pane-header-brand (--z-control-panel = 2200), which
        starts at left:0 when the drawer is closed and would otherwise swallow
        pointer events. The centred brand-label keeps clear of it via
-       --brand-side-reserve (defined on :root above), which is sized to the
-       WIDER (trailing) end of that region, so a single leading icon is well
-       inside it in either drawer state.
+       --brand-side-reserve (defined on :root above), whose leading term is this
+       control at --brand-lead-inset. That is the same value this rule places it
+       with, so the two cannot disagree about where it is.
 
        It takes --header-band-lift like the three header regions, so the drawer
        toggle sits at the same height as every other control in the bar. It once
-       sat the lift out, because centering the header's LEFT-MOST slot on the bar
-       lifts this group's needs-attention badge (threadToggleBadgeCount) onto the
-       traffic lights; the overlay build clears them SIDEWAYS instead, which
-       dissolves the collision without singling this control out vertically (see
-       the [data-titlebar-overlay] rule below). Same for .view-selector-slot with
-       the drawer open. */
+       sat the lift out. Centering the header's LEFT-MOST slot on the bar lifts
+       this group's needs-attention badge (threadToggleBadgeCount) onto the
+       traffic lights. The overlay build clears them SIDEWAYS instead, via
+       --brand-lead-inset on :root above, and that dissolves the collision
+       without singling this control out vertically. Same for
+       .view-selector-slot with the drawer open. */
+
+    /* It stays a child of .app-header rather than moving into the strip, and
+       that keeps the window drag correct for free. The strip's own drag handler
+       never sees these pointer events, since the header subtree paints, and
+       hit-tests, above it. The header's own handler already exempts interactive
+       targets via headerCanDragStart. */
     .thread-toggle-slot {
-        /* Where the toggle rests while the drawer is shut: the header's own
-           leading padding. Named rather than written inline so the overlay
-           build can move that resting place without restating the drawer-open
-           geometry, which is identical on both builds. */
-        --thread-toggle-home: 0.5rem;
         position: absolute;
-        left: var(--thread-toggle-home);
+        /* Where the toggle rests while the drawer is shut. The value is on
+           :root because --brand-side-reserve reads it too: the centred brand
+           cluster has to clear this control, and a private copy here is how the
+           two came apart on the overlay build. The drawer-open geometry below
+           is identical on both builds and does not read it. */
+        left: var(--brand-lead-inset);
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
         display: flex;
@@ -1006,30 +1050,6 @@
         z-index: calc(var(--z-control-panel) + 1);
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
                     visibility var(--duration-slow);
-    }
-
-    /* Packaged macOS: the toggle rests after the traffic lights instead of at
-       the row's own padding. Horizontal only, deliberately: it keeps the
-       vertical centring of the base rule above, so it lines up with "Threads",
-       the search icon and every other control in the bar. Its box still reaches
-       up into the reclaimed band, which costs nothing (nothing clips between
-       .titlebar-strip and .app-header, and both paint the same blue) and is
-       exactly why the sideways step is still needed.
-
-       It moves the RESTING PLACE rather than `left` itself, which is what keeps
-       this from having to restate (and so drift from) the drawer-open rule
-       below: with the drawer open the toggle is at the Conversation pane's
-       leading edge on both builds, well clear of the lights, because the
-       drawer's own floor is derived from a row that starts after this same
-       reserve (store/paneMinimums.ts, ADR 0058).
-
-       It stays a child of .app-header rather than moving into the strip, which
-       is what keeps the window drag correct for free: the strip's own drag
-       handler never sees these pointer events (the header subtree paints, and
-       hit-tests, above it), and the header's handler already exempts
-       interactive targets via headerCanDragStart. */
-    :root[data-titlebar-overlay] .thread-toggle-slot {
-        --thread-toggle-home: var(--titlebar-lights-reserve);
     }
 
     /* Drawer open: the Conversation pane header's leading edge, the same x the
@@ -1132,7 +1152,7 @@
     }
 
     /* Drawer open, packaged macOS: the whole ROW starts after the traffic
-       lights, which is the same sideways step --thread-toggle-home makes for the
+       lights, which is the same sideways step --brand-lead-inset makes for the
        drawer toggle in the other state, so the header's leading control lands on
        one x whatever the drawer is doing: the Filter button here while the row
        is up, the toggle once the row has clipped away and it has finished
@@ -1336,6 +1356,21 @@
        control inside scrolls it away and back. The parent's `min-height` is what
        keeps this box inside it however --header-mark-tap is retuned; do not drop
        it without reading its note. */
+
+    /* Why no pane width can put an end of this box on a flanking control. Write
+       `lead` for --brand-lead-inset plus one --header-icon-box, and `natural`
+       for --desktop-nav-min-span. The box's leading edge resolves to
+       max(--brand-side-reserve, (pane - natural) / 2), and both arms clear
+       `lead`:
+       - the reserve is a max() that includes `lead`;
+       - (pane - natural) / 2 is at its smallest at the Conversation pane's own
+         floor, and store/paneMinimums.ts derives that floor as
+         natural + 2 * lead.
+       The box is centred, so the trailing end has the same clearance, and
+       useHeaderActionCollapse folds the actions cluster to fit whatever this
+       box leaves. Retuning any of the four terms keeps the proof, since the
+       floor is computed from the same tokens; a floor written as a constant
+       again is what breaks it, and was the reported overlap. */
     .app-header .pane-header-brand .pane-header-brand-label {
         position: absolute;
         left: 50%;
@@ -1425,8 +1460,11 @@
        cannot, never squeeze below the controls' own width. Its middle arm is
        the structural non-overlap guarantee that `min-width: 0` used to give the
        flex zone, and it is a DERIVED reserve rather than a guessed one (see
-       --content-side-reserve). On the min-span arm the ends do reach the
-       clusters, and there `useHeaderActionCollapse` is what pulls the actions
+       --content-side-reserve). The min-span arm engages only BELOW this pane's
+       own floor, since twice the reserve plus the min span is inside
+       MIN_CONTENT_PANE_REM (store/paneMinimums.ts). Only an unclamped persisted
+       ratio reaches such a width. There the ends do reach the
+       clusters, and `useHeaderActionCollapse` is what pulls the actions
        into the ⋯ menu instead.
 
        As tall as the row, by construction rather than by luck: the row's height

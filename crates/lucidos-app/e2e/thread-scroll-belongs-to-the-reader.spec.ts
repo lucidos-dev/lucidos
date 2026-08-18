@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed } from './helpers';
 
 /** The transcript's scroll position belongs to the reader: the app moves it only
  *  when the reader asks, and exactly ONE of those asks is STANDING rather than
@@ -51,6 +51,9 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     // A short viewport so a modest transcript overflows: with no scroll capacity
     // the assertions are vacuous.
     await page.setViewportSize({ width: 1280, height: 400 });
+    // Nothing may ride until the toggle is pressed below, and the seed ships
+    // armed. The test after this one is the half that covers the default.
+    await disarmFollowSeed(page);
     await navigateToApp(page);
 
     const tc = page.locator('.thread-content.visible:visible').first();
@@ -63,17 +66,20 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
       last.appendChild(grown);
     });
 
-    // The first message in a brand-new thread. It IS the thread, so there is
-    // nothing to catch up to and nothing is armed: the 40-line reply grows past
-    // the fold BELOW the reader, who has not moved a pixel and is offered the
-    // chevron. This used to end on the answer's last line.
+    // The first message in a brand-new thread. The submit holds them at the live
+    // edge until the agent draws, which on a thread that IS this turn is barely
+    // anywhere: far enough to bring the status row into view (ADR 0080). Then it
+    // lets go, and the 40-line reply grows past the fold BELOW them, with the
+    // chevron their way down. This used to end on the answer's last line.
     await sendMessage(page, 'List the numbers from 1 to 40, one per line, and nothing else.');
     await waitForResponse(page);
     await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(100);
     await expect.poll(atBottom).toBe(false);
-    // Still where they started, not merely short of the bottom. The slack
-    // absorbs a repaint nudge's deliberate 1px, nothing near a drag.
-    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBeLessThan(50);
+    // Not merely short of the bottom: still up at the turn's own opening, a
+    // small fraction of the way down, rather than carried through the reply.
+    const opening = await tc.evaluate(el => el.scrollTop);
+    const reach = await tc.evaluate(el => el.scrollHeight - el.clientHeight);
+    expect(opening).toBeLessThan(reach / 4);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
 
     // A send into that same thread DOES move them, once: the reader is above the
@@ -113,28 +119,65 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
 
     // Past the old pin window (500ms) with room to spare, so the grow below lands
     // in the world the bug lived in: no suppression left, no render, no gesture.
-    // The thread is IDLE now, and an idle thread carries NOBODY, armed or not:
-    // growth here is the transcript finishing its own rendering rather than the
-    // agent producing anything to be carried toward. The ride is kept, though,
-    // and picks them back up the moment the thread runs again.
+    // The thread is IDLE, and an idle thread carries nobody who SCROLLED AWAY.
+    // This reader never left the edge, and ADR 0064's other half is theirs: the
+    // app's own rendering must not slide the edge out from under them. So the
+    // grow keeps them on it rather than stranding them a screen above.
     await page.waitForTimeout(1500);
-    const riding = await tc.evaluate(el => el.scrollTop);
     await growLastTurn();
-    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
-    await expect.poll(atBottom).toBe(false);
-    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
+    await expect.poll(atBottom).toBe(true);
+    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
     await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 
     // Taking the ride back writes NO scroll: turning the follow off means "leave
     // me where I am reading", not "put me back where I was".
+    const riding = await tc.evaluate(el => el.scrollTop);
     await toggle.click();
     await expect(toggle).toHaveAttribute('aria-pressed', 'false');
     await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
+
+    // And with the ride off, the next grow leaves them behind: that is the
+    // difference the toggle makes, and the chevron is their way back down.
+    await growLastTurn();
+    await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
+    await expect.poll(atBottom).toBe(false);
 
     // The chevron reaches the TRUE bottom of the grown content, and arms nothing.
     await page.locator('button.scroll-to-bottom.visible').click();
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
     await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  /** The DEFAULT, which is the half the journey above cannot see. That test
+   *  disarms the seed on purpose, so nothing in it says what a device that has
+   *  pressed nothing does.
+   *
+   *  The seed ships ARMED, so this context rides with no press behind it. Only
+   *  a disarm press turns it off, and there has been none. */
+  test('a device that has never pressed the toggle rides a brand-new thread', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
+
+    await page.setViewportSize({ width: 1280, height: 400 });
+    // Deliberately NOT disarmed: an untouched context IS the case under test.
+    await navigateToApp(page);
+
+    const tc = page.locator('.thread-content.visible:visible').first();
+    const toggle = page.locator('button[data-role="follow-live-edge"]:visible').first();
+    const atBottom = () => tc.evaluate(el => el.scrollTop + el.clientHeight >= el.scrollHeight - 2);
+
+    // The compose view has no transcript to describe, so the toggle shows the
+    // SEED there. Lit before anything is sent is the whole of the default.
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+    // And it CARRIES on the thread that compose becomes. The reply lands the
+    // reader on the live edge. The same send leaves an unarmed reader up at the
+    // turn's opening, a small fraction of the way down.
+    await sendMessage(page, 'List the numbers from 1 to 40, one per line, and nothing else.');
+    await waitForResponse(page);
+    await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(100);
+    await expect.poll(atBottom).toBe(true);
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
   });
 });

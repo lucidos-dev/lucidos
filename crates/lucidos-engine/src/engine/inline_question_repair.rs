@@ -1,230 +1,225 @@
-//! Defense against Opus 4.7's recurring habit of emitting the
-//! `ask_user_question` tool call as inline `<ask_user_question>...</ask_user_question>`
-//! XML text instead of as a structured tool call. The canonical leak was
-//! observed in a single thread / engine instance even after the
-//! sharpened `ASK_USER_QUESTION_RULE` instruction explicitly told the model
-//! "STOP if about to type `<ask_user_question`" — and the model still
-//! emitted it.
+//! Defense against the chat model emitting the `ask_user_question` tool call as
+//! inline text instead of as a structured tool call. The user then reads raw tag
+//! characters and a JSON blob, and gets no clickable card. It has happened after
+//! the `ASK_USER_QUESTION_RULE` instruction explicitly told the model "STOP if
+//! about to type `<ask_user_question`", so prompt wording is not the fix.
 //!
-//! This is a **model-tolerance measure** — tracked in
+//! This is a **model-tolerance measure**, tracked in
 //! `docs/temporary-measures.md` §2 under the `model-tool-call-as-text`
-//! investigation (the generic `<invoke>` form of the same leak lives in
-//! [`super::inline_tool_call_repair`]). Remove it when the model stops leaking
-//! the tag.
+//! investigation. The generic `<invoke>` form of the same leak lives in
+//! [`super::inline_tool_call_repair`]. Remove it when the model stops leaking.
+//!
+//! Three leak shapes are recognised, all normalised to the questions array:
+//! a JSON array body, a single-key `{"questions": [...]}` object body, and an
+//! unfenced trailing payload carrying that object with no tag at all.
 //!
 //! Two helpers live here:
-//! - [`detect_inline_ask_user_question`] — pure function the agentic loop
-//!   calls AFTER the LLM returns its final text. If the text contains a
-//!   wrapper tag whose body parses as the JSON-array question schema, the
-//!   detector returns the parsed payload + the cleaned text (tag removed,
-//!   surrounding whitespace collapsed).
-//! - [`buffer_contains_inline_tag`] — cheap substring check the streaming
-//!   callback runs on every delta so it can stop flushing `TextStreamed` /
-//!   `CumulativeTextUpdated` once the tag starts forming. Mid-stream
-//!   suppression hides the raw tag from the user's live view; the
-//!   post-response detector still runs and re-routes the question through
+//! - [`detect_inline_ask_user_question`], the pure function the agentic loop
+//!   calls after the LLM returns its final text. See [`InlineQuestionLeak`] for
+//!   the outcomes.
+//! - [`buffer_contains_inline_tag`], a cheap substring check the streaming
+//!   callback runs on every delta so it can stop flushing once the tag starts
+//!   forming. That hides the raw tag from the live view. The post-response
+//!   detector still runs and re-routes the question through
 //!   `walk_question_batch`.
 
-/// What the detector found. Carries the parsed question array (suitable for
-/// wrapping as `{"questions": ...}` and feeding the existing
-/// `parse_ask_user_question_inputs` parser) and the text with the wrapper
-/// tag (plus the leading whitespace that immediately precedes it) stripped.
+/// What the detector found.
 #[derive(Debug, Clone)]
-pub(crate) struct DetectedQuestion {
-    /// The body parsed from inside `<ask_user_question>...</ask_user_question>`.
-    /// Always a JSON array of question objects.
-    pub questions_json: serde_json::Value,
-    /// The original assistant text minus the wrapper tag and any
-    /// surrounding whitespace that would otherwise dangle.
-    pub cleaned_text: String,
+pub(crate) enum InlineQuestionLeak {
+    /// A payload that parsed AND passed the same validation
+    /// `walk_question_batch` applies. The caller synthesises a real tool call
+    /// from it, so the user gets the clickable card the model meant to ask for.
+    Dispatch {
+        /// The questions array, ready to wrap as `{"questions": ...}` for
+        /// `parse_ask_user_question_inputs`.
+        questions_json: serde_json::Value,
+        /// The assistant text minus the leaked block and any whitespace that
+        /// would otherwise dangle.
+        cleaned_text: String,
+    },
+    /// A wrapper tag whose body is not a dispatchable payload: prose, malformed
+    /// JSON, or a payload the downstream walk would reject. The tag is stripped
+    /// and the body kept as ordinary prose, so the user still reads the
+    /// question and can answer by typing. The caller also forces a bounded
+    /// re-ask, giving the model one chance to produce a real card.
+    Degenerate {
+        /// The assistant text with the tags removed and the body left in place.
+        cleaned_text: String,
+    },
 }
 
-/// Scan `text` for an inline `<ask_user_question>...</ask_user_question>`
-/// wrapper. Returns `Some(DetectedQuestion)` when the wrapper is present and
-/// its body parses as a JSON array of question objects, `None` otherwise.
+const OPEN: &str = "<ask_user_question>";
+const CLOSE: &str = "</ask_user_question>";
+
+/// Scan `text` for a leaked `ask_user_question`.
 ///
-/// Recognises only the JSON-array body form
-/// (`<ask_user_question>[{"question":..., "options":[...]}]</ask_user_question>`)
-/// — the variant Opus 4.7 has consistently emitted across the observed
-/// leaks. The earliest leak used a markdown-bullet body inside the
-/// tag; that variant is left untouched here (the agentic loop logs the
-/// detection miss so monitoring still surfaces it).
+/// The wrapper tag is tried first. With no tag outside a code region, an
+/// unfenced payload sitting alone at the end of the response is tried instead.
 ///
-/// The match is anchored on the literal opening tag `<ask_user_question>`
-/// and the closing `</ask_user_question>`. Whitespace either side of the
-/// body is tolerated.
-pub(crate) fn detect_inline_ask_user_question(text: &str) -> Option<DetectedQuestion> {
-    const OPEN: &str = "<ask_user_question>";
-    const CLOSE: &str = "</ask_user_question>";
-    let open_at = text.find(OPEN)?;
+/// Returns `None` when neither matches, and the caller falls back to normal
+/// handling.
+pub(crate) fn detect_inline_ask_user_question(text: &str) -> Option<InlineQuestionLeak> {
+    match first_leaked_tag(text) {
+        Some(open_at) => Some(detect_tagged(text, open_at)),
+        None => detect_bare_payload(text),
+    }
+}
+
+/// Where the first genuinely leaked opening tag starts. A tag inside a code
+/// region is the model demonstrating the format, so it is skipped rather than
+/// abandoning the scan: an explainer can quote the tag and still leak one.
+fn first_leaked_tag(text: &str) -> Option<usize> {
+    text.match_indices(OPEN)
+        .map(|(at, _)| at)
+        .find(|at| !inside_code(text, *at))
+}
+
+/// True when `at` sits inside a code region: all four markdown forms, since a
+/// quoted example in any of them is prose we must not eat.
+///
+/// - A fence, backtick or tilde. An odd count before `at` leaves one open.
+/// - An indented block: four spaces or a tab, and nothing else, ahead of `at`.
+/// - An inline span. An odd backtick count earlier on the line leaves one open.
+///
+/// Approximate rather than CommonMark-exact, and every approximation errs
+/// toward "code". Missing a leak costs one visible tag, while a false positive
+/// deletes prose the user cannot get back.
+fn inside_code(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    if before.matches("```").count() % 2 == 1 || before.matches("~~~").count() % 2 == 1 {
+        return true;
+    }
+    let line_start = before.rfind('\n').map_or(0, |nl| nl + 1);
+    let line_prefix = &before[line_start..];
+    let indent_only =
+        !line_prefix.is_empty() && line_prefix.bytes().all(|b| b == b' ' || b == b'\t');
+    if indent_only && (line_prefix.contains('\t') || line_prefix.len() >= 4) {
+        return true;
+    }
+    line_prefix.matches('`').count() % 2 == 1
+}
+
+/// Classify a wrapper tag known to start at `open_at`. Always a leak, because
+/// the model typed the tool's own tag: the only question is whether its body
+/// can be dispatched.
+fn detect_tagged(text: &str, open_at: usize) -> InlineQuestionLeak {
     let body_start = open_at + OPEN.len();
-    let close_rel = text[body_start..].find(CLOSE)?;
-    let body_end = body_start + close_rel;
-    let close_end = body_end + CLOSE.len();
-    let body = text[body_start..body_end].trim();
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    if !parsed.is_array() {
+    // An unterminated tag runs to the end of the text. The model still typed
+    // the tag, so this is a leak; the body is whatever followed.
+    let (body, close_end) = match text[body_start..].find(CLOSE) {
+        Some(close_rel) => {
+            let body_end = body_start + close_rel;
+            (&text[body_start..body_end], body_end + CLOSE.len())
+        }
+        None => (&text[body_start..], text.len()),
+    };
+    let body = body.trim();
+    match dispatchable_questions(body) {
+        Some(questions_json) => InlineQuestionLeak::Dispatch {
+            questions_json,
+            cleaned_text: splice_out(text, open_at, close_end, ""),
+        },
+        // Keep the body: it is the only question the turn asked.
+        None => InlineQuestionLeak::Degenerate {
+            cleaned_text: splice_out(text, open_at, close_end, body),
+        },
+    }
+}
+
+/// Scan for a payload the model emitted with no wrapper tag at all, sitting
+/// alone at the end of the response. Three anchors carry the false-positive
+/// guard: the candidate runs to the end of the text, it is a single-key
+/// `questions` object, and it is outside any code region.
+///
+/// **A fenced payload is deliberately NOT recovered.** The fence marks the JSON
+/// as an illustration. Recovering it would delete the example from an answer
+/// explaining the tool's own schema, which is the "do not swallow legitimate
+/// prose" case. Unlike a wrong question card, that deletion is not something
+/// the user can undo.
+fn detect_bare_payload(text: &str) -> Option<InlineQuestionLeak> {
+    let trimmed_end = text.trim_end();
+    let (candidate_at, body) = trailing_json_object(trimmed_end)?;
+    if inside_code(trimmed_end, candidate_at) {
         return None;
     }
-    let before = text[..open_at].trim_end();
-    let after = text[close_end..].trim_start();
-    let cleaned_text = match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => before.to_string(),
-        (true, false) => after.to_string(),
-        (false, false) => format!("{}\n\n{}", before, after),
-    };
-    Some(DetectedQuestion {
-        questions_json: parsed,
-        cleaned_text,
+    let questions_json = dispatchable_questions(body)?;
+    Some(InlineQuestionLeak::Dispatch {
+        questions_json,
+        cleaned_text: splice_out(text, candidate_at, text.len(), ""),
     })
 }
 
-/// Cheap substring check used by the streaming callback on every token
-/// delta. Returns `true` once the buffer contains the opening fragment of
-/// an inline `<ask_user_question` tag (closing `>` not required, so we
-/// catch the suppression window before the body even arrives). Once this
-/// returns `true`, the callback stops emitting `CumulativeTextUpdated` and
-/// `TextStreamed` deltas for the remainder of the LLM turn — the
-/// post-response repair path takes over.
+/// The EARLIEST line-anchored `{` from which the whole rest of `text` parses as
+/// one JSON value, with its offset. Line-anchored, so a brace mid-sentence
+/// cannot start a candidate. Earliest rather than last makes the match greedy:
+/// a candidate that swallows trailing prose fails to parse and is skipped, so
+/// the one that wins starts exactly where the trailing object starts.
+fn trailing_json_object(text: &str) -> Option<(usize, &str)> {
+    if !text.ends_with('}') {
+        return None;
+    }
+    text.match_indices('{')
+        .filter(|(at, _)| *at == 0 || text[..*at].ends_with('\n'))
+        .map(|(at, _)| (at, &text[at..]))
+        .find(|(_, body)| serde_json::from_str::<serde_json::Value>(body).is_ok())
+}
+
+/// Parse `body` and return the questions array, but only when the payload would
+/// survive the walk. Accepts a bare JSON array, or an object whose ONLY
+/// top-level key is `questions`. Returns `None` for anything else.
+///
+/// Validation is `walk_question_batch`'s own gate, deliberately: it needs at
+/// least one question, each with non-empty `question` text. Synthesising a call
+/// that gate would reject only turns a visible tag into an invisible tool
+/// error, leaving the user with nothing at all.
+fn dispatchable_questions(body: &str) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let questions = match parsed {
+        array @ serde_json::Value::Array(_) => array,
+        serde_json::Value::Object(mut map) if map.len() == 1 => map
+            .remove("questions")
+            .filter(serde_json::Value::is_array)?,
+        _ => return None,
+    };
+    let parser_input = serde_json::json!({ "questions": questions });
+    let walked = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+    if walked.is_empty() || walked.iter().any(|q| q.question.is_empty()) {
+        return None;
+    }
+    Some(questions)
+}
+
+/// Replace `text[cut_from..cut_to]` with `replacement`, collapsing the
+/// whitespace that would otherwise dangle where the block was.
+fn splice_out(text: &str, cut_from: usize, cut_to: usize, replacement: &str) -> String {
+    let before = text[..cut_from].trim_end();
+    let after = text[cut_to..].trim_start();
+    [before, replacement.trim(), after]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Cheap substring check the streaming callback runs on every token delta.
+/// Returns `true` once the buffer holds the opening fragment of the tag. The
+/// closing `>` is not required, so suppression starts before the body arrives.
+/// Once true, the callback stops emitting `CumulativeTextUpdated` and
+/// `TextStreamed` for the rest of the LLM turn, and the post-response repair
+/// takes over.
+///
+/// Deliberately tag-only. A bare payload has no tag to match on. "Alone at the
+/// end" is not decidable from a prefix, so guessing would kill live streaming
+/// for a turn that merely discusses the schema. The bare form self-corrects at
+/// the final flush, which emits the cleaned text.
+///
+/// Nor can it persist on the way. `should_flush` flushes only at a paragraph
+/// boundary, and a payload alone at the end has no blank line after it. So no
+/// `TextStreamed` delta ever carries one.
 pub(crate) fn buffer_contains_inline_tag(buf: &str) -> bool {
     buf.contains("<ask_user_question")
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ----- detect_inline_ask_user_question -----
-
-    #[test]
-    fn detect_returns_none_on_plain_text() {
-        assert!(detect_inline_ask_user_question("hello world").is_none());
-    }
-
-    #[test]
-    fn detect_returns_none_when_only_open_tag() {
-        let text = r#"intro <ask_user_question>[{"question":"x","options":[{"label":"a"}]}]"#;
-        assert!(detect_inline_ask_user_question(text).is_none());
-    }
-
-    #[test]
-    fn detect_returns_none_when_body_not_json() {
-        let text = "<ask_user_question>not json</ask_user_question>";
-        assert!(detect_inline_ask_user_question(text).is_none());
-    }
-
-    #[test]
-    fn detect_returns_none_when_body_not_array() {
-        // JSON object (single question without array wrapper) — out of
-        // scope. The schema the parser consumes is `{"questions": [...]}`
-        // wrapping an ARRAY. A bare object falls through.
-        let text =
-            r#"<ask_user_question>{"question":"x","options":[{"label":"a"}]}</ask_user_question>"#;
-        assert!(detect_inline_ask_user_question(text).is_none());
-    }
-
-    #[test]
-    fn detect_parses_json_array_body() {
-        let text = r#"<ask_user_question>[{"question":"Continue?","options":[{"label":"Yes"},{"label":"No"}]}]</ask_user_question>"#;
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        assert!(d.questions_json.is_array());
-        assert_eq!(d.questions_json.as_array().unwrap().len(), 1);
-        assert_eq!(d.cleaned_text, "");
-    }
-
-    #[test]
-    fn detect_feeds_existing_parser_via_questions_wrap() {
-        // The whole point of returning `questions_json` is that the
-        // existing CC parser path accepts it once wrapped as
-        // `{"questions": <array>}`. This test pins that compatibility.
-        let text = r#"<ask_user_question>[{"question":"Continue?","options":[{"label":"Yes","description":"go ahead"},{"label":"No"}]}]</ask_user_question>"#;
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        let parser_input = serde_json::json!({ "questions": d.questions_json });
-        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].question, "Continue?");
-        assert_eq!(parsed[0].options.len(), 2);
-        assert_eq!(parsed[0].options[0].label, "Yes");
-    }
-
-    #[test]
-    fn detect_strips_tag_and_preserves_preceding_text() {
-        let text = "Some prose.\n\n<ask_user_question>[{\"question\":\"x\",\"options\":[{\"label\":\"a\"}]}]</ask_user_question>";
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        assert_eq!(d.cleaned_text, "Some prose.");
-    }
-
-    #[test]
-    fn detect_collapses_double_blank_lines_around_tag() {
-        // Most common live shape: prose preamble, blank line, tag, end of
-        // text. Cleaned should drop the trailing blank line so the
-        // assistant text doesn't end in a phantom paragraph break.
-        let text = "Paragraph.\n\n<ask_user_question>[{\"question\":\"x\",\"options\":[{\"label\":\"a\"}]}]</ask_user_question>\n\n";
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        assert_eq!(d.cleaned_text, "Paragraph.");
-    }
-
-    #[test]
-    fn detect_preserves_trailing_prose_after_tag() {
-        let text = "Before.\n\n<ask_user_question>[{\"question\":\"x\",\"options\":[{\"label\":\"a\"}]}]</ask_user_question>\n\nAfter.";
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        assert_eq!(d.cleaned_text, "Before.\n\nAfter.");
-    }
-
-    #[test]
-    fn detect_real_leak_fixture() {
-        // Verbatim from a real observed leak event, edited only to shorten
-        // the descriptions to fit a Rust string literal.
-        let text = r#"#1 fixes today's instance. #2 fixes future drift. They're independent.
-
-<ask_user_question>
-[{"question":"How do you want to close the bug-filing gap?","options":[{"label":"Both — file now, strengthen prompt","description":"manual emit gets CC moving on the executable-bar guard immediately"},{"label":"File the bug now","description":"Just kick the fix workflow with what we know"},{"label":"Just strengthen the prompt","description":"Trust the next codex session to file it correctly"},{"label":"Look at the scratch space first","description":"Read the last few session logs to extract the actual repro"}]}]
-</ask_user_question>"#;
-        let d = detect_inline_ask_user_question(text).expect("should detect");
-        assert!(d.cleaned_text.starts_with("#1 fixes today's instance."));
-        assert!(!d.cleaned_text.contains("<ask_user_question"));
-        let parser_input = serde_json::json!({ "questions": d.questions_json });
-        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
-        assert_eq!(parsed.len(), 1);
-        assert!(parsed[0].question.starts_with("How do you want"));
-        assert_eq!(parsed[0].options.len(), 4);
-    }
-
-    // ----- buffer_contains_inline_tag -----
-
-    #[test]
-    fn buffer_check_true_on_partial_open_tag() {
-        // Detection must fire BEFORE the closing `>` arrives so the
-        // streaming callback suppresses the tag-body delta before the
-        // user sees it. The fragment "<ask_user_question" is enough.
-        assert!(buffer_contains_inline_tag("hello <ask_user_question"));
-    }
-
-    #[test]
-    fn buffer_check_true_on_full_open_tag() {
-        assert!(buffer_contains_inline_tag("hello <ask_user_question>"));
-    }
-
-    #[test]
-    fn buffer_check_true_on_full_wrapped_block() {
-        assert!(buffer_contains_inline_tag(
-            "hi <ask_user_question>body</ask_user_question> bye"
-        ));
-    }
-
-    #[test]
-    fn buffer_check_false_on_plain_text() {
-        assert!(!buffer_contains_inline_tag("hello world"));
-    }
-
-    #[test]
-    fn buffer_check_false_on_bare_tool_name_in_prose() {
-        // The rule mentions the tool name `ask_user_question` lots of
-        // times. Those mentions must NOT trip suppression — only the
-        // angle-bracket wrapper does.
-        assert!(!buffer_contains_inline_tag(
-            "I'll use the ask_user_question tool to ask."
-        ));
-    }
-}
+#[path = "inline_question_repair_tests.rs"]
+mod tests;

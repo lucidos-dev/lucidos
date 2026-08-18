@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { connectionStatus, toasts, showToast, restartRequired, restartGroups, engineStartedAt, updateAvailable, latestTauriAppVersion, engineVersion, latestEngineVersion, engineRestarting } from '../store';
-import { syncRestartToast, RESTART_LS_KEY } from '../actions/chat-changes';
+import { connectionStatus, toasts, restartRequired, restartGroups, engineStartedAt, updateAvailable, latestTauriAppVersion, engineVersion, latestEngineVersion, engineRestarting, engineRestartNewVersion, activeProgressDialog } from '../store';
+import { syncRestartState, RESTART_LS_KEY } from '../actions/chat-changes';
 
 // Mock dependencies so checkConnection can run in isolation
 const mockCheckHealth = vi.fn();
@@ -36,7 +36,7 @@ vi.mock('../actions/notifications', () => ({
 
 const { checkConnection, handleRestartTimeout } = await import('../actions/connection');
 
-const RESTART_TOAST_KEY = 'restart-required';
+const RESTART_FAILURE_TOAST_KEY = 'restart-required';
 const STARTED_AT = '2026-03-20T06:00:00Z';
 const RESTARTED_AT = '2026-03-20T07:00:00Z';
 
@@ -51,13 +51,14 @@ beforeEach(() => {
   engineVersion.value = null;
   latestEngineVersion.value = null;
   engineRestarting.value = false;
+  engineRestartNewVersion.value = false;
   toasts.value = [];
   localStorage.removeItem(RESTART_LS_KEY);
   localStorage.removeItem('lucidos-restart-groups');
   delete (window as any).__LUCIDOS_APP_VERSION__;
 });
 
-describe('restart toast survives network reconnect', () => {
+describe('restart state survives network reconnect', () => {
   function loadedHealth(overrides: Record<string, unknown> = {}) {
     return {
       status: 'loaded',
@@ -89,7 +90,7 @@ describe('restart toast survives network reconnect', () => {
 
     // Seed pending restart state (simulates ChangeApplied with requires_restart=true)
     restartRequired.value = true;
-    syncRestartToast();
+    syncRestartState();
     localStorage.setItem(RESTART_LS_KEY, 'true');
 
     // Engine becomes unreachable (sustained health-check timeouts during apply)
@@ -111,17 +112,17 @@ describe('restart toast survives network reconnect', () => {
 
     // Seed pending restart state
     restartRequired.value = true;
-    syncRestartToast();
+    syncRestartState();
     localStorage.setItem(RESTART_LS_KEY, 'true');
 
     // Engine restarts — started_at changes
     mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
     await checkConnection();
 
-    // The switch completed — the engine-pending gate is cleared so the deferred
-    // client refresh toast can surface, and any keyed restart toast is dismissed.
+    // The switch completed: the engine-pending gate is cleared so the deferred
+    // client refresh toast can surface, and a stale restart-failure toast goes.
     expect(restartRequired.value).toBe(false);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
+    expect(toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY)).toBeFalsy();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
 
     // The post-restart confirmation is a plain, action-LESS success toast — no
@@ -137,7 +138,7 @@ describe('restart toast survives network reconnect', () => {
 
     // Seed pending restart state
     restartRequired.value = true;
-    syncRestartToast();
+    syncRestartState();
     localStorage.setItem(RESTART_LS_KEY, 'true');
 
     // Engine goes down (sustained failures past the debounce window)
@@ -149,41 +150,41 @@ describe('restart toast survives network reconnect', () => {
 
     // Switch completed — gate cleared, keyed toast dismissed
     expect(restartRequired.value).toBe(false);
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeFalsy();
+    expect(toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY)).toBeFalsy();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
   });
 
-  it('keeps the in-flight restart status toast up (unchanged) when the old engine goes unreachable', async () => {
+  it('keeps the in-flight restart dialog up (unchanged) when the old engine goes unreachable', async () => {
     await establishConnection();
 
-    // Restart in flight: the status toast is up (initiateEngineRestart). Its wording
-    // is stable for the whole window — there is no build→swap phase transition.
+    // Restart in flight: the dialog is up, and its wording is stable for the
+    // whole window, since there is no build to swap phase transition.
     engineRestarting.value = true;
+    engineRestartNewVersion.value = true;
     toasts.value = [];
-    showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
 
-    // Old engine killed → a /health failure must NOT dismiss or reword the toast;
-    // it stays with its spinner until reconnect (started_at change) clears it.
+    // Old engine killed. A /health failure must NOT close or reword the dialog;
+    // it stays until reconnect (started_at change) clears the flag.
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
-    const toast = toasts.value.find(t => t.key === RESTART_TOAST_KEY);
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toBe('Starting new version…');
-    expect(toast!.spinning).toBe(true);
+    expect(engineRestarting.value).toBe(true);
+    expect(activeProgressDialog.value.visible).toBe(true);
+    expect(activeProgressDialog.value.title).toBe('Starting new version');
   });
 
-  it('does not invent a restart toast on a transient blip when no restart is in flight', async () => {
+  it('does not invent a restart dialog on a transient blip when none is in flight', async () => {
     await establishConnection();
 
-    // No restart underway — a one-off health failure must not invent a progress toast.
+    // No restart underway: a one-off health failure must invent nothing.
     engineRestarting.value = false;
     toasts.value = [];
 
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
-    expect(toasts.value.find(t => t.key === RESTART_TOAST_KEY)).toBeUndefined();
+    expect(activeProgressDialog.value.visible).toBe(false);
+    expect(toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY)).toBeUndefined();
   });
 
   it('does not set updateAvailable on engine restart when the frontend bundle is unchanged', async () => {
@@ -339,6 +340,9 @@ describe('restart toast survives network reconnect', () => {
       await handleRestartTimeout();
 
       expect(engineRestarting.value).toBe(false);
+      // The dialog rides that flag, so the timeout is also what guarantees an
+      // engine that never came back cannot leave the user behind a modal.
+      expect(activeProgressDialog.value.visible).toBe(false);
       const toast = toasts.value.find(t => t.message === 'Engine restart timed out');
       expect(toast).toBeTruthy();
       expect(toast!.type).toBe('error');

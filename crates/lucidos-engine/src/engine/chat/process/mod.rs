@@ -8,6 +8,7 @@
 //! - [`context_sections`] — per-turn context-section builders.
 //! - [`titles`] — title-emit orchestration.
 //! - [`context_build`] — pure capture-section / loaded-knowhow helpers.
+//! - [`turn_clock`]: the turn's time context, split across the two prompt tiers.
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin, TriggerInvocation};
 use crate::engine::types::*;
@@ -23,6 +24,7 @@ mod history;
 mod run;
 mod system_prompt;
 mod titles;
+mod turn_clock;
 // `pub(super)` so the per-trigger knowhow listing in `chat::process_helpers`
 // can share this module's routing-description ceiling.
 pub(super) mod workspace_payload;

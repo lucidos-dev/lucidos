@@ -1104,23 +1104,64 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
 /// the backstop to fire first; see [`crate::core::MIN_MAX_TOOL_CALLS`].)
 pub(crate) const MAX_QUESTION_REASK: usize = 2;
 
-/// The forcing instruction appended as a user message when the model abandons a
-/// rejected `ask_user_question` and answers in prose instead. Pushes it back to
-/// the tool with the full question text — the interactive card is the whole
-/// point of the call, and a prose fallback silently degrades it into a
-/// typed-reply menu the user can't click.
-pub(crate) const QUESTION_REASK_INSTRUCTION: &str = "Your previous `ask_user_question` call was \
-    rejected because a question object had no `question` text (the `header` chip-label is not a \
-    substitute). Do NOT answer in prose or inline the options as a typed-reply menu — the user \
-    needs the clickable question card. Re-call `ask_user_question` now with the full question \
-    text filled in on every question object.";
+/// Why the loop is pushing the model to re-ask. Each cause carries its own
+/// forcing instruction. Telling the model a call was rejected when it never
+/// made one sends it looking for a mistake that isn't there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuestionReaskCause {
+    /// The model called `ask_user_question`, the engine rejected the call, and
+    /// the model answered in prose instead of re-calling.
+    CallRejected,
+    /// The model typed `<ask_user_question>` as text and its body was not a
+    /// dispatchable payload, so no call was ever made. Detected by
+    /// [`crate::engine::inline_question_repair`].
+    LeakedAsText,
+}
 
-/// Decide whether the no-tool-calls termination branch must force a re-ask
-/// instead of finalizing the turn. True only when the previous iteration's
-/// `ask_user_question` call errored AND the per-response force budget isn't
-/// spent. Pure so the bound is unit-testable without driving the whole loop.
-pub(crate) fn should_force_question_reask(ask_failed_last_iter: bool, reask_forced: usize) -> bool {
-    ask_failed_last_iter && reask_forced < MAX_QUESTION_REASK
+impl QuestionReaskCause {
+    /// The forcing instruction appended as a user message. Pushes the model
+    /// back to the tool with the full question text: the interactive card is
+    /// the whole point of the call, and a prose fallback degrades it into a
+    /// typed-reply menu the user can't click.
+    pub(crate) fn instruction(self) -> &'static str {
+        match self {
+            Self::CallRejected => {
+                "Your previous `ask_user_question` call was rejected because a question object \
+                 had no `question` text (the `header` chip-label is not a substitute). Do NOT \
+                 answer in prose or inline the options as a typed-reply menu: the user needs \
+                 the clickable question card. Re-call `ask_user_question` now with the full \
+                 question text filled in on every question object."
+            }
+            Self::LeakedAsText => {
+                "You typed an `<ask_user_question>` tag as ordinary text, so no tool call was \
+                 made and the user got no clickable card. The tag is not parsed out of your \
+                 response. Do NOT type it again, and do NOT inline the options as a typed-reply \
+                 menu. INVOKE `ask_user_question` AS A TOOL CALL now, with the full question \
+                 text and 2-4 options."
+            }
+        }
+    }
+}
+
+/// Why the no-tool-calls termination branch must force a re-ask instead of
+/// finalizing the turn, or `None` to finalize normally.
+///
+/// The two causes share one `MAX_QUESTION_REASK` budget, so they cannot
+/// alternate past the cap. A rejected call wins when both hold: it is the more
+/// specific diagnosis, since the model did reach the tool. Pure, so the bound
+/// is unit-testable without driving the whole loop.
+pub(crate) fn question_reask_cause(
+    ask_failed_last_iter: bool,
+    leaked_as_text: bool,
+    reask_forced: usize,
+) -> Option<QuestionReaskCause> {
+    if reask_forced >= MAX_QUESTION_REASK {
+        return None;
+    }
+    if ask_failed_last_iter {
+        return Some(QuestionReaskCause::CallRejected);
+    }
+    leaked_as_text.then_some(QuestionReaskCause::LeakedAsText)
 }
 
 /// How many times one turn may be sent back for leaving work open with nothing

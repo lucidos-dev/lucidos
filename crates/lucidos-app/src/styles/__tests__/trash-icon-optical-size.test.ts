@@ -22,11 +22,11 @@
  * stroke-width the rule divides.
  *
  * The second describe covers what the `--icon-glyph` indirection is FOR. Three
- * bands take three nominals off one shared box: a header band, a list row's
- * action cluster, and an icon inline in a run of text. Only the glyph moves,
- * never the 2.25rem tap target the box rule exists to guarantee. It also pins
- * the split as the SINGLE source of all three sizes: a caller that reintroduces
- * a local nominal is back to two places to look.
+ * bands take three nominals off one shared 2.25rem tap target: a header band, a
+ * list row's action cluster, an icon inline in text. Only the glyph moves.
+ * It also pins the split as the SINGLE source of all three sizes. And it pins
+ * the two shapes the target comes in. The two chrome bands take it as a box;
+ * the inline one lays it over its own, a word in a line of text.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -119,11 +119,32 @@ for (const r of cssRules(baseCss)) {
   }
 }
 
-/** The rule that owns the 2.25rem tap target the three bands share. */
-const boxRule = hostRules.find(r => {
+/** The rule the three bands share, which is where the tap target is declared.
+ *  Found by its selector list, not by the declaration, so a band dropped from
+ *  it fails the lookup instead of quietly reading a shorter list. */
+const bandRule = hostRules.find(r => {
   const members = selectorList(r.selector);
   return BANDS.every(band => members.includes(`.icon-btn.${band}`));
 });
+
+/** The two chrome bands take the target as their own box. */
+const boxRule = hostRules.find(r => {
+  const members = selectorList(r.selector);
+  return members.includes('.icon-btn.header-icon')
+    && members.includes('.icon-btn.row-icon')
+    && !members.includes('.icon-btn.inline-icon')
+    && r.props.has('width');
+});
+
+/** The inline band takes it as an overlay, so its box can stay the glyph. */
+const overlayRule = hostRules.find(r =>
+  selectorList(r.selector).includes('.icon-btn.inline-icon::before'),
+);
+
+/** The inline band's own rule: the chip padding and the margin cancelling it. */
+const inlineChipRule = hostRules.find(r =>
+  selectorList(r.selector).includes('.icon-btn.inline-icon') && r.props.has('padding'),
+);
 
 /** Every rule that sets a nominal for one of the three boxes, keyed by band.
  *  Both tests below read this one map, so neither can derive a different
@@ -148,23 +169,22 @@ const callerRules = [
 
 describe('the nominal glyph size is declared per band, on the shared tap target', () => {
   it('keeps the tap target on one rule and puts a nominal on each class it names', () => {
-    expect(boxRule, 'no rule shares the tap target across all three bands').toBeDefined();
-    expect(boxRule!.props.get('width'), 'the shared rule is not the 2.25rem tap target').toBe('2.25rem');
-    expect(boxRule!.props.get('height')).toBe('2.25rem');
+    expect(bandRule, 'no rule shares a declaration across all three bands').toBeDefined();
+    expect(bandRule!.props.get('--icon-tap-target'), 'the shared target is not 2.25rem').toBe('2.25rem');
     // The bands take different nominals, so one riding the shared rule would be
     // a default that silently reaches all of them again.
-    expect(boxRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for every band').toBe(false);
+    expect(bandRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for every band').toBe(false);
 
     for (const band of BANDS) {
       const found = bandNominals.get(band)!;
       // Exactly one: a second in this sheet would be a silent second default,
       // and whichever lost would be dead code.
       expect(found.length, `.${band} does not declare exactly one nominal`).toBe(1);
-      // On a selector the shared box rule itself names, which is what keeps a
+      // On a selector the shared band rule itself names, which is what keeps a
       // nominal from landing on anything that is not one of these tap targets.
-      expect(selectorList(boxRule!.selector), `.${band}'s nominal is not on a shared tap target`)
+      expect(selectorList(bandRule!.selector), `.${band}'s nominal is not on a shared tap target`)
         .toContain(found[0].selector);
-      // And the nominal rule moves the glyph only. The box was grown
+      // And the nominal rule moves the glyph only. The target was grown
       // deliberately after the trash was reported unhittable on mobile.
       expect([...found[0].props.keys()], `"${found[0].selector}" sets more than the nominal`)
         .toEqual(['--icon-glyph']);
@@ -178,6 +198,49 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
       expect(svg!.props.get('width'), `${sel} is not sized from the nominal`).toBe('var(--icon-glyph)');
       expect(svg!.props.get('height')).toBe('var(--icon-glyph)');
     }
+  });
+
+  it('gives every band the full target, as a box in a strip and an overlay in text', () => {
+    // Two shapes, one number. A retune has to reach both, so both read the var
+    // rather than restating it. A band that stopped reading it would ship a
+    // target sized by whatever its glyph happens to be.
+    expect(boxRule, 'the two chrome bands no longer share a box rule').toBeDefined();
+    expect(overlayRule, 'the inline band has no tap-target overlay').toBeDefined();
+    for (const [name, rule] of [['box', boxRule!], ['overlay', overlayRule!]] as const) {
+      for (const prop of ['width', 'height']) {
+        expect(rule.props.get(prop), `the ${name} does not take its ${prop} from the target`)
+          .toBe('var(--icon-tap-target)');
+      }
+    }
+    // The overlay only IS a tap target while it covers the glyph and takes the
+    // pointer, which is what these declarations buy.
+    expect(overlayRule!.props.get('content'), 'the overlay is not generated').toBe("''");
+    expect(overlayRule!.props.get('position'), 'the overlay is in flow').toBe('absolute');
+    // All three, because the transform centres nothing on its own. Drop the
+    // offsets and the target slides half its width off the glyph while a scan
+    // asserting the transform alone still passes.
+    expect(overlayRule!.props.get('left'), 'the overlay has no horizontal offset').toBe('50%');
+    expect(overlayRule!.props.get('top'), 'the overlay has no vertical offset').toBe('50%');
+    expect(overlayRule!.props.get('transform'), 'the overlay is not pulled back onto its centre')
+      .toBe('translate(-50%, -50%)');
+
+    // And the inline band's own box stays the glyph. Sizing it puts the target
+    // back into the line of text. That is what stretched the turn header to
+    // 2.25rem against the --turn-header-line every other header keeps. Its chip
+    // padding is allowed, on the condition below.
+    expect(inlineChipRule, 'the inline band declares no chip padding').toBeDefined();
+    for (const prop of ['width', 'height', 'min-width', 'min-height']) {
+      expect(inlineChipRule!.props.has(prop), `the inline band sets ${prop} on its box`).toBe(false);
+    }
+    // The pairing IS the condition: the chip reaches past the glyph without
+    // costing the line any height, exactly as `.initiator-actor` hands its own
+    // hover chip back. Expressed against one var, so neither half can move
+    // alone. Block only: the chip's width is real spacing beside the words.
+    expect(inlineChipRule!.props.get('padding'), 'the chip padding is not one named value')
+      .toBe('var(--inline-icon-chip)');
+    expect(inlineChipRule!.props.get('margin-block'), 'the chip is not handed back')
+      .toBe('calc(-1 * var(--inline-icon-chip))');
+    expect(inlineChipRule!.props.has('margin'), 'the chip is handed back on both axes').toBe(false);
   });
 
   it('starts the bands at the large step and takes one step down per band', () => {

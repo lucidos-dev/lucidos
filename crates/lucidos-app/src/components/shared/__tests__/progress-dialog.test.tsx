@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { progressDialogBody } from '../ProgressDialog';
+import { restartDialogState, appUpdateDialogState } from '../../../store/progressDialogCopy';
 import type { ProgressDialogState } from '../../../store/types';
 
 /**
@@ -76,5 +77,33 @@ describe('progressDialogBody', () => {
     // the button that opened the dialog. -1 keeps it out of the tab order.
     const panel = byClass(progressDialogBody({ state: base }), 'progress-dialog-body')[0];
     expect((panel.props as { tabIndex?: number }).tabIndex).toBe(-1);
+  });
+});
+
+/** The two real flows, through the same body. Each is a state the shipped
+ *  builders produce, so what is asserted here is what the app renders. */
+describe('the flows that own the dialog', () => {
+  it('gives a restart a spinner and no way out', () => {
+    const body = progressDialogBody({ state: restartDialogState(true) });
+    expect(byClass(body, 'mini-spinner')).toHaveLength(1);
+    expect(byClass(body, 'progress-bar-fill')).toHaveLength(0);
+    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(0);
+  });
+
+  it('gives a sized download a bar and a Cancel', () => {
+    const state = appUpdateDialogState(
+      { version: '0.31.0', phase: 'downloading', downloaded: 50, total: 200 },
+      () => {},
+    );
+    const body = progressDialogBody({ state });
+    expect(byClass(body, 'progress-bar-fill')).toHaveLength(1);
+    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(1);
+  });
+
+  it('takes the Cancel away once the install has committed', () => {
+    const state = appUpdateDialogState({ version: '0.31.0', phase: 'installing' }, () => {});
+    const body = progressDialogBody({ state });
+    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(0);
+    expect(byClass(body, 'mini-spinner')).toHaveLength(1);
   });
 });

@@ -1,9 +1,10 @@
 use super::messages::build_session_messages;
 use super::types::SessionMessage;
 use super::EventStore;
+use crate::core::event_subscription::EventSubscription;
 use crate::core::EventRow;
 use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Preference marker: set after `backfill_trigger_id_v5_to_config_id` runs
 /// successfully so subsequent boots skip the events scan.
@@ -60,6 +61,32 @@ impl LegacyInitiator {
             .into()),
         }
     }
+}
+
+/// One live *event wait*, as the client needs to render it.
+///
+/// Stored in the `thread_summaries.live_event_waits` JSONB column and carried
+/// verbatim on [`ThreadSummary`] and [`ThreadAggregate`]. Every field copies
+/// the wait's `EventWaitStarted` payload. So this projects the event rather
+/// than inventing a second notion of what a wait is (ADR 0047).
+///
+/// Deliberately NOT [`crate::engine::event_wait::LiveWait`], which is the
+/// dispatcher's runtime cache and carries what *matching* needs (`thread_id`,
+/// `tool_use_id`, `armed_at`, `watermark`). This carries what the subscription
+/// indicator draws, and nothing else: `reason` is the sentence, `on` is the
+/// chips, `expires_at` is the countdown, and `wait_id` is what the Stop
+/// waiting button cancels.
+///
+/// The TS mirror is `EventWaitSummary` in
+/// `crates/lucidos-app/src/store/thread-events/thread-event-types.ts`. Same
+/// name, same snake_case field names, so the column deserializes straight into
+/// `meta.liveEventWaits` with no mapping layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventWaitSummary {
+    pub wait_id: uuid::Uuid,
+    pub on: Vec<EventSubscription>,
+    pub reason: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Format a display title from optional title and first_message fields.
@@ -121,6 +148,17 @@ pub struct ThreadSummary {
     /// subscription holds no turn, so no backend predicate consumes it
     /// (ADR 0049). Its own thread's waits only, never a descendant roll-up.
     pub live_event_wait_count: i64,
+    /// The same waits the count counts, spelled out: one entry per unresolved
+    /// wait, oldest first. This is what the subscription indicator renders, so
+    /// the count says how many and this says which.
+    ///
+    /// Carried on the summary for one reason: the client used to build this
+    /// list ONLY by folding a thread's own `EventWait*` events, and nothing
+    /// reconciled it against the server. A single missed `EventWaitDelivered`
+    /// stranded a resolved wait on screen with a live countdown, permanently.
+    /// The two columns are written by one `UPDATE` per projection arm, and the
+    /// count is derived from this array's length, so they cannot disagree.
+    pub live_event_waits: Vec<EventWaitSummary>,
     /// Count of descendants (transitive) currently in a state that blocks this
     /// thread from being archived (per `is_blocking` in `thread_lifecycle.rs`).
     /// Maintained by EventBus on `thread_summaries.blocking_descendant_count`.
@@ -319,6 +357,9 @@ struct ThreadRow {
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
     live_event_wait_count: i64,
+    /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
+    /// decodes a JSONB column into a typed value.
+    live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
     status: String,
     /// Pure git truth — `git diff main..branch` is non-empty.
     coding_agent_has_diff: bool,
@@ -395,6 +436,13 @@ pub struct ThreadAggregate {
     /// aggregate so the Waiting dot lights the moment a wait is registered or
     /// resolved, on every open client, without a refetch.
     pub live_event_wait_count: i64,
+    /// The waits themselves. See `ThreadSummary::live_event_waits`.
+    ///
+    /// Carried here as well as on the summary, and that is what makes the
+    /// subscription panel self-healing. `applyAggregateToMeta` runs BEFORE
+    /// `handleEvent`'s seq-dedup guard, so even a re-delivered event repairs a
+    /// stranded list. That is the one path that could not repair it before.
+    pub live_event_waits: Vec<EventWaitSummary>,
     /// Pure git truth — drives the Diff button. See `ThreadSummary::coding_agent_has_diff`.
     pub coding_agent_has_diff: bool,
     /// Coding-agent thread's formal "ready for review" offer — set by `ChangeProposed` only.
@@ -474,6 +522,7 @@ fn row_to_thread_aggregate(
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
         live_event_wait_count: r.live_event_wait_count,
+        live_event_waits: r.live_event_waits.0,
         coding_agent_has_diff: r.coding_agent_has_diff,
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
@@ -517,7 +566,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, \
-        {a}.live_event_wait_count::bigint, \
+        {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.coding_agent_applying, {a}.last_revived_at, \
         {a}.is_saved, {a}.has_response, \
@@ -599,6 +648,7 @@ impl EventStore {
                     blocking_descendant_count: r.blocking_descendant_count,
                     attention_descendant_count: r.attention_descendant_count,
                     live_event_wait_count: r.live_event_wait_count,
+                    live_event_waits: r.live_event_waits.0,
                     status: r.status,
                     coding_agent_has_diff: r.coding_agent_has_diff,
                     coding_agent_proposed: r.coding_agent_proposed,
@@ -820,3 +870,7 @@ mod search_tests;
 #[cfg(test)]
 #[path = "../threads_tests/extraction.rs"]
 mod extraction_tests;
+
+#[cfg(test)]
+#[path = "../threads_tests/turn_clock.rs"]
+mod turn_clock_tests;

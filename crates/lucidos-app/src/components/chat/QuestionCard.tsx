@@ -6,12 +6,12 @@ import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { followAnsweredQuestion } from './scrollState';
+import type { AnswerKind } from '../../store/thread-events';
 
-export type ResolvedAnswer =
-  | { kind: 'Selected'; option_id: string }
-  | { kind: 'FreeText'; text: string }
-  | { kind: 'MultiSelected'; option_ids: string[]; text?: string }
-  | { kind: 'Canceled' };
+/** Local name for the wire `AnswerKind`. Aliased rather than restated, because
+ *  this card renders every kind the engine can persist. A second copy of the
+ *  union is a variant waiting to be added in one place and missed here. */
+export type ResolvedAnswer = AnswerKind;
 
 export interface QuestionBodyProps {
   threadId: string;
@@ -355,6 +355,14 @@ export function AnsweredBody({
           <span class="permission-btn-check" aria-hidden="true">✓ </span>
           Cancel
         </button>
+      )}
+      {/* Not a button, because nobody chose it. The user replied with
+          something else and the engine closed the question for them, so the
+          card says what happened rather than offering an affordance. */}
+      {resolved.kind === 'Superseded' && (
+        <span class="question-superseded-note">
+          Replaced by your next message
+        </span>
       )}
     </div>
   );

@@ -2023,6 +2023,12 @@ pub fn run() {
 /// `interpretKeyEvents:` finds no command for the arrow keys. It falls back to
 /// `insertText:`, typing raw NSFunctionKey characters into the focused textarea.
 ///
+/// The frontend refuses such a character before it reaches a field
+/// (`utils/noFunctionKeyText.ts`). It has to: an arrow press at the END of the
+/// text falls through to `insertText:` even with this menu in place. So
+/// breaking the menu no longer types squares: watch instead for arrow keys
+/// doing nothing at all.
+///
 /// macOS then grafts on the service-aware items. Cmd+Q maps to "Close to Menu
 /// Bar", and the full teardown is the separate, unshortcutted "Quit and Stop
 /// Background Service". Other platforms keep the default menu unchanged.

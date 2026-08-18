@@ -62,6 +62,17 @@ describe('settings navigation', () => {
     }
   });
 
+  it('puts MCP Servers in the Assistant group, next to Permissions', () => {
+    // The two answer one question from opposite ends: which tools the agent is
+    // offered, and which of those it may call without asking. The MCP
+    // allowlist lives on the MCP page for the same reason, so a permission
+    // pattern sits beside the server list it names.
+    const assistant = SETTINGS_NAV_ITEMS.filter((i) => i.group === 'Assistant').map((i) => i.key);
+    expect(assistant).toContain('mcp');
+    expect(assistant.indexOf('mcp')).toBe(assistant.indexOf('permissions') + 1);
+    expect(settingsSubviewLabel('mcp')).toBe('MCP Servers');
+  });
+
   it('has retired the single-setting and platform-gated categories', () => {
     // `links` held one dropdown that renders on installed iOS PWAs only;
     // `experimental` held one toggle that renders under Tauri only. Both are

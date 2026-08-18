@@ -494,8 +494,11 @@ function ExpandableChannelRow(props: ExpandableChannelRowProps) {
       </label>
       {expanded && groups.map(group => (
         <Fragment key={group.label || 'default'}>
+          {/* Its own class, not the change selector's
+              `.dropdown-section-header`. That one stands on a dropdown's left
+              edge, which here falls left of every row this heading spans. */}
           {showHeaders && (
-            <div class="dropdown-section-header">{group.label}</div>
+            <div class="thread-filter-group-title">{group.label}</div>
           )}
           {group.items.map(child => (
             <ChildRow

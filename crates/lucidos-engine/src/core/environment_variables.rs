@@ -6,6 +6,10 @@
 //! `run_bash`, background bash, scheduled scripts, triggers, Claude Code, and
 //! Codex — alongside the `CRED_*` / `OAUTH_*` injection.
 //!
+//! The store has a **second consumer**: [`apply_to_process_env`] copies every
+//! pair into the ENGINE'S OWN process env, once at startup. The two differ on
+//! restart, and its doc comment states the rule for both.
+//!
 //! These are deliberately **not** secret: the value is carried in the
 //! `EnvironmentVariableSet` SystemEvent (broadcast to every device), and may
 //! appear in tool-call payloads, logs, and the event store. That is the whole
@@ -418,21 +422,25 @@ pub async fn migrate_env_file_to_db(
     }
 }
 
-/// Apply the stored environment variables to the ENGINE'S OWN process env at
-/// startup, so engine-internal shell-outs that inherit the process env — the
-/// engine's own `git push`/`fetch`/`clone` (Apply-time + repo add), stdio MCP
-/// servers, `open`, etc. — see them. This restores the inheritance the retired
-/// per-workspace `data/.env` provided (`load_workspace_env` used to `set_var`
-/// these at startup).
+/// The engine-process half of the store. Applies the stored variables to the
+/// ENGINE'S OWN process env, once at startup. That restores the inheritance the
+/// retired per-workspace `data/.env` provided (`load_workspace_env` used to
+/// `set_var` these at startup).
+///
+/// Two kinds of reader see them. Engine-internal shell-outs inherit the process
+/// env: the engine's own `git push`/`fetch`/`clone` (Apply time, repo add),
+/// stdio MCP servers, `open`. Engine code calling `std::env::var` reads them
+/// directly.
 ///
 /// Reserved names are filtered (via `env_pairs`), so this can NEVER overwrite an
 /// engine-critical process var (`PG*`, `PATH`, internal `LUCIDOS_*`, …).
 ///
-/// Restart semantics mirror the old `data/.env`: these process-env values are
-/// applied once at startup, so an env-var CHANGE reaches engine-internal
-/// shell-outs only on the next restart. The per-spawn injection
-/// (`build_script_env_vars` / `apply_lucidos_env`) is the no-restart path and
-/// already covers every tool/agent subprocess, which is where freshness matters.
+/// Restart semantics mirror the old `data/.env`, and this half is the one that
+/// needs a restart. Running once at startup means a caller inside the engine
+/// reads whatever the store held when the engine last started. A `OnceLock`
+/// around such a read pins that value for the process lifetime. The per-spawn
+/// injection (`build_script_env_vars` / `apply_lucidos_env`) is the no-restart
+/// path, and already covers every tool/agent subprocess, where freshness matters.
 pub async fn apply_to_process_env(pool: &PgPool) {
     let pairs = match EnvironmentVariableStore::env_pairs(pool).await {
         Ok(pairs) => pairs,

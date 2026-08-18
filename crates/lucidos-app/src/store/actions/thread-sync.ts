@@ -655,9 +655,9 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       onClick: () => focusThread(threadId),
       autoDismissMs: TOAST_AUTO_DISMISS_MS,
     });
-    // Set restart toast immediately from the thread event — don't wait for
-    // the separate ChangesUpdated system event. If ChangesUpdated is missed
-    // (SSE drop, Vite reload race), this ensures the toast appears.
+    // Record the restart state immediately from the thread event, rather than
+    // waiting for the separate ChangesUpdated system event. If ChangesUpdated is
+    // missed (SSE drop, Vite reload race), this is what lights the badge.
     if (requiresRestart) {
       const commits = event.commits ?? [];
       const threadTitle = event.thread_title ?? threadMap.value.get(threadId)?.meta.title ?? 'Untitled thread';
@@ -1038,7 +1038,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // loadMoreChanges, which read the real field.
       //
       // restartRequired is deliberately untouched here. Stale SSE values would
-      // otherwise dismiss an active restart toast.
+      // otherwise drop the restart state while one is genuinely pending.
       //
       // Debounce the repo-scoped refresh: ChangesUpdated fires globally.
       if (repoChangesDebounce) clearTimeout(repoChangesDebounce);

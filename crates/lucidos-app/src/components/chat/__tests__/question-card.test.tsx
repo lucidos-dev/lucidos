@@ -111,6 +111,23 @@ describe('AnsweredBody — Canceled state', () => {
     expect(text).not.toContain('question-canceled-badge');
   });
 
+  // Nobody chose this outcome, so the card states it rather than rendering a
+  // picked affordance. Reading "Canceled" here would blame the user for
+  // dismissing a question they actually replied past.
+  it('renders a plain note for a Superseded answer, never the Cancel affordance', () => {
+    const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
+      question: 'q',
+      options: [{ id: 'a', label: 'A' }],
+      multiSelect: false,
+      resolved: { kind: 'Superseded' },
+    }));
+    expect(text).toContain('question-superseded-note');
+    expect(text).toContain('Replaced by your next message');
+    expect(text).not.toContain('question-cancel-picked');
+    expect(text).not.toContain('Cancel');
+  });
+
   it('does not render the cancel-as-picked button for a Selected answer', () => {
     const text = vnodeToText(AnsweredBody({
       toolUseId: 'tool-1',

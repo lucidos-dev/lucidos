@@ -278,9 +278,15 @@ async fn tick_skips_hung_tool_past_ceiling_when_not_running() {
     seed_cc_thread(&bus, thread_id).await; // status='running'…
                                            // …then settle it so the projection is no longer `running` (stands in for
                                            // `waiting_for_user_answer`, which `thread_is_running` also treats as not-running).
-    crate::engine::claude_code::settle_stuck_running_thread(&pool, &bus, thread_id, None)
-        .await
-        .expect("settle");
+    crate::engine::claude_code::settle_stuck_running_thread(
+        &pool,
+        &bus,
+        thread_id,
+        None,
+        crate::engine::claude_code::SettleTerminal::StuckProjection,
+    )
+    .await
+    .expect("settle");
 
     let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (session, _msg_rx) = make_session(stale_for(CEILING_MS));

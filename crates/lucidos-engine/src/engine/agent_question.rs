@@ -48,17 +48,60 @@ pub async fn resolve_pending_question_as_canceled(
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
 ) -> bool {
+    resolve_pending_question_as(engine, thread_id, AnswerKind::Canceled, actor, "canceled").await
+}
+
+/// Resolve any pending `UserQuestionAsked` for `thread_id` as `Superseded`,
+/// because a follow-up arrived that could not be its answer. Same
+/// swallow-the-conflict contract as [`resolve_pending_question_as_canceled`].
+///
+/// This is what keeps a coding-agent thread from deadlocking on its own
+/// question. The agent is parked inside the call that asked. It cannot read the
+/// follow-up until that call returns, and only an answer makes it return.
+/// Meanwhile the follow-up's own `CodingAgentPromptSent` lands in
+/// `QUESTION_OVERTAKEN_EVENT_TYPES`, which kills the card's buttons and the
+/// typed-answer route. Nobody can answer it and nothing else will, so the
+/// follow-up has to.
+///
+/// Uses the broad `lookup_pending_question_tool_use_id` on purpose. A question
+/// the agent already overtook parks the same call the same way. That is the
+/// parallel-tool-call race, and the narrow "active" lookup walks straight past
+/// it. See `docs/adr/0082-a-followup-supersedes-the-open-question.md`.
+pub async fn resolve_pending_question_as_superseded(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> bool {
+    resolve_pending_question_as(
+        engine,
+        thread_id,
+        AnswerKind::Superseded,
+        actor,
+        "superseded",
+    )
+    .await
+}
+
+/// Shared body of the two resolve-the-dangling-card helpers. `label` names the
+/// caller in the conflict log, which is the only thing that differs beyond the
+/// kind itself.
+async fn resolve_pending_question_as(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    kind: AnswerKind,
+    actor: Option<MessageOrigin>,
+    label: &str,
+) -> bool {
     let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), thread_id).await
     else {
         return false;
     };
-    let result =
-        answer_pending_question(engine, thread_id, tool_use_id, AnswerKind::Canceled, actor).await;
-    match result {
+    match answer_pending_question(engine, thread_id, tool_use_id, kind, actor).await {
         AnswerResult::Resumed => true,
         AnswerResult::Conflict(msg) => {
             log!(
-                "[CCQuestion] resolve_pending_question_as_canceled({}): {}",
+                "[CCQuestion] resolve_pending_question_as_{}({}): {}",
+                label,
                 thread_id,
                 msg
             );
@@ -257,7 +300,9 @@ impl LucidosEngine {
         }
 
         let mut answer_kinds: Vec<serde_json::Value> = Vec::with_capacity(total);
-        let mut first_canceled_index: Option<usize> = None;
+        // Where the walk stopped early, and with which kind, so the padding
+        // below repeats that kind rather than assuming a cancel.
+        let mut ended_at: Option<(usize, AnswerKind)> = None;
         for (i, q) in parsed.into_iter().enumerate() {
             let sub_id = synth_question_id(outer_tool_use_id, i);
 
@@ -272,10 +317,10 @@ impl LucidosEngine {
             match lookup_existing_answer(self.pool(), thread_id, &sub_id).await {
                 Ok(Some(prior)) => {
                     self.question_wait_registry.forget(&sub_id).await;
-                    let canceled = is_canceled_answer(&prior);
+                    let ending = batch_ending_answer(&prior);
                     answer_kinds.push(prior);
-                    if canceled {
-                        first_canceled_index = Some(i);
+                    if let Some(kind) = ending {
+                        ended_at = Some((i, kind));
                         break;
                     }
                     continue;
@@ -335,37 +380,44 @@ impl LucidosEngine {
             };
             self.question_wait_registry.forget(&sub_id).await;
 
-            let canceled = is_canceled_answer(&payload.answers);
+            let ending = batch_ending_answer(&payload.answers);
             answer_kinds.push(payload.answers);
-            if canceled {
-                first_canceled_index = Some(i);
+            if let Some(kind) = ending {
+                ended_at = Some((i, kind));
                 break;
             }
         }
 
-        // Persist Canceled markers for any sub_ids the loop short-circuited
-        // past. Without this, an engine restart between the cancel and the
+        // Pad the sub_ids the loop short-circuited past with the same kind that
+        // ended it. Without this, an engine restart between that answer and the
         // caller's next re-entry would re-fire the walk, the per-question
-        // crash-recovery lookup would see no answer for the trailing
-        // sub_ids, and we'd re-emit `UserQuestionAsked` for cards the user
-        // already implicitly canceled.
-        if let Some(canceled_at) = first_canceled_index {
-            for j in (canceled_at + 1)..total {
+        // crash-recovery lookup would see no answer for the trailing sub_ids,
+        // and we'd re-emit `UserQuestionAsked` for cards the user is already
+        // done with.
+        if let Some((ended_index, ending_kind)) = ended_at {
+            let padding = serde_json::to_value(&ending_kind).unwrap_or(serde_json::Value::Null);
+            for j in (ended_index + 1)..total {
                 let remaining_sub = synth_question_id(outer_tool_use_id, j);
+                // Carry the padding into the returned kinds too, so the agent
+                // reads the same outcome the events record. Without it,
+                // `build_hook_answers` fills the gap with its `(canceled)`
+                // default, and a superseded batch tells the model its trailing
+                // questions were canceled.
+                answer_kinds.push(padding.clone());
                 self.event_bus
                     .emit_or_log(
                         BusEvent::Thread {
                             thread_id,
                             event: ThreadEvent::UserQuestionAnswered {
                                 tool_use_id: remaining_sub,
-                                answer: AnswerKind::Canceled,
+                                answer: ending_kind.clone(),
                             },
                             meta: EventMeta {
                                 channel: Some(channel),
                                 ..EventMeta::NONE
                             },
                         },
-                        "[QuestionWalk] cancel padding for remaining sub_id",
+                        "[QuestionWalk] padding for remaining sub_id",
                     )
                     .await;
             }
@@ -449,10 +501,31 @@ pub(crate) fn synth_question_id(outer: &str, index: usize) -> String {
     format!("{outer}#q{index}")
 }
 
-/// True when an `AnswerKind` JSON object has `kind == "Canceled"`. Used by
-/// `walk_question_batch` to short-circuit the multi-question loop.
-pub(crate) fn is_canceled_answer(answer_kind: &serde_json::Value) -> bool {
-    answer_kind.get("kind").and_then(|k| k.as_str()) == Some("Canceled")
+/// The batch-ending `AnswerKind` a persisted answer carries, or `None` when
+/// `walk_question_batch` should keep asking. Two kinds stop the walk, because
+/// both mean the user is done with the whole batch rather than this one card:
+/// `Canceled` (they dismissed it) and `Superseded` (they replied with something
+/// else). The kind comes back out so the padding written for the untouched
+/// sub-ids says the same thing the real answer did.
+pub(crate) fn batch_ending_answer(answer_kind: &serde_json::Value) -> Option<AnswerKind> {
+    match answer_kind.get("kind").and_then(|k| k.as_str()) {
+        Some("Canceled") => Some(AnswerKind::Canceled),
+        Some("Superseded") => Some(AnswerKind::Superseded),
+        _ => None,
+    }
+}
+
+/// True for the answer kinds that resolve a question with NO engine-driven
+/// resume behind them. `Canceled` tears the thread down, so nothing follows.
+/// `Superseded` is followed by the very message that replaced the question, and
+/// that follow-up drives the next turn itself. Either way the engine must emit
+/// neither a resume marker nor a `ContinuationRequested`. The first would strand
+/// an empty Thinking step, the second would race the follow-up.
+///
+/// [`arm_question_resume_if_live`] deliberately does not use this. A superseded
+/// session is alive and still finishing its turn, so it does need the flag.
+fn answer_resolves_without_resume(answer: &AnswerKind) -> bool {
+    matches!(answer, AnswerKind::Canceled | AnswerKind::Superseded)
 }
 
 /// Most recent `UserQuestionAnswered.answer` for `tool_use_id`, if any. DB
@@ -521,9 +594,21 @@ fn lookup_option_label(
         .unwrap_or_else(|| opt_id.to_string())
 }
 
+/// What a superseded question hands back to the agent that asked it. It has to
+/// do two jobs at once: stop the model re-asking, and stop it reading the
+/// replacement as an answer to what it asked. The message that superseded the
+/// question is already on its way in. So the tool result only has to point at
+/// it.
+const SUPERSEDED_HOOK_VALUE: &str = "(superseded) The user did not answer this \
+    question. They sent a new message instead, which arrives as your next \
+    input. Work from that, and do not ask this question again unless it is \
+    still open after reading it.";
+
 /// `Canceled` produces a `(canceled)` marker rather than an empty string —
 /// an empty answer causes CC's model to read the question as unanswered and
-/// re-invoke the tool in a loop. `MultiSelected` joins resolved labels with
+/// re-invoke the tool in a loop. `Superseded` carries a longer sentence for the
+/// same reason, plus a pointer at the message that replaced the question.
+/// `MultiSelected` joins resolved labels with
 /// `", "` and appends any non-empty `text` (freetext typed in the prompt
 /// textarea while the card was on screen) on the same separator.
 fn answer_kind_to_hook_value(
@@ -566,6 +651,7 @@ fn answer_kind_to_hook_value(
             .cloned()
             .unwrap_or(serde_json::Value::String(String::new())),
         "Canceled" => serde_json::Value::String("(canceled)".to_string()),
+        "Superseded" => serde_json::Value::String(SUPERSEDED_HOOK_VALUE.to_string()),
         _ => serde_json::Value::String(format!("(unknown answer kind: {})", kind)),
     }
 }
@@ -620,6 +706,10 @@ fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
              offered, so it picks none of them: read it as what they actually want."
         }
         Some("Canceled") => "The question was canceled.",
+        Some("Superseded") => {
+            "The user never answered this. They sent a new message instead, \
+             which replaced the question."
+        }
         _ => "That is the user's answer.",
     }
 }
@@ -939,8 +1029,9 @@ pub async fn answer_pending_question(
         // the thread — the chat parity of CC's `--resume`. With a live loop the
         // notify already woke the blocked tool, which returns the answer on the
         // same turn. `Canceled` is a teardown sentinel (archive/stop), never a
-        // resume.
-        if !had_waiter && !matches!(answer, AnswerKind::Canceled) {
+        // resume, and `Superseded` is followed by the message that replaced the
+        // question, which drives the next turn itself.
+        if !had_waiter && !answer_resolves_without_resume(&answer) {
             // Resume on the ORIGINATING channel — this branch runs for both
             // `Chat` and `Trigger` questions (both skip CC side effects), so a
             // restart-preserved trigger question must resume as `Trigger`, not
@@ -1258,6 +1349,11 @@ async fn resume_chat_after_answer(
 /// turn ever runs, so the marker would strand as an empty `Thinking ✓`
 /// placeholder under the QuestionCard's own ✓ Cancel state. Returns `true`
 /// when the marker was emitted, `false` when skipped.
+///
+/// Skipped for `AnswerKind::Superseded` for the mirror-image reason: the
+/// follow-up that superseded the question emits its own
+/// `CodingAgentPromptSent` moments later, and that is the placeholder. Emitting
+/// one here would leave two Thinking steps for one turn.
 pub(crate) async fn emit_resume_marker_for_cc_answer(
     bus: &EventBus,
     thread_id: Uuid,
@@ -1272,7 +1368,7 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
     // the same endpoint.
     coding_agent: crate::runtime::CodingAgent,
 ) -> bool {
-    if matches!(answer, AnswerKind::Canceled) {
+    if answer_resolves_without_resume(answer) {
         return false;
     }
     bus.emit_or_log(
@@ -1310,11 +1406,14 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
 /// `AnswerKind::Canceled` is the engine-internal sentinel used by
 /// `archive_thread` to resolve a pending question card before tearing the
 /// thread down — resuming there would race the subsequent `stop_agent`
-/// call.
+/// call. `AnswerKind::Superseded` is excluded for the same class of reason: the
+/// follow-up that superseded the question is itself mid-flight through
+/// `process_message_with_steps_internal`, and it spawns its own `--resume` when
+/// the subprocess is dead. A continuation here would race that.
 ///
 /// Returns `true` when `ContinuationRequested` was emitted, `false` when a live
 /// subprocess was found (`notify()` already woke the in-flight hook) or the
-/// answer was a `Canceled` sentinel.
+/// answer carried no resume of its own.
 async fn ensure_resume_after_answer(
     event_bus: &EventBus,
     agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
@@ -1322,7 +1421,7 @@ async fn ensure_resume_after_answer(
     answer: &AnswerKind,
     actor: Option<MessageOrigin>,
 ) -> bool {
-    if matches!(answer, AnswerKind::Canceled) {
+    if answer_resolves_without_resume(answer) {
         return false;
     }
     let has_live_subprocess = {
@@ -1361,6 +1460,12 @@ async fn ensure_resume_after_answer(
 /// for a dead/absent subprocess (that path spawns a fresh `--resume` turn via
 /// `ensure_resume_after_answer`, whose new run loop starts with clean flags).
 /// Returns whether a live subprocess was armed.
+///
+/// `AnswerKind::Superseded` DOES arm, which is why this guard is not
+/// [`answer_resolves_without_resume`] like its three neighbours. A superseded
+/// session is not being torn down. It wakes, finishes the turn it was in, and
+/// reads the follow-up only after that. Its post-answer events need the same
+/// re-arming a real answer's do.
 async fn arm_question_resume_if_live(
     agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     thread_id: Uuid,

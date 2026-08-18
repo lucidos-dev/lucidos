@@ -71,12 +71,30 @@ pub(super) async fn claude_code_stop(
     // message `--resume`s the same `cc_session_id` on the same branch. Apply /
     // Discard keep `stop_agent`: each carries its own terminator
     // (`ChangeApplied` / `ChangeDiscarded`) and must hard-stop, not interrupt.
-    use crate::engine::claude_code::{StopReason, SESSION_ALREADY_WAITING};
+    use crate::engine::claude_code::{SettleTerminal, StopReason, SESSION_ALREADY_WAITING};
     let reason = query.reason();
     match reason {
         // `canceled = false` means nothing was interruptible — the client's
         // optimistic "canceling" state is stale and it must re-sync.
-        StopReason::UserStop => match state.engine.interrupt_agent(thread_id, actor).await {
+        //
+        // The settle fallback inside `interrupt_agent` fires when no agent is
+        // left to interrupt, the normal shape for a question parked overnight.
+        // The cancel-stamp above is what set that row to `running`, so tell the
+        // settle: it then emits the `ResponseCanceled` a live agent would have,
+        // not a stale-settle abort. See `SettleTerminal`.
+        StopReason::UserStop => match state
+            .engine
+            .interrupt_agent(
+                thread_id,
+                actor,
+                if question_resolved {
+                    SettleTerminal::CanceledQuestion
+                } else {
+                    SettleTerminal::StuckProjection
+                },
+            )
+            .await
+        {
             Ok(interrupted) => Ok(Json(super::CancelResponse {
                 canceled: question_resolved || interrupted,
             })),
@@ -331,7 +349,17 @@ pub(super) async fn claude_code_interrupt(
 ) -> Result<StatusCode, StatusCode> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match state.engine.interrupt_agent(thread_id, actor).await {
+    // No question card is cancel-stamped on this route, so a `running` row it
+    // settles is one this request did not write.
+    match state
+        .engine
+        .interrupt_agent(
+            thread_id,
+            actor,
+            crate::engine::claude_code::SettleTerminal::StuckProjection,
+        )
+        .await
+    {
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             crate::log!("[API] interrupt_agent failed: {}", e);

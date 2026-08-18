@@ -10,6 +10,7 @@ import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
+import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
@@ -76,6 +77,7 @@ if (isIOSPwa()) {
 installActionBtnBlurListener();
 installNoAutofill();
 installNoDrag();
+installNoFunctionKeyText();
 // Both render roots, so a near-miss drop cannot navigate the picker document
 // either (utils/strayFileDrop.ts).
 installStrayFileDropGuard();

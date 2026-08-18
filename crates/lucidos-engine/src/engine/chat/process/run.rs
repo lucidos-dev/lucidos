@@ -363,6 +363,25 @@ impl LucidosEngine {
                 origin.clone(),
             )
             .await;
+
+            // Question supersede, the same move for the question lane. Getting
+            // here means the fast-path above did NOT consume this message as
+            // the answer, so any question still open is one this follow-up
+            // cannot answer: an agent-driven message, or a question the agent
+            // already overtook. Leaving it open deadlocks the thread, because
+            // the agent is parked inside the call that asked and only an answer
+            // releases it. See
+            // `crate::engine::agent_question::resolve_pending_question_as_superseded`.
+            //
+            // Coding-agent lane only. A chat thread queues a non-answering
+            // follow-up as an injection and keeps the question live and
+            // answerable, which is the behaviour we want there.
+            crate::engine::agent_question::resolve_pending_question_as_superseded(
+                &self.clone_arc(),
+                thread_id,
+                origin.clone(),
+            )
+            .await;
         }
 
         // Same supersede for the command-guard permission lane (ADR 0002): a
@@ -1000,6 +1019,16 @@ impl LucidosEngine {
             .flatten()
             .unwrap_or_default();
 
+        // This turn's clock. Every reading the model sees derives from it,
+        // never from `Utc::now()`. The message array is rebuilt from events on
+        // each request. A wall-clock reading inside it would differ on rebuild,
+        // and cost the message tier the hit the system tier just gained.
+        //
+        // Keyed on the thread, NOT on `origin_id`: an answer-driven resume
+        // re-uses the interrupted turn's anchor, which can be a day old. See
+        // `super::turn_clock`.
+        let turn_started_at = self.turn_started_at(thread_id).await;
+
         // Resume tool blocks + conversation history + per-thread loaded
         // knowhow, all derived from a single events fetch (see
         // `load_chat_history`).
@@ -1009,9 +1038,9 @@ impl LucidosEngine {
                 is_trigger,
                 is_new_thread,
                 thread_id,
-                &thread_id_str,
                 user_message,
                 &memory_model_pref,
+                turn_started_at,
             ),
         )
         .await
@@ -1197,7 +1226,7 @@ impl LucidosEngine {
         // 200k-token Claude), so a big-window turn isn't trimmed back to the
         // smaller model's limit. The window comes from the model's registry row
         // when it declares one — the id-shape fallback has no rule for
-        // OpenRouter / Gemini / local ids and would hand them all 200k.
+        // OpenRouter / xAI / Gemini / local ids and would hand them all 200k.
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let total_budget = agent_context_char_budget(self.context_window_for(resolved_model));
@@ -1211,6 +1240,11 @@ impl LucidosEngine {
         // bodies can be large and were previously un-budgeted.
         let loaded_knowhow_block = build_loaded_knowhow_block(&loaded_knowhow_docs);
 
+        // Built here for the same reason: it is unconditional, so it belongs in
+        // `fixed_size` rather than in the formatting slack.
+        let current_time_block =
+            super::turn_clock::current_time_block(turn_started_at, &user_timezone);
+
         // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()
             + device_preferences_context.len()
@@ -1222,6 +1256,7 @@ impl LucidosEngine {
             + file_context_section.len()
             + url_context_section.len()
             + loaded_knowhow_block.as_deref().map_or(0, str::len)
+            + current_time_block.len()
             + user_message.len()
             + 500; // 500 for formatting
         let expendable_budget = message_budget.saturating_sub(fixed_size);
@@ -1326,6 +1361,9 @@ impl LucidosEngine {
         }
         let request_line = format!("Request: {}", user_message);
         user_message_parts.push(&request_line);
+        // Last, so the clock sits in the message tier tail rather than at the
+        // front of the cached system block.
+        user_message_parts.push(&current_time_block);
 
         // Attached images ride inline as base64 image blocks on the user message
         // (`build_user_content_with_images` below) and stay visible for the whole
@@ -1360,6 +1398,7 @@ impl LucidosEngine {
             &setup_reminder,
             &thread_depth_context,
             user_message,
+            &current_time_block,
             &loaded_knowhow_docs,
             &resume_tool_blocks,
             capture_body,

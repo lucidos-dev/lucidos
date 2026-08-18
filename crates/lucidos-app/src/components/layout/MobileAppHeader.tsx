@@ -236,7 +236,14 @@ export function MobileThreadTitleBar() {
   const visualStatus = threadVisualStatus(eventThread);
 
   return (
-    <div class={`mobile-thread-title-row${scrolledFromTop.value ? ' scrolled' : ''}`}>
+    // data-scroller-pinned: the transcript's iOS repaint nudge compensates its
+    // own 1px scroll with a transform on the scroll container, which is exact
+    // for content the scroll moved. Sticky means the scroll moved this row not
+    // at all, so it undoes that compensation itself (utils/iosRepaint.ts).
+    <div
+      class={`mobile-thread-title-row${scrolledFromTop.value ? ' scrolled' : ''}`}
+      data-scroller-pinned
+    >
       <ThreadStatusIcon status={visualStatus} />
       <ThreadTitleEditor threadId={threadId} title={threadTitle} />
       <span class="thread-view-header-actions">

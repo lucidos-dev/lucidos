@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.28.0 — 2026-08-18
+
+### Added
+
+- **MCP Servers page in Settings.** Every configured server with its state in words, what its tools cost on each request, a Run switch, an Auto-approve switch, and Remove behind a confirm. Expanding a row lists that server's tools by descending cost, each with a switch that keeps the tool out of the model's context and refuses it at dispatch. A matching `lucidos mcp` CLI covers the same verbs.
+- **MCP tool permissions are editable from that page**, as patterns: `Mcp(<server>:<tool>)` for one tool, `Mcp(<server>:*)` for a whole server. The list is machine-wide and shared by every workspace on the install, and it holds whatever the Always allow buttons have written.
+- **xAI as a provider.** Grok models ship as builtins in the picker, Settings gains an xAI key block, `LUCIDOS_XAI_API_KEY` works as an env fallback in the desktop app as well as headless, and an app reaches Grok on the engine's own credential through `lucidos.proxy('xai')`.
+- **Connect URLs on the access page, in any browser and scoped to the workspace you are in.** Each row is an address you can copy straight to another device, including the tailnet MagicDNS name, and the page checks that the gateway answering that address is the one serving you.
+- **`run_thread` can pin a child's model and reasoning effort.** Both are optional and resolve independently, so pinning one leaves the other on the account default.
+- **The subscription panel carries a live list of what a thread is waiting for**, reconciled against the server rather than assembled from events alone.
+
+### Changed
+
+- A thread rides the live edge by default. Only pressing the follow toggle off turns that off, and the preference sticks per device. The toggle is a magnet now, so it no longer wears the same arrow as Download thread one row above it.
+- The current-time reading rides at the end of the user message and is derived from the turn's own anchor, so the cached system block stays byte-stable across a turn boundary and is shared thread to thread. The stated UTC offset is exact, so a half-hour or quarter-hour zone reads correctly.
+- Opening a thread holds a skeleton for as long as the transcript is predicted to take, then crossfades to the content. Submitting a message lands the view on the new turn once the agent starts drawing.
+- A caller on the local API bearing a thread-bound token can archive or cancel itself and its own descendants, and nothing else. Refusals are typed, with the HTTP status beside the taxonomy.
+- The zoom shortcut panel dismisses itself 1.5 seconds after the last change, and reaching for its slider cancels the countdown.
+- Coming back to a thread that finished while you were away keeps you on the live edge.
+- The plugin install receipt states the setup steps once.
+- A finished sub-thread stays in the inbox with the state it ran with. Only an unattended trigger run hides itself on completion.
+
+### Fixed
+
+- A dropdown opened with the mouse in the desktop app takes the keystrokes you filter with. The trigger holds focus until you type, then the filter box takes over.
+- A follow-up sent to a coding agent parked on a question resolves that question rather than deadlocking it with the card's buttons dead and the agent still waiting. A canceled question settles as a cancel.
+- An `ask_user_question` tag that leaks into the stream is recovered whether it carries an array, an object or bare prose, and a tag quoted inside any of the four markdown code forms is left alone.
+- Arrow keys at the end of a text field stop inserting tofu squares in the desktop app.
+- The Conversation cluster in the header can never overlap the drawer toggle, at any UI scale, in the packaged build.
+- The workspace pill holds its chevron on a cold launch rather than shimmering.
+- On iOS, the sticky thread title stays still through the compositor repaint nudge.
+- The MCP servers page reports tool cost against the chat model you saved, and a million tokens renders as 1M.
+- Two MCP switches flipped inside one round trip settle on what you clicked, and a reload in flight never reverts a switch made under it.
+- The Repos and Apps headings in the thread filter line up with the rows they head, and the notification detail nav row owns the gap down to its title.
+- The queued-message trash no longer spaces out the line it sits in.
+- A wait label states its reason once, without a doubled waiting word.
+- The build-only `rand` 0.7.3 dependency is out of the lockfile, resolving GHSA-cq8v-f236-94qc.
 ## v0.27.1 — 2026-08-14
 
 ### Changed

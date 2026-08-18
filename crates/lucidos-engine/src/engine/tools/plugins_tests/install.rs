@@ -294,8 +294,11 @@ async fn cancel_pending_install_returns_error_for_unknown_id() {
     assert!(bus.emitted_events().is_empty(), "no event on failed cancel");
 }
 
+/// The receipt panel prints this summary as its description line. It renders
+/// the manifest's `setup` as its own markdown section below, so a summary
+/// carrying the setup text shows the user the same wall twice.
 #[tokio::test]
-async fn install_appends_setup_text_when_manifest_declares_it() {
+async fn install_summary_stays_one_line_when_manifest_declares_setup() {
     const SETUP_MANIFEST: &str = r#"
 id = "with-setup"
 version = "0.1.0"
@@ -327,47 +330,10 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
     .await
     .expect("install must succeed");
 
-    assert!(
-        msg.starts_with("Installed With Setup v0.1.0 (1 files)."),
-        "install summary line must come first, got: {:?}",
-        msg
+    assert_eq!(
+        msg, "Installed With Setup v0.1.0 (1 files).",
+        "a manifest with setup must not widen the summary beyond the one line"
     );
-    assert!(
-        msg.contains("Setup:"),
-        "tool result must label the setup section so the LLM acts on it, got: {:?}",
-        msg
-    );
-    assert!(
-        msg.contains("Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggested cron: `0 0 4 * * *`."),
-        "tool result must include the verbatim setup text from the manifest, got: {:?}",
-        msg
-    );
-
-    let _ = std::fs::remove_dir_all(&scratch);
-}
-
-#[tokio::test]
-async fn install_omits_setup_section_when_manifest_has_no_setup() {
-    let scratch = fresh_workspace();
-    let archive_dir = scratch.join("archive");
-    std::fs::create_dir_all(&archive_dir).unwrap();
-    let archive = build_fixture_archive(&archive_dir, "---\nname: F\n---\nx");
-    let unpacked = extract_to(&archive_dir, &archive);
-
-    let bus = MockEventBus::new();
-    let (msg, _files) = install_from_unpacked_with_bus(
-        &scratch,
-        &bus,
-        &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
-    )
-    .await
-    .expect("install must succeed");
-
-    assert_eq!(msg, "Installed Fixture Plugin v0.1.0 (2 files).");
 
     let _ = std::fs::remove_dir_all(&scratch);
 }

@@ -320,20 +320,30 @@
       ]
     },
     {
-      "name": "sub_thread_chat_stays_default",
+      "name": "sub_thread_chat_stays_in_the_inbox",
       "thread_type": "chat",
-      "is_top_level": false,
-      "description": "Sub-thread chat: ResponseGenerated does NOT mark unread — goes directly to history",
+      "is_unattended": false,
+      "description": "Sub-thread chat: ResponseGenerated keeps the inbox state it ran with. Nobody archived it, so nothing may record one",
       "steps": [
         {"emit": "MessageReceived"},
+        {"emit": "ResponseGenerated", "expected": {"stored_section": "inbox"}}
+      ]
+    },
+    {
+      "name": "unattended_trigger_run_archives_on_completion",
+      "thread_type": "chat",
+      "is_unattended": true,
+      "description": "Unattended trigger run: no user opted into reviewing it, so its terminal event hides it",
+      "steps": [
+        {"emit": "TriggerStarted"},
         {"emit": "ResponseGenerated", "expected": {"stored_section": "archived"}}
       ]
     },
     {
-      "name": "sub_thread_cc_goes_to_unread",
+      "name": "unattended_cc_still_goes_to_inbox",
       "thread_type": "claude_code",
-      "is_top_level": false,
-      "description": "Sub-thread CC: CodingAgentIdled marks unread — every CC session needs user action (Apply/Discard/Done)",
+      "is_unattended": true,
+      "description": "Coding-agent run, unattended: CodingAgentIdled still surfaces it, because every session needs Apply, Discard or Archive",
       "steps": [
         {"emit": "MessageReceived"},
         {"emit": "SessionStarted"},

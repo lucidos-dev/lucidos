@@ -70,6 +70,32 @@ export function isTypeaheadSeedKey(
     && !e.metaKey && !e.ctrlKey && !e.altKey;
 }
 
+/** Which element must hold focus while the menu is open. Whatever has focus
+ *  handles the menu's keystrokes. That is what makes type-to-search work:
+ *  `'trigger'` routes a printable key into the typeahead seed, and `'filter'`
+ *  owns input once that seed has revealed the box.
+ *
+ *  The open effect ASSERTS `'trigger'` rather than assuming it. WebKit does not
+ *  focus a `<button>` on click (the macOS convention), so a menu opened with
+ *  the mouse left focus where it already was. In the Tauri app that is usually
+ *  the prompt textarea, where the filter query landed instead of filtering.
+ *
+ *  `null` leaves focus alone, in two cases. On mobile, moving it would only pop
+ *  the on-screen keyboard, and there is no keyboard to type-to-search with.
+ *  Before the panel is positioned it is `visibility: hidden`, and unfocusable.
+ *  Pure, exported for testing. */
+export function openMenuFocusTarget(opts: {
+  freeText: boolean;
+  searching: boolean;
+  positioned: boolean;
+  mobile: boolean;
+}): 'input' | 'filter' | 'trigger' | null {
+  if (opts.freeText) return 'input';
+  if (opts.mobile) return null;
+  if (opts.searching) return opts.positioned ? 'filter' : null;
+  return 'trigger';
+}
+
 /** Class list for the menu panel. The menu is portaled to `<body>` (see the
  *  `<Overlay portal>` below), which severs every ancestor-scoped rule that used
  *  to reach it through the DOM. Exactly one such context styled the rows: a
@@ -191,23 +217,24 @@ export function Dropdown({
 
   useHidePanelWebviewWhile(open);
 
-  // Focus management while open. For freeText the trigger IS the text input, so
-  // focus it on open (existing behavior). For a normal dropdown, focus stays on
-  // the trigger button until the user types — so there's no empty filter box and
-  // no blinking caret on open. Once `searching` latches, move focus into the now-
-  // visible filter box (desktop only — auto-focusing on mobile would pop the
-  // on-screen keyboard; and only once `pos` is computed, since the panel is
-  // `visibility: hidden` — and unfocusable — until then).
+  // Focus management while open. `openMenuFocusTarget` holds the policy; this
+  // effect applies it. The freeText input keeps its one-frame deferral, since
+  // its own `onFocus` is one of the paths that opens the menu.
   useEffect(() => {
     if (!open) return;
-    if (freeText) {
+    const target = openMenuFocusTarget({
+      freeText: !!freeText, searching, positioned: pos !== null, mobile: isMobile(),
+    });
+    if (target === 'input') {
       requestAnimationFrame(() => {
         if (inputRef.current && document.activeElement !== inputRef.current) inputRef.current.focus();
       });
-    } else if (searching && pos && !isMobile() && filterRef.current
-      && document.activeElement !== filterRef.current) {
-      filterRef.current.focus();
+      return;
     }
+    const el = target === 'filter' ? filterRef.current : target === 'trigger' ? buttonRef.current : null;
+    // preventScroll: the trigger was just activated, so it is already in view,
+    // and scrolling to it would shift the surface under the open menu.
+    if (el && document.activeElement !== el) el.focus({ preventScroll: true });
   }, [open, searching, pos, freeText]);
 
   useEffect(() => {

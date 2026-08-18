@@ -15,7 +15,11 @@ pub(crate) mod claude_code;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub mod command_permission;
-mod context;
+/// `pub(crate)` for the two cost helpers: `tool_definitions_chars` and
+/// `estimate_tokens_from_chars` are what the MCP settings surface reports, and
+/// it lives outside `engine`. One definition of "what does this cost" is the
+/// whole point, since a second ratio is what once showed a 205k prompt as 361k.
+pub(crate) mod context;
 pub mod db_health;
 pub mod engine_version;
 pub mod event_bus;
@@ -923,7 +927,7 @@ fn spawn_models_registry_subscriber(
 
 /// Hot-swap the engine's active LLM provider when a provider credential changes.
 /// On any `Credential{Created,Updated,Deleted}` for a provider service
-/// (`openai`/`anthropic`/`openrouter`/`local`), re-resolve `select_provider`
+/// (`openai`/`anthropic`/`openrouter`/`xai`/`local`), re-resolve `select_provider`
 /// against current DB state via [`crate::llm::build_active_provider`] and swap
 /// the shared provider handle in place — so a first-run user who adds a key in
 /// Settings → Models → Providers gets a working chat with NO restart, and removing the

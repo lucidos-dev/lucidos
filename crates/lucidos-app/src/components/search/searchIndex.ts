@@ -55,6 +55,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews (one per SETTINGS_NAV_ITEMS entry)
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
   { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
+  { id: 'mcp', label: 'MCP Servers', subview: 'mcp', path: 'Settings', keywords: 'mcp model context protocol server tools context cost tokens start stop remove disable allowlist' },
   { id: 'coding-agents', label: 'Coding Agents', subview: 'coding-agents', path: 'Settings', keywords: 'coding agent claude code codex binary path cli repository repositories git worktree' },
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'locale', label: 'Locale', subview: 'locale', path: 'Settings', keywords: 'language timezone region locale time zone' },
@@ -93,7 +94,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'coding-agents:repositories', label: 'Repositories', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:repositories', keywords: 'repository repositories git local clone register external repo' },
 
   // Access subview
-  { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet address phone open elsewhere', tauriOnly: true, packagedOnly: true },
+  // Ungated on purpose: the section renders in any browser now, deriving its
+  // tailnet rows from two plain-HTTP reads. Gating it hid the address the
+  // browser user came looking for, from behind the section showing it.
+  { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet magicdns address phone open elsewhere' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
   { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
 
@@ -102,7 +106,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:image-generation', label: 'Image generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
   { id: 'models:background-tasks', label: 'Background tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
   { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:vertex-ai', keywords: 'vertex gcloud gcp google adc region' },
-  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter local gcloud gcp google api key direct credential gpt claude' },
+  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter xai grok local gcloud gcp google api key direct credential gpt claude' },
   { id: 'models:reasoning', label: 'Reasoning', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:reasoning' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
@@ -148,6 +152,12 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
+  { id: 'permissions:mcp', label: 'MCP tool permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:mcp', keywords: 'mcp model context protocol server tool permissions allowlist always allow' },
+
+  // MCP Servers subview
+  { id: 'mcp:cost', label: 'Context cost', subview: 'mcp', path: 'Settings → MCP Servers', anchor: 'mcp:cost', keywords: 'mcp context cost tokens window per request tool definitions expensive' },
+  { id: 'mcp:servers', label: 'Servers', subview: 'mcp', path: 'Settings → MCP Servers', anchor: 'mcp:servers', keywords: 'mcp server start stop remove running auto approve disable tool unusable id dispatch' },
+  { id: 'mcp:allowed-tools', label: 'MCP tool permissions', subview: 'mcp', path: 'Settings → MCP Servers', anchor: 'mcp:allowed-tools', keywords: 'mcp allowed tools allowlist always allow permission pattern' },
 ];
 
 /** Per-shortcut search entries, synthesized from the registry so they reflect

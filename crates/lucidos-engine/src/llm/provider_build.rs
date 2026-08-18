@@ -20,6 +20,7 @@ use crate::llm::{
     AnthropicAuth, AnthropicAuthSource, AnthropicProvider, LlmProvider, OpenAiKeySource,
     OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingProvider,
     UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL,
+    XAI_BASE_URL,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use std::sync::Arc;
 /// provider is installed. Vertex is env/gcloud-based (no credential) and
 /// hot-swaps its region via `spawn_vertex_region_subscriber` instead — so it is
 /// deliberately absent here. The credential subscriber filters on this set.
-pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 4] = ["openai", "anthropic", "openrouter", "local"];
+pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
+    ["openai", "anthropic", "openrouter", "xai", "local"];
 
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
 /// engine boot (into `UnconfiguredProvider`) before any provider is configured,
@@ -95,6 +97,7 @@ struct DirectProviders {
     openai: Option<OpenAiProvider>,
     anthropic: Option<AnthropicProvider>,
     openrouter: Option<OpenAiProvider>,
+    xai: Option<OpenAiProvider>,
     local: Option<OpenAiProvider>,
     /// Search backends in chain order — Anthropic before OpenAI. Vertex is
     /// prepended by the caller, which owns the Vertex config.
@@ -127,6 +130,11 @@ async fn resolve_direct_providers(
             std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
             default_model,
         );
+        let xai = build_xai_provider(
+            None,
+            std::env::var("LUCIDOS_XAI_API_KEY").ok(),
+            default_model,
+        );
         let local = build_local_provider(None, None, default_model);
         // Same chain order as the DB-up path below: Anthropic, then OpenAI.
         let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
@@ -138,6 +146,7 @@ async fn resolve_direct_providers(
             openai,
             anthropic,
             openrouter,
+            xai,
             local,
             search_backends,
         };
@@ -188,6 +197,21 @@ async fn resolve_direct_providers(
         default_model,
     );
 
+    // xAI: a stored `xai` credential wins; otherwise the env fallback.
+    let xai_credential = match CredentialStore::get(pool, "xai").await {
+        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
+        Ok(None) => None,
+        Err(e) => {
+            crate::log!("[Startup] Failed to read xAI credential: {}", e);
+            None
+        }
+    };
+    let xai = build_xai_provider(
+        xai_credential,
+        std::env::var("LUCIDOS_XAI_API_KEY").ok(),
+        default_model,
+    );
+
     // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
     // default applied inside the builder) and an optional `local` credential.
     let local_base_pref = match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
@@ -220,6 +244,7 @@ async fn resolve_direct_providers(
         openai,
         anthropic,
         openrouter,
+        xai,
         local,
         search_backends,
     }
@@ -376,6 +401,7 @@ pub async fn build_active_provider(
         openai,
         anthropic,
         openrouter,
+        xai,
         local,
         search_backends,
     } = resolve_direct_providers(
@@ -394,6 +420,7 @@ pub async fn build_active_provider(
         has_openai: openai.is_some(),
         has_anthropic: anthropic.is_some(),
         has_openrouter: openrouter.is_some(),
+        has_xai: xai.is_some(),
         has_local: local.is_some(),
         boot_without_provider: ctx.boot_without_provider,
     });
@@ -458,6 +485,7 @@ pub async fn build_active_provider(
             openai,
             anthropic,
             openrouter,
+            xai,
             local,
             ctx.model_registry.clone(),
             ctx.default_model.clone(),
@@ -532,27 +560,83 @@ fn build_openrouter_provider(
     env_key: Option<String>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
+    build_bearer_openai_compatible(
+        "OpenRouter",
+        OPENROUTER_BASE_URL,
+        credential,
+        env_key,
+        default_model,
+        vec![
+            (
+                "HTTP-Referer".to_string(),
+                "https://lucidos.dev".to_string(),
+            ),
+            ("X-Title".to_string(), "Lucidos".to_string()),
+        ],
+    )
+}
+
+/// Build the xAI provider: an [`OpenAiProvider`] pinned to xAI's
+/// OpenAI-compatible Chat Completions endpoint, serving Grok. The key comes
+/// from a stored `xai` credential (Settings → Models → Providers), with
+/// `LUCIDOS_XAI_API_KEY` as the fallback. `None` when neither is configured.
+///
+/// Sends no extra headers: `HTTP-Referer` / `X-Title` are OpenRouter's own
+/// attribution convention, and xAI has no counterpart.
+fn build_xai_provider(
+    credential: Option<(AuthType, String)>,
+    env_key: Option<String>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    build_bearer_openai_compatible(
+        "xAI",
+        XAI_BASE_URL,
+        credential,
+        env_key,
+        default_model,
+        Vec::new(),
+    )
+}
+
+/// The shared body behind [`build_openrouter_provider`] and
+/// [`build_xai_provider`]: a hosted OpenAI-compatible backend authenticated by a
+/// single bearer key, differing only in base URL, attribution headers and the
+/// name in the startup log.
+///
+/// `force_chat_completions` is always true here. Neither service implements
+/// OpenAI's Responses API, so a `gpt-5`-shaped id served by one must still take
+/// the Chat Completions path.
+///
+/// The named wrappers stay, because each carries what is provider-specific:
+/// which env var falls back, and why the headers are there or absent.
+/// [`build_local_provider`] deliberately does NOT route through here: it
+/// resolves its own base URL, tolerates an empty key, and logs that base.
+fn build_bearer_openai_compatible(
+    provider_label: &str,
+    base_url: &str,
+    credential: Option<(AuthType, String)>,
+    env_key: Option<String>,
+    default_model: &str,
+    extra_headers: Vec<(String, String)>,
+) -> Option<OpenAiProvider> {
     let key = resolve_bearer_key(credential, env_key)?;
-    let extra_headers = vec![
-        (
-            "HTTP-Referer".to_string(),
-            "https://lucidos.dev".to_string(),
-        ),
-        ("X-Title".to_string(), "Lucidos".to_string()),
-    ];
     match OpenAiProvider::new_with_base_url(
         key,
         default_model.to_string(),
-        OPENROUTER_BASE_URL,
+        base_url,
         extra_headers,
         true,
     ) {
         Ok(p) => {
-            crate::log!("[Startup] OpenRouter provider configured");
+            crate::log!("[Startup] {} provider configured", provider_label);
             Some(p)
         }
         Err(e) => {
-            crate::log!("[Startup] Failed to build OpenRouter provider: {}", e);
+            crate::log!(
+                "[Startup] Failed to build {} provider: {}",
+                provider_label,
+                e
+            );
             None
         }
     }
@@ -647,7 +731,7 @@ mod tests {
     }
 
     /// Whether an ambient provider source could pre-configure a provider in this
-    /// process: the Anthropic / OpenAI / OpenRouter / local env fallbacks, OR a
+    /// process: the Anthropic / OpenAI / OpenRouter / xAI / local env fallbacks, OR a
     /// Codex CLI `apikey` login on disk (`${CODEX_HOME:-~/.codex}/auth.json`),
     /// which the OpenAI builder honors as its lowest-precedence fallback. On a
     /// dev shell or CI runner that has any of these, the "no provider
@@ -663,6 +747,7 @@ mod tests {
         std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("OPENAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok()
+            || std::env::var("LUCIDOS_XAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_LOCAL_BASE_URL").is_ok()
             || std::env::var("LUCIDOS_LOCAL_API_KEY").is_ok()
             || crate::llm::openai::codex_detect::load().is_some()
@@ -875,6 +960,39 @@ mod tests {
                 .expect("routing provider reports a set")
                 .contains(&crate::llm::ProviderKind::Vertex),
             "a resolved Vertex project must build + report the vertex backend"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// A stored `xai` credential alone configures the provider and reports it,
+    /// so the picker stops hiding every Grok row as "not set up".
+    ///
+    /// This also pins the ARGUMENT ORDER into `RoutingProvider::new`, whose
+    /// `openrouter`, `xai` and `local` arguments are three consecutive
+    /// `Option<OpenAiProvider>`. Swap two and the compiler stays silent, but the
+    /// kind reported here is the wrong one.
+    #[tokio::test]
+    async fn an_xai_credential_configures_and_reports_the_xai_backend() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = unconfigured_ctx(true);
+        seed_credential(
+            &pool,
+            "xai",
+            crate::llm::XAI_BASE_URL,
+            crate::core::AuthType::ApiKey,
+            "xai-test",
+        )
+        .await;
+
+        let (provider, selection) =
+            install(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        assert_eq!(selection, ProviderSelection::Real);
+        assert!(
+            provider
+                .configured_providers()
+                .expect("routing provider reports a set")
+                .contains(&crate::llm::ProviderKind::XAi),
+            "an xai credential must build + report the xai backend"
         );
         teardown_test_db(&db).await;
     }

@@ -363,7 +363,7 @@ impl LucidosEngine {
             return Ok("Navigated to Settings → Models. The UI shows:\n\
                 - The active Chat & triggers model (the model picker) and reasoning effort\n\
                 - Image generation and background-task models (title, image description, memory)\n\
-                - Providers (Anthropic, OpenAI, OpenRouter, local) and the model registry\n\
+                - Providers (Anthropic, OpenAI, OpenRouter, xAI, local) and the model registry\n\
                 Tell the user they can change the active model from the picker here. To switch \
                 it for them instead, use set_preference(key='chat_model'); to add a model to the \
                 picker, use manage_models."
@@ -378,8 +378,11 @@ impl LucidosEngine {
                 - The user's environment variables as NAME = value rows\n\
                 - Buttons to add, edit, or delete a variable\n\
                 These are non-secret values injected into every subprocess Lucidos spawns \
-                (run_bash, run_python, scheduled scripts, coding agents). For secrets like API \
-                keys, the user should use credentials instead."
+                (run_bash, run_python, scheduled scripts, coding agents), which pick a change up \
+                on the next spawn with no restart. The engine loads the same store into its own \
+                process environment once at startup, so a variable the engine itself reads \
+                changes only after an engine restart. For secrets like API keys, the user should \
+                use credentials instead."
                     .to_string(),
             );
         }

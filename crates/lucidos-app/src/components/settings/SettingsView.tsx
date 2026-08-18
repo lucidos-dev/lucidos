@@ -30,6 +30,7 @@ import { ModelsManager } from './ModelsManager';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
 import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
+import { XaiProviderSettings } from './XaiProviderSettings';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
@@ -38,6 +39,7 @@ import { AllowlistEditor } from './AllowlistEditor';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { MarketplacesSection } from './MarketplacesSection';
+import { McpServersPage } from './McpServersPage';
 import { MobileAccessPage } from './MobileAccessPage';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
@@ -52,6 +54,7 @@ import { loadRepositories } from '../../store/actions/chat';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
+import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
@@ -88,37 +91,6 @@ function formatScopes(scopes: string): string {
     })
     .filter((v, i, a) => a.indexOf(v) === i) // dedupe
     .join(', ');
-}
-
-/** A toggle switch backed by a `Loadable` preference. Until the preference has
- *  loaded it renders a neutral placeholder pill — NOT a definite on/off position
- *  — so the persisted value mounts in its final spot instead of animating across
- *  from the loading default on every page reload (the `.toggle-slider` knob has a
- *  0.2s transition that would otherwise visibly slide off→on). CSS transitions
- *  don't fire on initial mount, so a freshly-mounted checked toggle lands
- *  silently. The placeholder is a `<span>` (not the real `<label>`) so Preact
- *  replaces the whole subtree when `loaded` flips — guaranteeing the fresh mount
- *  rather than an in-place `checked` update that would animate. */
-function LoadableToggle(props: {
-  loaded: boolean;
-  checked: boolean;
-  disabled?: boolean;
-  onChange: (checked: boolean) => void;
-}) {
-  if (!props.loaded) {
-    return <span class="toggle-switch toggle-switch-loading" aria-hidden="true" />;
-  }
-  return (
-    <label class={`toggle-switch${props.disabled ? ' toggle-switch-disabled' : ''}`}>
-      <input
-        type="checkbox"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={(e) => props.onChange((e.currentTarget as HTMLInputElement).checked)}
-      />
-      <span class="toggle-slider" />
-    </label>
-  );
 }
 
 const THEMES: Array<{ value: Theme; label: string }> = [
@@ -987,6 +959,30 @@ export function SettingsView() {
             </>
           }
         />
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="permissions:mcp">
+            MCP tool permissions
+          </div>
+          <div class="settings-row">
+            <span class="settings-row-label">
+              MCP servers
+              <Explainer title="MCP tool permissions">
+                <p>
+                  The MCP allowlist lives beside the server list, on its own page. A
+                  pattern there is meaningless without knowing which servers are
+                  registered and which tools each one offers.
+                </p>
+                <p>
+                  That page also says what every server costs each request, and lets you
+                  switch a server or a single tool off.
+                </p>
+              </Explainer>
+            </span>
+            <button class="action-btn" onClick={() => openSettingsSubview('mcp')}>
+              Open
+            </button>
+          </div>
+        </div>
       </>
     );
   }
@@ -1135,6 +1131,7 @@ export function SettingsView() {
           <AnthropicProviderSettings />
           <OpenAiProviderSettings />
           <OpenRouterProviderSettings />
+          <XaiProviderSettings />
           <LocalProviderSettings />
         </div>
         <ModelsManager />
@@ -1409,6 +1406,7 @@ export function SettingsView() {
       case 'marketplaces': return <MarketplacesSection />;
       case 'access': return accessSection();
       case 'permissions': return permissionsSection();
+      case 'mcp': return <McpServersPage />;
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;

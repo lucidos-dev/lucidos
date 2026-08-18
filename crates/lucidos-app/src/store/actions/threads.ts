@@ -465,14 +465,14 @@ function collectArchiveCascade(rootId: string): Set<string> {
  *  so an ordinary unsaved thread with three live subscriptions archived on the
  *  first tap and the event-wait dispatcher cancelled all three.
  *
- *  **Two sources, because neither alone is right.** `meta.liveEventWaits` is
- *  folded from a thread's LOADED events, so it names every subscription on the
- *  thread the user is looking at and knows nothing about a sub-thread whose
- *  events were never fetched. `meta.liveEventWaitCount` is the projected column
- *  and is right for every row in the map. So the named ones come from the list
- *  and the rest are counted from the column, rather than the dialog waiting on
- *  a fetch before it can open. The thread being archived is always fully named,
- *  which is the case that matters.
+ *  **Two sources, because a row can be counted before it is named.** Both now
+ *  come from the same projection: `meta.liveEventWaitCount` and
+ *  `meta.liveEventWaits` arrive together on every thread summary, so a row in
+ *  the map normally names every subscription it holds. They can still differ
+ *  for a row assembled from another path, an optimistic SSE skeleton or a
+ *  fixture that carries the count alone. So the named ones come from the list,
+ *  and any remainder is counted from the column. The dialog never waits on a
+ *  fetch before it can open.
  *
  *  Returns `null` when the cascade holds none, which is what keeps an ordinary
  *  archive a single tap.
@@ -498,11 +498,9 @@ export function subscriptionsStoppedByArchive(
       });
     }
     // The shortfall is counted whether the thread named NONE of its
-    // subscriptions or only some. A thread's events load in a window, so one
-    // holding two subscriptions can have the newer `EventWaitStarted` in the
-    // window and the older one outside it: counting only the all-or-nothing
-    // case would name one, drop the other, and under-report the total in the
-    // one dialog whose whole job is not to.
+    // subscriptions or only some. Handling only the all-or-nothing case would
+    // name one and drop the other, under-reporting the total in the one dialog
+    // whose whole job is not to.
     unnamed += Math.max(0, t.meta.liveEventWaitCount - waits.length);
   }
   const count = named + unnamed;

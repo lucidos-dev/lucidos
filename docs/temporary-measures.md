@@ -570,6 +570,85 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   line becomes.
 - **Status:** active
 
+### macOS function-key characters inserted as text at a caret boundary
+
+- **Added:** 2026-08-15
+- **Lives in:** `crates/lucidos-app/src/utils/noFunctionKeyText.ts` and its
+  `installNoFunctionKeyText()` call in `crates/lucidos-app/src/main.tsx`.
+- **Scope note:** the native half, `install_app_menu`
+  (`crates/lucidos-app/src/lib.rs`), is **permanent** and is NOT part of this
+  measure. A complete app menu is what loads the standard text-editing key
+  bindings, so without it no arrow key moves the caret at all. This row covers
+  only the frontend guard.
+- **Impermanent because:** AppKit reserves 0xF700 to 0xF8FF for function keys,
+  so the right arrow's key event carries 0xF703 as its characters. macOS maps
+  the key to `moveRight:`. At the end of the text that command has nothing to
+  move over, so the keystroke falls through to plain text insertion. WebKit's
+  guard there rejects only control characters below 0x20, so the private-use
+  character lands in the field as a tofu square. The user reported it against
+  the chat prompt in the desktop app. No web page should receive such a
+  character as text, so the guard compensates for the embedded webview rather
+  than our own design.
+- **The refusal stops at 0xF747, not 0xF8FF, and that bound replaces a platform
+  gate.** Apple assigns constants only up to Mode Switch. No key event can carry
+  anything above it, and the rest of the private-use block belongs to the fonts
+  that squat there. A narrow unconditional guard beats a wide one gated on
+  Tauri. The gate would still refuse a Character Viewer glyph in the desktop
+  app, the one client where a user is likeliest to insert one.
+- **Not covered: app iframes.** A document-level listener cannot reach into an
+  app iframe, so an app's own text field still takes the character. Nobody has
+  reported it there, and the fix would be the same guard in the SDK.
+- **Removal / resolution condition:** when a right arrow at the end of a prompt
+  inserts nothing in the packaged desktop app, with the listener disabled. Check
+  the other three arrows and Page Up/Down too, since each takes the same path at
+  its own boundary. Then delete the module, its test, and the call plus import
+  in `main.tsx`. Drop the paragraph the guard added to `install_app_menu`'s
+  docstring, and keep the menu itself.
+- **Status:** active
+- **Investigation:** n/a (the cause is upstream in the embedded webview, and
+  nothing is being chased here)
+
+### Prompt-cache wire probe
+
+- **Added:** 2026-08-17
+- **Lives in:** `crates/lucidos-engine/src/llm/cache_probe.rs` plus
+  `cache_probe_tests.rs`, gated on `LUCIDOS_CACHE_PROBE`. Everything outside
+  that module is thin, and all of it is in this list.
+  - `pub(crate) mod cache_probe;` in `crates/lucidos-engine/src/llm/mod.rs`.
+  - `log_request` and `log_response` in
+    `crates/lucidos-engine/src/llm/anthropic_wire.rs`, at the end of
+    `build_claude_request` and `parse_claude_stream`.
+  - the `url` field on both `WireTarget` variants in the same file, plus the
+    `'a` lifetime it forced onto the enum. With it go the `request_url`
+    binding in `build_claude_request`'s target match and the two construction
+    sites (`llm/vertex/claude.rs`, `llm/anthropic/chat.rs`). In
+    `anthropic/chat.rs` the `messages_url` binding also moved above the
+    builder call to feed it.
+  - `VERTEX_TEST_URL` and `the_probe_url_argument_never_reaches_the_body` in
+    `anthropic_wire.rs`'s test module. Three other tests there construct a
+    `WireTarget` and need the field dropped, not deleting.
+  - the `scope` wrapper around `provider.chat` in
+    `crates/lucidos-engine/src/engine/agentic_loop/run.rs`.
+
+  Writes to engine.log only: no event, no DB row, no UI.
+- **Impermanent because:** Pure telemetry for the **first-of-turn prompt-cache
+  miss** investigation below. `ContextCaptured` records section composition, not
+  the serialized bytes, which is why 578k rows could rule out every candidate
+  and still not name the cause. The probe hashes each cache-prefix segment on the
+  exact JSON that goes on the wire, so two consecutive calls diff mechanically.
+  It compensates for nothing in the design and changes no behaviour.
+- **Removal / resolution condition:** When the **first-of-turn prompt-cache
+  miss** investigation (`prompt-cache-first-of-turn-miss`) is closed, that is,
+  the cause is identified and either fixed or attributed upstream. Verify no open
+  work still needs the `[CacheProbe]` lines. Then delete every site in the
+  "Lives in" list above, which is written to be followed top to bottom. The env
+  var then has no reader, so remove its bullet from the `lucidos-env-vars` skill
+  in the same change. `grep -rE 'CacheProbe|LUCIDOS_CACHE_PROBE|cache_probe' .`
+  must come back empty, and `make lint` must pass: the `WireTarget` lifetime is
+  the one piece a partial removal leaves behind compiling.
+- **Status:** active
+- **Investigation:** `prompt-cache-first-of-turn-miss`
+
 ---
 
 ## 2. Model-tolerance measures
@@ -973,19 +1052,30 @@ condition; fix the condition rather than acting on it.
 
 - **Added:** when `inline_question_repair` shipped (backfilled to the registry
   2026-06-30 — it predates this rule and was never logged).
-- **Lives in:** `crates/lucidos-engine/src/engine/inline_question_repair.rs` +
-  its wiring in `crates/lucidos-engine/src/engine/agentic_loop/run.rs`
-  (mid-stream suppression + the post-response `inline_repair` block).
+- **Widened:** 2026-08-15, after two fresh leaks got through. See
+  `docs/plans/2026-08-15-inline-question-leak-object-body-and-degenerate-tag.md`.
+- **Lives in:** `crates/lucidos-engine/src/engine/inline_question_repair.rs`,
+  with its tests in the sibling `inline_question_repair_tests.rs`. Wired in
+  `crates/lucidos-engine/src/engine/agentic_loop/run.rs`: mid-stream
+  suppression, the post-response `inline_repair` block, and the
+  `QuestionReaskCause::LeakedAsText` arm of the re-ask guard.
 - **Impermanent because (tolerates):** The same leak class as the entry above, for
   one specific tool: the model emits `<ask_user_question>[...]</ask_user_question>`
   as inline text instead of a structured `ask_user_question` tool call —
   collapsing a clickable question card into raw XML. Observed even after the
   `ASK_USER_QUESTION_RULE` prompt explicitly told the model not to type the tag,
   so prompt guidance alone was insufficient.
+- **Body shapes tolerated:** three, all normalised to the questions array. A JSON
+  array is the shape that shipped. A single-key `{"questions": [...]}` object and
+  an unfenced payload of that object, alone at the end with no tag, were added
+  when the measure widened. The detector shipped requiring an array, which is
+  why both 2026-08-15 leaks got through: one carried the object form, the other
+  bare prose. A tag whose body is not dispatchable is stripped, its prose kept,
+  and a bounded re-ask forced.
 - **Removal / resolution condition:** Same as above — when the model stops leaking
   the tag (sample chat turns for `<ask_user_question` in persisted text with the
   repair disabled). On removal, drop the module + its `run.rs` wiring + the
-  suppression branch.
+  suppression branch + the `LeakedAsText` re-ask cause.
 - **Status:** active
 - **Investigation:** `model-tool-call-as-text`
 
@@ -1479,3 +1569,61 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Status:** open
 - **Measures referencing this investigation:** HTML entities in tool-argument
   text (§2).
+
+### `prompt-cache-first-of-turn-miss`: the first Claude call of a turn reads no cache
+
+- **Opened:** 2026-08-17
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** An investigation closes once its question is
+  answered. Across 578k `ContextCaptured` rows in the `dev` workspace, mid-turn
+  Claude calls read cache 99.3-99.4% of the time and write ~2.1k tokens. The
+  FIRST call of a turn reads NOTHING in ~47% of cases and writes ~67.5k. It
+  holds even when the previous call was seconds earlier on the same thread: at a
+  matched sub-30s gap, first-of-turn misses 28.6% against mid-turn 0.6%.
+- **What the data already ruled out** (do not re-investigate): tool count, model
+  id, elapsed time, concurrent-thread eviction, and `frontend_origin`. Section
+  composition too: in 1,029 zero-read cases both cached blocks were
+  byte-identical in `char_count` to the previous call. The 30s
+  `pool_idle_timeout` is a second-order effect and cannot be the mechanism, per
+  the matched-gap number.
+- **The CURRENT TIME stamp is NO LONGER ruled out, and is now fixed.** The
+  `char_count` evidence above was the reason it was cleared, and equal counts
+  are not equal content: the wire probe caught a boundary where `system_bytes`
+  held constant while `system_hash` moved, which is a fixed-width field
+  changing. That is a PARTIAL read (tools survived, system did not), so it is a
+  different failure from the all-or-nothing zero this entry tracks. Fixed by ADR
+  0084. Re-measure before attributing any remaining zero-read case.
+- **The 30-day measurement split the boundary write into three causes.**
+  `data/artifacts/context-economics-investigation.md` in the `dev` workspace,
+  over 19,254 `ContextCaptured` rows and 94 paired probe lines. The clock takes
+  about a third and is fixed. The messages[0] rotation takes about a half,
+  measured changing at 94.3% of 1,115 boundaries, and ADR 0085 removes it.
+- **The ~9,200 unmatched tools tokens are RETIRED, and were never real.** ADR
+  0088 and
+  `docs/investigations/2026-08-18-tools-array-and-system-prompt-economics.md`
+  show two arithmetic artifacts behind them. The 22,659 they came from is a
+  bucket mean over 36.7% zeros. The non-zero reads in that same bucket average
+  35,581, which is ABOVE the tier. The $0.058 came from a three-way residual of
+  the boundary write. Do not re-derive it.
+- **Reads are all-or-nothing**, now measured rather than asserted. Over 30 days
+  and 1,423 boundaries, ZERO reads landed between nothing and the full tools
+  tier. Each engine build reads one exact value, low equal to high. So this is
+  a lookup that never matched, not a prefix that diverged partway.
+- **The live question is the size of the zero-read population.** It is 56.8%
+  over 30 days and 58.6% over 7, against the ~47% recorded above over all 578k
+  rows. Name the window whenever you quote it. Whichever window, the tools
+  array those boundaries failed to match is byte-identical on every thread and
+  every workspace of that build.
+- **The structural fact that shapes the search:** the tools array and the system
+  prompt are built once per turn in `engine::chat::process::run` and handed to
+  `run_agentic_loop` frozen. So the cached prefix cannot move mid-turn, and is
+  rebuilt from scratch between turns, which is exactly where the miss lives.
+- **Removal / resolution condition:** The cause is identified, and either fixed
+  or attributed to Anthropic with evidence. The discriminator is two consecutive
+  calls on one thread whose `[CacheProbe]` prefix hashes are identical while the
+  second reads zero. That puts the miss upstream. Differing hashes name the
+  segment we changed, and the bug is ours. On close, flip every measure tagged
+  `Investigation: prompt-cache-first-of-turn-miss` to `removed` per its own
+  removal steps.
+- **Status:** open
+- **Measures referencing this investigation:** Prompt-cache wire probe (§1).

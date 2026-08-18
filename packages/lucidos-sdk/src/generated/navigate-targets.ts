@@ -29,6 +29,7 @@ export type NavigateTarget = (typeof NAVIGATE_TARGETS)[number];
 export const SETTINGS_VIEW_TARGETS = [
   'models',
   'permissions',
+  'mcp',
   'coding-agents',
   'accounts',
   'locale',

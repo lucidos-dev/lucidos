@@ -3,16 +3,13 @@ import { openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail } from '../../utils/errorDetail';
-import { formatBytes } from '../../utils/formatBytes';
 import {
   checkAppUpdate,
   installAppUpdateAndRestart,
-  cancelAppUpdate,
   listen,
   APP_UPDATE_PROGRESS_EVENT,
   type AppUpdateOffer,
   type AppUpdateProgress,
-  type AppUpdateRunning,
 } from '../../utils/tauri';
 
 /** How often the packaged client re-checks for an app update. The client is
@@ -34,11 +31,13 @@ const APP_UPDATE_POLL_MS = 60 * 60 * 1000; // 1h
  *  user could notice the wait. */
 const APP_UPDATE_RESUME_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
-/** ONE key for the whole packaged-update surface: the "Lucidos <v> available"
- *  offer, the live progress narration, and a failure. Keyed toasts update in
- *  place, so the offer MORPHS into the progress readout instead of a second toast
- *  stacking on top of it — the same single-surface discipline
- *  `initiateEngineRestart` applies to the engine switch. */
+/** ONE key for every packaged-update TOAST: the "Lucidos <v> available" offer,
+ *  and a failure. Keyed, so a failure replaces the offer in place rather than
+ *  stacking a second toast on it.
+ *
+ *  The live progress is not here. A run takes the app away and comes back with
+ *  a different one, so it owns the progress dialog instead
+ *  (docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md). */
 const UPDATE_TOAST_KEY = 'app-update-available';
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,65 +62,6 @@ let subscribing = false;
  *  engine's `/health`, which is the only source dev has. The two would then
  *  fight on every poll. */
 let updaterOwnsLatestVersion = false;
-
-/** How the update surface should read for a given progress frame: the sentence,
- *  the determinate fraction (or `null` when there is no honest one), and whether
- *  the run can still be abandoned.
- *
- *  Pure, and the SINGLE derivation behind both the toast and Settings → System —
- *  the two must never disagree about what the update is doing. Terminal frames
- *  (`cancelled` / `failed`) are deliberately absent: they end the run rather than
- *  describe it, so their callers replace the toast instead of updating it. */
-export interface AppUpdateNarration {
-  message: string;
-  /** Determinate fraction in [0, 1], or `null` when there is no honest one.
-   *  Clamped HERE rather than at each renderer: the toast and the System page
-   *  both paint it, and a server whose `Content-Length` undercounts the body
-   *  would otherwise send one of them past the end of its own track. */
-  progress: number | null;
-  cancellable: boolean;
-}
-
-/** `Lucidos 2026.7.30`, or a version-less fallback for the window before the
- *  check has resolved one. */
-function updateLabel(version: string | null): string {
-  return version ? `Lucidos ${version}` : 'the update';
-}
-
-export function appUpdateNarration(frame: AppUpdateRunning): AppUpdateNarration {
-  const name = updateLabel(frame.version);
-  switch (frame.phase) {
-    case 'checking':
-      // Cancellable: the check is a network round-trip that can hang on a bad
-      // connection, and the Rust side races it against the cancel signal too.
-      return { message: 'Checking for updates…', progress: null, cancellable: true };
-    case 'downloading': {
-      // No `Content-Length` means no honest percentage — show the bytes moving
-      // and let the spinner carry the rest. Never a fabricated bar.
-      const { downloaded, total } = frame;
-      const sized = total !== null && total > 0;
-      return {
-        message: `Downloading ${name} — ${formatBytes(downloaded)}${sized ? ` of ${formatBytes(total)}` : ''}`,
-        progress: sized ? Math.min(1, downloaded / total) : null,
-        cancellable: true,
-      };
-    }
-    case 'verifying':
-      // Signature check over the buffered bytes — sub-second, and nothing has
-      // touched the disk yet. A cancel WOULD still land here (Rust runs the check
-      // inside the abortable download), but a button that appears and vanishes
-      // within a few hundred ms is noise, so it is withheld. Hiding a working
-      // affordance is safe; the rule is only never to OFFER one that can't work.
-      // Full bar: the transfer really is complete.
-      return { message: `Verifying ${name}…`, progress: 1, cancellable: false };
-    case 'installing':
-      return { message: `Installing ${name}…`, progress: null, cancellable: false };
-    case 'restarting-services':
-      return { message: 'Restarting background services…', progress: null, cancellable: false };
-    case 'relaunching':
-      return { message: 'Relaunching Lucidos…', progress: null, cancellable: false };
-  }
-}
 
 /** Surface the "Lucidos <v> available → Update & restart" offer. Extracted so
  *  the cancel path can put it straight back: abandoning a download abandons the
@@ -151,9 +91,12 @@ function offerAppUpdate(version: string): void {
   });
 }
 
-/** Render one progress frame onto the update surface. Terminal frames end the
- *  run (clearing {@link appUpdateProgress}, which is what re-enables ordinary
- *  toasts) and replace the narration; the rest update it in place. */
+/** Take one progress frame. A running frame is simply RECORDED: the progress
+ *  dialog is derived from {@link appUpdateProgress}, so recording the frame is
+ *  what draws it, and clearing the signal is what closes it.
+ *
+ *  A terminal frame ends the run and says why on a toast. A finished operation
+ *  is a message, rather than something the user must watch. */
 function handleAppUpdateProgress(frame: AppUpdateProgress): void {
   if (frame.phase === 'cancelled') {
     appUpdateProgress.value = null;
@@ -186,24 +129,16 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
     showToast(frame.message, 'error', { key: UPDATE_TOAST_KEY });
     return;
   }
+  // A running frame. The dialog reads this signal, applies the narration, and
+  // offers Cancel exactly while `cancellable` says one can still work. Nothing
+  // needs keeping alive against the toast suppression either, since a dialog is
+  // not a toast. That matters from `installing` on, where the launchd service
+  // restarts and the gateway serving this page dies with it.
   appUpdateProgress.value = frame;
-  const narration = appUpdateNarration(frame);
-  showToast(narration.message, 'info', {
-    key: UPDATE_TOAST_KEY,
-    spinning: true,
-    progress: narration.progress,
-    // The last phases restart the launchd service, which kills the gateway
-    // serving this page; without this the narration would be suppressed by the
-    // very disconnection it is explaining.
-    showWhileUnavailable: true,
-    // Cancel IS the escape hatch while one exists, and once it doesn't there is
-    // nothing to escape to — an X beside "Cancel" would just read as a second,
-    // differently-behaved cancel.
-    dismissable: false,
-    secondaryAction: narration.cancellable
-      ? { label: 'Cancel', onClick: () => { void cancelAppUpdate(); } }
-      : undefined,
-  });
+  // Drop the offer the run started from. The keyed toast used to be REPLACED by
+  // the narration. Now that the narration is a dialog, the offer would sit
+  // behind it, still inviting a click on an update already running.
+  removeToast(UPDATE_TOAST_KEY);
 }
 
 /** Subscribe to the Rust updater's progress stream. Idempotent across remounts;

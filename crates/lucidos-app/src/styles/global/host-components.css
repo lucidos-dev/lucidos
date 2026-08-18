@@ -216,33 +216,78 @@
     }
 }
 
-/* Icon-only buttons: one 2.25rem tap target, background filling the full area.
-   Three bands, by what the control sits in: `header-icon` in a header band,
-   `row-icon` in a list row's action cluster, `inline-icon` inline in a run of
-   text. Three names for one box because only the header one is narrowed by the
-   mobile thread title bar, which squeezes it onto the title's own line, and
-   neither of the others must follow it there. Left to `.icon-btn`'s bare
-   padding any of them would be its glyph plus 0.25rem, a ~24px target a thumb
-   misses that reads squat beside the row's text. That is what the queued
-   message's trash (1.25rem) and the trigger group heading's pair (1.375rem)
-   each were before they came here.
+/* Icon-only buttons: one 2.25rem tap target, three bands by what the control
+   sits in. `header-icon` in a header band, `row-icon` in a list row's action
+   cluster, `inline-icon` inline in a run of text. Three names because each band
+   answers to something different. The mobile thread title bar narrows the
+   header one, squeezing it onto the title's own line. The inline one has to
+   keep its target off the line it interrupts. Left to
+   `.icon-btn`'s bare padding any of them would be its glyph plus 0.25rem, a
+   ~24px target a thumb misses that reads squat beside the row's text. That is
+   what the queued message's trash (1.25rem) and the trigger group heading's
+   pair (1.375rem) each were before they came here.
 
    `--icon-glyph` is the NOMINAL size of whatever glyph the box holds, and it is
-   the only part that varies: the 2.25rem box is the tap target, grown
+   the only part that varies: `--icon-tap-target` is the tap target, grown
    deliberately after the trash was reported unhittable on mobile (and after the
    `.edge-swipe-right` overlay fix), so a band that wants a smaller icon turns
-   the glyph down and leaves the box alone. It is declared per class below, on
+   the glyph down and leaves the target alone. It is declared per class below, on
    selectors this rule's own list carries, so a nominal can never be set on
    something that is not one of these tap targets. */
 .icon-btn.header-icon,
 .icon-btn.row-icon,
 .icon-btn.inline-icon {
+    --icon-tap-target: 2.25rem;
     position: relative;
-    width: 2.25rem;
-    height: 2.25rem;
-    padding: 0;
     justify-content: center;
     -webkit-tap-highlight-color: transparent;
+}
+
+/* Both chrome bands take the target as their BOX. Each sits in a strip that
+   exists to hold controls, so a box larger than its glyph costs nothing there:
+   the strip is already that tall and the icons are its content. */
+.icon-btn.header-icon,
+.icon-btn.row-icon {
+    width: var(--icon-tap-target);
+    height: var(--icon-tap-target);
+    padding: 0;
+}
+
+/* An inline icon cannot take the target as its box: it interrupts a line of
+   text rather than sitting in a strip of its own. As a box the target WAS the
+   layout. It set the turn header's height to the target, against the
+   --turn-header-line every other header keeps. It also held the words either
+   side of the trash half an em further apart than their own gaps ask for. All
+   of that is padding nobody can see, and it was reported as too much space
+   around the glyph.
+
+   So the box is the glyph, and an overlay carries the target instead. The
+   negative margin hands `.icon-btn`'s own chip padding back, the way
+   `.initiator-actor` does (chat/input-messages.css). Vertical only: the chip's
+   WIDTH is what separates the trash from the words, and it is the one part of
+   that separation the user can see. */
+.icon-btn.inline-icon {
+    --inline-icon-chip: 0.25rem;
+    padding: var(--inline-icon-chip);
+    margin-block: calc(-1 * var(--inline-icon-chip));
+}
+
+/* The overlay. Centred, so it reaches past the chip evenly and stops short of
+   both neighbours. It clears the queued message's own gaps, 0.375rem to the
+   label and 0.5rem to the timestamp, which is what keeps the trash off the
+   timestamp button beside it. Transparent and positioned, so it takes the
+   pointer without painting anything.
+
+   `left`/`top` are load-bearing: the transform centres nothing on its own, and
+   without them the target slides half its width off the glyph. */
+.icon-btn.inline-icon::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: var(--icon-tap-target);
+    height: var(--icon-tap-target);
+    transform: translate(-50%, -50%);
 }
 
 /* A header icon IS the content of its band, so it takes the large step. */

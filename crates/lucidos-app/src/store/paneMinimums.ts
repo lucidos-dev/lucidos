@@ -17,12 +17,12 @@
  * `360` they replace at a 16px root.
  *
  * The cost of deriving them is that the three no longer fit every window: they
- * sum to 972px at 100% ui-scale, 1175 at 125%, 1378 at 150% and 1581 at 175%,
+ * sum to 1010px at 100% ui-scale, 1182 at 125%, 1355 at 150% and 1527 at 175%,
  * so from 150% on a 1280px screen `clampSplitRatio`'s empty-range branch is what
- * the user actually meets (137.5%, the step below, still fits at 1277). That
+ * the user actually meets (137.5%, the step below, still fits at 1269). That
  * branch is load-bearing, not a corner. Those sums hold on every desktop client,
- * because the drawer's floor no longer varies by build (see
- * `computeMinDrawerWidth`).
+ * because neither derived floor varies by build (see `computeMinDrawerWidth`
+ * and `computeMinThreadPaneWidth`).
  *
  * Deliberately holds no signal and imports nothing from `store.ts`: the store's
  * own module init reads `minDrawerWidth()` to clamp the persisted drawer width,
@@ -53,12 +53,25 @@ const DRAWER_ROW_PAD_REM = 0.5;
  *  it always was. */
 const TITLEBAR_LIGHTS_RESERVE_PX = 80;
 
-/** The Conversation pane's floor. 300px at a 16px root, which is the constant
- *  this replaces. */
-const MIN_THREAD_PANE_REM = 18.75;
-/** The Canvas pane's floor. 360px at a 16px root, likewise. It is the wider of
- *  the two because its header (hamburger, title, action icons) and its typical
- *  content need more room than a chat column. */
+/** One END of the Conversation header's row, in rem, excluding whatever leads
+ *  it: the drawer toggle's box. Mirrors `.thread-toggle-slot` in
+ *  styles/panels/shell.css (`--header-icon-box`). */
+const THREAD_ROW_SIDE_REM = 2.25;
+/** The row's own leading padding, in rem. `--brand-lead-inset`'s web value, and
+ *  the floor UNDER the floor for the same reason the drawer's is: whatever lead
+ *  the row is sized around, an end is never narrower than the padding every
+ *  build has. */
+const THREAD_ROW_PAD_REM = 0.5;
+/** The centred brand cluster at its natural width, in rem: two chevrons and the
+ *  mark's tap target, touching. Mirrors `--desktop-nav-min-span`
+ *  (`2 * --header-icon-box + --header-mark-tap`), which the clamp on
+ *  `.pane-header-brand-label` floors the box at. */
+const THREAD_ROW_CLUSTER_REM = 2 * 2.25 + 2.1;
+/** The Canvas pane's floor. 360px at a 16px root. It is a constant where the
+ *  other two are derived, and it can be. Its row needs
+ *  `2 * --content-side-reserve + --desktop-nav-min-span`, which is 22.1rem, so
+ *  this already covers it. The Canvas title cluster therefore never reaches its
+ *  clamp's min-span arm at or above this width. Pinned in the suite. */
 const MIN_CONTENT_PANE_REM = 22.5;
 
 /** Floor for the thread drawer's width, from the root font size and the lead its
@@ -91,25 +104,51 @@ export function computeMinDrawerWidth(remPx: number, leadPx: number): number {
   return Math.ceil(2 * sidePx + DRAWER_ROW_TITLE_REM * remPx);
 }
 
+/** The lead both derived floors are sized around, read from CSS rather than
+ *  restated, with the literal as the fallback. The property is declared inside
+ *  the desktop media query, so a viewport under 769px (or a test harness with no
+ *  layout engine) reports nothing. */
+function titlebarLightsReservePx(): number {
+  const reserve = parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue('--titlebar-lights-reserve'),
+  );
+  return Number.isFinite(reserve) ? reserve : TITLEBAR_LIGHTS_RESERVE_PX;
+}
+
 /** Floor for the thread drawer's width, at the CURRENT root font size. Reads no
  *  build attribute: `data-titlebar-overlay` decides how the row is LAID OUT, not
  *  how narrow the drawer may get. */
 export function minDrawerWidth(): number {
-  // Read from CSS rather than restated, with the literal as the fallback: the
-  // property is declared inside the desktop media query, so a viewport under
-  // 769px (or a test harness with no layout engine) reports nothing.
-  const reserve = parseFloat(
-    getComputedStyle(document.documentElement).getPropertyValue('--titlebar-lights-reserve'),
-  );
-  return computeMinDrawerWidth(
-    getRemPx(),
-    Number.isFinite(reserve) ? reserve : TITLEBAR_LIGHTS_RESERVE_PX,
-  );
+  return computeMinDrawerWidth(getRemPx(), titlebarLightsReservePx());
 }
 
-/** Floor for the Conversation pane. */
+/** Floor for the Conversation pane, from the root font size and the lead its
+ *  header row is sized around. Pure, like `computeMinDrawerWidth` above, and the
+ *  same shape for the same reason. The brand cluster is centred on the PANE
+ *  (`.pane-header-brand-label`), so it clears the WIDER of the row's two ends on
+ *  BOTH sides. That is why the lead is counted twice.
+ *
+ *  This is the width at which the cluster, held at its natural span, exactly
+ *  meets the drawer toggle. It was a flat `18.75rem` before. On the packaged
+ *  build that let a drag rest where the back chevron sat ON the toggle: the
+ *  row's leading end there is the traffic-lights reserve plus a button, which no
+ *  constant knew about.
+ *
+ *  ONE floor for every desktop client, exactly as the drawer's is: its caller
+ *  passes the reserve on the web build too (ADR 0058). The trailing end is the
+ *  narrower one on both builds, because the actions fold into the ⋯ menu long
+ *  before this width (`useHeaderActionCollapse`). So the symmetric lead is what
+ *  governs. */
+export function computeMinThreadPaneWidth(remPx: number, leadPx: number): number {
+  const sidePx = Math.max(leadPx, THREAD_ROW_PAD_REM * remPx) + THREAD_ROW_SIDE_REM * remPx;
+  return Math.ceil(2 * sidePx + THREAD_ROW_CLUSTER_REM * remPx);
+}
+
+/** Floor for the Conversation pane, at the CURRENT root font size. Reads the
+ *  same lead the drawer's floor does, and by the same rule: the reserve decides
+ *  how the row is LAID OUT, not how narrow the pane may get. */
 export function minThreadPanePx(): number {
-  return Math.ceil(MIN_THREAD_PANE_REM * getRemPx());
+  return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx());
 }
 
 /** Floor for the Canvas pane. */

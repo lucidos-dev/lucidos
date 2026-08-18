@@ -63,11 +63,50 @@ describe('Mobile Access reachability', () => {
     // `window.__TAURI_INTERNALS__!` synchronously, so a button rendered in a
     // browser throws rather than rejecting.
     expect(page).toContain('const showMachineHalf = isTauri() && enginePackaged.value;');
-    expect(page).toContain('{showMachineHalf && connectUrlsSection()}');
     // `tailscaleActionRow` is the only thing carrying Sign in / Expose, so it
     // must sit on the gated side of the branch and `HostTailnetRow` (reporting
     // only) on the other.
     expect(page).toContain('if (showMachineHalf) return tailscaleActionRow();');
+  });
+
+  it('renders Connect URLs everywhere, because a URL is reporting', () => {
+    // The third round of the same mistake. Connect URLs was gated whole, so a
+    // browser saw no address at all. The MagicDNS URL is exactly what a user
+    // copies to another device. It renders on every platform now, and what
+    // varies is which rows it can fill.
+    expect(page).toContain('{connectUrlsSection()}');
+    expect(page).not.toContain('{showMachineHalf && connectUrlsSection()}');
+    // The tailnet rows are derived from the two plain-HTTP reads, never from
+    // the bridge, which is what lets them render with no Tauri at all.
+    expect(page).toContain('tailnetConnectRows({');
+    expect(page).toContain('workspaceServeUrl: tailnet.workspace_serve_url');
+  });
+
+  it('renders the Connect URLs anchor in every state, not only when loaded', () => {
+    // Same rule `NetworkAccessPage` records for `access:network`: the anchor is
+    // a navigation target, and `SettingsView` resolves it with ONE
+    // `querySelector` on the mounting commit. An anchor that waits for a fetch
+    // is missed on a cold open. Search Everywhere reaches this one from a
+    // browser now, so a shell that renders the title unconditionally is what
+    // keeps the jump landing. Exactly one anchor: a per-branch copy is how it
+    // drifts back to being conditional.
+    expect(page.match(/data-search-anchor="access:urls"/g) ?? []).toHaveLength(1);
+    expect(page).toContain('const shell = (body: ComponentChildren) => (');
+    // And the shell is what every branch returns, including the two that carry
+    // no rows at all.
+    expect(page).toContain('return shell(<LoadableError noun="connect info" error={failure} />);');
+    expect(page).toContain("return shell(showLoading ? <div class=\"empty-state\">Loading…</div> : null);");
+  });
+
+  it('scopes every printed URL to this workspace', () => {
+    // A bare gateway origin reaches the ROOT, which redirects to the sole
+    // workspace or to the picker. On a multi-workspace install that is the
+    // wrong address to hand out, and it is what every row used to print.
+    // `SCOPE_PATH` comes from the stamped `<base href>`, so this stays
+    // slug-agnostic; a literal slug here would be the regression.
+    expect(page).toContain('workspaceUrlAt(connect.localhost_url, SCOPE_PATH)');
+    expect(page).toContain('workspaceUrlAt(lan.url, SCOPE_PATH)');
+    expect(page).toContain('scope: SCOPE_PATH');
   });
 
   it('reports a failed load on BOTH sides instead of checking forever', () => {
@@ -88,9 +127,14 @@ describe('Mobile Access reachability', () => {
     // to a working setup.
     const guard = page.indexOf('if (!showMachineHalf) return;');
     const httpFetch = page.indexOf('getNetworkConfig()');
+    // Same rule for the tailnet probe: the MagicDNS name is the browser's only
+    // way to learn the address it is meant to hand another device.
+    const tailnetFetch = page.indexOf('getTailnetStatus()');
     const bridgeFetch = page.indexOf('getConnectInfo()');
     expect(httpFetch).toBeGreaterThan(-1);
+    expect(tailnetFetch).toBeGreaterThan(-1);
     expect(guard).toBeGreaterThan(httpFetch);
+    expect(guard).toBeGreaterThan(tailnetFetch);
     expect(bridgeFetch).toBeGreaterThan(guard);
     // And a missing bridge is still not an error to report.
     expect(page).not.toContain('Mobile access is only available in the desktop app.');

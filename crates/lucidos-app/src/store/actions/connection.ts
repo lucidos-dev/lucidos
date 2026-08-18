@@ -5,7 +5,7 @@ import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
-import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
+import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAILURE_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
@@ -296,8 +296,8 @@ export async function handleRestartTimeout(): Promise<void> {
   // overlay can never hang on a reachable-but-not-restart-detected edge.
   const health = await checkHealth();
   engineRestarting.value = false;
-  // Timeout's contract is to always end the restart — drop the in-flight marker
-  // too so a reload after a timed-out restart won't restore the progress toast.
+  // Timeout's contract is to always end the restart, so drop the in-flight
+  // marker too: a reload after a timed-out restart must not restore the dialog.
   clearRestartInFlight();
   if (health.status === 'loaded') {
     // Engine is reachable — the restart completed while we were suspended /
@@ -438,10 +438,10 @@ async function runConnectionCheck(): Promise<boolean> {
     consecutiveFailures = 0;
   }
 
-  // The in-flight restart status toast (initiateEngineRestart / restoreRestartToast)
-  // shows a single stable message for the whole window — there is no build→swap
-  // phase transition to advance here anymore. It stays up with its spinner via
-  // showWhileUnavailable until reconnect (started_at change) dismisses it below.
+  // The in-flight restart owns the progress dialog, which is derived from
+  // `engineRestarting` and shows one stable message for the whole window. There
+  // is no build to swap phase to advance here, and nothing to keep alive: the
+  // dialog closes when reconnect clears that flag below.
 
   // When disconnected, require multiple consecutive successes before showing connected.
   // Prevents red→green flicker when the engine flaps during restarts.
@@ -576,7 +576,7 @@ async function runConnectionCheck(): Promise<boolean> {
   // `hasEverConnected` gates out a fresh cold start's first connect (not a
   // restart). It resets on a page reload, so a reload mid-restart would normally
   // strand the detection — but `engineRestarting` (restored from the in-flight
-  // marker by restoreRestartToast, which also seeds the pre-restart started_at)
+  // marker by restoreRestartState, which also seeds the pre-restart started_at)
   // is an equally valid signal that a connect now is a restart completion. Either
   // unlocks detection; the `started_at` comparison still distinguishes a genuine
   // restart from the dev build phase (engine still up, same started_at).
@@ -585,15 +585,15 @@ async function runConnectionCheck(): Promise<boolean> {
   const engineRestarted = connected && everOrRestarting && !!health?.started_at && prevStartedAt !== health.started_at;
 
   if (reconnected || engineRestarted) {
-    // Only dismiss the restart toast when the engine actually restarted
-    // (started_at changed). On a simple reconnect (network hiccup, brief
-    // health timeout), the toast must persist — refreshChangesState() in
-    // runResumeSync will confirm the correct state from the API.
+    // Only end the restart when the engine actually restarted (started_at
+    // changed). On a simple reconnect (network hiccup, brief health timeout),
+    // the dialog must stay up. refreshChangesState() in runResumeSync will
+    // confirm the correct state from the API.
     if (engineRestarted) {
       engineRestarting.value = false;
       localStorage.removeItem(RESTART_LS_KEY);
-      // The restart finished — drop the in-flight marker so a later reload won't
-      // restore a stale progress toast (restoreRestartToast in chat-changes.ts).
+      // The restart finished, so drop the in-flight marker: a later reload must
+      // not restore a stale dialog (restoreRestartState in chat-changes.ts).
       clearRestartInFlight();
       // Restart done — clear the engine "switch pending / available" signals so
       // the reload-glyph badge reflects the fresh engine immediately; the version
@@ -601,7 +601,9 @@ async function runConnectionCheck(): Promise<boolean> {
       // restartRequired), so an optimistic clear is safe.
       restartRequired.value = false;
       engineVersionReady.value = false;
-      dismissToast(RESTART_TOAST_KEY);
+      // Clear a restart-failure toast left by an earlier attempt; the progress
+      // dialog needs nothing here, having closed with the flag above.
+      dismissToast(RESTART_FAILURE_TOAST_KEY);
       // Plain, benign confirmation with NO action. The client Refresh prompt is
       // owned SOLELY by the honest client-staleness check
       // (syncClientUpdateFromBuild below). The switched-to engine now serves its

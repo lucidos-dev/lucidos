@@ -1175,7 +1175,14 @@ const CHANGES_DOMAIN: Domain = Domain {
 // engine/tools/models.rs + api/settings.rs.
 // ---------------------------------------------------------------------------
 
-const MODEL_PROVIDER_ENUM: &[&str] = &["vertex", "anthropic", "openai", "openrouter", "local"];
+const MODEL_PROVIDER_ENUM: &[&str] = &[
+    "vertex",
+    "anthropic",
+    "openai",
+    "openrouter",
+    "xai",
+    "local",
+];
 
 const MODEL_ID_BODY_ARG: Arg = Arg {
     name: "id",
@@ -1239,7 +1246,7 @@ const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.",
+    description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.",
 };
 
 const MODELS_OPS: &[Operation] = &[
@@ -1555,7 +1562,7 @@ const ENV_VARS_OPS: &[Operation] = &[
 const ENV_VARS_DOMAIN: Domain = Domain {
     name: "env_vars",
     tool_name: "env_vars",
-    tool_summary: "Non-secret environment variables injected into every subprocess Lucidos spawns, effective on the next one with no restart. They appear in logs and events, so use request_credential for an API key, token or password.",
+    tool_summary: "Non-secret environment variables. A subprocess Lucidos spawns sees a change on its next spawn, no restart. The engine's own env gets them only at startup, so an engine-read var needs an engine restart. They appear in logs and events, so use request_credential for an API key, token or password.",
     // Full LLM/CLI parity (list/set/delete). The retired standalone
     // set_environment_variable tool stays wired as a back-compat alias to the
     // `set` action (see ENV_VARS_OPS). No SDK consumer (apps don't manage env vars).
@@ -2044,9 +2051,20 @@ const THREAD_QUEUE_DOMAIN: Domain = Domain {
 // mcp — MCP (Model Context Protocol) server management. Consolidates the five
 // flat tools (setup/list/start/stop/remove server) into one grouped LLM tool;
 // each action delegates to the existing execute_mcp_management_tool via the flat
-// alias. LLM-only: server setup/start/stop/remove run in-process (only
-// GET /mcp/servers has an HTTP route), so cli/sdk = false. See engine/tools/mcp.rs.
+// alias. list/start/stop/remove each have their own HTTP route and a generated
+// CLI command; only setup runs purely in-process. sdk = false, since no app
+// manages servers. See engine/tools/mcp.rs and api/mcp.rs.
 // ---------------------------------------------------------------------------
+
+/// The server id, as a path segment. Every per-server verb takes it.
+const MCP_ID_ARG: Arg = Arg {
+    name: "id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Path,
+    description: "MCP server id, as shown by `list`.",
+};
 
 const MCP_SETUP_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Lowercase with hyphens, e.g. 'blender-mcp'."},
@@ -2069,7 +2087,11 @@ const MCP_OPS: &[Operation] = &[
         llm_alias: Some("setup_mcp_server"),
         llm_schema: Some(MCP_SETUP_LLM_SCHEMA),
         llm: None,
-        cli: None,
+        // The one verb with no CLI command. Registration runs in-process, so
+        // there is no HTTP route. Its shape also lives in `llm_schema` rather
+        // than `args`, so the generator would emit a flagless command posting
+        // an empty body. Declaring the args means building the route first.
+        cli: Some(false),
         sdk: None,
     },
     Operation {
@@ -2091,8 +2113,8 @@ const MCP_OPS: &[Operation] = &[
         action: "start",
         summary: "Start a stopped MCP server by its id. (requires: id)",
         method: Method::Post,
-        path: "/mcp/servers",
-        args: &[],
+        path: "/mcp/servers/:id/start",
+        args: &[MCP_ID_ARG],
         cli_name: "start",
         sdk_name: "start",
         mutating: true,
@@ -2106,8 +2128,8 @@ const MCP_OPS: &[Operation] = &[
         action: "stop",
         summary: "Stop a running MCP server by its id. (requires: id)",
         method: Method::Post,
-        path: "/mcp/servers",
-        args: &[],
+        path: "/mcp/servers/:id/stop",
+        args: &[MCP_ID_ARG],
         cli_name: "stop",
         sdk_name: "stop",
         mutating: true,
@@ -2121,8 +2143,8 @@ const MCP_OPS: &[Operation] = &[
         action: "remove",
         summary: "Remove an MCP server configuration (stops it first if running). (requires: id)",
         method: Method::Delete,
-        path: "/mcp/servers",
-        args: &[],
+        path: "/mcp/servers/:id",
+        args: &[MCP_ID_ARG],
         cli_name: "remove",
         sdk_name: "remove",
         mutating: true,
@@ -2139,9 +2161,11 @@ const MCP_DOMAIN: Domain = Domain {
     tool_name: "mcp",
     tool_summary: "Manage MCP (Model Context Protocol) servers. web_search first for the right package and command.",
     llm: true,
-    // setup/start/stop/remove run in-process; only list has an HTTP route. No
-    // app/SDK consumer manages MCP servers — declared N/A (parity per surface).
-    cli: false,
+    // list/start/stop/remove each have their own HTTP route, so all four
+    // generate CLI commands. `setup` is the exception and says why on the op.
+    cli: true,
+    // No app manages MCP servers: an iframe has no business starting a process
+    // for the whole workspace. Declared N/A, which is parity per surface.
     sdk: false,
     operations: MCP_OPS,
     llm_aliases: &[],
@@ -2703,18 +2727,52 @@ mod tests {
 
     #[test]
     fn phase5a_domains_declared() {
-        // mcp — grouped LLM tool only (in-process management; no CLI/SDK).
+        // mcp: grouped LLM tool plus a CLI. No SDK, since no app manages
+        // servers.
         let mcp = domains().iter().find(|d| d.name == "mcp").unwrap();
         assert_eq!(
             mcp.actions(),
             vec!["setup", "list", "start", "stop", "remove"]
         );
-        assert!(mcp.llm && !mcp.cli && !mcp.sdk);
+        assert!(mcp.llm && mcp.cli && !mcp.sdk);
         assert_eq!(domain_for_tool("setup_mcp_server").unwrap().name, "mcp");
         assert_eq!(
             mcp.legacy_tool_for_action("remove"),
             Some("remove_mcp_server")
         );
+
+        // The routes each verb declares are the routes `api/mcp.rs` serves. A
+        // wrong path here is not cosmetic: the CLI generator builds its request
+        // out of it, so a stale one ships a command that 404s.
+        let op = |action: &str| {
+            mcp.operations
+                .iter()
+                .find(|o| o.action == action)
+                .unwrap_or_else(|| panic!("mcp has no {action}"))
+        };
+        assert_eq!(op("list").path, "/mcp/servers");
+        assert_eq!(op("start").path, "/mcp/servers/:id/start");
+        assert_eq!(op("stop").path, "/mcp/servers/:id/stop");
+        assert_eq!(op("remove").path, "/mcp/servers/:id");
+        assert_eq!(op("remove").method, Method::Delete);
+
+        // Every path segment the generator substitutes needs an arg to
+        // substitute from, or the emitted `format!` loses the id.
+        for action in ["start", "stop", "remove"] {
+            let o = op(action);
+            assert!(
+                o.args
+                    .iter()
+                    .any(|a| a.name == "id" && a.loc == ArgIn::Path),
+                "mcp {action} declares no :id path arg"
+            );
+            assert!(o.on_cli(mcp), "mcp {action} should generate a CLI command");
+        }
+
+        // setup is the one verb off the CLI: no HTTP route, and its shape is an
+        // llm_schema rather than args, so a generated command would post
+        // nothing.
+        assert!(!op("setup").on_cli(mcp));
 
         // plugins — grouped LLM tool only (confirm-panel handshake; no CLI/SDK).
         let plugins = domains().iter().find(|d| d.name == "plugins").unwrap();

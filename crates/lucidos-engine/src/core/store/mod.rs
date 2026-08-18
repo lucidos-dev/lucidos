@@ -13,8 +13,9 @@ pub(crate) use messages::{
 use sqlx::PgPool;
 pub use threads::{
     active_thread_statuses, fetch_thread_aggregate, parse_status_filter_csv,
-    parse_status_filter_values, status_value_list, FilterFacet, FilterFacets, LegacyInitiator,
-    StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary, ThreadSummaryFilters,
+    parse_status_filter_values, status_value_list, EventWaitSummary, FilterFacet, FilterFacets,
+    LegacyInitiator, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
+    ThreadSummaryFilters,
 };
 pub use types::*;
 use uuid::Uuid;

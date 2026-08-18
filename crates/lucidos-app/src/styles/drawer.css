@@ -219,6 +219,20 @@
     font-size: var(--font-size-sm);
 }
 
+/* The Repos / Apps grouping inside an expanded Coding Agent row. It heads the
+   CHILD rows, so it stands on THEIR column: the same indent step they take.
+   The words then start where the checkboxes under them do. The panel's own
+   left edge is outside every row it heads, and left of the parent row it
+   belongs to. Smaller and quieter than the rows themselves, being a divider
+   between two runs of them rather than one of them. */
+.thread-filter-group-title {
+    padding: 0.375rem 0.5rem 0.125rem calc(var(--drawer-row-inset) + 1rem);
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
 /* Leading channel glyph on the Show-section rows (Lucidos / Coding Agent /
    Triggers) — mirrors the per-thread source marks (ThreadTypeIcon). Fixed 1rem
    box so the labels align, matching the View rows' icon column. The Lucidos mark

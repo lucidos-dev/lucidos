@@ -409,7 +409,7 @@ mod has_diff_and_actor;
 mod has_response;
 mod idle_reconcile_counts;
 mod initiator_actor;
-mod live_event_wait_count;
+mod live_event_waits;
 mod origin_and_resume;
 mod proposed_apply_cycle;
 mod recovery_and_pipeline;

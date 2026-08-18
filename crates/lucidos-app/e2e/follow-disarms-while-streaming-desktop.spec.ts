@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed } from './helpers';
 
 /** Scrolling away from a reply IN FLIGHT retires the standing follow.
  *
@@ -52,6 +52,10 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
     // Short viewport so a modest transcript overflows: with no scroll capacity
     // there is nowhere to scroll away TO and the assertion is vacuous.
     await page.setViewportSize({ width: 1280, height: 400 });
+    // The ride has to be OFF here, so the click below is the arm this spec is
+    // about. The seed ships armed, and a fresh context has no press to say
+    // otherwise.
+    await disarmFollowSeed(page);
     await navigateToApp(page);
 
     const tc = page.locator('.thread-content.visible:visible').first();
