@@ -31,10 +31,12 @@ import {
   stepDetailModal,
   checkpointDiffModal,
   contextViewer,
+  eventConditionModal,
   searchEverywhereOpen,
   filePreviewModal,
 } from './store/store';
 import { scaleModalOpen } from './components/shared/scaleModalState';
+import { releaseNoticeModalOpen } from './store/actions/releaseNotices';
 import { viewportIsMobile } from './utils/viewport';
 
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));
@@ -43,9 +45,11 @@ const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageR
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
 const CheckpointDiffModal = lazyComponent(() => import('./components/chat/CheckpointDiffModal').then(m => m.CheckpointDiffModal));
 const ContextViewerModal = lazyComponent(() => import('./components/chat/ContextViewerModal').then(m => m.ContextViewerModal));
+const EventConditionModal = lazyComponent(() => import('./components/chat/EventConditionModal').then(m => m.EventConditionModal));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
 const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
+const ReleaseNoticeModal = lazyComponent(() => import('./components/shared/ReleaseNoticeModal').then(m => m.ReleaseNoticeModal));
 
 // Each overlay sits in its own slot so the signal subscription is leaf-scoped:
 // a flip re-renders the slot, not all of App and its descendants.
@@ -54,11 +58,15 @@ function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageR
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
 function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <CheckpointDiffModal /> : null; }
 function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
+function EventConditionSlot()    { return eventConditionModal.value  ? <EventConditionModal /> : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
 // Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
 // the file preview renderers (which the content pane already lazy-loads) out of
 // the initial bundle for every user who never opens an app that previews a file.
 function FilePreviewModalSlot()  { return filePreviewModal.value     ? <FilePreviewModal />  : null; }
+// Most workspaces owe no release notice, so the gate keeps the modal's chunk
+// off every load that will never draw it.
+function ReleaseNoticeSlot()     { return releaseNoticeModalOpen()   ? <ReleaseNoticeModal /> : null; }
 
 // FileSearchModal and SearchEverywhere render a hidden shell instead of
 // unmounting when closed (avoids will-change:transform ghost pixels on iOS
@@ -142,8 +150,10 @@ export function App() {
         <StepDetailModalSlot />
         <CheckpointDiffSlot />
         <ContextViewerSlot />
+        <EventConditionSlot />
         <FilePreviewModalSlot />
         <ScaleModalSlot />
+        <ReleaseNoticeSlot />
         <SearchEverywhereSlot />
       </OverlayLayer>
       <DropZone />

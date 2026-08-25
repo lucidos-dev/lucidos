@@ -33,6 +33,7 @@ import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences } from './preferences';
+import { loadReleaseNotices } from './releaseNotices';
 import { loadArtifacts, invalidateFilePreview } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
 import { clearWipIfMatches } from './wipPreview';
@@ -45,7 +46,11 @@ import { getDeviceId } from './devices';
 import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
-import { processSSEForReferences } from './entityReferences';
+import {
+  processSSEForReferences,
+  refreshLlmConfigured,
+  PROVIDER_PREFERENCE_KEYS,
+} from './entityReferences';
 import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
@@ -901,6 +906,13 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (BACKUP_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
         backupPreferencesVersion.value++;
       }
+      // A provider switch (or the free tier, or the local base URL) rebuilds
+      // the engine's active provider set in-process, exactly as a credential
+      // change does. So it takes the same `/health` re-probe: without it the
+      // model picker keeps offering a provider the engine has just dropped.
+      if (PROVIDER_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
+        refreshLlmConfigured();
+      }
       break;
     // The `set_language` and `set_timezone` chat-agent tools write the
     // preference and emit LanguageSet or TimezoneSet, but NOT
@@ -909,6 +921,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'LanguageSet':
     case 'TimezoneSet':
       void loadPreferences();
+      break;
+
+    case 'ReleaseNoticeResolved':
+      // Another device answered the notice this one may be showing. Re-read the
+      // list rather than closing locally: the answer moves the workspace on to
+      // the NEXT notice, and this page has to step with it. The cursor behind
+      // it is a silent preference, so this event is the only signal.
+      void loadReleaseNotices();
       break;
 
     case 'AppUiRefreshRequested':

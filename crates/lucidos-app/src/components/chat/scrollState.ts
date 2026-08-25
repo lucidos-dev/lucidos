@@ -568,18 +568,19 @@ function threadIsLive(): boolean {
  *
  *  It answers for a reader who is somewhere OTHER than the live edge, which is
  *  the only place the liveness term decides anything. A reader ON the edge is
- *  kept there whatever the thread is doing, by `keepTheLiveEdge`.
+ *  kept there whatever the thread is doing, by `keepTheLiveEdge` and, for a
+ *  turn control's reveal, by `readerKeepsTheLiveEdge`.
  *
  *  Three callers ask it: the growth branch (`honourGrowth`), the reveal snap
  *  (`honourAnchoredMutation`), and `withScrollAnchor`'s decision to skip the
  *  anchor correction. The last two are ONE act split across the DOM/layout
- *  line, so they must answer the same. Otherwise an idle armed reader gets
- *  neither the correction nor the snap, and drifts on the content above them.
+ *  line, so they must answer the same. Each of them ORs in the edge reading,
+ *  and both take the same one, so the pair still cannot disagree.
  *
  *  Deliberately NOT asked by the reader's own explicit requests, which write the
  *  live edge directly: pressing the toggle, resuming a recorded request on
- *  re-entry, and the seed. Nor by `keepTheLiveEdge`, whose three events are the
- *  app moving a rider who never left, rather than carrying one who did. */
+ *  re-entry, and the seed. Nor by `keepTheLiveEdge`, whose events are the app
+ *  moving a rider who never left, rather than carrying one who did. */
 export function followIsCarrying(): boolean {
   return _followingBottom.value && threadIsLive();
 }
@@ -1016,18 +1017,46 @@ function carryHeldScroll(el: HTMLElement): void {
  *  taking over. The transcript-wide reveals grow every turn, including those
  *  BELOW the anchored root, so the correction leaves the reader short.
  *
- *  Then, while the follow is CARRYING them, put them back ON the live edge in
- *  ONE held write, in the same frame the caller unfreezes: `snapToLiveEdge`.
+ *  Then, for a reader who belongs on the NEWEST content, one held write puts
+ *  them on the live edge, in the frame the caller unfreezes: `snapToLiveEdge`.
  *  That is not a position the reader ever occupied.
  *
- *  Carrying rather than merely ARMED (see `followIsCarrying`). This is the half
- *  of that test `withScrollAnchor` cannot make alone, and the two answers are
- *  one decision. Nothing at all for an unarmed reader. A tween here was tried
- *  and rejected, see ADR 0064. */
-export function honourAnchoredMutation(el: HTMLElement): void {
+ *  TWO readers belong there, and the caller answers for the second. The follow
+ *  is CARRYING one of them (`followIsCarrying`), carrying rather than merely
+ *  ARMED. The other was armed AND already ON the live edge when the reveal
+ *  began, and `onTheLiveEdge` is that reading, which only the caller can take.
+ *  See `readerKeepsTheLiveEdge` for why it cannot be taken here.
+ *
+ *  Nothing at all for anyone else. A tween here was tried and rejected, see
+ *  ADR 0064. */
+export function honourAnchoredMutation(el: HTMLElement, onTheLiveEdge = false): void {
   carryHeldScroll(el);
-  if (!followIsCarrying() || isAtLiveEdge(el)) return;
+  if (!(followIsCarrying() || onTheLiveEdge) || isAtLiveEdge(el)) return;
   snapToLiveEdge(el);
+}
+
+/** Does the reader KEEP the live edge across an anchored mutation: they asked
+ *  for it, and they are on it?
+ *
+ *  `keepTheLiveEdge`'s two POSITION terms, asked of an event that is neither a
+ *  scroll nor a resize. ADR 0064: "a reader ON the live edge is kept there,
+ *  running thread or quiet one". No liveness term, for the reason given there.
+ *  Its stand-downs are deliberately not repeated: `snapToLiveEdge` supersedes
+ *  every tween here on purpose.
+ *
+ *  It has to be asked BEFORE the mutation. Growth moves the edge while leaving
+ *  `scrollTop` where it was, so afterwards nothing can tell the reader was
+ *  resting on it. Holding their topmost line and holding the newest content
+ *  agree everywhere but here: rows revealed between the two push the end of
+ *  the thread off the bottom.
+ *
+ *  The BOX term stands in for the guard `keepTheLiveEdge` gets for free, which
+ *  is a snapshot that starts false rather than measured. A boxless container
+ *  answers `isAtLiveEdge` true, so a direct read has to ask. Height rather
+ *  than `isScrollable`: a reveal can make a short transcript tall, and its
+ *  reader is on the end of the thread like any other. */
+export function readerKeepsTheLiveEdge(el: HTMLElement): boolean {
+  return _followingBottom.value && el.clientHeight > 0 && isAtLiveEdge(el);
 }
 
 /** Is the container still exactly where our last held write left it? The exact
@@ -1359,6 +1388,35 @@ function cardTurn(el: HTMLElement, bodySelector: string, attr: string, value: st
   return null;
 }
 
+/** The two states a question card can be in that nobody can answer. Named
+ *  positively, off the classes `QuestionCard` renders, rather than inferred from
+ *  a missing id. An id that grew onto a dead body would silently make it
+ *  answerable again. */
+const DEAD_QUESTION_CLASSES = ['question-body-answered', 'question-body-terminated'];
+
+/** The question card a send would ANSWER, by its tool-use id, or null when
+ *  nothing on screen is waiting for one.
+ *
+ *  Only the NEWEST card is asked, which is `findLatestPendingQuestion`'s rule
+ *  read off the DOM instead of the projection. The engine serializes questions,
+ *  so a newest card that is answered or dead leaves nothing pending.
+ *
+ *  The DOM and not the thread projection, like every other question this module
+ *  asks: it must not import `store` (see `parseNavigatedTurn`).
+ *
+ *  A COLLAPSED divider unmounts its body (`InitiatorPanel`), so a send made
+ *  while the card is folded away finds nothing and takes the send's own
+ *  landing. `cardTurn` could not resolve that card either, so nothing here can
+ *  recover it without a marker that survives the fold. */
+function answerableQuestionId(el: HTMLElement): string | null {
+  if (typeof el.querySelectorAll !== 'function') return null;
+  const bodies = el.querySelectorAll<HTMLElement>('.question-body');
+  const newest = bodies[bodies.length - 1];
+  if (!newest) return null;
+  if (DEAD_QUESTION_CLASSES.some((c) => newest.classList?.contains(c))) return null;
+  return newest.getAttribute?.('data-tool-use-id') ?? null;
+}
+
 /** Fallback clearance when the computed `scroll-margin-top` is unavailable (the
  *  DOM-free unit environment, or an element with no layout): ~0.5rem, the base
  *  `--deep-link-focus-gap`. */
@@ -1576,20 +1634,36 @@ function awaitsNewTurn(newest: (el: HTMLElement) => HTMLElement | null): TurnRes
  *  fired a resize, so the landing is deferred until a DIFFERENT last user
  *  message is present.
  *
+ *  UNLESS a question is open, where the send IS that card's answer and lands on
+ *  the card. The engine routes typed text to the pending question as a
+ *  `FreeText` answer, emitting no `MessageReceived`. So what the reader
+ *  submitted renders as the card's own "Custom answer" block, and the optimistic
+ *  row is torn down when that answer lands. Against a local engine it is torn
+ *  down inside the frame it was inserted in. Waiting for it therefore waited for
+ *  a turn that never got a box: the landing lapsed and the reader never saw
+ *  their own answer. Reported.
+ *
  *  Called by the two send sites, `store/actions/chat.ts`'s `addPendingMessage`
  *  and `PromptInput`'s `submit`; see `followSubmit` on why two calls are one
- *  submit. */
+ *  submit. Deciding here rather than at either site is what keeps the two
+ *  agreeing about which turn this submit was made on. */
 export function followSentMessage(): void {
+  const el = resolveTarget();
+  const answering = el ? answerableQuestionId(el) : null;
+  if (answering) {
+    followAnsweredQuestion(answering);
+    return;
+  }
   followSubmit(awaitsNewTurn(lastUserTurn));
 }
 
 /** The reader submitted an answer to the question card `toolUseId`. The card is
  *  on screen already, so this landing needs none of the send's deferral.
  *
- *  Called by the two card-submitted answers: `QuestionCard`'s single-select
- *  option tap and `PromptInput`'s multi-select Submit. The THIRD way to answer,
- *  typing into the composer, is a send the engine reroutes as a `FreeText`
- *  answer, so it arrives through `followSentMessage`. */
+ *  All THREE ways to answer arrive here. `QuestionCard`'s single-select option
+ *  tap and `PromptInput`'s multi-select Submit call it directly. Typing into the
+ *  composer is a send, and `followSentMessage` routes it here for the reason
+ *  given there. */
 export function followAnsweredQuestion(toolUseId: string): void {
   followSubmit((el) => cardTurn(el, '.question-body', 'data-tool-use-id', toolUseId));
 }

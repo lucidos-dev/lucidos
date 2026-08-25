@@ -143,3 +143,35 @@ exists to stop. A refresh re-reads the assistant turns instead.
 0085's own. It left the floor to the experiment, and ADR 0087 is that
 experiment. A floor written into the lean arm changes what the eval measures,
 and buys nothing today, because the flag is off in every workspace.
+
+## Amendment, 2026-08-25: the refresh is detached, and the new-thread carve-out has no path left
+
+Two things on this page have moved. Neither reverses a decision.
+
+**The refresh no longer blocks the turn.** Decision 2 cached the paragraph and
+this page's consequences noted the call was still awaited in turn setup. It is
+now a detached task: the turn that decides a refresh is owed renders from the
+cache as it stood, and the fresh paragraph reaches the NEXT turn.
+
+The reasoning is this page's own, carried one step. A refresh already improved
+only later turns, since a cached paragraph is what the current one prints. So
+awaiting it put the purpose's whole 90 second deadline in front of the user's
+first agentic step, buying nothing for the turn that paid.
+
+Three things follow. The boundary event id is resolved BEFORE the call rather
+than after, so a turn cannot buy a paragraph with nowhere to cache it.
+`SummaryInFlight` allows one refresh per thread, because a detached task
+outlives its turn and a later turn would otherwise re-summarise the same region.
+And the deadline is now the only thing that stops the call.
+
+**The last consequence above no longer has a path.** It says only a follow-up
+turn may write the cache, because a new thread's older region is a global window
+over other threads. ADR 0124 deletes that window: a chat turn now reads only its
+own events. So `thread_local` and its no-cache branch are gone, and every
+summariser call caches.
+
+**One measurement here is stale in the other direction.** The 3-of-24 landing
+rate predates ADR 0107's deadline split. Over the three days after that landed,
+19 calls produced 13 cached paragraphs. Six produced nothing cacheable, five of
+them consecutive turns on one thread inside 37 minutes, which is the waste
+`SummaryInFlight` now prevents.

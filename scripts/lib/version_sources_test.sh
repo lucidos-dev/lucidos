@@ -67,6 +67,10 @@ fi
 #     and immediately reddened this gate: its findings are per-release evidence
 #     (`CFBundleShortVersionString = 0.19.0`, a shasum of a named tarball), which
 #     is the same class as a CHANGELOG entry and must not move when RELEASE does.
+#   release-notices.toml: same class as CHANGELOG.md. Each entry's `release`
+#     field names the release that notice shipped WITH, and the engine hides a
+#     notice until it reports that version, so rewriting it on a bump would
+#     re-show every answered notice in every workspace.
 #   *.lock, package-lock.json, node_modules — dependency versions, not ours.
 #   .github/dependabot.yml: same class, it exists to reason about THIRD-PARTY
 #     versions (the glib/gtk/tao/tauri resolution chain), so every literal in it
@@ -103,6 +107,7 @@ trap 'rm -f "$HITS_FILE" "$HITS_FILE".all "$HITS_FILE".raw "$STALE_FILE"' EXIT
 if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
     '.' \
     ':(exclude)CHANGELOG.md' \
+    ':(exclude)release-notices.toml' \
     ':(exclude)RELEASE' \
     ':(exclude)install.sh' \
     ':(exclude)docs/plans' \

@@ -137,6 +137,18 @@ export function toggleWindowMaximize(): Promise<void> {
 }
 
 /**
+ * Name the CALLING window (lib.rs `set_window_title`), so the macOS Window menu
+ * tells two windows apart by the workspace each is showing.
+ *
+ * Compose the string with `utils/windowTitle.ts` rather than here, and call it
+ * through `pushNativeWindowTitle`, which de-duplicates. The title is invisible
+ * in the window itself under the overlay title bar; it reaches the Window menu,
+ * Mission Control and the window switcher. Only call when isTauri() is true. */
+export function setWindowTitle(title: string): Promise<void> {
+  return invoke('set_window_title', { title });
+}
+
+/**
  * Show a native macOS notification banner via the app's own
  * `show_native_notification` command (notifications.rs). Rust drives Apple's
  * `UNUserNotificationCenter` and captures the tap via a delegate.

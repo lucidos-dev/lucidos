@@ -183,6 +183,29 @@
     }
 }
 
+/* Held on a permission card. The description keeps its normal colour, because
+   this row is the live business of the turn and the user is about to act on
+   it. What it must NOT have is the shimmer, which claims the machine is busy
+   when the machine is blocked on a human. `InlineStep` gates that on
+   `outcome === 'pending'`, so there is nothing to undo here.
+
+   --accent-notable, not --accent-yellow: waiting is the state that token was
+   split off to carry, and yellow is caution only. The thread drawer already
+   paints this same waiting thread notable, so the two surfaces agree. */
+.inline-step.blocked .step-icon {
+    color: var(--accent-notable);
+}
+
+/* Refused. Muted like .unfinished, and told apart from it by the mark and by
+   the absence of the strike-through: struck means the step stopped existing
+   mid-flight, where this one was answered and never started. Deliberately not
+   the red .error treatment either, because nothing went wrong: the user said
+   no and the agent has to route around it. */
+.inline-step.denied .step-icon,
+.inline-step.denied .step-description {
+    color: var(--text-muted);
+}
+
 
 .inline-step .step-description {
     white-space: nowrap;
@@ -577,7 +600,16 @@
     color: var(--text-muted);
 }
 
-/* One-line explanation under the description for an unfinished step. */
+.step-detail-status.blocked {
+    color: var(--accent-notable);
+}
+
+.step-detail-status.denied {
+    color: var(--text-muted);
+}
+
+/* One-line explanation under the description, for a step whose result area is
+   empty with no obvious reason. See `STEP_DETAIL_NOTE`. */
 .step-detail-note {
     color: var(--text-secondary);
     font-size: var(--font-size-md);

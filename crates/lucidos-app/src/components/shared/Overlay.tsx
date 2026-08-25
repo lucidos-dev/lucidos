@@ -1,8 +1,8 @@
-import { useRef, useEffect } from 'preact/hooks';
+import { useRef, useLayoutEffect } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren, RefObject, JSX } from 'preact';
 import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
-import { pushOverlay, removeOverlay } from '../../store/overlayStack';
+import { pushOverlay, removeOverlay, topPanelOverlay } from '../../store/overlayStack';
 
 let overlayIdCounter = 0;
 
@@ -150,8 +150,20 @@ export function Overlay({
   const internalRef = useRef<HTMLDivElement>(null);
   const panelRef = externalPanelRef ?? internalRef;
 
-  // Click-outside dismiss + swallow; the anchor (if any) is exempt.
-  useDismissOnOutside(open, panelRef, anchor, onClose);
+  // This overlay's `overlayStack` identity. Declared before the dismiss hook
+  // below, which reads it to ask whether this overlay is the top one.
+  const idRef = useRef<string>();
+  if (idRef.current === undefined) idRef.current = `overlay-${++overlayIdCounter}`;
+
+  // Click-outside dismiss + swallow; the anchor (if any) is exempt, and only
+  // the topmost PANEL answers. Two SIBLING overlays each read the other's panel
+  // as outside their own. So without the check, a click on the upper one closes
+  // the lower one behind it.
+  //
+  // `topPanelOverlay`, never the raw stack top: an Escape-only registrant draws
+  // nothing, so a pointer cannot be meant for it, and one sits ABOVE its own
+  // host panel by design (`ModelSelectionPicker`'s step).
+  useDismissOnOutside(open, panelRef, anchor, onClose, () => topPanelOverlay()?.id === idRef.current);
 
   // Escape via the central overlay stack (not a per-instance keydown listener —
   // those raced each other and the global dispatcher). Keep the latest onClose
@@ -159,12 +171,16 @@ export function Overlay({
   // re-registering every render.
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
-  const idRef = useRef<string>();
-  if (idRef.current === undefined) idRef.current = `overlay-${++overlayIdCounter}`;
-  useEffect(() => {
+  // `useLayoutEffect`, matching the dismiss listeners above rather than landing
+  // a frame after them. Those install pre-paint on purpose, so the contract is
+  // live from frame zero, and the gate above reads this registration. Split
+  // across the two phases, an overlay spent its first frame with live listeners
+  // answering nothing. That is the gap the layout effect exists to close. The
+  // inert-behind rides along for the same reason.
+  useLayoutEffect(() => {
     if (!open) return;
     const id = idRef.current!;
-    pushOverlay({ id, dismiss: () => onCloseRef.current() });
+    pushOverlay({ id, dismiss: () => onCloseRef.current(), hasPanel: true });
     acquireOverlayInert();
     return () => {
       removeOverlay(id);
@@ -177,7 +193,11 @@ export function Overlay({
   // render late (e.g. `menuRef.current` is null until the wrapper mounts) — this
   // re-marks the new node if the anchor changes while open, and always unmarks
   // the exact node it marked.
-  useEffect(() => markAnchorInteractive(open ? anchor : null), [open, anchor]);
+  //
+  // `useLayoutEffect` because it is the OTHER half of the inert-behind above,
+  // which is pre-paint. Left post-paint, the first painted frame inerts the
+  // shell with the anchor not yet exempted from it.
+  useLayoutEffect(() => markAnchorInteractive(open ? anchor : null), [open, anchor]);
 
   if (!open) {
     if (!keepMounted) return null;

@@ -1,0 +1,51 @@
+# Release notices: what a user has to KNOW or DO after upgrading.
+#
+# Most releases carry none, and that is the point. The modal only appears when
+# a release actually needs something from the reader, so it stays rare enough
+# to be read. What merely CHANGED belongs in CHANGELOG.md.
+#
+# Entries are OLDEST FIRST, and the file order is the order the reader is
+# walked through them in. Append at the end. Never reorder an entry, never
+# delete one, and never reuse an id: a workspace remembers the last notice it
+# resolved BY ID, and its place in this file is what "after that one" means.
+#
+# Fields, all validated at parse time by
+# crates/lucidos-engine/src/engine/release_notices.rs:
+#
+#   id             stable forever, kebab-case. Names the notice, not its release.
+#   since          the release this applies FROM, plain semver, no leading "v".
+#                  A floor, not a stamp: the notice is invisible until the
+#                  engine reports that version or newer. Write the CURRENT
+#                  release for a notice that applies as soon as it lands, and a
+#                  future one only to hold it back deliberately.
+#   title          one line. The modal's heading and the panel row's label.
+#   body           markdown. A link is how a notice points at a settings page.
+#   action_label   optional, and paired with action_prompt. Draws one button.
+#   action_prompt  optional. The button SENDS this sentence as a new message,
+#                  so write what the user would say, and make sure the knowhow
+#                  meant to answer it routes on those words. Say only enough to
+#                  REACH that knowhow. Spelling out what it will then do
+#                  restates what the recipe owns, and goes stale the day the
+#                  recipe moves.
+#
+# One action per notice, at most. Two things to do is two notices, because
+# acting closes the modal and moves the reader on to the next one.
+
+[[notice]]
+id = "run-a-workspace-audit"
+since = "0.29.0"
+title = "Run a workspace audit"
+body = """
+Lucidos keeps moving, and your workspace does not move with it. An app built \
+against an older SDK, a trigger subscribed to an event that has since been \
+renamed, a recipe still describing the old way to reach an API: all of them \
+keep sitting there, and a trigger on a renamed event simply stops firing with \
+nothing to see.
+
+A workspace audit sweeps what you have on disk and reports the drift. It \
+changes nothing on its own: it writes a report, and you decide what to fix.
+
+Worth doing now, and worth doing again after any release that moves a lot.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."

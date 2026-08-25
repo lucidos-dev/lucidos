@@ -84,7 +84,11 @@ vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn()
 // else declines so the 'file' branch falls back to openFilePreview.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview }));
-vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
+vi.mock('./entityReferences', () => ({
+  processSSEForReferences: vi.fn(),
+  refreshLlmConfigured: vi.fn(),
+  PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
+}));
 
 const { handleNavigationRequest, handleThreadEvent } = await import('./thread-sync');
 

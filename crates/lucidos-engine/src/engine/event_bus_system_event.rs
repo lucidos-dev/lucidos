@@ -60,6 +60,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// The user answered a *release notice*, by acting on it or by reading it.
+    ///
+    /// The cursor behind it is a silent preference, so this is the only durable
+    /// trace of the answer. It also closes the modal on the user's other
+    /// devices. That is why the resolve announces, rather than leaning on the
+    /// client that made it.
+    ReleaseNoticeResolved {
+        notice_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     MemoryRebuildProgress {
         processed: usize,
         total: usize,
@@ -1122,6 +1133,7 @@ impl SystemEvent {
     pub const PERSISTED_TYPE_NAMES: &'static [&'static str] = &[
         "NotificationCreated",
         "PreferencesChanged",
+        "ReleaseNoticeResolved",
         "ArtifactImported",
         "ArtifactCreated",
         "ArtifactUpdated",
@@ -1220,6 +1232,7 @@ impl SystemEvent {
             Self::NotificationRead { .. } => "NotificationRead",
             Self::NotificationsAllRead { .. } => "NotificationsAllRead",
             Self::PreferencesChanged { .. } => "PreferencesChanged",
+            Self::ReleaseNoticeResolved { .. } => "ReleaseNoticeResolved",
             Self::MemoryRebuildProgress { .. } => "MemoryRebuildProgress",
             Self::EmbeddingModelStatusChanged { .. } => "EmbeddingModelStatusChanged",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
@@ -1344,6 +1357,7 @@ impl SystemEvent {
         "NotificationRead",
         "NotificationsAllRead",
         "PreferencesChanged",
+        "ReleaseNoticeResolved",
         "MemoryRebuildProgress",
         "EmbeddingModelStatusChanged",
         "ChangesUpdated",
@@ -1456,6 +1470,7 @@ impl SystemEvent {
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
+            Self::ReleaseNoticeResolved { .. } => "release_notice",
             Self::ChangesUpdated { .. } | Self::ChangeDiscarded { .. } => "change",
             Self::MemoryRebuildProgress { .. }
             | Self::EmbeddingModelStatusChanged { .. }
@@ -1633,6 +1648,7 @@ impl SystemEvent {
             | Self::CredentialRevealed { service_name, .. } => service_name.clone(),
             Self::EnvironmentVariableSet { name, .. }
             | Self::EnvironmentVariableDeleted { name, .. } => name.clone(),
+            Self::ReleaseNoticeResolved { notice_id, .. } => notice_id.clone(),
             Self::ModelCreated { id, .. }
             | Self::ModelUpdated { id, .. }
             | Self::ModelDeleted { id, .. } => id.clone(),

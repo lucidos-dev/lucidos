@@ -3,7 +3,7 @@ import { stepDetailModal } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { stepStatus } from '../../store/thread-events';
-import type { Loadable } from '../../store/types';
+import type { Loadable, StepOutcome } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { highlightEllipsis } from './highlightEllipsis';
 import { fetchToolResult } from '../../api/threads';
@@ -99,6 +99,18 @@ function ResultArea({
   );
 }
 
+/** The one-line explanation under the description, for the two outcomes whose
+ *  status word does not account for an EMPTY result area below it. Without one
+ *  the emptiness reads as a second mystery on top of the first.
+ *
+ *  The rest need no entry. `'success'` and `'error'` have a result, and so does
+ *  `'denied'`: the refusal the agent was handed. `'pending'` is self-evident,
+ *  the row it was opened from being the one that shimmers. */
+const STEP_DETAIL_NOTE: Partial<Record<StepOutcome, string>> = {
+  unfinished: 'The turn ended before this tool reported a result, so what it did (if anything) was not recorded.',
+  blocked: 'Waiting for your decision on the permission card. The tool has not run, so there is nothing to report yet.',
+};
+
 /** What one step DID: its description, the untruncated command behind it, the
  *  reasoning that produced it, and whatever it reported back.
  *
@@ -130,13 +142,8 @@ export function StepDetailModal() {
           )}
         </div>
         <div class="step-detail-description">{highlightEllipsis(step.description)}</div>
-        {/* "Did not finish" alone doesn't say whose fault it was. Spell out
-            that nothing was reported back, so the empty result area below
-            reads as a consequence rather than a second mystery. */}
-        {step.outcome === 'unfinished' && (
-          <div class="step-detail-note">
-            {'The turn ended before this tool reported a result, so what it did (if anything) was not recorded.'}
-          </div>
+        {STEP_DETAIL_NOTE[step.outcome] && (
+          <div class="step-detail-note">{STEP_DETAIL_NOTE[step.outcome]}</div>
         )}
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
         {showFull && <pre class="step-detail-full">{step.full}</pre>}

@@ -85,25 +85,28 @@ export function formatRemaining(seconds: number): string {
   return `${s}s`;
 }
 
-/** The subscription as one label per watched event type, using the same words
- *  the agent used in `on:`. A condition is summarised as "filtered" rather than
- *  dumped: the raw operator JSON is developer-facing, and this is read by
- *  whoever is waiting.
+/** One subscription as a label, using the same words the agent used in `on:`.
  *
- *  A list rather than a sentence, because the transcript's event row renders
- *  each type as its own chip (`.event-name`, the one way an event type is
- *  spelled anywhere in the transcript) and cannot recover the types from a
- *  joined string without parsing its own output back apart.
+ *  A condition is summarised as "filtered" rather than dumped: the raw operator
+ *  JSON is developer-facing, and this is read by whoever is waiting.
  *
- *  Takes the `on:` list rather than a whole wait, because that is all it reads:
- *  the transcript row renders from the persisted `EventWaitStarted` and has no
- *  wait to hand it. */
-export function waitSubscriptionLabels(on: EventSubscription[]): string[] {
-  return on.map((s) => (s.condition ? `${s.event_type} (filtered)` : s.event_type));
+ *  The summary is not the whole answer though. The two PRESSABLE surfaces open
+ *  the condition itself, through `eventConditionDoor`, which is what makes
+ *  "filtered how" answerable from the UI. The third consumer is the archive
+ *  confirmation below, whose dialog takes plain strings and offers no door. */
+export function waitSubscriptionLabel(s: EventSubscription): string {
+  return s.condition ? `${s.event_type} (filtered)` : s.event_type;
 }
 
-/** The same labels as one line, for a surface with no room to chip them: the
- *  subscription panel's row, which already stacks a reason above it. */
+/** The whole subscription as one plain string, for a surface that can hold no
+ *  markup at all: the archive confirmation's detail list, which is `string[]`.
+ *
+ *  Neither pressable surface comes through here. Both label each entry on its
+ *  own, because both make a filtered entry pressable, and a button cannot
+ *  survive a joined string.
+ *
+ *  Takes the `on:` list rather than a whole wait, because that is all it reads.
+ *  Its caller holds whole waits and hands over `w.on`. */
 export function describeWaitSubscription(on: EventSubscription[]): string {
-  return waitSubscriptionLabels(on).join(' or ');
+  return on.map(waitSubscriptionLabel).join(' or ');
 }

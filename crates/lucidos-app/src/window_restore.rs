@@ -45,7 +45,10 @@ const GRAB_WIDTH_LOGICAL: f64 = 120.0;
 /// A window or monitor rect in physical pixels. `i64` throughout so an
 /// off-screen position far outside the desktop cannot underflow a subtraction
 /// or overflow an area product.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializable because `window_session` persists one per workspace, and a
+/// second rect type would be a second set of units to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Rect {
     pub x: i64,
     pub y: i64,
@@ -219,10 +222,44 @@ pub(crate) fn sanitize(restored: Rect, displays: &Displays, policy: &Policy) -> 
     (fixed != restored).then_some(fixed)
 }
 
-/// Read the main window's restored geometry, sanity-check it, and correct it in
-/// place if it is unusable. Called once from `setup`, which is after the
+/// The declared window config to judge `label` against, falling back to the
+/// declared `main` window.
+///
+/// Only `main` is in `tauri.conf.json`. Every other app window is built at run
+/// time and labelled `window-<n>`, so a plain `find` returns `None` for one and
+/// the clamp skips it. That made the clamp a no-op for the windows a session
+/// restore places, which are the ones whose rect came off a file on disk.
+///
+/// Falling back is right rather than merely convenient: `open_app_window`
+/// builds every extra window from the same defaults, so `main`'s declared
+/// minimums and default size are the policy for all of them.
+fn policy_config<'a>(
+    windows: &'a [tauri::utils::config::WindowConfig],
+    label: &str,
+) -> Option<&'a tauri::utils::config::WindowConfig> {
+    windows
+        .iter()
+        .find(|w| w.label == label)
+        .or_else(|| windows.iter().find(|w| w.label == crate::MAIN_WINDOW_LABEL))
+}
+
+/// The LOGICAL minimum size `tauri.conf.json` declares, or `None` when it
+/// declares neither half.
+///
+/// `open_app_window` applies it to every window it builds, which is what makes
+/// the clamp's minimum test sound for one. That test reads a frame under the
+/// minimum as corruption. A window the user could legitimately drag that small
+/// would then be snapped to the default size on its next restore.
+pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
+    let config = policy_config(&app.config().app.windows, crate::MAIN_WINDOW_LABEL)?;
+    Some((config.min_width?, config.min_height?))
+}
+
+/// Read a window's restored geometry, sanity-check it, and correct it in place
+/// if it is unusable. Called for `main` from `setup`, which is after the
 /// window-state plugin's `on_window_ready` restore and before anything shows the
 /// window (it is declared `visible: false` and shown by `show_startup_window`).
+/// Also called for each window a session restore places, while it is hidden.
 ///
 /// Every failure here is a no-op with a log line: a client that cannot read its
 /// own monitors must still come up.
@@ -248,15 +285,8 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
     if window.is_fullscreen().unwrap_or(false) {
         return;
     }
-    let Some(config) = app
-        .config()
-        .app
-        .windows
-        .iter()
-        .find(|w| w.label == label)
-        .cloned()
-    else {
-        eprintln!("[Tauri] No `{label}` window in the config: skipping the restore clamp");
+    let Some(config) = policy_config(&app.config().app.windows, label).cloned() else {
+        eprintln!("[Tauri] No window config to clamp `{label}` against: skipping the clamp");
         return;
     };
 
@@ -348,6 +378,43 @@ fn work_area_rect(monitor: &tauri::Monitor) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Which config the clamp judges a window against ───────────────────────
+
+    fn window_config(label: &str) -> tauri::utils::config::WindowConfig {
+        tauri::utils::config::WindowConfig {
+            label: label.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // The clamp used to `find` the exact label and skip when it missed. Only
+    // `main` is declared, so it skipped every `window-<n>`: precisely the
+    // windows a session restore places from a rect read off disk.
+    #[test]
+    fn a_runtime_window_is_judged_against_the_declared_main_config() {
+        let windows = [window_config("main")];
+        assert_eq!(
+            policy_config(&windows, "window-0").map(|w| w.label.as_str()),
+            Some("main"),
+        );
+    }
+
+    #[test]
+    fn a_declared_window_keeps_its_own_config() {
+        let windows = [window_config("main"), window_config("other")];
+        assert_eq!(
+            policy_config(&windows, "other").map(|w| w.label.as_str()),
+            Some("other"),
+        );
+    }
+
+    // No config at all is the one case with no policy to apply, and the clamp
+    // then skips rather than inventing minimums.
+    #[test]
+    fn no_declared_window_leaves_nothing_to_clamp_against() {
+        assert!(policy_config(&[], "main").is_none());
+    }
 
     /// A single 3456x2234 physical panel with a 74px menu bar, the display the
     /// bug was reported on.

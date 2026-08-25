@@ -1257,6 +1257,7 @@ impl LucidosEngine {
             vertex_token_cache,
             model_registry: engine_model_registry,
             openai_api_key,
+            summarizing_threads: Default::default(),
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),

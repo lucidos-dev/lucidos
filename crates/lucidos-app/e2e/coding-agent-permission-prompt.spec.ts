@@ -135,6 +135,15 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       ignoreHTTPSErrors: true,
     });
     let promptResponse: Promise<Awaited<ReturnType<typeof apiContext.post>>> | undefined;
+
+    // Empty the allowlist for the duration: the engine's gate reads it on every
+    // prompt, so a pre-existing bare `Bash` line would answer this request
+    // before any card renders. Restored in the finally below.
+    const snapshotResp = await apiContext.get('/api/v1/cc-allowed-tools');
+    expect(snapshotResp.status()).toBe(200);
+    const snapshot = (await snapshotResp.json()).contents as string;
+    await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: '' } });
+
     try {
       await navigateToApp(page);
       await openThreadDrawer(page);
@@ -178,6 +187,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       if (promptResponse) {
         await promptResponse.catch(() => undefined);
       }
+      await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
       await apiContext.dispose();
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -298,10 +308,14 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
     });
     let promptResponse: Promise<Awaited<ReturnType<typeof apiContext.post>>> | undefined;
 
-    // Snapshot the file so we can restore it (don't pollute the real ~/.lucidos).
+    // Snapshot the file so we can restore it (don't pollute the real workspace),
+    // then empty it: the engine's gate reads this file on every prompt, so a
+    // pre-existing bare `Skill` line would answer the request before any card
+    // renders. The finally below restores it whatever happens.
     const snapshotResp = await apiContext.get('/api/v1/cc-allowed-tools');
     expect(snapshotResp.status()).toBe(200);
     const snapshot = (await snapshotResp.json()).contents as string;
+    await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: '' } });
 
     try {
       await navigateToApp(page);

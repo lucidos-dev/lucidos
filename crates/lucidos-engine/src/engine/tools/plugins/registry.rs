@@ -6,12 +6,13 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_marketplaces::InstalledPluginSummary;
 use crate::core::plugins::{self, compare_versions, PluginManifest, UpdateDecision};
 use crate::core::DATA_DIR;
 use crate::triggers::definition::TriggerDefinition;
 
-use super::source::{detect_source, fetch_source};
+use super::source::{credentials_for_source, detect_source, fetch_source};
 
 /// Canonical plugin id for a `PluginInstalled` row: the `id` from the raw
 /// manifest in the payload, falling back to the `aggregate_id` column when
@@ -678,7 +679,7 @@ pub(crate) async fn check_plugin_updates_impl(
 
     let mut report: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
     for (id, rec) in entries {
-        report.push(check_one(workspace_path, &id, rec).await);
+        report.push(check_one(workspace_path, pool, &id, rec).await);
     }
 
     serde_json::to_string_pretty(&report)
@@ -698,6 +699,7 @@ fn all_recorded_files_missing(data_dir: &Path, files: &[String]) -> bool {
 
 async fn check_one(
     workspace_path: &Path,
+    pool: &sqlx::PgPool,
     id: &str,
     installed: Option<InstalledRecord>,
 ) -> serde_json::Value {
@@ -720,7 +722,7 @@ async fn check_one(
         }
     };
 
-    match fetch_remote_manifest(workspace_path, &source).await {
+    match fetch_remote_manifest(workspace_path, pool, &source).await {
         Ok(remote) => {
             let changed =
                 compare_versions(&installed_version, &remote.version) == UpdateDecision::Update;
@@ -755,12 +757,14 @@ async fn check_one(
 /// worker for the rest of the sweep.
 pub(crate) async fn fetch_remote_manifest(
     workspace_path: &Path,
+    pool: &sqlx::PgPool,
     source_str: &str,
 ) -> Result<PluginManifest, String> {
     let workspace_path = workspace_path.to_path_buf();
+    let credentials = credentials_for_source(pool, source_str).await;
     let source_str = source_str.to_string();
     tokio::task::spawn_blocking(move || {
-        fetch_remote_manifest_blocking(&workspace_path, &source_str)
+        fetch_remote_manifest_blocking(&workspace_path, &source_str, &credentials)
     })
     .await
     .map_err(|e| format!("manifest fetch task panicked: {}", e))?
@@ -771,9 +775,10 @@ pub(crate) async fn fetch_remote_manifest(
 fn fetch_remote_manifest_blocking(
     workspace_path: &Path,
     source_str: &str,
+    credentials: &GitCredentials,
 ) -> Result<PluginManifest, String> {
     let source = detect_source(source_str)?;
-    let (_scratch, plugin_root, _source_type) = fetch_source(workspace_path, &source)?;
+    let (_scratch, plugin_root, _source_type) = fetch_source(workspace_path, &source, credentials)?;
     let manifest_path = plugin_root.join("manifest.toml");
     let text =
         std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;

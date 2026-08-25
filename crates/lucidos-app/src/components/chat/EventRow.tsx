@@ -82,6 +82,11 @@ export interface EventRowChip {
    *  event has nowhere to open, which is what keeps a dead tap unreachable
    *  rather than merely unlikely (see `eventHasTarget`). */
   onClick?: () => void;
+  /** What pressing it does, as the accessible name and the tooltip. Defaults to
+   *  the jump, which is what a chip has meant since the "Go to event" link was
+   *  folded into it. A subscription chip opens its condition instead, and a chip
+   *  that says only the event type would leave both taps unlabelled. */
+  action?: string;
   /** The jump is in flight. The chip keeps its name (it is a fact about the
    *  row, not a button label) and goes inert, so an impatient second tap cannot
    *  start a second navigation. */
@@ -204,11 +209,11 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
  *
  *  With `onClick` it is a real `<button>`, not a `<code>` carrying a handler, so
  *  it is reachable by keyboard and announces itself. Its accessible name says
- *  where it goes: the visible text is a bare event type, which says only what
- *  the event IS. */
+ *  what pressing it does, because the visible text is a bare event type and says
+ *  only what the event IS. */
 export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildren {
   if (!chip.onClick) return <code key={key} class="event-name">{chip.name}</code>;
-  const label = `Go to the ${chip.name} event`;
+  const label = chip.action ?? `Go to the ${chip.name} event`;
   return (
     <button
       key={key}

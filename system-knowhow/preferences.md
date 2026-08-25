@@ -93,6 +93,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
+| `coding_agent_claude_permission_mode` | global | `accept-edits` \| `auto` | `accept-edits` | Which of Claude Code's own permission modes coding-agent threads run in. `accept-edits` cards anything outside the session's working directories. `auto` lets Claude Code's safety classifier approve routine actions instead, reaching shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Claude Code only; Codex ignores it. Applies to new sessions. |
 | `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set AND its account connected (see that key). |
 | `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination, independent of `backup_schedule`: it stays set with the schedule `off`, and the Backup page's provider dropdown both opens on it and writes it. Setting this connects NOTHING: the account is connected with `connect_oauth_account`, or by the user in **Settings → Accounts** (never on the Backup page, which has no account UI). Until then backups run and the upload fails. `get_backup_status` reports whether the account is connected. |
 | `backup_retention` | global | number 1–50 | `5` | How many recent backups to keep; older ones are pruned after each successful backup. |
@@ -140,6 +141,22 @@ surface):
   defers the toast on every device; a genuinely newer build (a different id)
   re-surfaces it everywhere. Managed by the version-update toasts, never via
   `set_preference`.
+- `release_notice_cursor`: internal UI state, not a setting. It holds the id of
+  the last *release notice* this workspace answered, and everything after it in
+  the authored order is still owed. Workspace-global (`device_id IS NULL`), so
+  answering on one device settles it on every device. Written by the engine when
+  the user answers a notice, and seeded once at startup. Never via
+  `set_preference`: clearing it re-shows every notice the user has already read.
+- `provider_enabled_vertex`, `provider_enabled_anthropic`,
+  `provider_enabled_openai`, `provider_enabled_openrouter`,
+  `provider_enabled_xai`, `provider_enabled_local`: the per-provider enable
+  switches on Settings → Models → Providers. Absent means **on**, and only an
+  explicit `false` switches a provider off. Off drops it from the model picker
+  and from web search, with no restart. It leaves the stored key untouched, so
+  the user can park a key and pick it up later. Never via `set_preference`: the
+  provider you switch off may be the one answering this turn. Contrast
+  `opencode_free_enabled` above, which IS settable, because turning a keyless
+  free tier on cannot leave the workspace unable to answer.
 
 > Keep this file in lockstep with `core/preference_catalog.rs` — a `cargo test`
 > sync test fails if a catalog key is missing here (see

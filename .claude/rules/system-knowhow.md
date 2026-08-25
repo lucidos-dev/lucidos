@@ -59,6 +59,9 @@ paths:
   - "crates/lucidos-engine/src/runtime/python.rs"
   - "crates/lucidos-engine/src/engine/thread_queue/**"
   - "crates/lucidos-engine/src/api/thread_queue.rs"
+  # The deterministic half of this rule. Editing the gate should load what the
+  # gate is for.
+  - "scripts/check-knowhow-refs.sh"
 ---
 
 # System-Knowhow Maintenance
@@ -80,7 +83,7 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 
 | You changed… | You MUST also update… |
 |---|---|
-| `crates/lucidos-engine/src/engine/thread_events/` (`ThreadEvent` enum: variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md`. A **rename** must record the old name in `thread-events.md` as `Legacy alias: <OldName>`: that exact form is what `workspace-audit.md`'s retired-event-name check reads to tell a silently-dead trigger subscription from a workspace domain event, so a rename written up any other way leaves the check blind to it. The line goes with the alias. A rename shipping no `serde(alias)` reads no old rows, so a `Legacy alias:` line would claim a reader that does not exist. Write nothing then, and accept that the audit is blind to that name: `WorkingUnderstandingWritten` and `ContextKeptOpen` are the two. |
+| `crates/lucidos-engine/src/engine/thread_events/` (`ThreadEvent` enum: variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md`. A **rename** must add the old name to `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, beside its `serde(alias)`. That const is what the `events` tool serves as `retired`, and the only list `workspace-audit.md`'s retired-name check reads. Leave a rename out of it and a silently-dead trigger subscription reads as a workspace domain event. A `Legacy alias: <OldName>` note in the doc row is prose for a human reader, worth writing but not load-bearing. A rename with no `serde(alias)` reads no old rows, so it belongs in neither place and the audit stays blind (`WorkingUnderstandingWritten`, `ContextKeptOpen`). |
 | `crates/lucidos-engine/src/engine/event_bus/` (`SystemEvent` enum: variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first: workspace-learning + thread-events + coding-agent-events all index events by name) |
 | `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events/`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/triggers.md` if the change opens a new "you can now `on_event:` X" path |
 | `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
@@ -122,6 +125,8 @@ A new surface in any of these categories cannot land without a matching `system-
 
 The check is intentional, not just a heuristic: the engine LLM that reads these knowhow files is a downstream consumer of the same code, on every workspace install. Drift compounds across thousands of LLM calls. A 5-minute doc edit at change time saves hours of wrong guidance later.
 
+That review is a judgment. Under it sits one deterministic floor, `./scripts/check-knowhow-refs.sh`, which `/harden` Phase 4.5 runs for every diff. It fails on a repo path or knowhow id resolving to nothing, an event name no engine enum has, and an undefined severity. Those are the shapes a *reader* cannot spot, because they look identical to a live reference. Everything above stays the reviewer's job.
+
 ## After-the-fact detection
 
 `system-knowhow/workspace-audit.md` is the recipe a workspace can run to detect drift between its installed system-knowhow files and the actual engine surfaces. It's the safety net — useful for spotting drift introduced by older changes that landed without the rule above. The rule above is the prevention; the audit is the cleanup.
@@ -130,12 +135,15 @@ The check is intentional, not just a heuristic: the engine LLM that reads these 
 
 `system-knowhow/workspace-audit.md` is the recipe Lucidos uses to audit a workspace for drift against current conventions. It deliberately **references** the other system-knowhow files instead of restating their rules — so when you change one of those files, the audit may need to follow.
 
-If your change touches `system-knowhow/best-practices.md`, `system-knowhow/js-sdk.md`, `system-knowhow/lucidos-cli.md`, `system-knowhow/intent-registry.md`, `system-knowhow/thread-events.md`, `docs/taxonomy.md`, or the engine system prompt's taxonomy / trigger section, open `system-knowhow/workspace-audit.md` and check that:
+Its sources are the files in its own § "Sources of truth" table, plus `system-knowhow/triggers.md`, `docs/taxonomy.md`, and the engine system prompt's taxonomy / trigger section. Touch any of those and open `system-knowhow/workspace-audit.md` to check that:
 
 - The reference table still names the right files and what they own.
 - Any check that names a section heading or filename in those sources still resolves.
 - New rules warrant a new check (or expansion of an existing check).
 - Removed / renamed rules don't leave dangling checks.
+- No check has quietly grown a **copy** of a rule its source owns. That is how the retired-event check ended up citing two names that were never event renames. Cite the section, name the severity, and stop.
+
+`./scripts/check-knowhow-refs.sh` catches the mechanical half in `/harden`: a repo path or sibling knowhow file that no longer exists, an invented retired event name, and a severity word outside the audit's own legend. It cannot see a check that has gone semantically stale, so the four bullets above still need a human.
 
 ## Maintaining workspace-learning
 

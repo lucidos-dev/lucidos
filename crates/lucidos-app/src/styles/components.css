@@ -291,6 +291,48 @@
     align-self: center;
 }
 
+/* The release-notice modal reuses .confirm-dialog's box too, so only its own
+   parts are here. It is wider than a confirm, because its body is authored
+   markdown rather than one sentence. */
+.release-notice {
+    max-width: 34rem;
+}
+
+/* Which release this came from, and where the reader is in the queue. Above the
+   title and quieter than it: the instruction is the subject, its provenance is
+   not. */
+.release-notice-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-md);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    margin-bottom: var(--space-xs);
+}
+
+.release-notice-step {
+    font-variant-numeric: tabular-nums;
+}
+
+/* Scrolls inside the capped box, the same way the confirm dialog's details list
+   does, so a long notice cannot push its buttons off screen. */
+/* Shared by the modal and the What's New rows, so one notice reads the same in
+   both. Its font-size is named here because `.markdown-content` deliberately
+   sets none: that rule is also served to app iframes, so the size belongs to
+   whatever surface wears it. */
+.release-notice-body {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+/* Modal only. Scrolls inside the capped box, the same way the confirm dialog's
+   details list does, so a long notice cannot push its buttons off screen. */
+.release-notice .release-notice-body {
+    overflow-y: auto;
+    margin-bottom: 1.25rem;
+}
+
 .confirm-actions-right {
     display: flex;
     gap: 0.5rem;

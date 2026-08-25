@@ -102,6 +102,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // Coding Agents subview
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
+  { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
   { id: 'coding-agents:repositories', label: 'Repositories', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:repositories', keywords: 'repository repositories git local clone register external repo' },
 
   // Access subview
@@ -119,13 +120,21 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:background-tasks', label: 'Background tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
   { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:vertex-ai', keywords: 'vertex gcloud gcp google adc region' },
   { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter xai grok opencode free keyless local gcloud gcp google api key direct credential gpt claude' },
+  // Its own row, not just a keyword on the section above. It is the one
+  // provider a user with no key can turn on. So "free" lands on the switch,
+  // rather than on the top of a page they then have to scan.
+  { id: 'models:opencode-free', label: 'OpenCode Free (keyless)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:opencode-free', keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
   { id: 'models:chat-model', label: 'Model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
   { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
-  { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:region' },
+  // Lands on the Vertex header, not on the Region row itself. That row sits
+  // inside the provider's block, which renders only while Vertex is switched
+  // on. An anchor pointing at it scrolls to nothing whenever it is off. The
+  // header is always there, and carries the switch that brings the row back.
+  { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:vertex-ai' },
 
   // Appearance & Behavior subview (Links absorbed the retired Links and
   // Experimental categories, so its two rows keep their own platform flags)

@@ -247,65 +247,99 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
 
   /** **Clicking around an IDLE thread.**
    *
-   *  The block above is the LIVE case, which is where "riding" and "reading"
-   *  genuinely conflict: content is arriving, and an armed reader has asked to
-   *  be kept on the newest of it. On an idle thread nothing is arriving, so
-   *  there is no conflict to resolve and no reason to move anybody: the reader
-   *  expanding a turn on a finished thread wants to see what they expanded.
+   *  The block above is the LIVE case, where "riding" and "reading" genuinely
+   *  conflict: content is arriving and an armed reader asked for the newest of
+   *  it. On an idle thread nothing is arriving, so the ride carries nobody, and
+   *  a reader parked in HISTORY gets the correction. They expanded a turn and
+   *  want to see what they expanded.
    *
-   *  So an armed reader is treated exactly as an unarmed one here, and BOTH
-   *  halves have to agree about that or they get neither treatment. The snap
-   *  lives in `honourAnchoredMutation` and the decision to skip the correction
-   *  lives in `withScrollAnchor`; skip one without the other and the reader is
-   *  left frozen at their old offset with the content above them grown, which
-   *  is a drift rather than a hold. `followIsCarrying` is the one question both
-   *  ask, which is what makes that state unreachable.
+   *  A reader sitting ON the live edge is the exception, and the two answers
+   *  cannot both be given. Rows revealed between their topmost line and the end
+   *  of the thread push that end off the bottom. So holding the line is what
+   *  moves them. ADR 0064 decides it: an armed reader on the live edge is kept
+   *  there, running thread or quiet one.
    *
-   *  A reveal is also GROWTH, so in the app the resize handler runs for one too,
-   *  and since 2026-08-13 its growth branch keeps an armed reader who is still ON
-   *  the live edge there (`keepTheLiveEdge`). The two do not fight, because
-   *  the correction below WRITES the container and its scroll event re-measures
-   *  the reader as off the edge before the resize is delivered, which is what
-   *  `defers to an anchor correction that moved them off the edge first` in
-   *  `scroll-follow-the-live-edge.test.ts` pins. What that leaves is the reveal
-   *  whose correction is a no-op because it grew content only BELOW the reader:
-   *  they were on the edge and still are, and growth carries them to the new
-   *  bottom exactly as it would for an arriving card. This file drives the two
-   *  anchor halves directly and wires no observers, so the cases below are the
-   *  correction's own answer rather than the whole app's. */
-  describe('and holds an armed reader still on an IDLE thread instead', () => {
+   *  BOTH halves have to agree, or the reader gets neither treatment. The snap
+   *  lives in `honourAnchoredMutation` and the skip lives in `withScrollAnchor`.
+   *  Skip one without the other and the reader is frozen at their old offset
+   *  with the content above them grown, which is a drift. So the caller asks
+   *  `readerKeepsTheLiveEdge` once, before the mutation, and hands that one
+   *  answer to the other half.
+   *
+   *  A reveal is GROWTH too, so the resize handler runs for one. Its growth
+   *  branch keeps an armed reader who is still ON the live edge there
+   *  (`keepTheLiveEdge`). The two agree by construction: they read the same two
+   *  terms. This file drives the two anchor halves directly, so the cases below
+   *  are the correction's own answer rather than the whole app's. */
+  describe('and keeps an armed reader on the end of an IDLE thread', () => {
     /** Arm the follow, then let the thread go quiet. */
-    function armedOnAFinishedThread() {
-      const el = makeContainer({ scrollTop: 2500, scrollHeight: 3000, clientHeight: 500 });
+    function armedOnAFinishedThread(scrollTop = 2500) {
+      const el = makeContainer({ scrollTop: 3000, scrollHeight: 3000, clientHeight: 500 });
       setActiveScrollElement(el);
       setFollowLiveEdge(true);
       vi.advanceTimersByTime(1500);
       expect(followingLiveEdge.value).toBe(true);
       setThreadLive(false);
+      el.scrollTop = scrollTop;
       el.settled.length = 0;
       return el;
     }
 
-    it('gives them the anchor correction when the steps go on, not the live edge', () => {
+    it('keeps the newest content under their eye when the steps go on', () => {
       const el = armedOnAFinishedThread();
 
       showSteps(el);
 
-      // 3700, the same single correction the unarmed reader gets above, and NOT
-      // 4500: on a finished thread the 2000px that appeared is the transcript
-      // rendering itself, not the agent writing anything worth being carried to.
-      expect(el.settled).toEqual([3700]);
-      expect(el.settled).not.toContain(4500);
+      // 4500, the new live edge, in ONE write. Not 3700: holding their topmost
+      // line would push the end of the thread 800px below the fold, which is
+      // the report this case came from.
+      expect(el.settled).toEqual([4500]);
+      expect(el.settled).not.toContain(3700);
     });
 
-    it('gives them the anchor correction when the steps go off', () => {
+    it('lets the shrink carry them when the steps go off', () => {
       const el = armedOnAFinishedThread();
 
       hideSteps(el);
 
-      // The shrink's clamp, then the correction that puts the toggled turn back
-      // under their eyes: the unarmed reader's pair, exactly.
-      expect(el.settled).toEqual([2300, 1300]);
+      // The shrink's own clamp put them on the new end, so there is nothing
+      // left to write. 1300 is the correction they are NOT given.
+      expect(el.settled).toEqual([2300]);
+      expect(el.settled).not.toContain(1300);
+    });
+
+    it('still corrects an armed reader parked back in history', () => {
+      // The edge term is what makes this different, and it is why the ride's
+      // own flag cannot answer alone. Nothing is arriving, they are nowhere
+      // near the end, and the turn they expanded stays under their eye.
+      const el = armedOnAFinishedThread(1200);
+
+      showSteps(el);
+
+      expect(el.settled).toEqual([2400]);
+      expect(el.settled).not.toContain(4500);
+    });
+
+    it('keeps the end when the reveal makes a short thread scrollable', () => {
+      // A transcript SHORTER than its pane has no overflow to be at the edge
+      // of, and the reveal is exactly what gives it one. An `isScrollable`
+      // term would drop the request for precisely that reader.
+      const el = makeContainer({ scrollTop: 0, scrollHeight: 400, clientHeight: 500 });
+      setActiveScrollElement(el);
+      setFollowLiveEdge(true);
+      vi.advanceTimersByTime(1500);
+      setThreadLive(false);
+      el.settled.length = 0;
+
+      const anchor = makeAnchor(el, 100);
+      withScrollAnchor(anchor, () => {
+        (anchor as any).offsetTop = 900;
+        el.scrollHeight = 5000;
+      });
+      vi.advanceTimersByTime(1500);
+
+      // The new end, not the 800 the anchor correction would have held them at.
+      expect(el.settled).toEqual([4500]);
     });
 
     it('keeps the ride armed through all of it', () => {

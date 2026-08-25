@@ -44,7 +44,9 @@ Skip `data/artifacts/` (user content; no executable code that calls the SDK) and
 
 ## Detection patterns
 
-Grep each file for these patterns. The list is the same one the audit's `tap_shape` check uses — keep them in sync if you edit one.
+Grep each file for these patterns. **This list is the only copy.**
+`system-knowhow/workspace-audit.md` cites it rather than restating it, so a new
+form is added here and nowhere else.
 
 ### Python / shell / generic-string
 
@@ -59,7 +61,15 @@ Grep each file for these patterns. The list is the same one the audit's `tap_sha
 - `tap: 'none'` / `tap: "none"`
 - `tap: 'open_app'` / `tap: "open_app"`
 - `tap: 'open_thread'` / `tap: "open_thread"`
-- `'tap': 'modal'` (key-quoted variants — less common but exists)
+- `'tap': 'modal'` (key-quoted variants, less common but they exist)
+
+### The retired object form
+
+- `{ "kind": "none" }` / `{ kind: 'none' }`, in either language.
+
+This one is not a 400. The engine coerces it to `{ kind: 'modal' }` on write, so
+the call succeeds and the code reads as current. It is still stale, and it still
+spreads by copy, so rewrite it to `{ kind: 'modal' }` with the rest.
 
 ### URL-encoded / hash-form
 

@@ -1,12 +1,14 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
   activeSubThreads,
   SubThreadRow,
+  subscriptionLine,
   waitingIndicatorBody,
   waitingPanelBody,
   type SubThreadWait,
 } from '../WaitingPanel';
+import { eventConditionModal } from '../../../store/store';
 
 const focusThreadOrBootstrap = vi.fn();
 vi.mock('../../../store/actions/threads', () => ({
@@ -278,6 +280,52 @@ describe('waitingPanelBody', () => {
     const text = body({ waits: [], subThreads: { threads: [thread('c1')], unresolved: 2 } });
     expect(text).toContain('data-role="waiting-sub-threads-more"');
     expect(text).toContain('and 2 more');
+  });
+});
+
+/** **The panel says "(filtered)" too, so it owes the same answer as the
+ *  transcript.** Both go through `eventConditionDoor`, which is what keeps one
+ *  affordance from acquiring two behaviours.
+ *
+ *  The joined LOOK survives: still one muted mono line reading `A or B`. Only a
+ *  filtered entry becomes a button, and the modal it opens stacks over this
+ *  popover rather than replacing it. */
+describe('the panel subscription line', () => {
+  afterEach(() => { eventConditionModal.value = null; });
+
+  const CONDITION = { 'workflow_run.event': 'completed' };
+
+  it('reads as one joined line whether or not an entry is filtered', () => {
+    const text = vnodeToText(subscriptionLine([
+      { event_type: 'GithubWorkflowRunStateChanged', condition: CONDITION },
+      { event_type: 'ChangeProposed' },
+    ]));
+    expect(text).toContain('GithubWorkflowRunStateChanged (filtered)');
+    expect(text).toContain(' or ');
+    expect(text).toContain('ChangeProposed');
+  });
+
+  it('opens the condition from a filtered entry', () => {
+    const line = subscriptionLine([
+      { event_type: 'GithubWorkflowRunStateChanged', condition: CONDITION },
+    ]);
+    const button = line[0] as VNode<{ 'aria-label': string; onClick: () => void }>;
+    expect(button.type).toBe('button');
+    // The same accessible name the transcript chip carries, because both come
+    // from the one door.
+    expect(button.props['aria-label']).toBe('Show the condition filtering GithubWorkflowRunStateChanged');
+    button.props.onClick();
+    expect(eventConditionModal.value).toEqual({
+      eventType: 'GithubWorkflowRunStateChanged',
+      condition: CONDITION,
+    });
+  });
+
+  /** An entry with no condition promises nothing, so it must offer no door. */
+  it('leaves an unfiltered entry as plain text', () => {
+    const line = subscriptionLine([{ event_type: 'ChangeProposed' }]);
+    expect((line[0] as VNode).type).toBe('span');
+    expect(vnodeToText(line)).toBe('<span>ChangeProposed</span>');
   });
 });
 

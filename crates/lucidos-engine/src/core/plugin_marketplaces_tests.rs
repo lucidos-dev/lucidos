@@ -102,7 +102,7 @@ fn scan_catalog_reports_marketplace_with_only_invalid_manifests() {
     let mut registry = PluginMarketplaceRegistry::default();
     add_local_marketplace(&mut registry, repo_dir.path());
 
-    let catalog = scan_catalog(workspace.path(), &registry, &[]);
+    let catalog = scan_catalog(workspace.path(), &registry, &[], &GitCredentials::none());
 
     assert!(catalog.plugins.is_empty());
     assert_eq!(catalog.errors.len(), 1);
@@ -124,7 +124,7 @@ fn scan_catalog_discovers_root_plugin_from_git_marketplace() {
     let mut registry = PluginMarketplaceRegistry::default();
     let source = add_local_marketplace(&mut registry, repo_dir.path());
 
-    let catalog = scan_catalog(workspace.path(), &registry, &[]);
+    let catalog = scan_catalog(workspace.path(), &registry, &[], &GitCredentials::none());
 
     assert!(catalog.errors.is_empty(), "errors: {:?}", catalog.errors);
     assert_eq!(catalog.plugins.len(), 1);

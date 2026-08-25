@@ -359,7 +359,11 @@ export type PersistScope = 'narrow' | 'broad' | 'session';
  *  both. */
 export interface EventSubscription {
   event_type: string;
-  condition?: unknown;
+  /** An object, not arbitrary JSON, even though Rust types it `Option<Value>`:
+   *  `condition::validate` refuses anything else at the write surface, and
+   *  `evaluate` answers false for it. This is also what the trigger form and
+   *  the SDK say, which is what lets one type serve all three. */
+  condition?: Record<string, unknown>;
 }
 
 /** Mirrors the Rust `EventWaitCancelCause` (serde rename_all = "snake_case"):

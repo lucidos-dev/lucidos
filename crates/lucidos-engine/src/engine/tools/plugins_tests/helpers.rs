@@ -18,7 +18,8 @@ pub(super) async fn install_from_source_with_bus(
     overwrite: bool,
 ) -> Result<String, String> {
     let source = detect_source(source_str)?;
-    let (_scratch, plugin_root, source_type) = fetch_source(workspace_path, &source)?;
+    let (_scratch, plugin_root, source_type) =
+        fetch_source(workspace_path, &source, &GitCredentials::none())?;
     let write = install_from_unpacked_with_bus(
         workspace_path,
         bus,

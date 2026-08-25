@@ -745,6 +745,20 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   );
 }
 
+/** Are two gated-step mark sets the same? Absent and empty are one state: a
+ *  resolution deletes the last entry rather than dropping the set, so the two
+ *  spellings of "nothing is marked" must not read as a change.
+ *
+ *  Iterated rather than compared by identity, because a FULL rebuild allocates
+ *  fresh sets. See the `blockedStepSeqs` line in `chatExchangePropsEqual`. */
+function sameStepSeqs(a: Set<number> | undefined, b: Set<number> | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return (a?.size ?? 0) === (b?.size ?? 0);
+  if (a.size !== b.size) return false;
+  for (const seq of a) if (!b.has(seq)) return false;
+  return true;
+}
+
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
  *
  *  Default `memo` shallow-compares props, and a from-scratch `computeExchanges`
@@ -761,9 +775,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
  *   - `questionOvertaken`, flipped when the agent ignored a question.
  *   - `continuationMoved`, the turn handed to a later exchange, which
  *     finalizes this one's pending Thinking marker.
+ *   - `blockedStepSeqs` / `deniedStepSeqs`, a permission decision on a call
+ *     this exchange owns. They are the one mark written from OUTSIDE, by a
+ *     card that is its own later exchange, so nothing else here moves with it.
  *
  *  All other props are primitives or strings, compared with Object.is. */
-function chatExchangePropsEqual(prev: Props, next: Props): boolean {
+export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.revision !== next.revision) return false;
   if (prev.streamingBuffer !== next.streamingBuffer) return false;
   if (prev.isLast !== next.isLast) return false;
@@ -792,6 +809,14 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   const aLast = a.steps[a.steps.length - 1]?.seq;
   const bLast = b.steps[b.steps.length - 1]?.seq;
   if (aLast !== bLast) return false;
+  // A permission card marks a call in the PREVIOUS exchange, whose own steps do
+  // not change, so every field above is identical across that mark. The
+  // incremental fold bumps `revision` for it. A FULL rebuild allocates fresh
+  // objects carrying no revision, and there the fingerprint is the only thing
+  // deciding. Without these two the held call keeps rendering "In progress"
+  // after an out-of-order event forced the rebuild.
+  if (!sameStepSeqs(a.blockedStepSeqs, b.blockedStepSeqs)) return false;
+  if (!sameStepSeqs(a.deniedStepSeqs, b.deniedStepSeqs)) return false;
   return true;
 }
 

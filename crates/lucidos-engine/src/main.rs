@@ -694,6 +694,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    // Place this workspace in the release-notice sequence, once. Both inputs
+    // are boot facts: the release this binary reports, and whether the
+    // workspace has ever held a thread. A workspace already in the sequence is
+    // left alone, so this is a no-op on every boot but the first.
+    lucidos_engine::engine::release_notices::seed_cursor_at_startup(
+        shared_engine.pool(),
+        lucidos_engine::engine::release_notices::all(),
+    )
+    .await;
+
     // Started BEFORE the recovery sweep below. Recovery broadcasts terminators
     // this consumer must see to flip abandoned todos, and a tokio broadcast
     // channel does not replay history for a late subscriber.

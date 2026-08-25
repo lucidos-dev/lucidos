@@ -1,6 +1,6 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
-import { AWAIT_EVENT_TOOL, waitSubscriptionLabels } from './event-waits';
+import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
@@ -57,9 +57,24 @@ function resolvePendingSteps(
   }
 }
 
-/** Is anything on this turn still running? The other projection asks the same
- *  question of its mixed array through `lastPendingStepIndex`. */
-const anyStepPending = (steps: StepLike[]) => steps.some(s => s.outcome === 'pending');
+/** A row that has not reached a verdict: running, or held on a permission card.
+ *  Both projections ask through this, the flat one over its own array and the
+ *  other through `lastStepIndex`.
+ *
+ *  Deliberately NOT used by the sweeps, which key on `'pending'` alone, so a
+ *  held row is exempt from them by construction. */
+const isLiveStep = (s: StepLike) => s.outcome === 'pending' || s.outcome === 'blocked';
+
+/** Settle the step a `tool_use_id`-matched result belongs to, which is most of
+ *  them: this runs for every coding-agent call, gated or not.
+ *
+ *  It ticks off a running call, and a held one whose resolution never folded.
+ *  It never touches a DENIED one. The result there is the refusal handed back
+ *  to the agent, and a green check over it is the lie this state exists to
+ *  end. */
+function settleMatchedCallStep(step: StepLike): void {
+  if (step.outcome === 'pending' || step.outcome === 'blocked') step.outcome = 'success';
+}
 
 /** Does a LIVE coding-agent turn owe the reader a `Thinking` row right now?
  *
@@ -70,7 +85,7 @@ const anyStepPending = (steps: StepLike[]) => steps.some(s => s.outcome === 'pen
  *  end of each projection, never pushed from an event arm: ADR 0066.
  *
  *  Three conditions are the branch this is called from, in both projections,
- *  so they are not re-tested here. Of the four tested here, `anyPending` is
+ *  so they are not re-tested here. Of the four tested here, `anyLive` is
  *  self-evident and the other three are:
  *
  *  - A coding-agent turn, because only one of those has the gap. Wider than
@@ -86,10 +101,14 @@ function needsLiveThinkingRow(opts: {
   exchange: Exchange;
   isLast: boolean;
   hasCCContent: boolean;
-  anyPending: boolean;
+  /** A row already speaks for the turn. `'blocked'` counts, and it is the one
+   *  that is not running: a call held on a permission card IS the turn's
+   *  current row. A Thinking row beside it would shimmer over a turn that is
+   *  waiting for the reader. */
+  anyLive: boolean;
 }): boolean {
-  const { exchange, isLast, hasCCContent, anyPending } = opts;
-  if (!isLast || anyPending) return false;
+  const { exchange, isLast, hasCCContent, anyLive } = opts;
+  if (!isLast || anyLive) return false;
   if (abortTookEngineDown(exchange.userEvent)) return false;
   // The `SessionStarted` scan runs only in the start window, where
   // `hasCCContent` is false and everything cheaper has already passed.
@@ -152,10 +171,24 @@ function nameThinkingRow<T extends StepLike>(rows: T[], naming: Partial<T>): boo
   const last = rows[rows.length - 1];
   if (last && last.outcome === 'success' && isThinking(last)) {
     Object.assign(last, naming);
-    last.outcome = 'pending';
+    // Reopened into the arriving call's OWN state, which the caller supplies:
+    // `'pending'` normally, `'blocked'` or `'denied'` under a permission card.
+    last.outcome = naming.outcome ?? 'pending';
     return true;
   }
   return false;
+}
+
+/** What a tool call's row starts in. `'pending'` is the ordinary answer. The
+ *  two others come from a permission card gating this exact call step, which
+ *  the grouping fold records (see `Exchange.blockedStepSeqs`).
+ *
+ *  Both projections read it, so a held call cannot say one thing in the summary
+ *  row and another inline. */
+function callOutcome(exchange: Exchange, seq: number): StepOutcome {
+  if (exchange.deniedStepSeqs?.has(seq)) return 'denied';
+  if (exchange.blockedStepSeqs?.has(seq)) return 'blocked';
+  return 'pending';
 }
 
 /** `nameThinkingRow` for the ResponseEvent projection, whose array also carries
@@ -183,7 +216,8 @@ function nameThinkingStep(
     return false;
   }
   Object.assign(marker, naming);
-  marker.outcome = 'pending';
+  // Same as `nameThinkingRow`: the caller owns the reopened state.
+  marker.outcome = naming.outcome ?? 'pending';
   events.splice(idx, 1);
   events.push(marker);
   return true;
@@ -303,7 +337,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
     if (lastThinkingIdx < 0) return;
     steps[lastThinkingIdx].contextCapture = synthesizeContextCapture(legacyAcc);
   };
-  for (const { event } of exchange.steps) {
+  for (const { seq, event } of exchange.steps) {
     switch (event.type) {
       // 'MemorySearched' is the retired name. Historical rows still carry it,
       // because the snapshot endpoint serves the raw `event_type` column.
@@ -390,8 +424,11 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         // The call NAMES the row it came out of rather than checking that row
         // off and queueing beneath it. See `nameThinkingRow`.
         const e = event as { name: string; args: unknown; description?: string };
-        const naming = { description: e.description || describeEngineTool(e.name, e.args) };
-        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming, outcome: 'pending' });
+        const naming = {
+          description: e.description || describeEngineTool(e.name, e.args),
+          outcome: callOutcome(exchange, seq),
+        };
+        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming });
         break;
       }
       case 'ToolResult':
@@ -406,8 +443,9 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         const naming = {
           description: e.description || describeCCTool(e.name, e.args),
           tool_use_id: toolUseIdOf(event),
+          outcome: callOutcome(exchange, seq),
         };
-        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming, outcome: 'pending' });
+        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -422,8 +460,8 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         let resolved = false;
         if (id) {
           for (const step of steps) {
-            if (step.outcome === 'pending' && step.tool_use_id === id) {
-              step.outcome = 'success';
+            if (step.tool_use_id === id) {
+              settleMatchedCallStep(step);
               resolved = true;
               break;
             }
@@ -479,7 +517,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
     exchange,
     isLast,
     hasCCContent: exchangeHasCCContent(exchange),
-    anyPending: anyStepPending(steps),
+    anyLive: steps.some(isLiveStep),
   })) {
     steps.push({ description: 'Thinking', outcome: 'pending' });
   }
@@ -500,9 +538,26 @@ function lastStepIndex(events: ResponseEvent[], pred?: (s: StepLike) => boolean)
 /** Index of the last pending step matching `pred`, or -1. The lookup half of
  *  `resolveLastPendingResponseStep`, for callers that replace a step rather
  *  than resolving it. With `pred` omitted it answers "is anything still
- *  running", which is `anyStepPending` for the other projection's shape. */
+ *  RUNNING", which is narrower than `isLiveStep`: a call held on a permission
+ *  card is live without running. */
 function lastPendingStepIndex(events: ResponseEvent[], pred?: (s: StepLike) => boolean): number {
   return lastStepIndex(events, s => s.outcome === 'pending' && (!pred || pred(s)));
+}
+
+/** The denied step an arriving chat `ToolResult` belongs to, or null.
+ *
+ *  The chat lanes pair a result to the last PENDING step, and a denied one is
+ *  no longer pending. So the refusal the guard hands back would land nowhere,
+ *  and the step detail would show a refused command with no explanation. Only
+ *  a step still missing its result can claim one, and the chat agentic loop is
+ *  sequential, so at most one is ever waiting. */
+function lastDeniedStepAwaitingResult(
+  events: ResponseEvent[],
+): Extract<ResponseEvent, { type: 'step' }> | null {
+  const idx = lastStepIndex(events, s => s.outcome === 'denied');
+  const step = idx >= 0 ? events[idx] : undefined;
+  if (!step || step.type !== 'step' || step.result !== undefined) return null;
+  return step;
 }
 
 /** Mark the last pending step in a ResponseEvent[] as completed and return it
@@ -581,7 +636,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     events.push(step);
   };
 
-  for (const { event } of exchange.steps) {
+  for (const { seq, event } of exchange.steps) {
     const created = event.created;
     switch (event.type) {
       // Legacy name kept alongside the current one, as in `exchangeSteps`.
@@ -671,9 +726,10 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           description: e.description || describeEngineTool(e.name, e.args),
           tool_name: e.name,
           full: fullCommandForEngineTool(e.name, e.args),
+          outcome: callOutcome(exchange, seq),
           created,
         };
-        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', outcome: 'pending', ...naming });
+        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         break;
       }
       case 'ToolResult': {
@@ -690,7 +746,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         const resolved = resolveLastPendingResponseStep(
           events,
           toolResult.name === AWAIT_EVENT_TOOL ? isAwaitEventStep : isNotThinking,
-        );
+        ) ?? lastDeniedStepAwaitingResult(events);
         if (resolved) {
           if (toolResult.result !== undefined) resolved.result = toolResult.result;
           // Always stamp the source event id so a re-fetch path can address
@@ -733,9 +789,10 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           tool_name: e.name,
           tool_use_id: toolUseIdOf(event),
           full: fullCommandForCCTool(e.name, e.args),
+          outcome: callOutcome(exchange, seq),
           created,
         };
-        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', outcome: 'pending', ...naming });
+        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -746,8 +803,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         let resolved = false;
         if (id) {
           for (const e of events) {
-            if (e.type === 'step' && e.outcome === 'pending' && e.tool_use_id === id) {
-              e.outcome = 'success';
+            if (e.type === 'step' && e.tool_use_id === id) {
+              settleMatchedCallStep(e);
               if (ccResult !== undefined) e.result = ccResult;
               resolved = true;
               break;
@@ -837,7 +894,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         const row: ResponseEvent = {
           type: 'event_wait',
           wait_id: e.wait_id,
-          subscriptions: waitSubscriptionLabels(e.on),
+          subscriptions: e.on,
           reason: e.reason,
           expires_at: e.expires_at,
           state: 'waiting',
@@ -903,7 +960,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           wait_id: e.wait_id,
           // A legacy row carries neither, and then names no subscription
           // rather than inventing one.
-          subscriptions: e.on ? waitSubscriptionLabels(e.on) : [],
+          subscriptions: e.on ?? [],
           reason: e.reason ?? '',
           // The deadline died with the subscription, so there is nothing to
           // count down to. The row renders its note, not a countdown.
@@ -998,7 +1055,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     exchange,
     isLast,
     hasCCContent,
-    anyPending: lastPendingStepIndex(events) >= 0,
+    anyLive: lastStepIndex(events, isLiveStep) >= 0,
   })) {
     // The turn is live and nothing is running, so the model holds control.
     // See `needsLiveThinkingRow` and ADR 0066.
@@ -1046,6 +1103,12 @@ export function stepStatus(outcome: StepOutcome): { label: string; icon: string;
     case 'success': return { label: 'Completed', icon: '✓', className: 'success' };
     case 'error': return { label: 'Failed', icon: '⚠', className: 'error' };
     case 'unfinished': return { label: 'Did not finish', icon: '⊘', className: 'unfinished' };
+    // A pause bar, because held-not-running is exactly what was being misread.
+    // Text rather than an emoji, for the reason `EVENT_ROW_MARK` gives: these
+    // are marks in a column of prose, coloured by the type around them.
+    case 'blocked': return { label: 'Needs approval', icon: '‖', className: 'blocked' };
+    // The pair of the success check, so the two read as one answered question.
+    case 'denied': return { label: 'Denied', icon: '✗', className: 'denied' };
   }
 }
 

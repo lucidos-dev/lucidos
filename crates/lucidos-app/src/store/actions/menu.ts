@@ -113,6 +113,18 @@ export function openProviderSettings(): void {
   openSettingsSubview('models');
 }
 
+/** Deep-link to the OpenCode Free switch, one row inside the same Providers
+ *  section. It is where the onboarding surface sends a user with no key, whose
+ *  one actionable option is the keyless tier.
+ *
+ *  It navigates and nothing else. The tier is opt-in and states its terms at
+ *  the switch (ADR 0104). So the decision stays on the row the user lands on,
+ *  never on the button that sent them there. */
+export function openFreeProviderSettings(): void {
+  settingsScrollTarget.value = 'models:opencode-free';
+  openSettingsSubview('models');
+}
+
 /** Deep-link to Settings → System → Backup in a single render. Two callers: the
  *  app-shell backup reminder's "Set up backup" button, and the tap on the
  *  backup-failure toast. No scroll target: the page is short, and its health

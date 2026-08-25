@@ -111,6 +111,7 @@ What this means for plugin authors:
 
 - **Lead with `name` and `description`.** They render at the top of the panel. A vague description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide; a single word ("browser-skills") doesn't.
 - **Use `setup` for wiring instructions the agent should run after install.** It renders as markdown in the panel so the user sees the steps before confirming, and on confirm a Lucidos Agent setup thread is spawned — the agent references this text (from the `PluginInstalled` event, guided by `system-knowhow/plugin-setup`), plans it as a todo list, and walks the user through the steps, asking for anything it needs (credentials, choices) and doing the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
+  This is also the only way to ship anything that is workspace state rather than a file, a webhook above all.
 - **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path -- the user reviews the new version's file list (added/changed/removed -- well, "would overwrite" for changed) before any bytes are written.
 - **Staged installs expire after 1 hour.** A panel left open longer is silently discarded; the user has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone). Don't author flows that expect the panel to sit open for a full day.
 
@@ -213,39 +214,99 @@ archive paths are rejected -- marketplaces must be git. The clone is shallow
 before the scan, so nothing about the marketplace persists in the workspace
 except the registry entry in `data/config/plugin-marketplaces.json`.
 
+A `file://` URL is a valid marketplace source, and it clones deep rather than
+shallow: libgit2's local transport rejects a shallow fetch. A local bare clone
+of a repo, refreshed out of band, is a working offline marketplace.
+
 Scans run at startup, on registration/rename, whenever the Plugins panel is
 shown or "Installed only" is unchecked, and every five minutes. A scan **never
 installs** -- it notifies about newer versions and the user clicks Update.
 
-### Private and internal repos do NOT work (v1)
+### Private and internal repos
 
-**The clone is anonymous.** Both clone paths -- the marketplace scan
-(`clone_marketplace`) and the plugin install (`tools/plugins/source.rs`) --
-build a `git2::RepoBuilder` with no `RemoteCallbacks` credential handler
-anywhere in the crate. There is no git-credential-helper fallback, no
-`GITHUB_TOKEN` lookup, no SSH agent hookup.
+**The clone authenticates.** One shared helper, `core/git_auth.rs`, supplies
+credentials for every clone the engine makes: the marketplace scan
+(`clone_marketplace`), the plugin install and update fetch
+(`tools/plugins/source.rs`), and both `git_clone` tool routes. A public repo is
+unaffected. libgit2 asks for a credential only when the remote demands one.
 
-A private or internal repo therefore **registers successfully and then fails
-every scan**, surfacing in the catalog's `errors` as:
+**A token comes from Settings, Credentials, and nowhere else.** No environment
+variable holds one. Before the clone starts, the engine looks up the credential
+whose **Base URL** scopes the clone URL, and hands that one credential to the
+clone.
 
-```
-git clone failed: remote authentication required but no callback set; class=Http (34); code=Auth (-16)
-```
+For each round libgit2 says which credential kinds the remote accepts, and the
+helper offers only those, in this order:
 
-This is easy to misdiagnose as a bad token or a `gh auth` problem -- it is
-neither; the engine never presents a credential at all. Being logged in with
-`gh` on the same machine does not help, because git2 does not consult it.
+1. **SSH agent**, for a `git@host:...` or `ssh://` URL. The key comes from a
+   running ssh-agent, under the username in the URL, defaulting to `git`. When
+   the URL carries no username, libgit2 asks for one first.
+2. **The stored credential**, for an HTTPS URL. It travels as the password
+   first, beside the username `x-access-token`, which is the form GitHub
+   documents. If the host refuses that, a bare token is offered again as the
+   username with an empty password, the older form some other hosts want. A
+   credential that carries its own username (Basic Auth, Password) is only ever
+   sent in the password form.
+3. **The git credential helper**, meaning whatever `git credential` answers.
+   This is the path that finds an existing `gh auth login` or a macOS keychain
+   entry.
+4. **No credential**, for a host that negotiates its own.
 
-Implications for a team that wants a private marketplace:
+Each source is offered **at most once per clone**. libgit2 re-invokes the
+callback every time the remote refuses, so offering one twice would spin
+forever. Once the list is spent the clone fails with a message naming the URL
+and the fix. The fix follows the URL: ssh-agent for an SSH remote, and the
+credential to store for an HTTPS one. That message reaches the catalog's
+`errors` array and the install tool's return, not only the log.
 
-- A public repo is the only shape that works today. Do not put anything
-  workspace-private in plugins there -- and note that every plugin authoring
-  rule about excluding personal data becomes a hard requirement.
-- `file://` URLs are accepted as a marketplace source (and skip the shallow-clone
-  depth), so a local bare clone of a private repo, refreshed out-of-band, is a
-  workable stopgap.
-- Fixing this properly means adding `RemoteCallbacks` with
-  `git2::Cred::credential_helper` (or a token env var) to both clone sites.
+#### Storing the credential
+
+Settings, Credentials, **Add**. Three fields decide the clone:
+
+| Field | Value |
+|---|---|
+| Service Name | Any label you like. Nothing matches on it. |
+| Base URL | `https://github.com` for github.com. For a GitHub Enterprise install, its own host, `https://github.example.io`. |
+| Auth Type | **Bearer Token**, with a token that can read the repo. |
+
+**Base URL is the whole scoping rule.** It must be the host you clone from, so
+`https://github.com`, **not** `https://api.github.com`. Those are different
+hosts, and a credential registered for the API host never matches a clone. A
+credential for the REST API and a credential for the clone are two rows.
+
+A Base URL may also carry a path, `https://github.com/example-org`, which scopes
+it to that owner. When several credentials match one URL the longest Base URL
+wins, so an org-scoped token overrides a host-wide one.
+
+A GitHub Enterprise install needs nothing extra beyond its own row. The clone
+never guesses which host is GitHub, so there is no host list to maintain.
+
+The row takes effect on the next scan, with no restart: every clone reads the
+store when it starts. Scans run every five minutes and whenever the Plugins
+panel opens.
+
+Two alternatives need no credential row at all:
+
+- **`gh auth login` on the machine.** It writes a helper into the git config,
+  and step 3 finds it. A desktop app launched from the Dock may not have `gh`
+  on its `PATH`, and then the helper cannot run.
+- **An SSH URL.** Register the marketplace as `git@github.com:owner/repo.git`
+  with your key in ssh-agent. Per-plugin install URLs are still rewritten to
+  HTTPS tree URLs, so a multi-plugin marketplace also needs step 2 or 3 for the
+  install itself.
+
+What still does not work:
+
+- **No token in the URL.** Lucidos saves a marketplace source verbatim in
+  `data/config/plugin-marketplaces.json`, which git tracks, and shows it in the
+  Plugins panel. Store a credential instead.
+- **A credential is scoped by Base URL, not by repo.** A host-wide GitHub
+  credential reaches every repo on github.com that the token itself can read.
+  Scope the token to read access on the repos you actually need, or narrow the
+  Base URL to one owner.
+- **The credential must be one a git remote can present.** Bearer Token and API
+  Key hold a bare token, Basic Auth and Password hold a username and password.
+  An OAuth Client credential holds neither and is skipped.
 
 ### Org permissions can block repo creation independently
 
@@ -298,6 +359,12 @@ The four content directories make almost anything technically packageable, but a
 2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is the equivalent of a library shipping a crontab line -- wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
 3. **Orphaned cron entries.** If the install instructions create a cron trigger as a side effect (asking an agent to call `create_trigger`), it carries no plugin provenance, so uninstall does not know to remove it — the workspace ends up with an orphaned cron entry pointing at deleted knowhow. (Event-driven triggers declared as `triggers/<slug>/trigger.toml` avoid this: install auto-registers them stamped with the plugin id, and uninstall auto-deletes exactly those — see "Shipping triggers".)
 4. **Install-time prompt is the right UX.** When `install_plugin` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
+
+**Webhooks do not ship either, and for the same reason.** A webhook is a row in the `webhooks` table, not a file, so there is no manifest field for one and no sixth content dir. Three things would have to travel with it and none can. The shared secret is a `credentials` row, and plugins never ship credentials. The delivery URL does not exist until create time, and the host is the installing machine's own funnel. The sender-side registration only the account owner can do.
+
+Everything downstream of the event still ships, and it is most of the value: the `triggers/<slug>/trigger.toml` subscribing to the pinned event, the script that reads the payload, and the knowhow describing the payload shape and its field paths. The `setup` field is the bridge for the hook itself. Write it as instructions to the agent. Request the shared secret as a credential. Run `lucidos webhooks create` with the same event type the trigger subscribes to. Read back the delivery path, and hand the user the URL plus the exact steps to register it with the sender.
+
+**A plugin doing this should say so in its `description`.** The trigger goes live at install, subscribed to an event type nothing emits until setup finishes. If the user cancels the setup thread, or the create fails, the trigger sits there never firing and nothing warns anyone. The same failure mode as a half-done event rename. The `setup` text should verify the hook exists before it reports done.
 
 Concretely:
 

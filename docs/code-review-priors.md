@@ -798,6 +798,28 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`answerableQuestionId` reads the DOM rather than the thread projection, and
+  the staleness a reviewer sees is not removable by reading the store instead.**
+  `scrollState.ts` decides whether a send is really an answer by asking the
+  newest `.question-body`. Two reviewers flagged the same shape on the branch
+  that added it: use the send path's thread state, and drop
+  `question-body-terminated` from `DEAD_QUESTION_CLASSES` because a terminated
+  body carries no id anyway.
+
+  The DOM is not the weaker source here. `scrollState` may not import `store` at
+  all (see `parseNavigatedTurn`), and for a MULTI-SELECT answer the DOM is
+  strictly fresher: `setPendingAnswer` swaps in `AnsweredBody` on the tap, while
+  `effectiveThreadStatus` waits for SSE. For a typed answer neither knows until
+  the event lands, so moving the read to the store keeps the same window.
+  The window costs a landing anchored on the card instead of the new row, and
+  both rest at the live edge (ADR 0080).
+
+  The terminated entry is belt to a brace on purpose, matching `turnIsQueued`
+  in the same module: recognise a state POSITIVELY, never by an absent
+  attribute. An id added to `TerminatedQuestionBody` would otherwise make a dead
+  card answerable with nothing failing. Re-flag only if the module gains a
+  legitimate `store` import, or if the card stops carrying its state in a class.
+
 - **`tabIndex={-1}` on a toast or confirm-dialog scroll box takes away no
   keyboard scrolling, because that surface's own Tab cycle never reached it.**
   Chrome promotes an overflowing scroller to a Tab stop when it holds no
@@ -2973,3 +2995,42 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   its name at registration.
   (`crates/lucidos-app/src/components/settings/deviceList.ts`,
   `crates/lucidos-engine/src/core/devices.rs`.)
+
+- **The three underline affordances are not one class waiting to be extracted,
+  and the audience split is why.** `.accent-link`
+  (`styles/global/shared-components.css`), `.event-name-link`
+  (`styles/chat/event-rows.css`) and `.event-wait-subscription-filter`
+  (`styles/chat/waiting-indicator.css`) each carry a button reset plus the same
+  40% accent underline, ramping to full on hover. Read as copy-paste, that
+  argues for one shared atom the three compose with.
+
+  The first of the three cannot compose with anything. `shared-components.css`
+  is `include_str!`d by the engine and served to every app iframe. So a base
+  class living there ships to apps, and one living anywhere else is unreachable
+  from it. Moving `.accent-link` out is worse still, since it is
+  part of the documented app-facing class contract. That leaves a two-copy
+  extraction across two chat files, where the copies already differ in what
+  they do with colour: `.event-name-link` keeps its chip background and darkens
+  it on hover, and the other two only tint text.
+
+  Re-flag if a fourth copy appears. Re-flag too if the two chat rules converge
+  on identical colour behaviour, which would make a chat-local base class carry
+  its weight.
+
+- **Two glossary entries still say "panel-less" where the term is now
+  *Escape-only registrant*, and that is deliberate.** `docs/glossary.md`'s
+  § Overlay stack and § Thread filter panel each use the adjective in a
+  descriptive clause. A reviewer applying `.claude/rules/glossary.md`'s
+  one-name-root rule reads that as a half-finished rename.
+
+  Both clauses sit inside single-line paragraphs of ten and eight sentences,
+  several of them well over the word limit. `scripts/check-prose.sh` scores an
+  edited line as added. So retouching either one to swap two words makes every
+  pre-existing breach in that paragraph a failure to fix. `.claude/rules/prose.md`
+  forbids exactly that: "Never start a repo-wide sweep on your own." The term
+  itself IS defined once, in the paragraph appended to § Overlay stack. Neither
+  older clause claims to be a definition or an exhaustive list.
+
+  Re-flag when either paragraph is being rewritten for its own sake, which is
+  when the swap becomes free. Re-flag too if a THIRD spelling appears, since the
+  argument here is only that the two survivors are ordinary adjectives.

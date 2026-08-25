@@ -1,14 +1,24 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
+import { pushNativeWindowTitle } from '../utils/windowTitle';
 
-// Sync page title with unread count
+// Sync page title with unread count and workspace name
 effect(() => {
   document.title = pageTitle.value;
+});
+
+// Names the packaged window after the workspace it shows, so the macOS Window
+// menu lists two workspaces rather than "Lucidos" twice. A no-op in the
+// browser. Its own effect rather than a line in the one above. This title
+// carries no unread count, so it must not re-push on every count change. See
+// utils/windowTitle.ts.
+effect(() => {
+  void pushNativeWindowTitle(visibleWorkspaceName.value);
 });
 
 // PWA app-icon badge: mirror the unread count onto the installed PWA icon. What

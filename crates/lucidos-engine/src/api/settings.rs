@@ -84,8 +84,13 @@ pub(super) async fn write_grant_file(
 }
 
 /// PUT /api/v1/cc-allowed-tools — overwrite the file with the provided contents
-/// (atomic). Newly spawned Claude Code subprocesses pick this up immediately; in-flight
-/// subprocesses keep their frozen `--allowedTools` flag until they restart.
+/// (atomic).
+///
+/// The engine's own permission gate reads this file fresh on each prompt, so an
+/// ADDED pattern binds every live session at once (ADR 0125). A REMOVED one
+/// binds the gate just as fast. But an in-flight subprocess keeps its frozen
+/// `--allowedTools` flag until it respawns, and never asks the engine about a
+/// call that flag already covers.
 pub(super) async fn put_cc_allowed_tools(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -46,6 +46,7 @@ pub(crate) mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
 pub(crate) mod preferences;
+pub mod release_notices;
 mod session_seed;
 pub mod startup_lease;
 pub mod supervisor_respawn_sidecar;
@@ -376,6 +377,16 @@ pub struct LucidosEngine {
     /// trimmer needs the declared context window to size its budget.
     model_registry: crate::llm::model_registry::ModelRegistry,
     openai_api_key: Option<String>,
+    /// Threads with a *conversation summary* refresh in flight, claimed by
+    /// `SummaryInFlight`.
+    ///
+    /// The refresh is detached, so it outlives the turn that started it and a
+    /// later turn can arrive while it runs. Without this the same region is
+    /// summarised twice, which one thread did five turns running.
+    ///
+    /// Ephemeral by design. Losing it on restart permits a duplicate call and
+    /// nothing worse: the cache is the `ConversationSummarized` event.
+    summarizing_threads: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     rebuilding_memory: AtomicBool,
     cancel_rebuild: AtomicBool,
     /// Set once the engine has begun graceful shutdown or a restart (`main.rs`

@@ -236,6 +236,15 @@ pub struct SpawnArgs<'a> {
     /// `spawn_env::resolve_binary_override`). `None` (unset — every install
     /// before the preference existed) keeps the probe → PATH auto-detection.
     pub binary_override: Option<&'a str>,
+    /// The `coding_agent_claude_permission_mode` preference, verbatim, resolved
+    /// by `claude_code::resolve_permission_mode` at the point of use.
+    ///
+    /// Claude Code only. Its CLI `--permission-mode` outranks every settings
+    /// file, so a user cannot pick a mode any other way. `None`, and anything
+    /// the resolver does not recognise, means `acceptEdits`: the mode every
+    /// session ran before the preference existed. Codex has no equivalent and
+    /// ignores this field, as it ignores `claude_config_dir`.
+    pub permission_mode: Option<&'a str>,
 }
 
 /// An in-band permission request raised by the agent's own protocol — the

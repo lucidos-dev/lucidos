@@ -1226,7 +1226,7 @@ event that retires it.
   loop takes a `CuratedTurn`, runs the sweep and appends the tail.
   `engine/context.rs` carries `ProtectedAddresses`, `TrimGuards` and the
   mode-aware recovery clause. `llm/anthropic_wire.rs` anchors its cache marker
-  in front of a `ContentBlock::EngineTail`, and `SummaryPlan::needs_refresh`
+  in front of a `ContentBlock::EngineTail`, and `SummaryPlan::refresh_boundary`
   holds the summariser gate.
 - **Impermanent because:** it is one arm of an experiment, not a setting anyone
   is meant to live with. The mode ships dark so the benchmark can measure it

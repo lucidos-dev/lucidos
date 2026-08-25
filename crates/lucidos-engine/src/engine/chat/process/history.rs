@@ -2,6 +2,10 @@
 //! stringified `[CONVERSATION HISTORY]` block, the verbatim resume tool
 //! blocks, and the per-thread loaded-knowhow set from a single events fetch.
 //! Split out of `process_message_with_steps_internal`.
+//!
+//! **Every message here belongs to this thread** (ADR 0124). The one fetch is
+//! `get_thread_events`, so a turn cannot read another conversation. Cross-thread
+//! continuity is long-term memory's job.
 
 use crate::core::events::{image_handle, ImageRef};
 use crate::engine::context::{
@@ -60,11 +64,27 @@ impl LucidosEngine {
         // compressed by the party that knew what mattered.
         context_mode: super::context_mode::ContextMode,
     ) -> ChatHistoryLoad {
+        // Two turn shapes carry no conversation history, and both render the
+        // same empty load (ADR 0124). A trigger has no conversation. A send
+        // with no thread id has no history of its own, and it must not borrow
+        // anyone else's: it used to seed itself from the 32 most recently
+        // active threads, which is what put other conversations in this one's
+        // prompt. Memory recall runs on this turn like any other, so what
+        // carries across threads still reaches it.
+        if is_trigger || is_new_thread {
+            return ChatHistoryLoad {
+                resume_tool_blocks: Vec::new(),
+                loaded_knowhow_docs: Vec::new(),
+                history_context: String::new(),
+                conversation_summary: user_message.to_string(),
+                history_image_hashes: Vec::new(),
+            };
+        }
+
         // Resume tool blocks: full ToolUse + ToolResult Message pairs for the
         // most recent N tool calls (Phase 3). Pinned `load_knowhow` results
         // survive regardless of N — see
-        // `build_resume_tool_blocks_with_skip_ids`. Empty for triggers and
-        // the no-history path.
+        // `build_resume_tool_blocks_with_skip_ids`.
         let mut resume_tool_blocks: Vec<Message> = Vec::new();
         let mut resume_skip_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -85,72 +105,50 @@ impl LucidosEngine {
         // `None` before its first successful summarisation (ADR 0102).
         let mut cached_summary: Option<crate::core::store::CachedSummary> = None;
 
-        // Load conversation history from DB.
-        // For follow-ups, load only the thread's messages to avoid cross-thread leakage.
-        // If >HISTORY_COMPRESS_THRESHOLD messages, older messages are summarized via Flash
-        // and only the last HISTORY_RECENT_MESSAGES are included verbatim.
-        let (history_context, conversation_summary, history_image_hashes) = if !is_trigger {
-            // Follow-ups: scope to thread; new threads: load global recent messages.
-            //
-            // For follow-ups we fetch the thread's events ONCE and derive both
-            // the SessionMessage history (for stringified `[CONVERSATION
-            // HISTORY]` formatting) AND the verbatim resume tool blocks (most
-            // recent N + pinned `load_knowhow` results) from that single
-            // walk. The earlier shape did two separate DB calls
-            // (`get_thread_messages` then `get_thread_events`) for the same
-            // rows — same SQL, same thread_id, twice the round-trip — and
-            // also silently swallowed the second call's error, losing
-            // procedure context exactly when the bug Phase 3 fixes recurs.
-            let messages_result = if !is_new_thread {
-                match self
-                    .event_store
-                    .get_thread_events(&thread_id.to_string())
-                    .await
-                {
-                    Ok(events) => {
-                        // Engine restart loses the per-thread loaded-knowhow set
-                        // (in-memory only). Replay this thread's load_knowhow
-                        // ToolResult events into the store before deriving the
-                        // resume tool blocks so the dedupe in Phase 4 still
-                        // fires after a cold start. Idempotent — re-running on
-                        // the same events converges. Only replay when the slot
-                        // is empty, so this is a no-op on the warm path
-                        // (handler already populated it on the prior turn).
-                        let docs_empty = self.loaded_knowhow.for_thread(thread_id).await.is_empty();
-                        if docs_empty {
-                            self.loaded_knowhow
-                                .recover_for_thread(thread_id, &events)
-                                .await;
-                        }
-                        // Single fetch — every consumer below borrows from
-                        // this Vec instead of cloning anew.
-                        loaded_knowhow_docs = self.loaded_knowhow.for_thread(thread_id).await;
-                        cached_summary = crate::core::store::newest_conversation_summary(&events);
-                        let loaded_knowhow_ids: std::collections::HashSet<String> =
-                            loaded_knowhow_docs.iter().map(|d| d.id.clone()).collect();
-                        let (blocks, skip_ids) =
-                            crate::core::store::build_resume_tool_blocks_with_skip_ids(
-                                &events,
-                                crate::core::store::RESUME_VERBATIM_TOOL_TAIL,
-                                &loaded_knowhow_ids,
-                            );
-                        resume_tool_blocks = blocks;
-                        resume_skip_ids = skip_ids;
-                        Ok(crate::core::store::build_session_messages(&events))
+        // One fetch of this thread's events, several consumers, each borrowing
+        // from it rather than cloning anew. It yields the SessionMessage
+        // history, the resume tool blocks, the loaded knowhow and the cached
+        // summary. Fetching per consumer ran the same SQL repeatedly.
+        let (history_context, conversation_summary, history_image_hashes) = {
+            let messages_result = match self
+                .event_store
+                .get_thread_events(&thread_id.to_string())
+                .await
+            {
+                Ok(events) => {
+                    // Engine restart loses the per-thread loaded-knowhow set,
+                    // which is in memory only. Replaying this thread's
+                    // load_knowhow results keeps the dedupe below working after
+                    // a cold start. Idempotent, so only the empty slot needs
+                    // it: the warm path was populated on the prior turn.
+                    let docs_empty = self.loaded_knowhow.for_thread(thread_id).await.is_empty();
+                    if docs_empty {
+                        self.loaded_knowhow
+                            .recover_for_thread(thread_id, &events)
+                            .await;
                     }
-                    Err(e) => {
-                        log!(
-                            "[Chat] resume context load failed (DB error): {}; \
-                             orchestrator will resume without verbatim tool history",
-                            e
+                    loaded_knowhow_docs = self.loaded_knowhow.for_thread(thread_id).await;
+                    cached_summary = crate::core::store::newest_conversation_summary(&events);
+                    let loaded_knowhow_ids: std::collections::HashSet<String> =
+                        loaded_knowhow_docs.iter().map(|d| d.id.clone()).collect();
+                    let (blocks, skip_ids) =
+                        crate::core::store::build_resume_tool_blocks_with_skip_ids(
+                            &events,
+                            crate::core::store::RESUME_VERBATIM_TOOL_TAIL,
+                            &loaded_knowhow_ids,
                         );
-                        Err(e)
-                    }
+                    resume_tool_blocks = blocks;
+                    resume_skip_ids = skip_ids;
+                    Ok(crate::core::store::build_session_messages(&events))
                 }
-            } else {
-                self.event_store
-                    .get_recent_messages((HISTORY_RECENT_MESSAGES * 2 + 2) as i64, None)
-                    .await
+                Err(e) => {
+                    log!(
+                        "[Chat] resume context load failed (DB error): {}; \
+                         orchestrator will resume without verbatim tool history",
+                        e
+                    );
+                    Err(e)
+                }
             };
 
             match messages_result {
@@ -166,13 +164,8 @@ impl LucidosEngine {
                         messages
                     };
 
-                    // New threads pull history from multiple recent threads — their
-                    // images are irrelevant (and can consume hundreds of thousands of tokens).
-                    let prior_image_hashes: Vec<Vec<String>> = if is_new_thread {
-                        vec![]
-                    } else {
-                        filter_recent_history_image_hashes(&all_prior, MAX_HISTORY_IMAGE_MESSAGES)
-                    };
+                    let prior_image_hashes: Vec<Vec<String>> =
+                        filter_recent_history_image_hashes(&all_prior, MAX_HISTORY_IMAGE_MESSAGES);
 
                     // Per-message flag: is this message's image data included in the
                     // LLM context? Used by format_history_msg to annotate dropped
@@ -184,9 +177,8 @@ impl LucidosEngine {
                             .iter()
                             .map(|m| {
                                 if m.role == "user" {
-                                    let included = !is_new_thread
-                                        && user_idx >= cutoff
-                                        && !m.user_image_hashes.is_empty();
+                                    let included =
+                                        user_idx >= cutoff && !m.user_image_hashes.is_empty();
                                     user_idx += 1;
                                     included
                                 } else {
@@ -350,30 +342,20 @@ impl LucidosEngine {
                         let older = &all_prior[..split_point];
                         let recent = &all_prior[split_point..];
 
-                        let mut plan = SummaryPlan::for_region(older, cached_summary.as_ref());
+                        let plan = SummaryPlan::for_region(older, cached_summary.as_ref());
 
-                        // A refresh is attempted only once the uncovered turns
-                        // have piled up. Until then they render compacted, so
-                        // waiting costs a few hundred chars and no model call.
-                        //
-                        // Under the context mode there is no refresh at all. An
-                        // auxiliary model does not know what the thread is
-                        // doing, so it writes a generic precis and drops the one
-                        // constant the task needed. The working understanding
-                        // covers the same region, written by the party that
-                        // does know, and the compacted rendering is the
-                        // fallback.
-                        if plan.needs_refresh(context_mode) {
-                            let fresh = self
-                                .refresh_conversation_summary(
-                                    thread_id,
-                                    older,
-                                    &msg_image_starts,
-                                    &format_history_msg,
-                                    !is_new_thread,
-                                )
-                                .await;
-                            plan.apply_refresh(older, fresh);
+                        // Detached, so `plan` is what this turn renders either
+                        // way. A fresh paragraph reaches the NEXT turn through
+                        // the cache.
+                        if let Some(boundary) = plan.refresh_boundary(older, context_mode) {
+                            self.spawn_conversation_summary_refresh(
+                                thread_id,
+                                older,
+                                &msg_image_starts,
+                                &format_history_msg,
+                                boundary,
+                            )
+                            .await;
                         }
 
                         let covered = plan.covered();
@@ -398,8 +380,6 @@ impl LucidosEngine {
                 }
                 Err(_) => (String::new(), user_message.to_string(), vec![]),
             }
-        } else {
-            (String::new(), user_message.to_string(), vec![])
         };
 
         ChatHistoryLoad {
@@ -412,28 +392,76 @@ impl LucidosEngine {
     }
 }
 
+/// One thread's claim on the *conversation summary* refresh, released on drop.
+///
+/// Drop rather than an explicit release, so a task that panics still frees the
+/// thread. Otherwise one panic would stop that thread ever refreshing again.
+pub(super) struct SummaryInFlight {
+    threads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    thread_id: Uuid,
+}
+
+impl SummaryInFlight {
+    /// Claim `thread_id`, or `None` when a refresh is already running for it.
+    pub(super) fn claim(
+        threads: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+        thread_id: Uuid,
+    ) -> Option<Self> {
+        // A poisoned lock means a previous holder panicked mid-insert. The set
+        // is a duplicate-call guard, so reading through the poison costs at
+        // most one extra summary and keeps refreshes working.
+        let claimed = threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id);
+        claimed.then(|| Self {
+            threads: threads.clone(),
+            thread_id,
+        })
+    }
+}
+
+impl Drop for SummaryInFlight {
+    fn drop(&mut self) {
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.thread_id);
+    }
+}
+
 impl LucidosEngine {
-    /// Re-summarise this thread's older assistant turns, and cache the result.
+    /// Start a refresh of this thread's older assistant turns, and return.
     ///
-    /// `None` when the call failed, timed out or came back empty, and the
-    /// caller then keeps whatever summary it already had (ADR 0102). User
-    /// turns are deliberately not in the input.
-    async fn refresh_conversation_summary<F>(
+    /// **The paragraph is for the NEXT turn, never this one.** This turn has
+    /// already decided what it renders, from the cache as it stood. So the
+    /// model call is detached, and the user waits for none of it.
+    ///
+    /// Nothing is emitted unless the call returns a usable paragraph, which is
+    /// ADR 0102's ratchet: one success holds until a later success replaces it.
+    /// User turns are deliberately not in the input.
+    async fn spawn_conversation_summary_refresh<F>(
         &self,
         thread_id: Uuid,
         older: &[crate::core::store::SessionMessage],
         msg_image_starts: &[usize],
         format_msg: &F,
-        // Whether `older` is this thread's OWN history. A new thread's older
-        // region comes from `get_recent_messages`, which is other threads'
-        // messages. See the guard below for what that forbids.
-        thread_local: bool,
-    ) -> Option<String>
-    where
+        // The newest turn this paragraph will cover, from
+        // `SummaryPlan::refresh_boundary`. Resolving it before the call is what
+        // stops a turn buying a paragraph with nowhere to cache it.
+        boundary: Uuid,
+    ) where
         F: Fn(&crate::core::store::SessionMessage, bool, usize, usize) -> String,
     {
-        let extractor = self.extractor.as_ref()?;
-        let newest = older.iter().rposition(|m| m.role == "assistant")?;
+        let Some(extractor) = self.extractor.as_ref() else {
+            return;
+        };
+        let Some(in_flight) = SummaryInFlight::claim(&self.summarizing_threads, thread_id) else {
+            return;
+        };
+
+        // Formatting is pure and stays here, so the closure's borrows never
+        // have to outlive the turn. The task owns plain strings.
         let turns: Vec<String> = older
             .iter()
             .enumerate()
@@ -441,62 +469,61 @@ impl LucidosEngine {
             .map(|(i, m)| format_msg(m, false, msg_image_starts[i], i))
             .collect();
         let covered_count = turns.len();
+        let body = turns.join("\n");
+
         let purpose = crate::engine::ContextPurpose::ConversationSummary;
-        let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
         let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
-        // Record what actually ran. `is_extractor_default` asks the same
-        // question `provider_for_model` branches on, so the recorded name
-        // cannot drift from the model the call hit.
+        let provider = match extractor.provider_for_model(call.model(), call.attempt_timeout()) {
+            Ok(provider) => provider,
+            Err(e) => {
+                log!(
+                    "[Chat] Failed to build conversation-summary provider: {}",
+                    e
+                );
+                return;
+            }
+        };
+        // The provider that will actually run, so the recorded name cannot
+        // drift from the model the call hits.
         let recorded_model = if crate::engine::aux_purpose::is_extractor_default(call.model()) {
-            extractor.default_background_model().to_string()
+            provider.default_model().to_string()
         } else {
             call.model().to_string()
         };
-        let text = summarize_or_none(
-            extractor.summarize_conversation(&turns.join("\n"), &call, Some(&capture)),
-            covered_count,
-            call.deadline(),
-        )
-        .await?;
+        let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
+        let bus = self.event_bus.clone();
+        let effort = call.reasoning().map(str::to_string);
+        let deadline = call.deadline();
 
-        // A new thread must not cache. Its older region is a global recent
-        // window over OTHER threads. A row written from it would file their
-        // content as this thread's own, and its boundary would name an event
-        // this thread's history never contains. The paragraph still rides
-        // this turn, which is what the global window is for.
-        if !thread_local {
-            return Some(text);
-        }
-
-        // The cache is keyed on the boundary turn's address. Without one the
-        // next turn could not tell how far this paragraph reaches, so the
-        // paragraph rides this turn and is not persisted.
-        match older[newest]
-            .event_id
-            .as_deref()
-            .and_then(|id| Uuid::parse_str(id).ok())
-        {
-            Some(handle) => {
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event:
-                                crate::engine::thread_events::ThreadEvent::ConversationSummarized {
-                                    summary: text.clone(),
-                                    covers_through_event_id: handle,
-                                    covered_count: covered_count as u32,
-                                    model: recorded_model,
-                                },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[Chat] ConversationSummarized",
-                    )
-                    .await;
-            }
-            None => log!("[Chat] summary not cached: newest covered turn has no event id"),
-        }
-        Some(text)
+        tokio::spawn(async move {
+            // `in_flight` rides into the task and releases when it ends.
+            let _in_flight = in_flight;
+            // Under the purpose's whole-call deadline. The task is detached,
+            // so nothing else would ever stop it.
+            let summarized = crate::memory::MemoryExtractor::summarize_conversation(
+                provider.as_ref(),
+                &body,
+                effort.as_deref(),
+                Some(&capture),
+            );
+            let Some(text) = summarize_or_none(summarized, covered_count, deadline).await else {
+                return;
+            };
+            bus.emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::ConversationSummarized {
+                        summary: text,
+                        covers_through_event_id: boundary,
+                        covered_count: covered_count as u32,
+                        model: recorded_model,
+                    },
+                    meta: crate::engine::thread_events::EventMeta::NONE,
+                },
+                "[Chat] ConversationSummarized",
+            )
+            .await;
+        });
     }
 }
 
@@ -583,33 +610,37 @@ impl SummaryPlan {
         }
     }
 
-    /// Whether this turn re-summarises the older region.
+    /// The turn a fresh paragraph would be cached against, or `None` to skip.
     ///
-    /// Two conditions, both required. The uncovered turns must have piled up
-    /// past [`HISTORY_SUMMARY_REFRESH_AFTER`], and the context mode must be
-    /// off. Under the mode the model writes the notes itself. An auxiliary pass
-    /// over the same region is then a second summary, worse and for a fee
-    /// (ADR 0109).
-    pub(super) fn needs_refresh(&self, mode: super::context_mode::ContextMode) -> bool {
-        !mode.is_on() && self.uncovered > HISTORY_SUMMARY_REFRESH_AFTER
-    }
-
-    /// Take a fresh paragraph, which now covers every assistant turn here.
+    /// Pure, so the whole spend decision is testable without a model. Three
+    /// gates, all required:
     ///
-    /// `None` is the failure case and deliberately changes nothing. The
-    /// thread keeps whatever it had, so a summariser that lands once holds
-    /// even when every later call errors or times out.
-    pub(super) fn apply_refresh(
-        &mut self,
+    /// - The uncovered turns must have piled up past
+    ///   [`HISTORY_SUMMARY_REFRESH_AFTER`]. Below it they render compacted,
+    ///   which costs a few hundred chars against an auxiliary model call.
+    /// - The context mode must be off. Under it the model writes the notes
+    ///   itself, so a second pass over the same region is a worse summary at a
+    ///   fee (ADR 0109).
+    /// - The newest assistant turn must have a parseable event id. The cache
+    ///   is keyed on that address, so without one the next turn could not tell
+    ///   how far the paragraph reaches.
+    ///
+    /// The third gate is here rather than after the call because the answer
+    /// does not depend on the answer. Read late, it let a turn buy a paragraph
+    /// and then log that it had nowhere to put it.
+    pub(super) fn refresh_boundary(
+        &self,
         older: &[crate::core::store::SessionMessage],
-        fresh: Option<String>,
-    ) {
-        let Some(text) = fresh else {
-            return;
-        };
-        self.boundary = older.iter().rposition(|m| m.role == "assistant");
-        self.uncovered = 0;
-        self.text = Some(text);
+        mode: super::context_mode::ContextMode,
+    ) -> Option<Uuid> {
+        if mode.is_on() || self.uncovered <= HISTORY_SUMMARY_REFRESH_AFTER {
+            return None;
+        }
+        let newest = older.iter().rposition(|m| m.role == "assistant")?;
+        older[newest]
+            .event_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
     }
 
     /// The paragraph and its boundary, when both are present.

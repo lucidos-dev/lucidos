@@ -150,13 +150,47 @@
 }
 
 /* Wraps rather than ellipsizing. It is a list of event-type names joined by
-   " or " (`describeWaitSubscription`), so it breaks cleanly at a space, and now
+   " or " (`subscriptionLine`), so it breaks cleanly at a space, and now
    that the panel is capped to the thread pane an ellipsis would hide the very
    thing the row is answering: WHICH event this thread is watching for. */
 .event-wait-subscription {
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     word-break: break-word;
+}
+
+/* A filtered entry, which opens its condition. It stays part of the muted line
+   rather than becoming a chip: the transcript's `.event-name` is already an
+   accent chip on its own row, but here every entry sits inside one sentence and
+   chipping them would make the panel's quietest line its loudest.
+
+   So it inherits the line's colour and takes ONLY the underline, drawn in the
+   accent at the same 40% strength `.accent-link` and `.event-name-link` use, so
+   "there is more behind this" reads the same wherever it appears. */
+.event-wait-subscription-filter {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    /* Family and size come from `base.css`'s control default, which inherits
+       them from the `<code>` around this. Weight and leading are named because
+       the UA button box supplies its own; the `font` shorthand would carry all
+       four and is banned (.claude/rules/frontend-css.md), since it also resets
+       font-feature-settings and hands a Fira Code user ligatures back. */
+    font-weight: inherit;
+    line-height: inherit;
+    color: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+}
+
+@media (hover: hover) {
+    .event-wait-subscription-filter:hover {
+        color: var(--accent);
+        text-decoration-color: var(--accent);
+    }
 }
 
 /* The row's fixed-size chrome, on one line under the reason: state and

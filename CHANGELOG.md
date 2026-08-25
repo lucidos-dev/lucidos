@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.30.0 — 2026-08-25
+
+### Added
+
+- **Release notices.** The first open after an upgrade shows what the new version needs from you, one notice at a time, each with a button that does it. Everything still owed is listed under Settings > System > What's New, in a "What you need to do" section.
+- **A private or internal git repo works as a plugin marketplace.** Add a row in Settings > Credentials with the clone host as its Base URL (`https://github.com`, Bearer Token) and the marketplace scan, the plugin install and `git_clone` all authenticate with it. A narrower Base URL wins, so an org-scoped token overrides a host-wide one.
+- **Switch a provider off in Settings > Models > Providers.** An off provider leaves the model picker and web search with no restart, and its stored key is kept, so you can park a key and pick it up later.
+- **Choose Claude Code's permission mode in Settings.** Accept edits cards anything outside the session's working directories. Auto lets Claude Code's safety classifier approve routine actions instead. Applies to new sessions.
+- **A launch reopens every workspace window you had open**, each at its own size and position.
+- **Each window is named after its workspace.** The macOS Window menu and the browser tab both carry the workspace name, and the tab keeps its unread count.
+- **What's New offers a release newer than the one running.** Where this session can install it, the row carries Update & restart.
+
+### Changed
+
+- A coding-agent session writes to the workspace data directory and to its scratch directory without a permission card. A symlinked data directory is refused.
+- A new thread carries no other conversation's messages in its prompt. Cross-thread continuity comes from long-term memory, which already runs on the first turn.
+- The conversation summariser runs off the turn's critical path, so a chat turn starts its first step without waiting for it.
+
+### Fixed
+
+- Only the top overlay answers an outside click. A declined pointerdown consumes its paired click, and a cancelled gesture leaves nothing behind to swallow the next tap.
+- The model menu dismisses on an outside click while a reasoning tier row is open.
+- The transcript holds the end of the thread through a step-log reveal, on a transcript that fits its pane as well as one that overflows.
+- A typed answer lands on the question card it answers.
+- A trigger fire says which kind it is: a scheduled occurrence, or an event match naming the matched event type.
+- Check for Updates reports its own verdict, and refuses a second click while one is in flight.
+- The waiting panel's filtered subscription line opens the condition it filters on.
+- Always allow binds the session it was clicked in.
+- A tool call held at a permission card reads as gated, and a refused one reads as refused.
+- The workspace name suggestions on the create form are offered on the first run only.
+- Both welcome screens share the composer's content box.
 ## v0.29.0 — 2026-08-25
 
 ### Added

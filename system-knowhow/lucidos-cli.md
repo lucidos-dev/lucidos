@@ -161,6 +161,27 @@ $ echo '# notes' | lucidos data write artifacts/ticket-workflow/node-types-and-a
 
 **Linking an artifact in chat — use the bare store path, never a scheme.** The clickable form is the `data/`-rooted path with no URL scheme (e.g. `artifacts/ticket-workflow/node-types-and-attributes.md`, or with the leading `data/`); the frontend's path linkifier rewrites it into a file-preview link. There is **no `artifact:` or `file:` scheme** — inventing one (by analogy to `thread:`/`app:`) produces a dead link the browser can't resolve. Paste the stdout link verbatim, or keep its target and swap the label for something friendlier: `[OST node types & attributes](artifacts/ticket-workflow/node-types-and-attributes.md)`.
 
+### `lucidos data-store add <name> <source-dir>`
+
+Move a directory to `~/.lucidos/data/<name>/` and print the absolute path.
+This is the one subcommand that never talks to the engine: it is a plain
+filesystem move, so it works with no workspace and no running engine.
+
+It is for a **bulk reference corpus the user wants to keep, but not inside any
+one workspace**. The store is cross-workspace and persistent, a sibling of
+`~/.lucidos/knowhow/`. When to reach for it, and what belongs in
+`artifacts/imported/` instead, is rule 8 in `system-knowhow/best-practices.md`.
+
+```bash
+$ lucidos data-store add sheet-music-corpus ~/Downloads/wikifonia
+/Users/me/.lucidos/data/sheet-music-corpus
+```
+
+`<name>` is a single path segment. A slash, a backslash, or a leading dot is
+refused. An existing destination is refused too, and the source is left
+untouched, so a re-run never merges two corpora by accident. Pin the printed
+path in the consuming app's knowhow, since nothing else records where it went.
+
 ### `lucidos events emit <EventType> --payload <json> [--summary <str>]`
 
 POST a domain event to the parent workspace's event store.

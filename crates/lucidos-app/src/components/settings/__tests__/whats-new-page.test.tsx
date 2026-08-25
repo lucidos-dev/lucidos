@@ -11,6 +11,8 @@ import {
   releaseRowIsOpen,
   releaseNotesBody,
   offeredRelease,
+  releaseRowAction,
+  releaseRowStatus,
   stripReleaseHeading,
   defaultOpenRelease,
 } from '../WhatsNewPage';
@@ -216,5 +218,74 @@ describe('offeredRelease', () => {
     // NOT fall back to the installed changelog: that would show the notes for
     // the version already running under a heading naming a different one.
     expect(offeredRelease('9.9.9', null)).toBe(null);
+  });
+});
+
+/**
+ * A changelog row can now be acted on.
+ *
+ * The panel lists the PUBLISHED changelog, so it can carry a release newer than
+ * the running one. It could say nothing about that and offer nothing, which is
+ * what the report was: the update is right there on screen and unreachable.
+ */
+describe('releaseRowStatus', () => {
+  it('marks the running release', () => {
+    expect(releaseRowStatus('0.28.0', '0.28.0', null)).toBe('running');
+  });
+
+  it('marks the release on offer', () => {
+    expect(releaseRowStatus('0.29.0', '0.28.0', '0.29.0')).toBe('available');
+  });
+
+  // The two sources are independent: the changelog is fetched from the public
+  // mirror, and the offer comes from the gateway's own periodic poll.
+  it('marks a published release the check has not offered', () => {
+    expect(releaseRowStatus('0.29.0', '0.28.0', null)).toBe('newer');
+  });
+
+  it('marks nothing older than the running release', () => {
+    expect(releaseRowStatus('0.27.0', '0.28.0', null)).toBe('none');
+    expect(releaseRowStatus('0.27.0', '0.28.0', '0.29.0')).toBe('none');
+  });
+
+  // /health can answer after the changelog does. Guessing in that window would
+  // put a Newer chip on every row in the list.
+  it('marks nothing while the running release is unknown', () => {
+    expect(releaseRowStatus('0.29.0', null, null)).toBe('none');
+  });
+
+  it('still marks the offer while the running release is unknown', () => {
+    expect(releaseRowStatus('0.29.0', null, '0.29.0')).toBe('available');
+  });
+
+  // On a dev workspace the running release is a CalVer app build id, whose
+  // first component outranks every release. The comparison is the shared one,
+  // so the list reads as history rather than as a wall of Newer chips.
+  it('marks nothing against a running version that outranks the list', () => {
+    expect(releaseRowStatus('0.29.0', '2026.8.13.1', null)).toBe('none');
+  });
+});
+
+describe('releaseRowAction', () => {
+  it('offers the install for the release actually on offer', () => {
+    expect(releaseRowAction('available', true)).toBe('install');
+  });
+
+  // A browser or PWA session and a headless install can both see the offer and
+  // neither can act on it. Their route is Settings, System.
+  it('offers no install where this session cannot install', () => {
+    expect(releaseRowAction('available', false)).toBeNull();
+  });
+
+  // The updater installs whatever the manifest resolves, so a row cannot ask
+  // for a version by name. A check is what could turn this row into an offer.
+  it('offers a check for a published release the updater has not offered', () => {
+    expect(releaseRowAction('newer', true)).toBe('check');
+    expect(releaseRowAction('newer', false)).toBe('check');
+  });
+
+  it('offers nothing on the running release or an older one', () => {
+    expect(releaseRowAction('running', true)).toBeNull();
+    expect(releaseRowAction('none', true)).toBeNull();
   });
 });

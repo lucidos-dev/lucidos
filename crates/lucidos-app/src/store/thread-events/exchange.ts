@@ -26,6 +26,20 @@ export type Exchange = {
    *  markers are stale — a pending TOOL step can still be resolved by a result
    *  that re-routes back by tool id. */
   continuationMoved?: boolean;
+  /** `seq` of every tool call in this exchange that a permission card is
+   *  holding, and of every one a decision refused. The renderer reads them at
+   *  the `ToolCalled` / `CodingAgentToolCalled` case and emits `'blocked'` /
+   *  `'denied'` in place of `'pending'` (see `StepOutcome`).
+   *
+   *  They live on the Exchange because the request is an exchange STARTER. The
+   *  call it gates therefore sits in the PREVIOUS exchange, and nothing in this
+   *  one's own steps could say so. The fold writes them, being the only layer
+   *  holding both sides: `toolCallOwners` maps the CC / Codex `tool_use_id` to
+   *  the owning exchange, and `gatedCalls` carries the pair forward so the
+   *  resolution finds the same row. Undefined until a card gates something, so
+   *  a thread that never sees one allocates nothing. */
+  blockedStepSeqs?: Set<number>;
+  deniedStepSeqs?: Set<number>;
   /** Mutation counter for the incremental grouping cache. The cached fold
    *  mutates Exchange objects IN PLACE on later appends (steps push,
    *  questionOvertaken flip, absorb re-anchor), so a memo comparing

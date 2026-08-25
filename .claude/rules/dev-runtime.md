@@ -24,6 +24,7 @@ paths:
   - "scripts/lib/prose_scan*.sh"
   - "scripts/check-adrs.sh"
   - "scripts/check-context-budget.sh"
+  - "scripts/check-knowhow-refs.sh"
   - "scripts/check-prompt-mirror.sh"
   - "scripts/check-build-script-paths.sh"
   - "scripts/check-eval-not-a-test.sh"
@@ -101,6 +102,7 @@ opt-in itself, and never starts a gateway.
 ./scripts/check-em-dashes.sh [--base <ref>]  # Fail if the branch ADDS a U+2014 / U+2015 (diff-scoped; /harden Phase 4.5 runs it for every diff). Rule + rationale: .claude/rules/no-em-dashes.md
 ./scripts/check-prose.sh [--base <ref>]     # Fail if the branch ADDS a comment block over 20 lines, a sentence over 25 words, a paragraph over 6 sentences, or an ISO date in a comment (diff-scoped; /harden Phase 4.5, every diff). Rule + rationale: .claude/rules/prose.md
 ./scripts/check-context-budget.sh [--report] # Fail if the always-loaded instruction set grew past its ceiling, or if a rule meant to be path-scoped went resident (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
+./scripts/check-knowhow-refs.sh           # Fail if a system-knowhow file names a repo path or sibling knowhow id that does not exist, cites an event no engine enum has, or uses a severity outside workspace-audit.md's legend (whole-tree; /harden Phase 4.5, every diff). Rule: .claude/rules/system-knowhow.md
 ./scripts/check-prompt-mirror.sh [--report]  # Fail if the one deliberately mirrored rule (process safety, ADR 0025) lost either half (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
 ./scripts/check-build-script-paths.sh [--report] # Fail if a cargo build script bakes its checkout path with compile-time `env!` instead of reading it at run time (whole-tree; /harden Phase 4.5, every diff). Rationale: ADR 0079
 ./scripts/check-eval-not-a-test.sh        # Fail if the context-handling benchmark became reachable from `cargo test` (= make lint-eval; part of make lint / make check). Rationale: ADR 0087 decision 15

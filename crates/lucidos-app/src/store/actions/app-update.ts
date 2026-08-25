@@ -1,4 +1,4 @@
-import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateProgress, releaseCheck } from '../store';
+import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, releaseCheck } from '../store';
 import { openWhatsNew, openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
@@ -33,6 +33,10 @@ let subscribing = false;
  *  not raise a second offer for the same release. The same dedupe the plugin
  *  marketplace scan keeps in `plugin-update-notice.json`, one layer up. */
 let lastOfferedVersion: string | null = null;
+/** The user-initiated check in flight, or `null`. Holding the PROMISE is what
+ *  makes a second caller join the first rather than race it: a bare boolean
+ *  would let the loser resolve with nothing. See {@link checkForUpdatesNow}. */
+let inFlightCheck: Promise<UpdateCheckVerdict> | null = null;
 /** Whether {@link latestTauriAppVersion} holds a value the CLIENT check wrote.
  *
  *  Gates the clear-on-no-update path so the client check never wipes a value it
@@ -40,6 +44,24 @@ let lastOfferedVersion: string | null = null;
  *  which is indistinguishable from "up to date". Assigning that null would
  *  clobber the version `connection.ts` reads from the engine's `/health`. */
 let clientOwnsLatestVersion = false;
+
+/** What a check concluded, as the thing the CALLER acts on.
+ *
+ *  The verdict travels as a return value rather than being re-read off the
+ *  signals afterwards. Those signals are also written by the background poll,
+ *  so a reader could otherwise report one request's state having awaited
+ *  another's. That is what showed "Lucidos is up to date" a moment before the
+ *  offer toast for the release it had just found. */
+export type UpdateCheckVerdict =
+  /** A newer release is available to this install. */
+  | { kind: 'available'; version: string }
+  /** The check ran and found nothing newer. */
+  | { kind: 'up-to-date' }
+  /** The check failed, or there was none this session could run. `reason` is
+   *  user-facing. */
+  | { kind: 'failed'; reason: string }
+  /** An install is already under way, so its own narration is the answer. */
+  | { kind: 'installing' };
 
 /** Surface the "Lucidos <v> available" offer.
  *
@@ -178,7 +200,7 @@ export function stopAppUpdateProgress(): void {
  *  and is owed an answer to, so that one records the failure.
  *
  *  `force` is that button asking for a poll now. */
-export async function refreshReleaseCheck(force = false): Promise<void> {
+export async function refreshReleaseCheck(force = false): Promise<UpdateCheckVerdict> {
   try {
     releaseCheck.value = await requestUpdateCheck(force);
   } catch (e) {
@@ -187,8 +209,9 @@ export async function refreshReleaseCheck(force = false): Promise<void> {
     // retries. Settings → System falls back to the client check while the
     // gateway announces nothing at all.
     console.warn('[app-update] gateway release check unavailable; retried on next resume', e);
-    if (force) appUpdateCheckError.value = errorDetail(e);
-    return;
+    const reason = errorDetail(e);
+    if (force) appUpdateCheckError.value = reason;
+    return { kind: 'failed', reason };
   }
   // A poll that FAILED must never read as "you are up to date", so the
   // gateway's own verdict drives the persistent Settings notice. Cleared by
@@ -199,13 +222,80 @@ export async function refreshReleaseCheck(force = false): Promise<void> {
   // Available row cannot end up describing a different release. The origin may
   // carry none, and then there is simply no link.
   latestTauriAppNotes.value = latest?.notes ?? null;
-  if (!latest) return;
-  if (lastOfferedVersion === latest.version) return;
+  if (!latest) {
+    // A stale answer plus a failed poll is not "up to date": the gateway has
+    // nothing newer to report BECAUSE it could not ask.
+    const lastError = releaseCheck.value.last_error;
+    return lastError ? { kind: 'failed', reason: lastError } : { kind: 'up-to-date' };
+  }
   // An update already running owns the shared toast key, and its narration is
   // a far more specific answer than a fresh offer would be.
-  if (appUpdateProgress.value) return;
-  lastOfferedVersion = latest.version;
-  offerAppUpdate(latest.version, latest.install);
+  if (appUpdateProgress.value) return { kind: 'installing' };
+  // The dedupe keeps a repeat BACKGROUND poll from re-offering on every resume.
+  // A forced check is a click, and a click is owed a reply: without the bypass,
+  // asking again after dismissing the toast produced nothing at all.
+  if (lastOfferedVersion !== latest.version || force) {
+    lastOfferedVersion = latest.version;
+    offerAppUpdate(latest.version, latest.install);
+  }
+  return { kind: 'available', version: latest.version };
+}
+
+/** The single user-initiated check, shared by every control that offers one.
+ *
+ *  It owns three things no caller should re-derive. The in-flight signal, so
+ *  the control can report itself and refuse a second start. The single flight,
+ *  so two overlapping clicks make one request and share one answer. And the
+ *  verdict, returned rather than read back off the signals.
+ *
+ *  The gateway owns the check (ADR 0108), so that is the first choice. The
+ *  client's own Tauri updater is the ADR 0105 fallback. It is taken only where
+ *  the gateway announces nothing at all, which means one too old to carry the
+ *  field. */
+export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
+  if (inFlightCheck) return inFlightCheck;
+  appUpdateCheckInFlight.value = true;
+  inFlightCheck = runUserCheck().finally(() => {
+    inFlightCheck = null;
+    appUpdateCheckInFlight.value = false;
+  });
+  return inFlightCheck;
+}
+
+/** The label an update control wears, in all three of its states.
+ *
+ *  Every word here, so Settings and What's New cannot drift apart. Handing each
+ *  surface its own idle string is what let them ship as "Check for Updates" and
+ *  "Check for updates" at once.
+ *
+ *  Paired with `disabled`, the in-flight word is also the whole of the feedback
+ *  a fast check needs. A spinner would be a second gate on top of this one. */
+export function updateControlLabel(checking: boolean, canInstall: boolean): string {
+  if (checking) return 'Checking…';
+  return canInstall ? 'Update & Restart' : 'Check for Updates';
+}
+
+/** Say what a user-initiated check concluded.
+ *
+ *  One wording for every control that offers a check, so Settings and What's
+ *  New cannot answer the same click differently. `available` and `installing`
+ *  are deliberately silent: the offer toast and the progress dialog have
+ *  already said more than a second toast could. */
+export function reportUpdateCheck(verdict: UpdateCheckVerdict): void {
+  if (verdict.kind === 'up-to-date') showToast('Lucidos is up to date', 'success');
+  else if (verdict.kind === 'failed') {
+    showToast(`Couldn't check for updates: ${verdict.reason}`, 'error');
+  }
+}
+
+async function runUserCheck(): Promise<UpdateCheckVerdict> {
+  if (appUpdateProgress.value) return { kind: 'installing' };
+  if (releaseCheck.value) return refreshReleaseCheck(true);
+  if (isTauri()) return checkAppUpdateViaClient();
+  // No gateway answer and no client updater: a browser or PWA session on a
+  // direct engine port. It cannot learn about a release at all, so "up to date"
+  // would be a guess dressed up as an answer.
+  return { kind: 'failed', reason: 'this session has no update check to run' };
 }
 
 /** Ask the Tauri updater directly. The ADR 0105 degradation for a gateway too
@@ -215,9 +305,9 @@ export async function refreshReleaseCheck(force = false): Promise<void> {
  *  User-initiated only, and on no timer. The outcome is recorded so the
  *  persistent Settings surface can report a failed check rather than let it look
  *  like "you are up to date". */
-export async function checkAppUpdateViaClient(): Promise<void> {
-  if (!isTauri()) return;
-  if (appUpdateProgress.value) return;
+export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
+  if (!isTauri()) return { kind: 'failed', reason: 'no client updater in this session' };
+  if (appUpdateProgress.value) return { kind: 'installing' };
   let offer: AppUpdateOffer | null;
   try {
     offer = await checkAppUpdate();
@@ -225,8 +315,9 @@ export async function checkAppUpdateViaClient(): Promise<void> {
     // Through `errorDetail` because the rejection is no longer always Rust's own
     // error string: an unreadable IPC payload arrives as an Error, and `String`
     // would put its "Error: " prefix in front of the reason on the System page.
-    appUpdateCheckError.value = errorDetail(e);
-    return;
+    const reason = errorDetail(e);
+    appUpdateCheckError.value = reason;
+    return { kind: 'failed', reason };
   }
   appUpdateCheckError.value = null;
   // The notes travel WITH the version, written and cleared on the same branches,
@@ -237,11 +328,14 @@ export async function checkAppUpdateViaClient(): Promise<void> {
     latestTauriAppNotes.value = offer.notes;
     clientOwnsLatestVersion = true;
     offerAppUpdate(offer.version, 'desktop-app');
-  } else if (clientOwnsLatestVersion) {
+    return { kind: 'available', version: offer.version };
+  }
+  if (clientOwnsLatestVersion) {
     latestTauriAppVersion.value = null;
     latestTauriAppNotes.value = null;
     clientOwnsLatestVersion = false;
   }
+  return { kind: 'up-to-date' };
 }
 
 /** The newer version available to install, or `null`.

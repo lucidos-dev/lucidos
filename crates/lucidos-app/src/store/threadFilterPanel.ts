@@ -5,8 +5,9 @@ import { pushOverlay, removeOverlay } from './overlayStack';
  *  pane, not something floating over other UI, so it neither dismisses on an
  *  outside click nor makes anything inert), but Escape should still close it,
  *  and Escape has exactly one owner app-wide: the LIFO `overlayStack` the
- *  central dispatcher pops. Same panel-less registration `ContentHeaderActions`
- *  uses for pseudo-fullscreen. */
+ *  central dispatcher pops. It registers as an *Escape-only registrant*, the
+ *  same way `ContentHeaderActions` does for pseudo-fullscreen: `hasPanel:
+ *  false`, so `topPanelOverlay` steps over it and no pointer reaches here. */
 const OVERLAY_ID = 'thread-filter-panel';
 
 /** Showing the filters is a state OF THE DRAWER, so it survives a reload the
@@ -37,7 +38,7 @@ function setPanelOpen(open: boolean): void {
 }
 
 function syncEscapeRegistration(): void {
-  if (threadFilterPanelOpen.value) pushOverlay({ id: OVERLAY_ID, dismiss: closeThreadFilterPanel });
+  if (threadFilterPanelOpen.value) pushOverlay({ id: OVERLAY_ID, dismiss: closeThreadFilterPanel, hasPanel: false });
   else removeOverlay(OVERLAY_ID);
 }
 

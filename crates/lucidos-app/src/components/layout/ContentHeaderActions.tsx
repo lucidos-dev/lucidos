@@ -90,7 +90,7 @@ export function ContentHeaderActions({ layout }: Props) {
   // Escape listener (which would race the dispatcher).
   useEffect(() => {
     if (!isPseudo) return;
-    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitPseudoFullscreen });
+    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitPseudoFullscreen, hasPanel: false });
     return () => removeOverlay('pseudo-fullscreen');
   }, [isPseudo]);
 

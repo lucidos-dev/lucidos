@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{
     compare_versions, detect_conflicts, validate_tree, PlannedFile, UpdateDecision,
     AUTH_MODULES_DIR,
@@ -37,8 +38,8 @@ use registry::{
     resolve_plugin_query, PluginBaseline,
 };
 use source::{
-    copy_atomic, detect_source, fetch_source, git_file_mode, write_atomic, write_atomic_like,
-    SourceType,
+    copy_atomic, credentials_for_source, detect_source, fetch_source, git_file_mode, write_atomic,
+    write_atomic_like, SourceType,
 };
 
 /// Every installed plugin's merge baseline, keyed by plugin id. Resolved before
@@ -175,10 +176,11 @@ impl LucidosEngine {
                         ));
                     }
                 };
-                let remote = match fetch_remote_manifest(&self.workspace_path, &source).await {
-                    Ok(m) => m,
-                    Err(e) => return Err(format!("Error: fetch latest manifest: {}", e)),
-                };
+                let remote =
+                    match fetch_remote_manifest(&self.workspace_path, &self.pool, &source).await {
+                        Ok(m) => m,
+                        Err(e) => return Err(format!("Error: fetch latest manifest: {}", e)),
+                    };
                 if compare_versions(&installed_version, &remote.version)
                     == UpdateDecision::AlreadyLatest
                 {
@@ -265,8 +267,10 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
             PluginBaselines::new()
         }
     };
+    // The staging body is synchronous, so its credentials are resolved here.
+    let credentials = credentials_for_source(&engine.pool, source_str).await;
     match tokio::task::spawn_blocking(move || {
-        prepare_install_request(&workspace, &pending, &source, &baselines)
+        prepare_install_request(&workspace, &pending, &source, &baselines, &credentials)
     })
     .await
     {
@@ -329,15 +333,17 @@ pub(crate) fn prepare_install_request(
     pending_installs: &std::sync::Arc<PendingInstallsMap>,
     source_str: &str,
     baselines: &PluginBaselines,
+    credentials: &GitCredentials,
 ) -> String {
     let source = match detect_source(source_str) {
         Ok(s) => s,
         Err(e) => return format!("Error: {}", e),
     };
-    let (scratch, plugin_root, source_type) = match fetch_source(workspace_path, &source) {
-        Ok(t) => t,
-        Err(e) => return format!("Error: {}", e),
-    };
+    let (scratch, plugin_root, source_type) =
+        match fetch_source(workspace_path, &source, credentials) {
+            Ok(t) => t,
+            Err(e) => return format!("Error: {}", e),
+        };
     let (manifest, planned) = match validate_tree(&plugin_root) {
         Ok(t) => t,
         Err(e) => return format!("Error: {}", e),

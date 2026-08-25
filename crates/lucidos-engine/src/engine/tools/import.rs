@@ -402,6 +402,11 @@ impl LucidosEngine {
                     })
                     .unwrap_or_default();
 
+                // Both routes below clone the same URL, and the clone itself is
+                // synchronous, so its credentials are resolved out here.
+                let credentials =
+                    crate::core::git_auth::GitCredentials::resolve_one(&self.pool, url).await;
+
                 let dest_subdir = match dest_route {
                     GitCloneRoute::Tmp(sub) => {
                         let target = self.workspace_path.join(crate::core::TMP_DIR).join(&sub);
@@ -421,18 +426,17 @@ impl LucidosEngine {
                             ));
                         }
                         log!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", url, target);
-                        {
-                            let mut builder = git2::build::RepoBuilder::new();
-                            let mut fetch_opts = git2::FetchOptions::new();
-                            fetch_opts.depth(1);
-                            if let Some(ref b) = branch {
-                                builder.branch(b);
-                            }
-                            builder.fetch_options(fetch_opts);
-                            if let Err(e) = builder.clone(url, &target) {
-                                let _ = std::fs::remove_dir_all(&target);
-                                return Ok(format!("Error: Failed to clone repository: {}", e));
-                            }
+                        // The repo drops at the end of this statement: git2
+                        // types are not Send, and there is async work below.
+                        if let Err(e) = crate::core::git_auth::shallow_clone(
+                            url,
+                            branch.as_deref(),
+                            &target,
+                            &credentials,
+                        ) {
+                            let _ = std::fs::remove_dir_all(&target);
+                            // `e` already names the clone and the fix.
+                            return Ok(format!("Error: {}", e));
                         }
                         return Ok(format!(
                             "[ACTION COMPLETED] CLONED TO TMP: {} → .lucidos/tmp/{}/ (ephemeral, gitignored, not indexed). \
@@ -448,22 +452,17 @@ impl LucidosEngine {
                     std::env::temp_dir().join(format!("lucidos_clone_{}", Uuid::new_v4()));
                 log!(@git_clone, "Cloning {} to {:?}", url, temp_dir);
 
-                {
-                    // Build clone options - these types are not Send so must be dropped before await
-                    let mut builder = git2::build::RepoBuilder::new();
-                    let mut fetch_opts = git2::FetchOptions::new();
-                    fetch_opts.depth(1); // Shallow clone for speed
-
-                    if let Some(ref b) = branch {
-                        builder.branch(b);
-                    }
-                    builder.fetch_options(fetch_opts);
-
-                    if let Err(e) = builder.clone(url, &temp_dir) {
-                        let _ = std::fs::remove_dir_all(&temp_dir);
-                        return Ok(format!("Error: Failed to clone repository: {}", e));
-                    }
-                    // builder and fetch_opts dropped here
+                // The repo drops at the end of this statement: git2 types are
+                // not Send, and there is async work below.
+                if let Err(e) = crate::core::git_auth::shallow_clone(
+                    url,
+                    branch.as_deref(),
+                    &temp_dir,
+                    &credentials,
+                ) {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    // `e` already names the clone and the fix.
+                    return Ok(format!("Error: {}", e));
                 }
 
                 // Default exclusions

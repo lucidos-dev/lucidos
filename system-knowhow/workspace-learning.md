@@ -176,4 +176,4 @@ Each run gets its own timestamped directory. Don't overwrite previous reports â€
 
 ## Maintenance
 
-When event types are added, renamed, or retired (especially the friction signals in "What to walk"), this recipe's checks may go stale. See the `Maintaining workspace-learning` section in the repo's `CLAUDE.md` for the rule that governs when this file must be updated alongside event schema changes.
+When event types are added, renamed, or retired (especially the friction signals in "What to walk"), this recipe's checks may go stale. See the `Maintaining workspace-learning` section in the repo's `.claude/rules/system-knowhow.md` for the rule that governs when this file must be updated alongside event schema changes.

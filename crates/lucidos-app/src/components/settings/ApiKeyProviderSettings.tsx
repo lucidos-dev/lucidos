@@ -2,8 +2,9 @@ import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { credentials } from '../../store/store';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
+import type { SwitchableProvider } from '../../store/actions/preferences';
 import { findProviderCredential } from './providerCredential';
-import { Explainer } from '../shared/Explainer';
+import { ProviderBlock } from './ProviderBlock';
 
 /** Shared block for a provider that authenticates with a single API key stored
  *  as an `api_key` credential (OpenAI, OpenRouter, xAI). The secret is
@@ -12,8 +13,9 @@ import { Explainer } from '../shared/Explainer';
  *  `SettingsView`. Providers with extra knobs (Anthropic's auth kind, Local's
  *  base URL) keep their own components. */
 export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, note }: {
-  /** Credential service name the engine reads (`openai`, `openrouter`, `xai`). */
-  service: string;
+  /** Credential service name the engine reads. It doubles as the provider id,
+   *  which is what the enable switch and `/health` are keyed on. */
+  service: SwitchableProvider;
   baseUrl: string;
   /** Row label, e.g. "OpenAI (direct)". */
   label: string;
@@ -42,26 +44,26 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
   }
 
   return (
-    <>
-      <div class="settings-row">
-        <span class="settings-row-label">
-          {label}
-          <Explainer title={label}>{note}</Explainer>
-          {/* `.list-row-details` is `display: flex`, so this span is a block box
-              inside the label's line and renders UNDER it. A manual "·" glue
-              would therefore be stranded at the start of that new line, the
-              same artifact the rule in `.claude/rules/frontend.md` names. */}
-          {existing && <span class="list-row-details">configured</span>}
-        </span>
-        {existing && (
-          <button
-            class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(existing.id, service)}
-          >
-            Remove
-          </button>
-        )}
-      </div>
+    <ProviderBlock
+      id={service}
+      label={label}
+      anchor={`models:${service}`}
+      explainer={note}
+      hasStoredConfig={!!existing}
+      /* `.list-row-details` is `display: flex`, so this span is a block box
+         inside the label's line and renders UNDER it. A manual "·" glue would
+         therefore be stranded at the start of that new line, the same artifact
+         the rule in `.claude/rules/frontend.md` names. */
+      detail={existing ? <span class="list-row-details">configured</span> : null}
+      actions={existing && (
+        <button
+          class="action-btn action-btn-danger"
+          onClick={() => void deleteCredential(existing.id, service)}
+        >
+          Remove
+        </button>
+      )}
+    >
       <div class="settings-row">
         <span class="settings-row-label">{existing ? 'Replace secret' : 'Secret'}</span>
         <input
@@ -82,6 +84,6 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
           {existing ? 'Update' : 'Save'}
         </button>
       </div>
-    </>
+    </ProviderBlock>
   );
 }

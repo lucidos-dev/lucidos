@@ -79,12 +79,12 @@ describe('dialogOwnsKey with a body-focused keystroke and a stacked overlay', ()
   const promptPanel = panelWithId('overlay-2');
 
   function openConfirmThenPrompt() {
-    pushOverlay({ id: 'overlay-1', dismiss: () => {} });
-    pushOverlay({ id: 'overlay-2', dismiss: () => {} });
+    pushOverlay({ id: 'overlay-1', dismiss: () => {}, hasPanel: true });
+    pushOverlay({ id: 'overlay-2', dismiss: () => {}, hasPanel: true });
   }
 
   it('answers when it is the only overlay open', () => {
-    pushOverlay({ id: 'overlay-1', dismiss: () => {} });
+    pushOverlay({ id: 'overlay-1', dismiss: () => {}, hasPanel: true });
     expect(dialogOwnsKey(targetInside(null), confirmPanel)).toBe(true);
   });
 
@@ -97,7 +97,7 @@ describe('dialogOwnsKey with a body-focused keystroke and a stacked overlay', ()
   it('follows the stack when the top overlay closes', () => {
     openConfirmThenPrompt();
     _resetOverlayStackForTesting();
-    pushOverlay({ id: 'overlay-1', dismiss: () => {} });
+    pushOverlay({ id: 'overlay-1', dismiss: () => {}, hasPanel: true });
     expect(dialogOwnsKey(targetInside(null), confirmPanel)).toBe(true);
   });
 

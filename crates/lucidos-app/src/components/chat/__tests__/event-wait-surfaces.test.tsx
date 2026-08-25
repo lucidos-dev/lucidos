@@ -15,7 +15,7 @@
  *  therefore put a green success check on a subscription that might sleep for
  *  hours, and ellipsized the reason and the subscription, which are the only two
  *  things it has to say. */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -32,6 +32,7 @@ import {
   PLACEHOLDER_FOLLOW_UP,
   promptPlaceholder,
 } from '../prompt-input-helpers';
+import { eventConditionModal } from '../../../store/store';
 import { isExchangeStartEvent } from '../../../store/thread-events';
 import type { EventWaitSummary, Exchange } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
@@ -82,7 +83,7 @@ type Wait = Extract<ResponseEvent, { type: 'event_wait' }>;
 const wait_ = (over: Partial<Wait> = {}): Wait => ({
   type: 'event_wait',
   wait_id: 'w1',
-  subscriptions: ['ChangeProposed'],
+  subscriptions: [{ event_type: 'ChangeProposed' }],
   reason: 'the release build to finish',
   expires_at: '2026-08-06T12:00:00Z',
   state: 'waiting',
@@ -99,6 +100,10 @@ const step = (event: Wait) => eventWaitRowBody({ event });
 const STEP_OUTCOME_CLASSES = ['success', 'error', 'pending', 'unfinished'];
 
 describe('EventWaitRow', () => {
+  // A module-level signal outlives the test that set it, so a later assertion
+  // that the modal is closed would pass or fail on test ORDER.
+  afterEach(() => { eventConditionModal.value = null; });
+
   /** The row says what the agent DID, subject first, and names the event types
    *  it is watching. Contained as a card since 2026-08-10, but a lighter one
    *  than `.step-note-card`: a record is not something you can act on. */
@@ -176,11 +181,40 @@ describe('EventWaitRow', () => {
    *  language itself uses. Two chips and one glue is ONE fact, so the row's
    *  middot separator steps over the "or" rather than fencing it. */
   it('chips every watched event type', () => {
-    const tree = step(wait_({ subscriptions: ['ChangeProposed', 'ChangeApplied'] }));
+    const tree = step(
+      wait_({ subscriptions: [{ event_type: 'ChangeProposed' }, { event_type: 'ChangeApplied' }] }),
+    );
     expect(vnodeText(tree)).toContain('ChangeProposed');
     expect(vnodeText(tree)).toContain('ChangeApplied');
     expect(vnodeText(tree)).toContain('or');
     expect(vnodeText(findByClass(tree, 'event-name'))).toBe('ChangeProposed');
+  });
+
+  /** **"(filtered)" says a filter exists and nothing about what it says**, and
+   *  the raw operator JSON is far too wide for a facts line. So the chip is the
+   *  door to it: pressing one opens the condition in a modal. Before that, the
+   *  row could report that a watch was narrowed and no surface could say how. */
+  it('opens the condition from a filtered chip', () => {
+    const condition = { 'workflow_run.event': 'completed' };
+    const tree = step(wait_({ subscriptions: [{ event_type: 'GithubWorkflowRunStateChanged', condition }] }));
+    const chip = findByClass(tree, 'event-name-link');
+    expect(vnodeText(chip)).toBe('GithubWorkflowRunStateChanged (filtered)');
+    // The visible text is a bare event type. The accessible name is what says
+    // pressing it opens the filter rather than jumping to an event.
+    expect(chip?.props['aria-label']).toBe('Show the condition filtering GithubWorkflowRunStateChanged');
+    (chip?.props.onClick as () => void)();
+    expect(eventConditionModal.value).toEqual({
+      eventType: 'GithubWorkflowRunStateChanged',
+      condition,
+    });
+  });
+
+  /** A chip with no condition promises nothing, so it must offer no door: a
+   *  pressable chip opening an empty modal is the same lie in reverse. */
+  it('leaves an unfiltered chip inert', () => {
+    const tree = step(wait_({ subscriptions: [{ event_type: 'ChangeProposed' }] }));
+    expect(findByClass(tree, 'event-name-link')).toBeNull();
+    expect(findByClass(tree, 'event-name')?.type).toBe('code');
   });
 
   /** The deadline is a FACT, not a countdown: ADR 0047's amendment puts the

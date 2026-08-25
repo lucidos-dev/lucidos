@@ -926,6 +926,17 @@ fn files_require_restart_for_the_engine_bundled_changelog() {
     assert!(!files_require_restart(&["docs/glossary.md".into()]));
 }
 
+/// The release notices are the changelog's sibling, `include_str!`'d by
+/// `engine::release_notices`. Missing the restart costs more here: the changelog
+/// merely reads stale, while an authored notice that never reaches a modal is an
+/// instruction the user is never given at all.
+#[test]
+fn files_require_restart_for_the_engine_bundled_release_notices() {
+    assert!(files_require_restart(&["release-notices.toml".into()]));
+    // Other TOML is not bundled into the binary.
+    assert!(!files_require_restart(&["rust-toolchain.toml".into()]));
+}
+
 /// The app document is the exception to "frontend files never restart": the
 /// gateway `include_str!`s it and lifts the boot-splash stylesheet + mark out at
 /// compile time (crates/lucidos-gateway/src/proxy.rs), so a running gateway

@@ -141,8 +141,8 @@ describe('resolveThreadActions', () => {
 
 describe('overlayStack', () => {
   it('is LIFO; top reflects the most recent push', () => {
-    pushOverlay({ id: 'a', dismiss: () => {} });
-    pushOverlay({ id: 'b', dismiss: () => {} });
+    pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
+    pushOverlay({ id: 'b', dismiss: () => {}, hasPanel: true });
     expect(topOverlay()?.id).toBe('b');
     removeOverlay('b');
     expect(topOverlay()?.id).toBe('a');
@@ -150,8 +150,8 @@ describe('overlayStack', () => {
 
   it('dismissTopOverlay calls the top entry dismiss and reports whether one existed', () => {
     let dismissed = '';
-    pushOverlay({ id: 'a', dismiss: () => { dismissed = 'a'; } });
-    pushOverlay({ id: 'b', dismiss: () => { dismissed = 'b'; } });
+    pushOverlay({ id: 'a', dismiss: () => { dismissed = 'a'; }, hasPanel: true });
+    pushOverlay({ id: 'b', dismiss: () => { dismissed = 'b'; }, hasPanel: true });
     expect(dismissTopOverlay()).toBe(true);
     expect(dismissed).toBe('b');
     _resetOverlayStackForTesting();
@@ -159,8 +159,8 @@ describe('overlayStack', () => {
   });
 
   it('re-pushing the same id replaces rather than duplicates', () => {
-    pushOverlay({ id: 'a', dismiss: () => {} });
-    pushOverlay({ id: 'a', dismiss: () => {} });
+    pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
+    pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
     expect(overlayStack.value.filter((e) => e.id === 'a')).toHaveLength(1);
   });
 });
@@ -169,7 +169,7 @@ describe('resolveGlobalActions', () => {
   it('prepends a dismiss-overlay action when an overlay is open', () => {
     setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle' } }));
     focusedThreadId.value = 't1';
-    pushOverlay({ id: 'modal', dismiss: () => {} });
+    pushOverlay({ id: 'modal', dismiss: () => {}, hasPanel: true });
     const actions = resolveGlobalActions();
     expect(actions[0]).toMatchObject({ kind: 'dismiss_overlay', category: 'dismiss' });
     // ...followed by the focused thread's actions.

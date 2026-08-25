@@ -1,6 +1,10 @@
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
-import type { AnswerKind, EventWaitCancelCause } from './thread-events/thread-event-types';
+import type {
+  AnswerKind,
+  EventSubscription,
+  EventWaitCancelCause,
+} from './thread-events/thread-event-types';
 
 // --- Async data loading ---
 // Every piece of async data must be in one of these states.
@@ -66,8 +70,16 @@ export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
  *  reported a failure, and from `'pending'`, which asserts something is still
  *  running. Deliberately NOT called `'interrupted'`: `ExchangeStatus` already
  *  uses that word one layer up for "user sent a follow-up while streaming",
- *  which renders as a neutral "Done ↳". */
-export type StepOutcome = 'pending' | 'success' | 'error' | 'unfinished';
+ *  which renders as a neutral "Done ↳".
+ *
+ *  `'blocked'` and `'denied'` are the two halves of a permission decision.
+ *  `'blocked'` means a card is open and the tool has not started. It is not
+ *  `'pending'`, which claims the machine is busy, and staying outside
+ *  `'pending'` is what exempts the row from `resolvePendingSteps`. `'denied'`
+ *  means the answer was no, so the tool never ran, which keeps it out of
+ *  `'error'` on the same ground as `'unfinished'`. See
+ *  `docs/plans/2026-08-25-permission-blocked-step-state.md`. */
+export type StepOutcome = 'pending' | 'success' | 'error' | 'unfinished' | 'blocked' | 'denied';
 
 // A single step in chat processing (tool call, memory search, etc.)
 export interface Step {
@@ -307,12 +319,12 @@ export type ResponseEvent =
        *  watch started. */
       type: 'event_wait';
       wait_id: string;
-      /** One label per watched event type (`waitSubscriptionLabels`), NOT a
-       *  joined line: the row chips each type through `.event-name`, and a
-       *  sentence would have to be parsed back apart to do that. Empty on a stop
-       *  row built from a pre-2026-08-07 `EventWaitCanceled`, which carries no
-       *  copy of what it stopped. */
-      subscriptions: string[];
+      /** The `on:` list verbatim, neither joined into a sentence nor flattened
+       *  to labels. The row chips each type through `.event-name`, and a
+       *  filtered one opens its own `condition`, so both halves have to survive
+       *  the projection. Empty on a stop row built from a legacy
+       *  `EventWaitCanceled`, which carries no copy of what it stopped. */
+      subscriptions: EventSubscription[];
       reason: string;
       /** Empty on a stop row built from a pre-2026-08-07 `EventWaitCanceled`,
        *  which carries no deadline of its own. */
@@ -381,16 +393,16 @@ export type SideEffectCategory =
   | 'out_of_workspace_destruction'
   | 'other';
 
-/** One event a trigger listens for, with an optional payload filter scoped
- *  to that event. A trigger fires when an incoming event matches any entry's
- *  `event_type` AND that entry's `condition` (if set) evaluates true against
- *  the payload. Conditions are per-entry, so a single trigger can subscribe
- *  to events with different payload shapes without one filter constraining
- *  the others. */
-export interface EventSubscription {
-  event_type: string;
-  condition?: Record<string, unknown>;
-}
+/** One event a trigger listens for. Re-exported rather than declared again: a
+ *  trigger's `on:` entry and a thread's *event wait* are the same shape, run
+ *  the same matcher, and had two TS types saying so differently. The engine's
+ *  `condition` is arbitrary JSON, which the copy here narrowed to an object.
+ *
+ *  A trigger fires when an incoming event matches an entry's `event_type` AND
+ *  that entry's `condition` (if set) evaluates true against the payload.
+ *  Conditions are per-entry, so one trigger can subscribe to events of
+ *  different payload shapes without one filter constraining the others. */
+export type { EventSubscription };
 
 // A trigger config (event-sourced).
 // Configs may be schedule-only, event-only, or hybrid; `deriveTriggerType()`

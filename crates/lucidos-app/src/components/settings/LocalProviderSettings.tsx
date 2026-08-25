@@ -7,7 +7,7 @@ import {
   DEFAULT_LOCAL_BASE_URL,
 } from '../../store/actions/preferences';
 import { findProviderCredential } from './providerCredential';
-import { Explainer } from '../shared/Explainer';
+import { ProviderBlock } from './ProviderBlock';
 
 const LOCAL_SERVICE = 'local';
 
@@ -65,41 +65,45 @@ export function LocalProviderSettings() {
   }
 
   return (
-    <>
-      <div class="settings-row">
-        <span class="settings-row-label">
-          Local (OpenAI-compatible)
-          <Explainer title="Local (OpenAI-compatible)">
-            <p>
-              Serves models on the <strong>local</strong> provider via any
-              OpenAI-compatible server: Ollama (default{' '}
-              <strong>{DEFAULT_LOCAL_BASE_URL}</strong>), LM Studio, vLLM, llama.cpp.
-            </p>
-            <p>
-              Add your local models in <strong>Manage Models</strong> with the{' '}
-              <strong>local</strong> provider, using the model id the server exposes
-              (e.g. <code>llama3.1</code>).
-            </p>
-            <p>
-              Also settable via the <strong>LUCIDOS_LOCAL_BASE_URL</strong> /{' '}
-              <strong>LUCIDOS_LOCAL_API_KEY</strong> launch env vars.
-            </p>
-          </Explainer>
-          {/* `.list-row-details` is `display: flex`, so this span is a block box
-              inside the label's line and renders UNDER it. A manual "·" glue
-              would therefore be stranded at the start of that new line, the
-              same artifact the rule in `.claude/rules/frontend.md` names. */}
-          {existing && <span class="list-row-details">key configured</span>}
-        </span>
-        {existing && (
-          <button
-            class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(existing.id, LOCAL_SERVICE)}
-          >
-            Remove key
-          </button>
-        )}
-      </div>
+    <ProviderBlock
+      id="local"
+      label="Local (OpenAI-compatible)"
+      anchor="models:local"
+      // The optional API key, which is the only thing an off state could
+      // promise to keep. The base URL is a preference, not a credential.
+      hasStoredConfig={!!existing}
+      explainer={
+        <>
+          <p>
+            Serves models on the <strong>local</strong> provider via any
+            OpenAI-compatible server: Ollama (default{' '}
+            <strong>{DEFAULT_LOCAL_BASE_URL}</strong>), LM Studio, vLLM, llama.cpp.
+          </p>
+          <p>
+            Add your local models in <strong>Manage Models</strong> with the{' '}
+            <strong>local</strong> provider, using the model id the server exposes
+            (e.g. <code>llama3.1</code>).
+          </p>
+          <p>
+            Also settable via the <strong>LUCIDOS_LOCAL_BASE_URL</strong> /{' '}
+            <strong>LUCIDOS_LOCAL_API_KEY</strong> launch env vars.
+          </p>
+        </>
+      }
+      /* `.list-row-details` is `display: flex`, so this span is a block box
+         inside the label's line and renders UNDER it. A manual "·" glue would
+         therefore be stranded at the start of that new line, the same artifact
+         the rule in `.claude/rules/frontend.md` names. */
+      detail={existing && <span class="list-row-details">key configured</span>}
+      actions={existing && (
+        <button
+          class="action-btn action-btn-danger"
+          onClick={() => void deleteCredential(existing.id, LOCAL_SERVICE)}
+        >
+          Remove key
+        </button>
+      )}
+    >
       <div class="settings-row">
         <span class="settings-row-label">Base URL</span>
         <input
@@ -140,6 +144,6 @@ export function LocalProviderSettings() {
           {existing ? 'Update key' : 'Save key'}
         </button>
       </div>
-    </>
+    </ProviderBlock>
   );
 }

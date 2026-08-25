@@ -36,6 +36,7 @@ import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
 import { XaiProviderSettings } from './XaiProviderSettings';
 import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
+import { ProviderBlock } from './ProviderBlock';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
@@ -52,6 +53,7 @@ import { buildDeviceRows, deviceDisplayName, deviceRowSummary, submittedDeviceNa
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
+import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
 import { SystemPage } from './SystemPage';
 import { isTauri, describeDeviceUserAgent } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
@@ -442,23 +444,27 @@ const VERTEX_REGIONS = [
  *  components. */
 function VertexProviderSettings() {
   return (
-    <>
-      <div class="settings-row">
-        <span class="settings-row-label" data-search-anchor="models:vertex-ai">
-          Vertex AI
-          <Explainer title="Vertex AI">
-            <p>
-              Serves the Claude models (Opus / Sonnet / Haiku) on the{' '}
-              <strong>vertex</strong> provider via Google Cloud.
-            </p>
-            <p>
-              No key to enter: it uses your <strong>gcloud</strong> Application Default
-              Credentials (<code>gcloud auth application-default login</code>). The region
-              below is the only setting.
-            </p>
-          </Explainer>
-        </span>
-      </div>
+    <ProviderBlock
+      id="vertex"
+      label="Vertex AI"
+      anchor="models:vertex-ai"
+      // No credential to keep: Vertex is configured on the machine, by gcloud.
+      // So its off state promises nothing about a stored key.
+      hasStoredConfig={false}
+      explainer={
+        <>
+          <p>
+            Serves the Claude models (Opus / Sonnet / Haiku) on the{' '}
+            <strong>vertex</strong> provider via Google Cloud.
+          </p>
+          <p>
+            No key to enter: it uses your <strong>gcloud</strong> Application Default
+            Credentials (<code>gcloud auth application-default login</code>). The region
+            below is the only setting.
+          </p>
+        </>
+      }
+    >
       <div class="settings-row" data-search-anchor="models:region">
         <span class="settings-row-label">Region</span>
         <Dropdown
@@ -469,7 +475,7 @@ function VertexProviderSettings() {
           onChange={setVertexRegion}
         />
       </div>
-    </>
+    </ProviderBlock>
   );
 }
 
@@ -942,6 +948,7 @@ export function SettingsView() {
     return (
       <>
         <CodingAgentBinariesSection />
+        <CodingAgentPermissionSection />
         {repositoriesSection()}
       </>
     );

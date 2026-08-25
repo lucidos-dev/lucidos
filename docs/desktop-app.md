@@ -50,8 +50,12 @@ window). On boot it:
 2. installs `~/Library/LaunchAgents/com.lucidos.client.plist`, the **login
    agent**, so the client itself comes back at the next login too (below),
 3. waits for the gateway health endpoint (`/~/api/v1/health`) on the stable
-   port, then points the window at `http://localhost:<port>` (smart root: one
-   workspace opens directly; multiple workspaces show the picker).
+   port, then opens the *window session* (`docs/glossary.md`; ADR 0123). `main`
+   goes to the first workspace that had a window last time. One extra window
+   opens per remaining entry, each at the size it was left. With nothing
+   recorded, `main` falls back to `http://localhost:<port>` (smart root: one
+   workspace opens directly; multiple workspaces show the picker). A
+   notification tap outranks both.
 
 **Two agents, one per role.** `com.lucidos.engine` is the *service agent*: the
 headless always-on stack, `RunAtLoad` + `KeepAlive`. `com.lucidos.client` is the

@@ -4,7 +4,7 @@ import { Dropdown } from '../shared/Dropdown';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import type { AuthType } from '../../store/types';
 import { findProviderCredential } from './providerCredential';
-import { Explainer } from '../shared/Explainer';
+import { ProviderBlock } from './ProviderBlock';
 
 const ANTHROPIC_SERVICE = 'anthropic';
 const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
@@ -49,39 +49,41 @@ export function AnthropicProviderSettings() {
   }
 
   return (
-    <>
-      <div class="settings-row">
-        <span class="settings-row-label">
-          Anthropic (direct)
-          <Explainer title="Anthropic (direct)">
-            <p>
-              Direct Anthropic serves models on the <strong>anthropic</strong> provider
-              (e.g. Fable 5). Stored here, the secret is used instead of the{' '}
-              <strong>ANTHROPIC_API_KEY</strong> launch environment variable, which stays
-              as a fallback when nothing is set here.
-            </p>
-            <p>
-              OAuth subscription tokens are short-lived: if requests start failing with a
-              401, re-paste a fresh token here.
-            </p>
-          </Explainer>
-          {/* `.list-row-details` is `display: flex`, so this span is a block box
-              inside the label's line and renders UNDER it. A manual "·" glue
-              would therefore be stranded at the start of that new line, the
-              same artifact the rule in `.claude/rules/frontend.md` names. */}
-          {existing && (
-            <span class="list-row-details">configured ({existing.auth_type})</span>
-          )}
-        </span>
-        {existing && (
-          <button
-            class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(existing.id, ANTHROPIC_SERVICE)}
-          >
-            Remove
-          </button>
-        )}
-      </div>
+    <ProviderBlock
+      id="anthropic"
+      label="Anthropic (direct)"
+      anchor="models:anthropic"
+      hasStoredConfig={!!existing}
+      explainer={
+        <>
+          <p>
+            Direct Anthropic serves models on the <strong>anthropic</strong> provider
+            (e.g. Fable 5). Stored here, the secret is used instead of the{' '}
+            <strong>ANTHROPIC_API_KEY</strong> launch environment variable, which stays
+            as a fallback when nothing is set here.
+          </p>
+          <p>
+            OAuth subscription tokens are short-lived: if requests start failing with a
+            401, re-paste a fresh token here.
+          </p>
+        </>
+      }
+      /* `.list-row-details` is `display: flex`, so this span is a block box
+         inside the label's line and renders UNDER it. A manual "·" glue would
+         therefore be stranded at the start of that new line, the same artifact
+         the rule in `.claude/rules/frontend.md` names. */
+      detail={existing && (
+        <span class="list-row-details">configured ({existing.auth_type})</span>
+      )}
+      actions={existing && (
+        <button
+          class="action-btn action-btn-danger"
+          onClick={() => void deleteCredential(existing.id, ANTHROPIC_SERVICE)}
+        >
+          Remove
+        </button>
+      )}
+    >
       <div class="settings-row">
         <span class="settings-row-label">Auth</span>
         <Dropdown options={AUTH_KINDS} value={authKind} onChange={setAuthKind} />
@@ -106,6 +108,6 @@ export function AnthropicProviderSettings() {
           {existing ? 'Update' : 'Save'}
         </button>
       </div>
-    </>
+    </ProviderBlock>
   );
 }

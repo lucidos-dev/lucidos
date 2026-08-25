@@ -673,7 +673,12 @@ impl CredentialStore {
     }
 }
 
-fn credential_base_url_matches(base_url: &str, request_url: &str) -> bool {
+/// Whether a credential scoped to `base_url` may be presented to `request_url`.
+///
+/// [`CredentialStore::find_by_url`] selects with this. `core::git_auth` also
+/// re-checks it on every git credential callback, so a redirect cannot carry a
+/// secret to a host the user never scoped it to.
+pub(crate) fn credential_base_url_matches(base_url: &str, request_url: &str) -> bool {
     let Ok(base) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };

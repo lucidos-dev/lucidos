@@ -45,6 +45,7 @@ pub(crate) mod proxy_static_layers;
 pub(crate) mod proxy_token_cache;
 pub(crate) mod proxy_wasm_host;
 pub(crate) mod proxy_wasm_signer;
+mod release_notices;
 mod repositories;
 mod sdk;
 mod sdk_fonts;
@@ -1177,6 +1178,7 @@ pub fn create_router(
         .merge(disk_usage::router())
         .merge(frontend_preview::router())
         .merge(search::router())
+        .merge(release_notices::router())
         .merge(repositories::router())
         .merge(sdk::router())
         .merge(sdk_fonts::router())

@@ -70,6 +70,11 @@ pub const SESSION_ENDED_REASON: &str =
 /// bypassed.
 pub const SESSION_ALLOW_REASON: &str = "Allowed for this thread";
 
+/// Reason returned when the request is covered by this workspace's persisted
+/// coding-agent allowlist, the file an "Always allow" click appends to. Emits
+/// no events either, for the same reason [`SESSION_ALLOW_REASON`] does not.
+pub const PERSISTED_ALLOW_REASON: &str = "Allowed by this workspace's coding-agent allowlist";
+
 /// Reason returned when the request is a file write landing inside the
 /// session's own worktree (see [`worktree_write_auto_allowed`]).
 pub const WORKTREE_WRITE_ALLOW_REASON: &str =
@@ -952,6 +957,45 @@ fn session_allow_covers(
     derive_allow_pattern(tool_name, input, AllowScope::Session).is_some_and(|p| allowed(&p))
 }
 
+/// Whether this workspace's persisted allowlist covers the request. Sibling of
+/// [`session_allow_covers`], over `cc-allowed-tools` instead of the per-thread
+/// set.
+///
+/// **The honour rule is [`derive_allow_pattern`] itself**: a stored pattern
+/// covers a request only where that function would have PRODUCED it for this
+/// same request, at `Broad` or `Narrow`. So the engine is never more permissive
+/// than the respawned subprocess will be. `None` at both persisted scopes
+/// records that CC ignores the pattern, and it rules out three cases:
+///
+///   * a bare `Edit` / `Write` / `NotebookEdit` / `ExitPlanMode` line;
+///   * a `Bash` command touching `.claude/` or `.git/`;
+///   * the Codex backend tools, whose driver never reads this file.
+///
+/// A command then takes the same per-segment rule as the session lane, through
+/// [`command_guard::grant_covers_command`].
+fn persisted_allow_covers(
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+    if matches!(tool_name, "Bash" | "command_execution") {
+        // `Broad` is `None` for exactly the two cases a stored pattern must not
+        // reach here: a CC-protected path, and a Codex backend tool.
+        if derive_allow_pattern(tool_name, input, AllowScope::Broad).is_none() {
+            return false;
+        }
+        let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        return command_guard::grant_covers_command(tool_name, command, allowed);
+    }
+    [AllowScope::Broad, AllowScope::Narrow]
+        .into_iter()
+        .filter_map(|scope| derive_allow_pattern(tool_name, input, scope))
+        .any(|pattern| allowed(&pattern))
+}
+
 /// Resolve a permission request for an unattended session from its classified
 /// verdict and the inherited grant. Returns `(allowed, reason)`.
 fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (bool, String) {
@@ -1006,7 +1050,7 @@ pub async fn lookup_session_worktree(
 }
 
 /// One blocking permission round-trip: the shared core both raise paths drive,
-/// CC's MCP HTTP path and the Codex app-server bridge. The flow is four gates,
+/// CC's MCP HTTP path and the Codex app-server bridge. The flow is five gates,
 /// in order:
 ///
 ///   1. **In-worktree write fast path.** A file write inside the session's own
@@ -1019,7 +1063,11 @@ pub async fn lookup_session_worktree(
 ///      auto-allows, an irreversible side-effect auto-allows only under a
 ///      matching trigger grant, everything else auto-denies. No card events,
 ///      so the session never hangs.
-///   4. **Interactive.** `register_or_attach` dedups, the canonical request
+///   4. **Persisted-allow pre-check.** An earlier "Always allow" click whose
+///      pattern is in this workspace's `cc-allowed-tools` skips the prompt.
+///      Deliberately BELOW the unattended gate, so a workspace grant can never
+///      override [`decide_unattended`].
+///   5. **Interactive.** `register_or_attach` dedups, the canonical request
 ///      emits `CodingAgentPermissionRequest`, and the wait on the broadcast is
 ///      **indefinite**.
 ///
@@ -1100,6 +1148,23 @@ pub async fn prompt_coding_agent_permission(
         return PermissionPromptOutcome {
             allowed,
             reason: Some(reason),
+        };
+    }
+
+    // The workspace's own "Always allow" grants, read fresh so a click binds
+    // THIS session rather than the next spawn: the file reaches Claude Code as
+    // `--allowedTools`, which is frozen for the subprocess's life. Mirrors the
+    // chat lane, which reads `agent-allowed-commands` on every prompt. Below
+    // the unattended gate on purpose, so a grant a human clicked can never
+    // decide a request nobody is watching.
+    let granted = crate::core::grants::patterns(
+        &crate::core::grants_dir(workspace_path),
+        crate::core::grants::GrantFile::CodingAgentTools,
+    );
+    if persisted_allow_covers(&tool_name, &input, |p| granted.iter().any(|g| g == p)) {
+        return PermissionPromptOutcome {
+            allowed: true,
+            reason: Some(PERSISTED_ALLOW_REASON.to_string()),
         };
     }
 
@@ -2506,6 +2571,116 @@ mod tests {
         ));
     }
 
+    /// An "Always allow" click binds the session it was clicked in, because the
+    /// gate reads the workspace allowlist itself. The pattern language is the
+    /// one the click stored.
+    #[test]
+    fn a_persisted_grant_covers_the_patterns_its_click_stored() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let cmd = |c: &str| serde_json::json!({ "command": c });
+
+        // Broad on a command means "any command", the label fast path.
+        assert!(persisted_allow_covers(
+            "Bash",
+            &cmd("cargo test"),
+            granted(&["Bash"])
+        ));
+        // Narrow is head-scoped, and the head is all it carries.
+        assert!(persisted_allow_covers(
+            "Bash",
+            &cmd("git status"),
+            granted(&["Bash(git:*)"])
+        ));
+        assert!(!persisted_allow_covers(
+            "Bash",
+            &cmd("rm -rf /"),
+            granted(&["Bash(git:*)"])
+        ));
+        // Broad on a tool with no sub-scope is the bare name.
+        assert!(persisted_allow_covers(
+            "Read",
+            &serde_json::json!({ "file_path": "/tmp/foo.md" }),
+            granted(&["Read"])
+        ));
+        // A Skill click can store either shape, and both must match.
+        let skill = serde_json::json!({ "skill": "code-review:code-review" });
+        assert!(persisted_allow_covers("Skill", &skill, granted(&["Skill"])));
+        assert!(persisted_allow_covers(
+            "Skill",
+            &skill,
+            granted(&["Skill(code-review:*)"])
+        ));
+        // An empty allowlist covers nothing, which is the first-run state.
+        assert!(!persisted_allow_covers("Read", &skill, granted(&[])));
+    }
+
+    /// The three shapes a stored pattern must never reach, all of them the same
+    /// finding: `derive_allow_pattern` returns `None` at both persisted scopes,
+    /// so Claude Code would keep carding them after the respawn.
+    #[test]
+    fn a_persisted_grant_never_reaches_what_claude_code_ignores() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let cmd = |c: &str| serde_json::json!({ "command": c });
+
+        // A bare line for a tool CC routes through the prompt regardless.
+        for tool in ["Edit", "Write", "NotebookEdit", "ExitPlanMode"] {
+            assert!(
+                !persisted_allow_covers(
+                    tool,
+                    &serde_json::json!({ "file_path": "/tmp/foo.md" }),
+                    granted(&["Edit", "Write", "NotebookEdit", "ExitPlanMode"])
+                ),
+                "a bare {tool} line must not cover its own request"
+            );
+        }
+        // A command touching a CC-protected path, under the broadest grant
+        // there is. The card for it stays, and so does the one after respawn.
+        for c in ["rm -rf .git/hooks", "cat .claude/settings.json"] {
+            assert!(
+                !persisted_allow_covers("Bash", &cmd(c), granted(&["Bash", "Bash(rm:*)"])),
+                "a protected-path command must still ask: {c}"
+            );
+        }
+        // Codex: no driver reads this file, so nothing in it may answer for one.
+        assert!(!persisted_allow_covers(
+            "command_execution",
+            &cmd("/bin/zsh -lc 'git status'"),
+            granted(&["Bash", "command_execution", "command_execution(git:*)"])
+        ));
+        assert!(!persisted_allow_covers(
+            "file_change",
+            &serde_json::json!({ "changes": [{ "path": "/tmp/x" }] }),
+            granted(&["file_change"])
+        ));
+    }
+
+    /// The per-segment rule the chat lane and the session lane already share.
+    /// A grant names a HEAD, so it stands only for a command whose head is what
+    /// runs.
+    #[test]
+    fn a_persisted_command_grant_covers_every_segment_or_none() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let cmd = |c: &str| serde_json::json!({ "command": c });
+
+        assert!(!persisted_allow_covers(
+            "Bash",
+            &cmd("git status && rm -rf /"),
+            granted(&["Bash(git:*)"])
+        ));
+        // A code-injecting preamble is a refusal, not a `ls` the grant covers.
+        assert!(!persisted_allow_covers(
+            "Bash",
+            &cmd("LD_PRELOAD=/tmp/evil.so ls"),
+            granted(&["Bash(ls:*)"])
+        ));
+        // A command with no readable text has no head to cover.
+        assert!(!persisted_allow_covers(
+            "Bash",
+            &serde_json::json!({}),
+            granted(&["Bash(ls:*)"])
+        ));
+    }
+
     #[test]
     fn decide_catastrophic_denies_even_when_other_granted() {
         let (allowed, _) =
@@ -3087,6 +3262,119 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(count, 0, "session-allow must not render a card");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A workspace dir whose `cc-allowed-tools` holds `patterns`, the state an
+    /// "Always allow" click leaves behind.
+    fn workspace_granting(patterns: &[&str]) -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let dir = crate::core::grants_dir(workspace.path());
+        std::fs::create_dir_all(&dir).expect("grants dir");
+        std::fs::write(
+            dir.join(crate::core::grants::GrantFile::CodingAgentTools.file_name()),
+            patterns.join("\n"),
+        )
+        .expect("write grant file");
+        workspace
+    }
+
+    /// The reported bug: "Always allow" wrote its line, and the very next
+    /// command in the SAME session raised a card anyway. The click binds now
+    /// because the gate reads the workspace allowlist, rather than waiting for
+    /// the respawn that refreshes CC's frozen `--allowedTools`.
+    #[tokio::test]
+    async fn prompt_skips_card_on_persisted_allow_match() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let pending = std::sync::Arc::new(Mutex::new(PermissionState::default()));
+        let thread_id = Uuid::new_v4();
+        let workspace = workspace_granting(&["# header line", "", "Bash"]);
+
+        // Timed: nothing ever answers this card, so a gate that stopped
+        // covering the request would hang the suite instead of failing it.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &empty_trigger_configs(),
+                workspace.path(),
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i3".to_string(),
+                    tool_name: "Bash".to_string(),
+                    // A DIFFERENT command from the one that was granted: the
+                    // click was broad, so the whole tool is covered.
+                    input: serde_json::json!({ "command": "cargo test" }),
+                },
+            ),
+        )
+        .await
+        .expect("a granted request never waits for a card");
+        assert!(outcome.allowed);
+        assert_eq!(outcome.reason.as_deref(), Some(PERSISTED_ALLOW_REASON));
+        assert_eq!(
+            card_count(&pool, thread_id).await,
+            0,
+            "a persisted grant must not render a card"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The gate sits BELOW the unattended one, so a grant a human clicked can
+    /// never answer for a session no human is watching. A catastrophic command
+    /// is denied whatever the allowlist says (ADR 0002).
+    #[tokio::test]
+    async fn an_unattended_session_ignores_the_workspace_allowlist() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let pending = std::sync::Arc::new(Mutex::new(PermissionState::default()));
+        let thread_id = Uuid::new_v4();
+        let trigger_id = "nightly-allowlist";
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "MessageReceived",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
+        let workspace = workspace_granting(&["Bash"]);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &trigger_configs_with(trigger_id, vec![]),
+                workspace.path(),
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i4".to_string(),
+                    tool_name: "Bash".to_string(),
+                    input: serde_json::json!({ "command": "rm -rf /" }),
+                },
+            ),
+        )
+        .await
+        .expect("an unattended session never waits for a card");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some(UNATTENDED_DENY_CATASTROPHIC_REASON)
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;

@@ -362,6 +362,15 @@ pub const CATALOG: &[PrefSpec] = &[
         description: "Absolute path to the `codex` CLI used for Codex threads. Leave unset to auto-detect (~/.local/bin, Homebrew, PATH). A set path that doesn't exist fails the spawn with an error naming this setting — it never silently falls back.",
         side_effect: PrefSideEffect::None,
     },
+    PrefSpec {
+        key: "coding_agent_claude_permission_mode",
+        label: "Claude Code permission mode",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(&["accept-edits", "auto"]),
+        default: "accept-edits",
+        description: "Which of Claude Code's own permission modes coding-agent threads run in. 'accept-edits' is the default and cards anything outside the session's working directories. 'auto' lets Claude Code's safety classifier approve routine actions instead, which reaches shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Applies to new sessions.",
+        side_effect: PrefSideEffect::None,
+    },
     // ---- Appearance (device-scoped) ----
     PrefSpec {
         key: "theme",
@@ -458,6 +467,18 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("network_bind", "the per-workspace engine network bind (loopback / all interfaces / a specific tailnet IP): a security setting changed in Settings → Access → Network access, not via set_preference"),
     ("engine_switch_dismissed_build", "internal UI state — the on-disk engine build id the user deferred the 'Switch to new version' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
     ("client_refresh_dismissed_build", "internal UI state — the served client build id the user deferred the 'refresh to sync' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
+    ("release_notice_cursor", "internal UI state: the id of the last release notice this workspace answered, which is what makes that sequence ordered and one-time. The user answers a notice in its own modal, and clearing this by hand re-shows every notice they have already read"),
+    // The six per-provider enable switches. Internal for the reason the command
+    // guard is: switching a provider off can be switching off the one answering
+    // this very turn, and the user is the only one who should decide that. Note
+    // the asymmetry with `opencode_free_enabled`, which stays settable: turning
+    // a keyless free tier ON cannot leave the workspace unable to answer.
+    ("provider_enabled_vertex", "whether the Vertex provider is switched on: the user decides in Settings → Models → Providers, and you must not switch off a provider that may be serving this turn"),
+    ("provider_enabled_anthropic", "whether the direct Anthropic provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    ("provider_enabled_openai", "whether the direct OpenAI provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    ("provider_enabled_openrouter", "whether the OpenRouter provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    ("provider_enabled_xai", "whether the xAI provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    ("provider_enabled_local", "whether the local OpenAI-compatible provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
 ];
 
 /// Preference keys the engine writes as its own internal state, and which
@@ -500,6 +521,12 @@ pub const SILENT_PREF_KEYS: &[(&str, &str)] = &[
     (
         "backfill_repo_names_from_changes_done",
         "a one-shot migration marker, so a completed backfill is not re-run",
+    ),
+    (
+        "release_notice_cursor",
+        "the last release notice this workspace answered: the resolve that moves \
+         it already announces ReleaseNoticeResolved, and the startup seed that \
+         places a workspace in the sequence is bookkeeping no user decided",
     ),
     (
         "backfill_cc_repo_id_to_deterministic_done",

@@ -1,5 +1,5 @@
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
-import { openProviderSettings } from '../../store/actions/menu';
+import { openFreeProviderSettings, openProviderSettings } from '../../store/actions/menu';
 import { startSetupInterview } from '../../store/actions/compose';
 import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
@@ -25,15 +25,25 @@ function WelcomeDisclaimer() {
 
 /** First-run state when the engine booted with no LLM provider configured
  *  (`llmConfigured === false`). The agent can't answer until a provider exists,
- *  so this replaces the setup-interview entry point with a single clear call to
- *  action that deep-links to Settings → Models → Providers. Shown regardless of the
- *  "Don't show this again" dismissal — provider setup is a requirement, not a tip. */
+ *  so this replaces the setup-interview entry point with calls to action that
+ *  deep-link into Settings → Models → Providers. Shown regardless of the
+ *  "Don't show this again" dismissal: provider setup is a requirement, not a tip.
+ *
+ *  TWO actions, because the first one is unreachable for the very user this
+ *  screen exists for. Every credential provider wants a key, and a key wants a
+ *  subscription or a card. OpenCode Free wants neither, so it is the only one
+ *  such a newcomer can act on. Naming it only under Providers hid it behind a
+ *  hunt for a key they do not have.
+ *
+ *  The free action NAVIGATES and nothing more. The tier is opt-in and states its
+ *  terms at the switch (ADR 0104). This surface says what it is and sends the
+ *  user to the row that asks. */
 export function ProviderSetupWelcome() {
   return (
     <div class="response-content markdown-content welcome-message">
       <h2>Welcome to Lucidos</h2>
       <p>
-        I'm the Lucidos Agent — but I can't answer yet. This workspace has no AI
+        I'm the Lucidos Agent, but I can't answer yet. This workspace has no AI
         provider configured. Connect one and I'll be ready to research, schedule,
         build apps, and act on your behalf.
       </p>
@@ -46,9 +56,21 @@ export function ProviderSetupWelcome() {
           Set up your AI provider
         </button>
         <p class="welcome-provider-setup-hint">
-          Opens Settings → Models → Providers. Add an OpenAI / Anthropic /
-          OpenRouter key or a local model — it takes effect right away, no
-          restart needed.
+          Opens Settings → Models → Providers. Add an OpenAI, Anthropic or
+          OpenRouter key, or point Lucidos at a local model. It takes effect
+          right away, with no restart.
+        </p>
+        <button
+          type="button"
+          class="action-btn welcome-provider-free-btn"
+          onClick={openFreeProviderSettings}
+        >
+          No key? Start on the free tier
+        </button>
+        <p class="welcome-provider-setup-hint">
+          OpenCode Free serves smaller models with no account, no key and no
+          card. It stays off until you switch it on, and the switch states its
+          terms.
         </p>
       </div>
       <WelcomeDisclaimer />

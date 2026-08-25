@@ -117,7 +117,8 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
  *  appropriately. The stand-down has its own value, `'fullscreen'`, because it
  *  is NOT the same as `'noop'`: the capture-phase dispatcher must still
  *  `stopPropagation` on it. `<Overlay>` installs its own bubble-phase Escape
- *  listener through `useDismissOnOutside`, which dismisses unconditionally, and
+ *  listener through `useDismissOnOutside`, which dismisses whenever that
+ *  overlay is the top panel (`isTop`), and
  *  it is normally shadowed by the `stopPropagation` the `'dismissed'` branch
  *  does. Falling through silently would let that listener close the overlay
  *  after all, which is the double action this branch exists to prevent (caught

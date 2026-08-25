@@ -58,6 +58,11 @@ pub const PREF_CHAT_REASONING_EFFORT: &str = "chat_reasoning_effort";
 pub const PREF_CODING_AGENT_CLAUDE_PATH: &str = "coding_agent_claude_path";
 pub const PREF_CODING_AGENT_CODEX_PATH: &str = "coding_agent_codex_path";
 
+// Which of Claude Code's own permission modes its threads run in. Unset =
+// `accept-edits`, the mode every session ran before this existed. Claude Code
+// only; resolved by `runtime::claude_code::resolve_permission_mode`.
+pub const PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE: &str = "coding_agent_claude_permission_mode";
+
 /// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
 /// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
 pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5@default";
@@ -79,6 +84,23 @@ pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 // by frontend Settings UI). A preference rather than a credential because there
 // is no secret: the relay serves the free models anonymously.
 pub const PREF_OPENCODE_FREE_ENABLED: &str = "opencode_free_enabled";
+
+// Per-provider enable switches, written by Settings → Models → Providers.
+//
+// ABSENT MEANS ENABLED. A provider still builds from its credential or its env
+// var, and only an explicit "false" holds it back. So a workspace that never
+// touched a switch resolves the identical provider set. The switch leaves the
+// credential alone: turning a provider off is how a user parks a key they still
+// want stored.
+//
+// OpenCode Free is deliberately not in this family. It is opt-IN by ADR 0104
+// and keeps `opencode_free_enabled`, whose absence means OFF.
+pub const PREF_PROVIDER_ENABLED_VERTEX: &str = "provider_enabled_vertex";
+pub const PREF_PROVIDER_ENABLED_ANTHROPIC: &str = "provider_enabled_anthropic";
+pub const PREF_PROVIDER_ENABLED_OPENAI: &str = "provider_enabled_openai";
+pub const PREF_PROVIDER_ENABLED_OPENROUTER: &str = "provider_enabled_openrouter";
+pub const PREF_PROVIDER_ENABLED_XAI: &str = "provider_enabled_xai";
+pub const PREF_PROVIDER_ENABLED_LOCAL: &str = "provider_enabled_local";
 
 // Image generation model (also written by frontend Settings UI)
 pub const PREF_IMAGE_MODEL: &str = "image_model";

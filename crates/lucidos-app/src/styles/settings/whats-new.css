@@ -9,6 +9,18 @@
     border-top: 1px solid var(--border-color);
 }
 
+/* A release you can act on carries its control BESIDE the toggle. It cannot go
+   inside: the toggle is itself a button, and a nested one is invalid markup. */
+.whats-new-release-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.whats-new-release-action {
+    flex: 0 0 auto;
+}
+
 /* The whole header is the toggle, so it spans the row and keeps the version and
    the date on one baseline. Reset of the UA button chrome, since this is a
    full-width row rather than a control. */
@@ -16,7 +28,14 @@
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
+    /* Both, because this class has two parents. `width` serves the SKELETON
+       row, whose header is a plain block child of `.whats-new-release`.
+       `flex` serves the loaded row, where the header shares
+       `.whats-new-release-row` with the action button, and `min-width` lets a
+       long date shrink there instead of pushing that button off the row. */
     width: 100%;
+    flex: 1;
+    min-width: 0;
     padding: 0.5rem 0;
     background: none;
     border: none;
@@ -104,4 +123,71 @@
    second gap under the section title. */
 .whats-new-notes > :first-child {
     margin-top: 0;
+}
+
+/* The release notices above the release list. A card each, because a notice is
+   a thing to act on rather than a row to skim, and there are seldom more than
+   one or two. */
+.release-notice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0 var(--space-lg);
+}
+
+.release-notice-row {
+    background: var(--bg-tertiary);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+}
+
+/* A read notice stays in the list so its instruction is never lost, and recedes
+   so the unread ones above it read first. */
+.release-notice-row[data-state="resolved"] {
+    background: transparent;
+    border: 1px solid var(--border-color);
+}
+
+.release-notice-row-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+}
+
+.release-notice-row-title {
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+/* From which release this applies. Pushed to the end, since it answers a
+   question the reader only asks after reading the instruction. */
+.release-notice-row-since {
+    margin-left: auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+.release-notice-row-mark {
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.25rem;
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+.release-notice-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+/* Says which notice has to come first, so a disabled button is never a dead end
+   with no explanation. */
+.release-notice-row-hint {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
 }

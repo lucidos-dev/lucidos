@@ -14,6 +14,7 @@ import { loadThreadQueue } from '../store/actions/threadQueue';
 import { loadRepositories } from '../store/actions/chat';
 import { loadPreferences, flushPendingPreferenceWrites } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
+import { loadReleaseNotices } from '../store/actions/releaseNotices';
 import { loadWorkspaceDisplayName } from '../store/actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
@@ -150,6 +151,10 @@ export function useStartup(): void {
       void checkEngineVersion();
     }).catch(() => { /* loadPreferences sets Loadable failed internally — UI shows the error */ });
     void loadPinnedApps();
+    // What this release needs the user to know or do. Loaded here rather than
+    // on a panel open, because the modal has to be able to raise itself. Almost
+    // always an empty list: most releases carry no notice at all.
+    void loadReleaseNotices();
     // The name the user gave this workspace lives in the gateway registry, not
     // in the engine, so ask for it (see actions/workspace-label.ts). Until it
     // lands, every surface shows the engine's own name.

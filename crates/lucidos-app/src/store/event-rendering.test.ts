@@ -86,7 +86,7 @@ describe('drawsResponseRow', () => {
       {
         type: 'event_wait',
         wait_id: 'w1',
-        subscriptions: ['a ChangeApplied on this workspace'],
+        subscriptions: [{ event_type: 'ChangeApplied' }],
         reason: 'waiting for the apply',
         expires_at: '2026-08-10T12:00:00Z',
         state: 'waiting',

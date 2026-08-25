@@ -10,7 +10,9 @@
 
 use crate::core::{
     AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
-    PREF_OPENCODE_FREE_ENABLED,
+    PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC, PREF_PROVIDER_ENABLED_LOCAL,
+    PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER, PREF_PROVIDER_ENABLED_VERTEX,
+    PREF_PROVIDER_ENABLED_XAI,
 };
 use crate::llm::web_search::{
     AnthropicServerToolSearch, OpenAiResponsesSearch, VertexGroundingSearch, WebSearchChain,
@@ -33,12 +35,35 @@ use std::sync::Arc;
 pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
+/// The six per-provider enable switches, in the order [`ProviderSwitches`]
+/// declares them. One list, so the preference catalog, the subscriber's watch
+/// set and the tests cannot drift apart.
+pub const PROVIDER_ENABLED_KEYS: [&str; 6] = [
+    PREF_PROVIDER_ENABLED_VERTEX,
+    PREF_PROVIDER_ENABLED_ANTHROPIC,
+    PREF_PROVIDER_ENABLED_OPENAI,
+    PREF_PROVIDER_ENABLED_OPENROUTER,
+    PREF_PROVIDER_ENABLED_XAI,
+    PREF_PROVIDER_ENABLED_LOCAL,
+];
+
 /// Preference keys that, when changed, change which LLM provider is installed.
 /// The same subscriber that watches [`PROVIDER_CREDENTIAL_SERVICES`] filters on
 /// this set, so a provider configured by a preference hot-swaps exactly like one
 /// configured by a credential. `opencode-free` has no credential at all, and the
-/// local base URL used to need a restart.
-pub const PROVIDER_PREFERENCE_KEYS: [&str; 2] = [PREF_OPENCODE_FREE_ENABLED, PREF_LOCAL_BASE_URL];
+/// local base URL used to need a restart. The six per-provider switches are here
+/// for the same reason: a switch that needed a restart is a switch the user
+/// reads as broken.
+pub const PROVIDER_PREFERENCE_KEYS: [&str; 8] = [
+    PREF_OPENCODE_FREE_ENABLED,
+    PREF_LOCAL_BASE_URL,
+    PREF_PROVIDER_ENABLED_VERTEX,
+    PREF_PROVIDER_ENABLED_ANTHROPIC,
+    PREF_PROVIDER_ENABLED_OPENAI,
+    PREF_PROVIDER_ENABLED_OPENROUTER,
+    PREF_PROVIDER_ENABLED_XAI,
+    PREF_PROVIDER_ENABLED_LOCAL,
+];
 
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
 /// engine boot (into `UnconfiguredProvider`) before any provider is configured,
@@ -57,6 +82,78 @@ fn reads_as_true(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// Whether a preference string reads as an explicit off. The inverse of
+/// [`reads_as_true`] over the same vocabulary, and deliberately NOT its
+/// negation: an unrecognised value is neither, which is what lets the
+/// per-provider switches below default to on.
+fn reads_as_false(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// The per-provider enable switches, resolved from the `provider_enabled_*`
+/// preferences (Settings → Models → Providers).
+///
+/// A switch is a VETO over a provider that is otherwise configured. It never
+/// installs one, and it never touches the credential: turning a provider off is
+/// how a user parks a key they still want stored.
+///
+/// Every field defaults to on, and only an explicit "false" turns one off. A
+/// workspace that never opened the page therefore resolves what it always did,
+/// and so does a boot that cannot read preferences at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderSwitches {
+    pub vertex: bool,
+    pub anthropic: bool,
+    pub openai: bool,
+    pub openrouter: bool,
+    pub xai: bool,
+    pub local: bool,
+}
+
+impl Default for ProviderSwitches {
+    fn default() -> Self {
+        Self {
+            vertex: true,
+            anthropic: true,
+            openai: true,
+            openrouter: true,
+            xai: true,
+            local: true,
+        }
+    }
+}
+
+/// One switch's value: on unless the stored preference explicitly says off.
+fn switch_is_on(stored: Option<&str>) -> bool {
+    !stored.is_some_and(reads_as_false)
+}
+
+/// Read the six switches, defaulting any unreadable one to on. A failed read is
+/// logged and treated as absent. Losing a provider over a transient query error
+/// is worse than honouring the veto one build late.
+async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
+    async fn one(pool: &PgPool, key: &str) -> bool {
+        match PreferenceStore::get(pool, key).await {
+            Ok(v) => switch_is_on(v.as_deref()),
+            Err(e) => {
+                crate::log!("[Startup] Failed to read {} preference: {}", key, e);
+                true
+            }
+        }
+    }
+    ProviderSwitches {
+        vertex: one(pool, PREF_PROVIDER_ENABLED_VERTEX).await,
+        anthropic: one(pool, PREF_PROVIDER_ENABLED_ANTHROPIC).await,
+        openai: one(pool, PREF_PROVIDER_ENABLED_OPENAI).await,
+        openrouter: one(pool, PREF_PROVIDER_ENABLED_OPENROUTER).await,
+        xai: one(pool, PREF_PROVIDER_ENABLED_XAI).await,
+        local: one(pool, PREF_PROVIDER_ENABLED_LOCAL).await,
+    }
 }
 
 /// Inputs the active-provider build needs beyond the DB pool. Fixed at boot
@@ -124,6 +221,10 @@ struct DirectProviders {
 /// OpenAI key all still apply, but stored credentials and the `local_base_url`
 /// preference can't be read. Every field degrades to `None` / an omitted backend
 /// on any read/build error so the engine still comes up on its other providers.
+///
+/// `switches` vetoes a provider the user has switched off, and takes its
+/// credential's search backend down with it: a provider that is off must not
+/// keep answering `web_search` on the key that is off with it.
 async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
@@ -131,9 +232,12 @@ async fn resolve_direct_providers(
     openai_env_key: Option<String>,
     openai_codex_key: Option<String>,
     anthropic_env_key: Option<String>,
+    switches: ProviderSwitches,
 ) -> DirectProviders {
     let Some(pool) = pool else {
-        // No DB access, but the env-var + Codex fallbacks must still work.
+        // No DB access, but the env-var + Codex fallbacks must still work. The
+        // switches live in the preferences table, so on this path they are the
+        // all-on default and there is nothing to veto.
         let openai_key = resolve_openai_api_key(None, openai_env_key, openai_codex_key);
         let openai = build_openai_provider(openai_key.clone(), default_model);
         let anthropic_auth = resolve_anthropic_auth(None, anthropic_env_key);
@@ -180,7 +284,11 @@ async fn resolve_direct_providers(
             None
         }
     };
-    let anthropic_auth = resolve_anthropic_auth(anthropic_credential, anthropic_env_key);
+    // The veto is applied to the resolved AUTH rather than to the built
+    // provider, so the search backend below drops with it: they are built from
+    // this one value precisely so they cannot disagree.
+    let anthropic_auth = resolve_anthropic_auth(anthropic_credential, anthropic_env_key)
+        .filter(|_| switches.anthropic);
     let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
 
     // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
@@ -193,8 +301,9 @@ async fn resolve_direct_providers(
         }
     };
     // Resolved once and reused: the provider needs it, and so does the OpenAI
-    // search backend.
-    let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key);
+    // search backend. Vetoed at the key, for the reason given above Anthropic's.
+    let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key)
+        .filter(|_| switches.openai);
     let openai = build_openai_provider(openai_key.clone(), default_model);
 
     // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
@@ -210,7 +319,8 @@ async fn resolve_direct_providers(
         openrouter_credential,
         std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
         default_model,
-    );
+    )
+    .filter(|_| switches.openrouter);
 
     // xAI: a stored `xai` credential wins; otherwise the env fallback.
     let xai_credential = match CredentialStore::get(pool, "xai").await {
@@ -225,7 +335,8 @@ async fn resolve_direct_providers(
         xai_credential,
         std::env::var("LUCIDOS_XAI_API_KEY").ok(),
         default_model,
-    );
+    )
+    .filter(|_| switches.xai);
 
     // OpenCode Free: a preference, not a credential. Nothing is read from the
     // credential store here, and nothing is sent as a bearer.
@@ -258,7 +369,8 @@ async fn resolve_direct_providers(
             None
         }
     };
-    let local = build_local_provider(local_base_pref, local_key, default_model);
+    let local =
+        build_local_provider(local_base_pref, local_key, default_model).filter(|_| switches.local);
 
     // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
@@ -399,11 +511,20 @@ pub async fn build_active_provider(
         });
     }
 
+    // The user's per-provider switches, read once and applied to every provider
+    // this build resolves. Without a pool they are the all-on default, so a
+    // degraded boot keeps whatever the env configures.
+    let switches = match pool {
+        Some(p) => read_provider_switches(p).await,
+        None => ProviderSwitches::default(),
+    };
+
     // Vertex (env/gcloud-based, not a credential). Reuse the engine's warm
     // token cache so a rebuild doesn't discard cached access tokens; fall back
     // to a fresh cache only when none exists (project configured but no cache —
     // not reachable for a non-mock boot, defensive).
-    let vertex = if !ctx.vertex_project_id.is_empty() {
+    let vertex_on = !ctx.vertex_project_id.is_empty() && switches.vertex;
+    let vertex = if vertex_on {
         let cache = ctx
             .vertex_token_cache
             .clone()
@@ -442,6 +563,7 @@ pub async fn build_active_provider(
         openai_env_key,
         openai_codex_key,
         anthropic_env_key,
+        switches,
     )
     .await;
 
@@ -462,7 +584,9 @@ pub async fn build_active_provider(
     // from the `vertex` provider above, which is about to be moved into the
     // router — and which carries the chat model, not the grounding one.
     let mut backends: Vec<Arc<dyn WebSearchProvider>> = Vec::new();
-    if !ctx.vertex_project_id.is_empty() {
+    // `vertex_on`, not the project id alone: a switched-off Vertex must not keep
+    // grounding web searches on the credentials it was switched off with.
+    if vertex_on {
         let cache = ctx
             .vertex_token_cache
             .clone()
@@ -956,6 +1080,7 @@ mod tests {
             None,
             None,
             Some("sk-ant-env".to_string()),
+            ProviderSwitches::default(),
         )
         .await;
         assert!(
@@ -988,6 +1113,7 @@ mod tests {
             None,
             None,
             None,
+            ProviderSwitches::default(),
         )
         .await;
         assert!(
@@ -1003,6 +1129,7 @@ mod tests {
             None,
             None,
             Some("sk-ant-env".to_string()),
+            ProviderSwitches::default(),
         )
         .await;
         assert!(
@@ -1374,5 +1501,195 @@ mod tests {
         let msg = chain.search("q", 5).await.unwrap_err().to_string();
         assert!(msg.contains("Settings → Models → Providers"), "{msg}");
         teardown_test_db(&db).await;
+    }
+
+    // ---- Per-provider enable switches -------------------------------------
+
+    /// Absent means enabled, and only an explicit off turns a switch off. This
+    /// is the back-compat guarantee: a workspace that never opened the page has
+    /// no rows at all, and must resolve every provider it always did.
+    #[test]
+    fn a_switch_is_on_unless_it_explicitly_says_off() {
+        assert!(switch_is_on(None), "absent must mean enabled");
+        for on in ["true", "TRUE", " on ", "1", "yes"] {
+            assert!(switch_is_on(Some(on)), "{on} must read as enabled");
+        }
+        for off in ["false", "FALSE", " off ", "0", "no"] {
+            assert!(!switch_is_on(Some(off)), "{off} must read as disabled");
+        }
+        // Neither vocabulary. Enabled, because a garbled value must not be the
+        // thing that quietly removes a working provider.
+        assert!(switch_is_on(Some("maybe")));
+        assert!(switch_is_on(Some("")));
+    }
+
+    /// The default is every switch on, which is what a DB-down boot resolves.
+    #[test]
+    fn default_switches_are_all_on() {
+        let s = ProviderSwitches::default();
+        assert!(s.vertex && s.anthropic && s.openai && s.openrouter && s.xai && s.local);
+    }
+
+    /// A switched-off provider leaves the router AND takes its search backend
+    /// with it, while its stored credential stays exactly where it was. That
+    /// pairing is the whole point: the switch parks a key, it does not spend it.
+    #[tokio::test]
+    async fn switching_anthropic_off_drops_it_and_keeps_the_credential() {
+        let (pool, db) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+        seed_credential(
+            &pool,
+            "anthropic",
+            "https://api.anthropic.com",
+            crate::core::AuthType::ApiKey,
+            "sk-ant-test",
+        )
+        .await;
+
+        let on = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            None,
+            ProviderSwitches::default(),
+        )
+        .await;
+        assert!(
+            on.anthropic.is_some(),
+            "the seeded credential configures it"
+        );
+        assert!(backend_ids(&on).contains(&"anthropic-server-tool"));
+
+        let off = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            None,
+            ProviderSwitches {
+                anthropic: false,
+                ..ProviderSwitches::default()
+            },
+        )
+        .await;
+        assert!(off.anthropic.is_none(), "the switch must veto the provider");
+        assert!(
+            !backend_ids(&off).contains(&"anthropic-server-tool"),
+            "and must take its search backend down with it: {:?}",
+            backend_ids(&off)
+        );
+
+        assert!(
+            crate::core::CredentialStore::get(&pool, "anthropic")
+                .await
+                .unwrap()
+                .is_some(),
+            "switching a provider off must never delete the key"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The switch is a veto, never an installer: turning one on for a provider
+    /// with no credential and no env key configures nothing.
+    #[tokio::test]
+    async fn a_switch_never_installs_an_unconfigured_provider() {
+        let (pool, db) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+        seed_preference(&pool, PREF_PROVIDER_ENABLED_OPENROUTER, "true")
+            .await
+            .unwrap();
+        let resolved = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            None,
+            read_provider_switches(&pool).await,
+        )
+        .await;
+        assert!(
+            resolved.openrouter.is_none() || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok(),
+            "an on switch with no key must configure nothing"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The stored preferences reach the resolved switches, key by key. Reads
+    /// them through the real store so a misspelled constant cannot pass.
+    #[tokio::test]
+    async fn stored_preferences_resolve_to_the_switches() {
+        let (pool, db) = setup_test_db().await;
+        assert!(
+            matches!(
+                read_provider_switches(&pool).await,
+                ProviderSwitches {
+                    vertex: true,
+                    anthropic: true,
+                    openai: true,
+                    openrouter: true,
+                    xai: true,
+                    local: true,
+                }
+            ),
+            "a workspace with no rows must resolve every switch on"
+        );
+
+        for key in PROVIDER_ENABLED_KEYS {
+            seed_preference(&pool, key, "false").await.unwrap();
+        }
+        let s = read_provider_switches(&pool).await;
+        assert!(
+            !s.vertex && !s.anthropic && !s.openai && !s.openrouter && !s.xai && !s.local,
+            "every key must reach its own field: {s:?}"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// A switch that needed a restart is a switch the user reads as broken, so
+    /// the config subscriber has to watch all six.
+    #[test]
+    fn every_switch_hot_swaps() {
+        for key in PROVIDER_ENABLED_KEYS {
+            assert!(
+                PROVIDER_PREFERENCE_KEYS.contains(&key),
+                "{key} must be watched by the provider config subscriber"
+            );
+        }
+    }
+
+    /// The frontend mirrors this watch set, to re-probe `/health` on the same
+    /// preferences that rebuild the provider here. A key added on this side and
+    /// forgotten there leaves the model picker offering a provider the engine
+    /// has already dropped, with nothing failing.
+    #[test]
+    fn the_frontend_mirrors_the_provider_preference_keys() {
+        let ts = include_str!("../../../lucidos-app/src/store/actions/entityReferences.ts");
+        for key in PROVIDER_PREFERENCE_KEYS {
+            assert!(
+                ts.contains(&format!("'{key}'")),
+                "{key} rebuilds the provider but entityReferences.ts does not \
+                 re-probe on it"
+            );
+        }
+    }
+
+    /// The agent must not be able to switch a provider off. Asserted from this
+    /// side, over the same key list the build reads, so a renamed constant
+    /// cannot leave a settable key behind in the catalog.
+    #[test]
+    fn no_switch_is_agent_settable() {
+        for key in PROVIDER_ENABLED_KEYS {
+            assert!(
+                crate::core::preference_catalog::INTERNAL_KEYS
+                    .iter()
+                    .any(|(k, _)| *k == key),
+                "{key} must be an INTERNAL_KEY: the provider it switches off may \
+                 be the one answering the turn"
+            );
+        }
     }
 }

@@ -38,8 +38,9 @@ test.describe('Overlay makes the UI behind it inert', () => {
     await expect(menu).toBeVisible();
 
     // While it's open: <html data-overlay-open>; the icons behind are inert; the
-    // panel AND the opening toggle stay interactive. Poll — the markers are set in
-    // post-commit effects, a tick after the menu mounts.
+    // panel AND the opening toggle stay interactive. Poll rather than read once:
+    // the markers are set in layout effects, so they land in the menu's own
+    // commit, but the driver's click resolves before that commit runs.
     const overlayOpen = () => page.evaluate(() => document.documentElement.hasAttribute('data-overlay-open'));
     await expect.poll(overlayOpen).toBe(true);
     await expect.poll(() => pe(behind)).toBe('none');
@@ -54,8 +55,9 @@ test.describe('Overlay makes the UI behind it inert', () => {
     );
     expect(appShellPe).not.toBe('none');
 
-    // Dismiss via Escape; the behind UI is live again (poll — the markers are
-    // removed in the effect cleanup, a tick after the menu unmounts).
+    // Dismiss via Escape; the behind UI is live again. Poll for the same reason
+    // as above: the cleanup runs in the unmount commit, which the driver's
+    // keypress resolves ahead of.
     await page.keyboard.press('Escape');
     await expect(page.locator('.dropdown-menu')).toHaveCount(0);
     await expect.poll(overlayOpen).toBe(false);

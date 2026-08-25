@@ -667,10 +667,23 @@
 }
 
 
-/* Welcome message */
+/* Welcome message.
+
+   The width block is LOAD-BEARING, not a restatement of `.thread-content > *`.
+   Both welcome variants also wear `.response-content`, which sets
+   `max-width: 100%` at the same specificity as that cap, and `chat.css` imports
+   this file AFTER input-messages.css, so the 100% wins on source order and the
+   surface runs the full pane. Declared here rather than on one variant, because
+   both dock above the composer and must share its edges: the same
+   --content-max-width cap, the same centring, and the --turn-body-inset a
+   transcript turn puts between its box and its visible content. */
 .welcome-message {
     white-space: normal;
     padding-top: 1.5rem;
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+    padding-inline: var(--turn-body-inset);
 }
 
 .welcome-message h2 {
@@ -885,6 +898,16 @@
     line-height: 1.4;
 }
 
+/* The second way out of first run: the keyless free tier, for a user with no key
+   to enter. A step under the credential CTA above it, and on the default blue
+   rather than that one's green, because the two are alternatives and only one
+   can read as the obvious press. The margin opens a break between the two
+   action-plus-hint pairs, which the block's own 0.5rem gap is too tight for. */
+.welcome-provider-free-btn {
+    margin-top: 0.5rem;
+    font-size: var(--font-size-lg);
+}
+
 /* Setup-interview entry point, on the configured-workspace welcome. Same shape
    as .welcome-provider-setup above (prominent button plus a quiet hint line)
    because it is the same class of thing: the one action worth taking on this
@@ -917,18 +940,8 @@
    layout that gives the welcome its natural height (instead of a filled scroll
    area) is owned by shell.css. */
 .welcome-hero {
-    /* Width + centering match the transcript children and the prompt below: both
-       are capped at `--content-max-width` and centered (`.thread-content > *`,
-       `.prompt-input-container`), so the welcome lines up with the prompt
-       textarea on both sides. (Inherited from `.thread-content > *` — kept
-       explicit here so the intent reads at a glance.) The --turn-body-inset
-       padding is the same one the composer column carries, and the same one a
-       transcript turn puts between its box and its visible content, so all three
-       share one content edge. */
-    max-width: var(--content-max-width);
-    margin-left: auto;
-    margin-right: auto;
-    padding-inline: var(--turn-body-inset);
+    /* Width and centring come from `.welcome-message` above, which both variants
+       share. */
     text-align: left;
     /* Anchor the dismiss pill (below) to this centered content box instead of the
        full-width pane, so it sits at the content's top-right edge. */

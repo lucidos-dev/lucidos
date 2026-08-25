@@ -14,6 +14,13 @@
 #   • The attach step only ADDS assets to a Release that ALREADY exists, and
 #     that Release is normally still a DRAFT when this runs.
 #
+# THE RC ARM RUNS THE SAME BUILD AN HOUR EARLIER, and attaches nothing. A push
+# to rc/** produces the four workflow artifacts and stops there; Phase B
+# downloads them and attaches them itself, pinning this run by
+# head_sha == RC_COMMIT. The tag-push arm below is unchanged and is the
+# fallback whenever that pin cannot be proven, so the release never depends on
+# the head start having worked. See docs/plans/2026-08-25-release-wall-clock.md.
+#
 # THE TAG PUSH IS WHAT ATTACHES (2026-08-04). release-to-lucidos.sh pushes the
 # v<version> tag, creates the Release as a DRAFT, and then WAITS for the assets
 # this run produces before flipping it public, so a release is COMPLETE at the
@@ -65,9 +72,9 @@ on:
         description: 'Release tag to attach to (e.g. v0.15.0). Empty = use the dispatched ref, which must then BE a tag. Set it to backfill a release whose own run failed or attached nothing.'
         type: string
         default: ''
-  # THE REAL TRIGGER. A v* tag push builds all four tarballs and attaches them to
-  # the Release carrying that tag, which at that point is still a DRAFT: this is
-  # what lets release-to-lucidos.sh publish a release that is already complete.
+  # THE ATTACHING TRIGGER. A v* tag push builds all four tarballs and attaches
+  # them to the Release carrying that tag, which at that point is still a DRAFT:
+  # that is what lets release-to-lucidos.sh publish a release already complete.
   #
   # Workflows run from the version of the file at the PUSHED REF, so the tag's
   # own tree decides what this does. That is why the attaching behaviour takes
@@ -75,9 +82,27 @@ on:
   #
   # `rc-<version>` never reaches this arm: the RC flow pushes a BRANCH
   # (rc/<version>) and creates the rc-<version> draft prerelease, and pushes no
-  # v* tag at all. The attach step re-checks anyway (see its two refusals).
+  # v* tag at all. The rc BRANCH arm below builds and never attaches, and the
+  # attach step re-checks anyway (see its two refusals).
   push:
     tags: ['v*']
+    # THE HEAD START. An rc/** push builds the same four tarballs and stops at
+    # the workflow artifact: the attach step's `if:` below admits only a v* tag
+    # push or an opt-in dispatch, so a branch push attaches nothing, creates
+    # nothing and tags nothing.
+    #
+    # It is the SAME OBJECT. Phase A builds the deterministic stripped orphan
+    # commit, pushes it to rc/<version> and records it as RC_COMMIT; Phase B
+    # asserts the remote rc/<version> is still that exact SHA and force-pushes
+    # that same object to main. So a tarball built here is built from precisely
+    # what ships, and it is built while Apple notarizes rather than after.
+    #
+    # Phase B then downloads this run's artifacts and attaches them in seconds,
+    # pinning the run by head_sha == RC_COMMIT and refusing anything else
+    # (release_draft_attach_from_rc_run). The tag-push arm above stays as the
+    # fallback for every case where that cannot be proven, so the slow path is
+    # still whole. See docs/plans/2026-08-25-release-wall-clock.md.
+    branches: ['rc/**']
 
 permissions:
   # `contents: write` is needed ONLY by the gated attach-to-release step below;
@@ -148,7 +173,7 @@ jobs:
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential perl pkg-config curl ca-certificates git python3 binutils
+            build-essential perl pkg-config curl ca-certificates git python3 binutils zstd
           git --version && python3 --version
 
       # The ubuntu:22.04 container has no Rust toolchain (the preinstalled one lives
@@ -187,6 +212,42 @@ jobs:
           cargo --version
           node --version
           npm --version
+
+      # ── THE DEPENDENCY CACHE, AND WHY A RELEASE BUILD MAY HAVE ONE ───────────
+      # cargo is 94% of this job: 32m16s of the Intel Mac's 33m45s last release,
+      # and third-party dependencies are 12m25s of that. Nothing was cached
+      # anywhere, so every release recompiled the whole tree four times.
+      #
+      # A poisoned cache in a smoke leg is a red run; here it would ship a bad
+      # binary, so the bar is different and three things meet it.
+      #
+      # ONLY DEPENDENCIES ARE RESTORED. rust-cache deletes the workspace
+      # members' artifacts from target/ before saving, so every release build
+      # still compiles all of crates/** from source. What comes back is
+      # third-party code plus the cargo registry, which cargo integrity-checks
+      # against Cargo.lock.
+      #
+      # THE KEY IS STRICT. rust-cache already folds in the rustc version and
+      # host, the job id, and hashes of Cargo.lock and every Cargo.toml. Three
+      # more go in here so no two legs can alias: the triple, the RUNNER IMAGE
+      # and the container tag.
+      #
+      # The runner image is the macOS half of what the container tag does for
+      # Linux. A dependency build script compiles C against the platform SDK
+      # (openssl-src, ring), and the SDK is a property of the image rather than
+      # of anything cargo fingerprints. Keying on the LABEL (macos-15,
+      # macos-15-intel) pins the OS major without evicting on the weekly patch
+      # bump, which a full image version would.
+      #
+      # ONLY THE rc ARM WRITES. The tag-push fallback and the backfill dispatch
+      # therefore read a cache written by a run of the very same commit, and the
+      # prefix keeps install-smoke's caches in a namespace this can never read.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-rel
+          key: ${{ matrix.triple }}-${{ matrix.runner }}-${{ matrix.container || 'runner' }}
+          save-if: ${{ startsWith(github.ref, 'refs/heads/rc/') }}
 
       - name: Build headless tarball (${{ matrix.triple }})
         run: |
@@ -232,14 +293,22 @@ jobs:
           done
           echo "OK — all staged binaries respect the ubuntu:22.04 portability floor."
 
-      # retention-days: 1, because this artifact is a short-lived inspection copy
-      # and nothing else reads it: no job anywhere runs download-artifact, and the
-      # attach step below reads dist/headless/ straight from this job's workspace.
-      # The same tarballs land on the release as ASSETS, which are not counted
-      # against the account's Actions storage, so the durable copy is there and
-      # this one only has to outlive the run. Without the key these ~250 MB per
-      # release inherit the repo's 90-day default: eight releases put 1.98 GB
-      # against a 0.5 GB included quota (2026-08-09).
+      # TWO RETENTIONS, because the two arms produce artifacts nobody reads and
+      # artifacts a release consumes.
+      #
+      # On a TAG push it stays 1 day. That copy is a short-lived inspection
+      # copy: the attach step below reads dist/headless/ straight from this
+      # job's workspace, and the durable copy is the release ASSET, which is not
+      # counted against the account's Actions storage. Without the key these
+      # ~250 MB per release inherit the repo's 90-day default: eight releases
+      # put 1.98 GB against a 0.5 GB included quota (2026-08-09).
+      #
+      # On an rc/** push it is 7 days, because Phase B DOWNLOADS this copy. The
+      # gap between the two phases is Apple's notary, which has taken fourteen
+      # hours and more, and a candidate can sit re-armed over a weekend. Expiry
+      # is safe rather than fatal (Phase B falls back to the tag-triggered
+      # build), so this is sized for the observed worst case with headroom, not
+      # for the theoretical one. There is one rc run per release.
       - name: Upload tarball + checksum as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -248,7 +317,7 @@ jobs:
             dist/headless/*.tar.gz
             dist/headless/*.tar.gz.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ startsWith(github.ref, 'refs/heads/rc/') && 7 || 1 }}
 
       # ── ATTACH TO THE RELEASE FOR THIS TAG, DRAFT OR PUBLISHED ────────────────
       # This is the step the whole ordering turns on. The Release exists (
@@ -393,14 +462,52 @@ jobs:
             exit 1
           fi
           echo "release id = $rel_id (draft=$rel_draft, prerelease=$rel_prerelease)"
+
+          # ATTACH MEANS ADD, AND ON A PUBLISHED RELEASE IT MEANS ONLY ADD.
+          #
+          # Uploading a name GitHub already carries needs the old asset deleted
+          # first, and the gap between the DELETE and the POST is a window in
+          # which the advertised `curl … | sh` 404s for that platform. On a
+          # DRAFT that costs nothing (nothing public resolves through it), so
+          # the clobber stays exactly as it was. On a PUBLISHED release it is a
+          # real outage, and since Phase B started attaching the rc build's
+          # tarballs itself this run reaches a published release as the normal
+          # case: it is the FALLBACK, arriving ~34 minutes late with an
+          # equivalent build of the same commit (see
+          # docs/plans/2026-08-25-release-wall-clock.md).
+          #
+          # So a published release keeps an asset that is already fully
+          # `uploaded`, and everything else still clobbers. A half-uploaded
+          # asset therefore stays replaceable, which is the state
+          # release_draft_missing_assets counts as missing and the backfill
+          # exists to repair.
           for f in dist/headless/*.tar.gz dist/headless/*.tar.gz.sha256; do
             base=$(basename "$f")
-            # delete any existing asset with the same name (clobber)
             existing=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               "$api/repos/${GITHUB_REPOSITORY}/releases/$rel_id/assets" | \
-              python3 -c "import sys,json;[print(a['id']) for a in json.load(sys.stdin) if a['name']=='$base']")
-            for aid in $existing; do
+              python3 -c "import sys,json;[print(a['id'], a.get('state','')) for a in json.load(sys.stdin) if a['name']==sys.argv[1]]" "$base")
+            stale_ids=""
+            keep=0
+            while read -r aid state; do
+              [ -n "$aid" ] || continue
+              # An ABSENT state reads as uploaded, matching
+              # release_draft_missing_assets, which treats the field as
+              # advisory so a future API that stopped emitting it cannot make
+              # every release look incomplete. It is also the safe direction
+              # here: if this parse ever stops finding the field, the miss
+              # keeps a live asset rather than deleting one.
+              if [ "$rel_draft" != "true" ] && [ "${state:-uploaded}" = "uploaded" ]; then
+                keep=1
+              fi
+              stale_ids="$stale_ids $aid"
+            done <<< "$existing"
+            if [ "$keep" = "1" ]; then
+              echo "  keep $base (already attached to the published ${attach_tag}; not re-uploading over a live asset)"
+              echo "       to REPLACE it deliberately: gh release delete-asset ${attach_tag} $base --repo ${GITHUB_REPOSITORY} --yes, then re-dispatch"
+              continue
+            fi
+            for aid in $stale_ids; do
               curl -sS -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
                 "$api/repos/${GITHUB_REPOSITORY}/releases/assets/$aid" >/dev/null
             done

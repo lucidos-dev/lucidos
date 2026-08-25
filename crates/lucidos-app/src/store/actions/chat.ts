@@ -360,15 +360,13 @@ function addPendingMessage(
       image_hashes: imageHashes,
     });
     if (focusedThreadId.value === threadId) {
-      // The reader just produced the content at the bottom, so take them to it
-      // and keep them there while the answer streams in. Called BEFORE the
-      // threadMap write below, so the optimistic row has not rendered yet and
-      // the landing correctly waits for it rather than resolving the previous
-      // message. That ordering is also what makes a BRAND-NEW thread read as
-      // the empty transcript it still is, which is how `followSentMessage`
-      // knows this send has nowhere to take anybody and arms nothing. This is
-      // one of exactly three things that arm the follow; the others are the
-      // down chevron and answering a question card. See `followSentMessage`.
+      // The reader just produced the content at the bottom, so rest them on the
+      // live edge until the agent draws (ADR 0080). It arms nothing. Called
+      // BEFORE the threadMap write below. The optimistic row has therefore not
+      // rendered, so the landing waits for it rather than resolving the previous
+      // message. That ordering also makes a BRAND-NEW thread read as the empty
+      // transcript it still is. So `followSentMessage` knows this send has
+      // nowhere to take anybody.
       followSentMessage();
       // Perf: stamp the open→paint re-render span for the `thread-rerender` mark
       // (a follow-up send on the focused thread re-renders the whole exchange

@@ -274,13 +274,28 @@ export function installPairedSwallow(): void {
  *    back up (with a task-scoped backstop for a handler that stops
  *    propagation). See the comments at those branches for the file-picker case
  *    it exists for.
- *  - `Escape` always dismisses.
+ *  - `Escape` dismisses when this overlay is the top panel. It is the fallback
+ *    path: the central capture-phase dispatcher normally gets there first.
  *
  *  `onDismiss` may return `false` to declare the call was a no-op (e.g. the
  *  popover is already on its way out via an animation). In that case the
  *  suppressor stays disarmed (and `onArm` is NOT called) so the user's tap on a
  *  sibling button still reaches its handler. Returning `void` / `true` keeps the
  *  default swallow.
+ *
+ *  **`isTop` is what makes STACKED overlays behave.** Each open overlay installs
+ *  its own document listener, and each asks only whether the target is outside
+ *  ITS panel. So without this, a click on the upper overlay reads as an outside
+ *  click to the lower one, which then closes invisibly behind it. Nesting hid
+ *  that for years: a dropdown inside a modal sits physically inside the modal's
+ *  panel, so the modal never saw it as outside. Two SIBLING overlays are the
+ *  case that exposes it, and a condition modal opened from the waiting panel is
+ *  exactly that.
+ *
+ *  The caller answers it with the top PANEL rather than the raw `overlayStack`
+ *  top, and `topPanelOverlay` says why. The CENTRAL Escape dispatcher keeps the
+ *  raw top, which is what lets a step inside a panel answer the key first. The
+ *  `onKey` below is only its fallback, so it follows `isTop` like the rest.
  *
  *  Exported as a pure factory so `.test.ts` can drive the handlers without
  *  jsdom — `useDismissOnOutside` is the hook that wires these to `document`
@@ -291,9 +306,11 @@ export function makeDismissHandlers(
   anchor: HTMLElement | null,
   onDismiss: () => void | boolean,
   onArm?: () => void,
+  isTop: () => boolean = () => true,
 ): {
   onPointerDown(e: PointerEvent): void;
   onTouchEnd(e: TouchEvent): void;
+  onCancel(): void;
   onClickCapture(e: MouseEvent): void;
   onClickBubble(e: MouseEvent): void;
   onKey(e: KeyboardEvent): void;
@@ -304,9 +321,26 @@ export function makeDismissHandlers(
   // dispatch: `onClickBubble` clears it when the same event reaches document
   // on the way back up. See `onClickCapture` for what it protects.
   let insideClick: MouseEvent | null = null;
+  // An outside PRIMARY pointerdown reached this handler and has not been paired
+  // with its click yet, INCLUDING one declined for not being the top panel. The
+  // fallback below exists for a click with no pointerdown behind it, and a
+  // declined pointerdown is still a pointerdown.
+  //
+  // Without it a stacked pair leaked: the upper overlay consumes the gesture
+  // and unmounts on the microtask, so by the time the paired click lands, this
+  // one IS top. It read the click as unpaired and closed too, which is the
+  // whole thing `isTop` was added to prevent, one task later.
+  //
+  // Primary-only for the same reason `suppressNextClick` is. A secondary button
+  // dispatches `contextmenu` or `auxclick` and never a `click`, so the pairing
+  // would never arrive. The flag would strand set and eat the next synthetic
+  // click's dismiss. `onCancel` covers the other way a gesture ends clickless.
+  let awaitingPairedClick = false;
   return {
     onPointerDown(e) {
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
+      if (e.button === 0) awaitingPairedClick = true;
+      if (!isTop()) return;
       const dismissed = onDismiss();
       if (e.button === 0 && dismissed !== false) {
         suppressNextClick = true;
@@ -321,13 +355,31 @@ export function makeDismissHandlers(
       // target: never swallow on the anchor (must toggle via its own handler)
       // or inside the panel. preventDefault() here also cancels the synthetic
       // click, so the flag can't strand.
-      if (!suppressNextClick) return;
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
+      // The touch gesture ends here, and the click it would pair with is
+      // cancelled: by the `preventDefault()` below when this handler armed, and
+      // by the TOP overlay's paired swallow when it declined. Either way
+      // nothing later clears the pairing, so it is cleared now.
+      awaitingPairedClick = false;
+      if (!suppressNextClick) return;
       suppressNextClick = false;
       e.stopPropagation();
       e.preventDefault();
     },
+    // A gesture the browser took away (a scroll, a drag, a lost pointer) ends
+    // with no click at all. BOTH flags waiting for one are then stale.
+    //
+    // The pairing would strand on an overlay that declined the pointerdown and
+    // stayed open. The swallow would strand on one that dismissed and stayed
+    // MOUNTED, which the drawer does by design during its slide-out: it then
+    // ate a neighbour's tap, the very thing its `false` return exists to stop.
+    onCancel() {
+      awaitingPairedClick = false;
+      suppressNextClick = false;
+    },
     onClickCapture(e) {
+      const paired = awaitingPairedClick;
+      awaitingPairedClick = false;
       if (suppressNextClick) {
         suppressNextClick = false;
         e.stopPropagation();
@@ -367,6 +419,12 @@ export function makeDismissHandlers(
         return;
       }
       if (insideClick) return;
+      // This click HAS a pointerdown behind it, and the branch below is for the
+      // ones that do not. Reaching here means the overlay above consumed that
+      // pointerdown. So the gesture was never meant for this overlay, however
+      // the stack looks now that the upper one has gone.
+      if (paired) return;
+      if (!isTop()) return;
       // Fallback for `click` events that weren't preceded by an outside
       // pointerdown — e.g. `HTMLElement.click()` (synthetic, common in e2e
       // tests and keyboard-shortcut handlers). The replaced hand-rolled
@@ -393,7 +451,7 @@ export function makeDismissHandlers(
       if (insideClick === e) insideClick = null;
     },
     onKey(e) {
-      if (e.key === 'Escape') onDismiss();
+      if (e.key === 'Escape' && isTop()) onDismiss();
     },
   };
 }
@@ -411,6 +469,7 @@ export function useDismissOnOutside(
   panelRef: { current: HTMLElement | null },
   anchor: HTMLElement | null,
   onDismiss: () => void | boolean,
+  isTop?: () => boolean,
 ): void {
   // Stash onDismiss in a ref so an inline arrow callback at the call site
   // doesn't churn the effect deps below. Callers should be free to write
@@ -419,6 +478,11 @@ export function useDismissOnOutside(
   // updated every render so the latest callback always wins on fire.
   const dismissRef = useRef(onDismiss);
   dismissRef.current = onDismiss;
+  // Same ref treatment, and for a second reason: the predicate reads the
+  // overlay stack, so it must be evaluated when the event fires rather than
+  // captured when the listeners installed.
+  const isTopRef = useRef(isTop);
+  isTopRef.current = isTop;
   // useLayoutEffect (not useEffect) so the document listeners attach
   // synchronously in the same commit that mounts the popover — i.e. BEFORE the
   // browser paints. A plain useEffect attaches a frame later, after paint, which
@@ -431,7 +495,13 @@ export function useDismissOnOutside(
   // helps once the listener exists, so the listener must exist from frame zero.
   useLayoutEffect(() => {
     if (!isOpen) return;
-    const handlers = makeDismissHandlers(panelRef, anchor, () => dismissRef.current(), installPairedSwallow);
+    const handlers = makeDismissHandlers(
+      panelRef,
+      anchor,
+      () => dismissRef.current(),
+      installPairedSwallow,
+      () => isTopRef.current?.() ?? true,
+    );
     document.addEventListener('pointerdown', handlers.onPointerDown, true);
     // Capture phase so this precedes the target button's own bubble-phase
     // `onTouchEnd`; non-passive so `preventDefault()` (which cancels the
@@ -443,12 +513,19 @@ export function useDismissOnOutside(
     // is what keeps the window one dispatch wide instead of one task wide.
     document.addEventListener('click', handlers.onClickBubble);
     document.addEventListener('keydown', handlers.onKey);
+    // Pairs with `installPairedSwallow`'s own cancel teardown. That one drops
+    // the surviving one-shot; this one drops the two local flags waiting for
+    // the same click. A gesture can end without the click it announced.
+    document.addEventListener('pointercancel', handlers.onCancel, true);
+    document.addEventListener('touchcancel', handlers.onCancel, true);
     return () => {
       document.removeEventListener('pointerdown', handlers.onPointerDown, true);
       document.removeEventListener('touchend', handlers.onTouchEnd, true);
       document.removeEventListener('click', handlers.onClickCapture, true);
       document.removeEventListener('click', handlers.onClickBubble);
       document.removeEventListener('keydown', handlers.onKey);
+      document.removeEventListener('pointercancel', handlers.onCancel, true);
+      document.removeEventListener('touchcancel', handlers.onCancel, true);
     };
   }, [isOpen, panelRef, anchor]);
 }

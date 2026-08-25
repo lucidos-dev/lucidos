@@ -33,8 +33,16 @@ vi.mock('../../../store/store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/store')>()),
   showConfirm: vi.fn(async () => true),
 }));
+// The two onboarding CTAs are deep links. Stub them so a press is observable
+// without mounting Settings, and keep the rest of the module real.
+vi.mock('../../../store/actions/menu', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../store/actions/menu')>()),
+  openProviderSettings: vi.fn(),
+  openFreeProviderSettings: vi.fn(),
+}));
 
 import { WelcomeMessage, ProviderSetupWelcome, SetupInterviewWelcome } from '../WelcomeMessage';
+import { openFreeProviderSettings, openProviderSettings } from '../../../store/actions/menu';
 import { showWelcomeSurface } from '../CreateThreadView';
 import { threadHeaderActions } from '../../layout/ThreadHeaderActions';
 import { dialogParagraphs } from '../../shared/DialogMessage';
@@ -303,6 +311,11 @@ describe('setup interview: cross-file wiring', () => {
 });
 
 describe('ProviderSetupWelcome — onboarding content', () => {
+  beforeEach(() => {
+    vi.mocked(openProviderSettings).mockClear();
+    vi.mocked(openFreeProviderSettings).mockClear();
+  });
+
   it('shows the setup CTA pointing at Settings → Models → Providers, and nothing that needs a model', () => {
     const tree = ProviderSetupWelcome() as AnyVNode;
     const btns = findByClass(tree, 'welcome-provider-setup-btn');
@@ -311,5 +324,38 @@ describe('ProviderSetupWelcome — onboarding content', () => {
     // The fix must steer to provider setup, not offer agent-assuming actions.
     expect(textOf(tree)).toContain('Settings → Models → Providers');
     expect(containsComponent(tree, SetupInterviewWelcome)).toBe(false);
+  });
+
+  it('names the keyless free tier as the option needing no key', () => {
+    // The credential CTA above it is unreachable without a subscription or a
+    // card, and this screen exists for the user who has neither.
+    const tree = ProviderSetupWelcome() as AnyVNode;
+    const text = textOf(tree);
+    expect(text).toContain('OpenCode Free');
+    expect(text).toContain('no key');
+    const free = findByClass(tree, 'welcome-provider-free-btn');
+    expect(free.length).toBe(1);
+    expect(textOf(free[0])).toContain('free tier');
+  });
+
+  it('routes the free action to the switch and enables nothing', () => {
+    const tree = ProviderSetupWelcome() as AnyVNode;
+    const free = findByClass(tree, 'welcome-provider-free-btn')[0];
+    (free.props.onClick as (e: MouseEvent) => void)({} as MouseEvent);
+    expect(openFreeProviderSettings).toHaveBeenCalledTimes(1);
+    // Not the section-level link. The tier is one row inside that section, and
+    // landing at the top of it is what made the tier hard to find.
+    expect(openProviderSettings).not.toHaveBeenCalled();
+  });
+
+  it('leaves the opt-in on the switch, never on this surface', () => {
+    // ADR 0104: the tier is off by default and states its terms where it is
+    // turned on. A welcome that could flip it would move the decision away from
+    // the sentence describing it. Source-scanned, because the guarantee is that
+    // the setter is not REACHABLE here, not merely that one path avoids it.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src: string = readFileSync(resolve(here, '../WelcomeMessage.tsx'), 'utf8');
+    expect(src).not.toContain('setOpenCodeFreeEnabled');
+    expect(src).not.toContain('opencode_free_enabled');
   });
 });

@@ -29,7 +29,7 @@ beforeEach(() => {
 describe('dispatchEscape (non-destructive Escape policy)', () => {
   it('dismisses the top overlay first, before any blur', () => {
     const dismiss = vi.fn();
-    pushOverlay({ id: 'm', dismiss });
+    pushOverlay({ id: 'm', dismiss, hasPanel: true });
     // Even with a focused text input, an open overlay wins.
     vi.mocked(isTextInput).mockReturnValue(true);
     expect(dispatchEscape({ blur: vi.fn() } as unknown as Element)).toBe('dismissed');
@@ -66,8 +66,8 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
   it('pops only the modal when an app is pseudo-fullscreen behind it', () => {
     const exitFullscreen = vi.fn();
     const closeModal = vi.fn();
-    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitFullscreen });
-    pushOverlay({ id: 'overlay-1', dismiss: closeModal });
+    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitFullscreen, hasPanel: false });
+    pushOverlay({ id: 'overlay-1', dismiss: closeModal, hasPanel: true });
 
     expect(dispatchEscape(null)).toBe('dismissed');
     expect(closeModal).toHaveBeenCalledTimes(1);
@@ -83,7 +83,7 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
   // and the next Escape closes it.
   it('stands down while an element is natively fullscreen', () => {
     const dismiss = vi.fn();
-    pushOverlay({ id: 'm', dismiss });
+    pushOverlay({ id: 'm', dismiss, hasPanel: true });
     expect(dispatchEscape(null, true)).toBe('fullscreen');
     expect(dismiss).not.toHaveBeenCalled();
   });
@@ -101,7 +101,7 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
 
   it('dismisses normally once native fullscreen is gone', () => {
     const dismiss = vi.fn();
-    pushOverlay({ id: 'm', dismiss });
+    pushOverlay({ id: 'm', dismiss, hasPanel: true });
     expect(dispatchEscape(null, false)).toBe('dismissed');
     expect(dismiss).toHaveBeenCalledTimes(1);
   });
@@ -281,7 +281,7 @@ describe('dispatchPreviewIframeShortcut (keydown INSIDE a content-pane preview i
 
   it('Escape dismisses an open host overlay (e.g. a modal over the content)', () => {
     const dismiss = vi.fn();
-    pushOverlay({ id: 'm', dismiss });
+    pushOverlay({ id: 'm', dismiss, hasPanel: true });
     const e = key({ key: 'Escape' });
     expect(dispatchPreviewIframeShortcut(e)).toBe(true);
     expect(dismiss).toHaveBeenCalledTimes(1);

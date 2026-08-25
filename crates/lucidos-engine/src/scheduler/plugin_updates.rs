@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::SharedEngine;
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_marketplaces::{
-    load_registry, scan_catalog, update_candidates, MarketplacePlugin, MarketplaceScanError,
+    clone_urls, load_registry, scan_catalog, update_candidates, MarketplacePlugin,
+    MarketplaceScanError,
 };
 use crate::engine::tools::plugins::installed_plugin_summaries;
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
@@ -95,8 +97,10 @@ pub(crate) async fn run_plugin_marketplace_update_check(
 
     let scan_workspace = workspace.clone();
     let scan_registry = registry.clone();
+    // The scan is synchronous, so its credentials are resolved out here.
+    let credentials = GitCredentials::resolve_many(&pool, &clone_urls(&registry)).await;
     let catalog = match tokio::task::spawn_blocking(move || {
-        scan_catalog(&scan_workspace, &scan_registry, &installed)
+        scan_catalog(&scan_workspace, &scan_registry, &installed, &credentials)
     })
     .await
     {

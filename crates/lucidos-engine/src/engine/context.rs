@@ -119,9 +119,12 @@ pub(super) const HISTORY_OLDER_USER_BUDGET: usize = 20_000;
 /// before the summary is rebuilt (ADR 0102).
 ///
 /// The uncovered turns render compacted in the meantime, so this trades up to
-/// `N * HISTORY_ASSISTANT_COMPACT` chars against an auxiliary model call in
-/// turn setup. That call sends tens of thousands of tokens and blocks the first
-/// agentic step, so a few compacted turns is the cheaper side.
+/// `N * HISTORY_ASSISTANT_COMPACT` chars against an auxiliary model call
+/// carrying tens of thousands of tokens.
+///
+/// A refresh lands one turn late, since it is detached (ADR 0102). So the gap
+/// this number allows is what a thread renders while the paragraph catches up,
+/// and 5 has not been re-derived against that.
 pub(super) const HISTORY_SUMMARY_REFRESH_AFTER: usize = 5;
 
 /// How many uncovered assistant turns the *older region* renders before it

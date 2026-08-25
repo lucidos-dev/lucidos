@@ -34,15 +34,16 @@ import type {
 import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
 import { cancelAppUpdate } from '../utils/tauri';
+import { documentTitle } from '../utils/windowTitle';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
-import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
+import type { EventSubscription, ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
-import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
+import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, ReleaseNoticeView } from '../api/client';
 import type { ReleaseCheck } from '../api/client/control';
 import type { EnvironmentVariable, ModelInfo } from '../api/types';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
@@ -425,6 +426,17 @@ export const whatsNewSeenRelease = signal<string | null>(
  *  RUNNING, which is the older one and the opposite of what an offer is
  *  about. */
 export const whatsNewTargetRelease = signal<string | null>(null);
+/** Every *release notice* this release has reached, with the id of the one the
+ *  workspace still owes an answer to.
+ *
+ *  Loaded at startup rather than on a panel open, unlike the changelog above:
+ *  the modal is the point, and it has to be able to raise itself. Small by
+ *  construction, since most releases carry no notice at all.
+ *
+ *  Per WORKSPACE, not per client. Answering on the laptop settles it on the
+ *  phone too, which is the opposite of {@link whatsNewSeenRelease} and is
+ *  deliberate: a notice asks for work on the workspace, done once. */
+export const releaseNoticeView = signal<Loadable<ReleaseNoticeView>>({ status: 'not-loaded' });
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 export const latestTauriAppVersion = signal<string | null>(null);
@@ -453,6 +465,15 @@ export const releaseCheck = signal<ReleaseCheck | null>(null);
  *  DIAGNOSABLE instead of silent. Swallowed, it makes a stranded install
  *  indistinguishable from an up-to-date one. */
 export const appUpdateCheckError = signal<string | null>(null);
+/** True while a USER-INITIATED update check is in flight.
+ *
+ *  Only the click sets it, never the background poll: the poll runs on mount
+ *  and on resume, and reporting it would make the button flicker on its own.
+ *
+ *  The control the user pressed reads it for its label and its `disabled`. A
+ *  check costing a network round-trip cannot then look like a dead button. See
+ *  `checkForUpdatesNow` in store/actions/app-update.ts. */
+export const appUpdateCheckInFlight = signal(false);
 /** Live phase of a packaged app-update run, or `null` when none is in flight.
  *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts).
  *  The engine has no part in it, so this stays null in a browser, PWA or dev
@@ -1735,8 +1756,11 @@ export const notificationsFilter = signal<'all' | 'unread'>(
 );
 export const notificationsHasMore = signal(false);
 export const notificationsLoadingMore = signal(false);
+/** The browser tab's title: the unread count, the product name, and which
+ *  workspace this is. Composed by `utils/windowTitle.ts`, which also composes
+ *  the packaged window's own title from the same name. */
 export const pageTitle = computed(() =>
-  unreadCount.value > 0 ? `(${unreadCount.value}) Lucidos` : 'Lucidos'
+  documentTitle(visibleWorkspaceName.value, unreadCount.value)
 );
 // --- Credentials ---
 export const credentials = signal<Loadable<CredentialInfo[]>>({ status: 'not-loaded' });
@@ -2205,6 +2229,43 @@ export interface ContextViewerState {
   description?: string;
 }
 export const contextViewer = signal<ContextViewerState | null>(null);
+
+// --- Event subscription condition ---
+// Set to one *event subscription* to show the `condition` filtering it; null =
+// closed. One subscription rather than the whole `on:` list, because that is
+// what the thing you pressed names.
+export interface EventConditionModalState {
+  eventType: string;
+  condition: Record<string, unknown>;
+}
+export const eventConditionModal = signal<EventConditionModalState | null>(null);
+
+/** The door to a subscription's condition, or `null` when it has none.
+ *
+ *  **Both PRESSABLE surfaces go through here**: the transcript row's chip and
+ *  the waiting panel's line. (The archive confirmation prints the same
+ *  "(filtered)" label into a plain string and offers no door.) They must open the same thing under
+ *  the same accessible name, and each must be pressable exactly when its label
+ *  says filtered. Two copies of that rule is how the two drift apart.
+ *
+ *  The panel is a backdrop-less popover and the modal is a top-anchored sheet.
+ *  So opening one from the other STACKS on `overlayStack` rather than replacing
+ *  it: Escape or an outside click closes the modal and lands back on the panel.
+ *
+ *  `condition` is captured here rather than re-read at click time, which is
+ *  what makes the returned `open` safe to hand to a handler. */
+export function eventConditionDoor(
+  s: EventSubscription,
+): { label: string; open: () => void } | null {
+  const condition = s.condition;
+  if (!condition) return null;
+  return {
+    label: `Show the condition filtering ${s.event_type}`,
+    open: () => {
+      eventConditionModal.value = { eventType: s.event_type, condition };
+    },
+  };
+}
 
 // --- Image popup + message route panel state live in their own modules; re-exported
 // so importers keep using `from '../store/store'`. ---

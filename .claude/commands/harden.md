@@ -354,6 +354,37 @@ reading the variable at run time, never by exempting the file. The gate is
 scoped to a `build.rs` beside a `Cargo.toml`, so ordinary source keeping
 compile-time `env!` (`crates/lucidos-engine/src/paths.rs`) is untouched.
 
+### Also always: system-knowhow points at things that exist
+
+```bash
+./scripts/check-knowhow-refs.sh
+```
+
+Whole-tree and unconditional, like the gates above, and milliseconds.
+
+`system-knowhow/` ships to every install, and the engine LLM reads it as fact
+rather than as a link it can shrug off. Four arms:
+
+- a backtick-quoted repo path that does not exist
+- a sibling knowhow file or id that does not resolve
+- an event name in the audit or learning recipe that no engine enum has
+- a severity word in `workspace-audit.md` outside its own legend
+
+Unconditional because the usual author of this drift is the OTHER side of the
+diff. A module becomes a directory, an event gets renamed, and a knowhow file
+nobody edited starts lying. Two module renames sat stale in three files that
+way, and `workspace-audit.md` spent months calling `ContextAssembled` a retired
+event rename. It never was one.
+
+Fix a failure by correcting the pointer or the name. Arm 3 keeps a short list
+of PascalCase names in those recipes that are genuinely not engine events. A
+recipe naming another real Rust type belongs on it. A name the recipe calls an
+EVENT never does: widening the list to silence one is the single misuse.
+
+The rule this backs is `.claude/rules/system-knowhow.md`, which also owns the
+half no script can see: a check whose names all resolve but whose meaning has
+gone stale.
+
 ### Also always: registered hooks can actually run
 
 ```bash

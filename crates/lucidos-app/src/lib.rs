@@ -23,6 +23,7 @@ mod shell_env;
 mod traffic_lights;
 mod updater;
 mod window_restore;
+mod window_session;
 
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
 /// Boots the bundled Postgres + engine and supervises them with no window. The
@@ -239,13 +240,194 @@ fn should_persist_geometry(dirty: bool, since_last_change: std::time::Duration) 
 /// next main-loop turn.
 fn persist_window_state_on_main(app: &tauri::AppHandle) {
     let handle = app.clone();
-    if let Err(e) = app.run_on_main_thread(move || {
-        if let Err(e) = handle.save_window_state(window_state_flags()) {
-            eprintln!("[Tauri] Failed to persist window state: {e}");
-        }
-    }) {
+    if let Err(e) = app.run_on_main_thread(move || persist_windows(&handle)) {
         eprintln!("[Tauri] Failed to schedule window-state save: {e}");
     }
+}
+
+/// Persist BOTH records the client keeps about its windows. Main thread only,
+/// for the reason [`persist_window_state_on_main`] gives.
+///
+/// The two are complementary rather than redundant. The plugin's record is per
+/// window LABEL, and restores `main` before anything knows what it will show.
+/// The session record is per WORKSPACE: which ones had a window, and how big
+/// each was. Only the second survives a label that changes between launches.
+///
+/// Every save site calls this, so a window recorded in one file is recorded in
+/// the other.
+fn persist_windows(app: &tauri::AppHandle) {
+    if let Err(e) = app.save_window_state(window_state_flags()) {
+        eprintln!("[Tauri] Failed to persist window state: {e}");
+    }
+    persist_window_session(app);
+}
+
+/// What this launch restores: a workspace per window, and the frame each wants.
+///
+/// Resolved once, in `setup`, and read again by `desktop::launch` on its own
+/// thread once the gateway is healthy. Memoized because the two reads must
+/// agree: the first window to settle rewrites the record underneath them.
+///
+/// A workspace with no remembered frame still gets a window, built at the
+/// default size.
+pub(crate) fn resolve_window_session_plan() -> &'static [(String, Option<window_restore::Rect>)] {
+    static PLAN: std::sync::OnceLock<Vec<(String, Option<window_restore::Rect>)>> =
+        std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        // Dev restores nothing: it shares the packaged app-data dir and
+        // `desktop::launch` is a no-op there, so the record is not its to read.
+        if tauri::is_dev() {
+            return Vec::new();
+        }
+        let Ok(app_data) = desktop::app_data_dir_from_env() else {
+            return Vec::new();
+        };
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let restore = should_show_window_at_startup(&args, false);
+        window_session::restore_plan(&window_session::read(&app_data), restore)
+    })
+}
+
+/// Put a window at `frame`, in the physical pixels the record stores.
+///
+/// Both restore paths go through here: `main` before the deferred show, and
+/// each extra window while it is still hidden. Best-effort and logged, since a
+/// window at the wrong size beats no window.
+fn place_window(window: &tauri::WebviewWindow, frame: window_restore::Rect, what: &str) {
+    if let Err(e) = window.set_size(tauri::PhysicalSize::new(
+        frame.width as u32,
+        frame.height as u32,
+    )) {
+        eprintln!("[Tauri] Failed to size {what}: {e}");
+    }
+    if let Err(e) =
+        window.set_position(tauri::PhysicalPosition::new(frame.x as i32, frame.y as i32))
+    {
+        eprintln!("[Tauri] Failed to place {what}: {e}");
+    }
+}
+
+/// Put `main` at the frame the workspace it will open remembers.
+///
+/// Before the show, so the window appears at its size rather than jumping to it
+/// a second later. The clamp runs after and sanitises whatever this leaves.
+fn size_main_window_for_its_workspace(app: &tauri::AppHandle, frame: window_restore::Rect) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        place_window(&window, frame, "the main window for its workspace");
+    }
+}
+
+/// Set once the client has begun a deliberate teardown: a quit, a restart, or
+/// the relaunch an update ends with.
+///
+/// Every one of those destroys its windows on the way out, one at a time. The
+/// `Destroyed` recapture would read that as the user closing them, and empty
+/// the record milliseconds after the teardown wrote it. The last record written
+/// BEFORE the teardown is the one that must stand.
+static TEARING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Declare that the windows are about to go away because the client is. Called
+/// by each deliberate exit path, right after its own [`persist_windows`].
+fn begin_teardown() {
+    TEARING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether this launch has ever put a window on screen, and the gate that rides
+/// on it.
+///
+/// The half of the session-write gate that rules out a LOGIN START. That launch
+/// comes up menu-bar-only and shows nothing, while `desktop::launch` still
+/// navigates the hidden `main` to the gateway root. The navigation half of the
+/// gate therefore passes, and the write replaced the user's arrangement with
+/// the empty one nobody was looking at.
+///
+/// A latch rather than a live visibility test. A hidden window IS part of the
+/// arrangement, since `main` is hidden rather than closed and the tray brings
+/// it back on its workspace. Testing visibility instead blocked the one write
+/// whose job is to SHRINK the record. What must not count is a launch where the
+/// user never saw anything at all.
+///
+/// A struct rather than a bare static, for the reason [`StartupShow`] is one:
+/// the rule is then testable against an instance a test owns.
+struct PresentedGate(AtomicBool);
+
+impl PresentedGate {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// A window is now on screen. Every path that puts one there says so.
+    fn note_presented(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Is the session record worth writing? BOTH halves, so the one expression
+    /// carries the whole rule.
+    fn may_write(&self, any_window_is_navigated: bool) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) && any_window_is_navigated
+    }
+}
+
+static PRESENTED: PresentedGate = PresentedGate::new();
+
+/// Re-record the window set after one closed, so the record stops naming it.
+///
+/// Stood down by a teardown, since a window destroyed on the way out was not
+/// closed by the user. See [`TEARING_DOWN`].
+fn forget_closed_window(app: &tauri::AppHandle) {
+    if TEARING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    persist_window_session(app);
+}
+
+/// Fold the live windows into the session record and write it.
+///
+/// Reading each window's geometry is a main-thread call, same as the plugin's
+/// save, so this is only ever reached through [`persist_windows`].
+fn persist_window_session(app: &tauri::AppHandle) {
+    // Dev shares the packaged install's app-data dir, and `desktop::launch`
+    // restores nothing there. Writing would only let a dev run rearrange the
+    // packaged client's windows.
+    if tauri::is_dev() {
+        return;
+    }
+    let Ok(app_data) = desktop::app_data_dir_from_env() else {
+        // No `HOME`, so nowhere to keep a record.
+        return;
+    };
+    let windows: Vec<window_session::WindowSnapshot> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_app_window(label))
+        .filter_map(|(label, window)| {
+            // The same pair the plugin persists and `window_restore` clamps, so
+            // all three reason about one set of numbers.
+            let (Ok(url), Ok(position), Ok(size)) =
+                (window.url(), window.outer_position(), window.inner_size())
+            else {
+                return None;
+            };
+            Some(window_session::WindowSnapshot {
+                label,
+                url: url.to_string(),
+                frame: window_restore::Rect {
+                    x: position.x as i64,
+                    y: position.y as i64,
+                    width: size.width as i64,
+                    height: size.height as i64,
+                },
+            })
+        })
+        .collect();
+    // A launch that never showed a window has no arrangement to record, and
+    // neither has one whose windows are all still on the splash. Each emptied
+    // the record through a different writer before this gate existed.
+    if !PRESENTED.may_write(window_session::any_window_is_navigated(&windows)) {
+        return;
+    }
+    let previous = window_session::read(&app_data);
+    window_session::write(&app_data, &window_session::capture(&previous, &windows));
 }
 
 /// Counter for generating unique webview/window labels.
@@ -434,13 +616,28 @@ fn toggle_window_maximize(window: tauri::Window) -> Result<(), String> {
     }
 }
 
+/// Title the CALLING window, so the macOS Window menu names the workspace that
+/// window is showing instead of listing "Lucidos" once per window.
+///
+/// The calling window, never `main`: two windows can sit on two workspaces, and
+/// the one to retitle is the one whose page reported the name. An app command,
+/// like `start_window_drag`, so the window-plugin ACL does not apply.
+///
+/// The title is invisible in the window itself, since `titleBarStyle: "Overlay"`
+/// plus `hiddenTitle` leaves that band to the webview. Where it does show is the
+/// Window menu, Mission Control and the window switcher.
+#[tauri::command]
+fn set_window_title(window: tauri::Window, title: String) -> Result<(), String> {
+    window.set_title(&title).map_err(|e| format!("{e}"))
+}
+
 /// Open an additional top-level app window (File → New Window / Cmd+N) on the
 /// window the user is looking at. Every window is just another client of the
 /// same engine (the engine + Postgres run as a shared launchd service, see
 /// `desktop`), so all windows share one workspace stack. The WKWebView
 /// crash-recovery watchdog stays scoped to `main`.
 fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
-    open_app_window(app, new_window_url(app))
+    open_app_window(app, new_window_url(app), None)
 }
 
 /// Build a top-level app window at `url`. The one builder every extra window
@@ -448,7 +645,16 @@ fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// File → New Window one: same `window-<n>` label (which is what
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
-fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String> {
+///
+/// `frame` is the geometry a RESTORED window wants, in physical pixels. Such a
+/// window is built hidden, placed, and shown once it is right, so it never
+/// appears at the default size and jumps. A fresh window passes `None` and
+/// takes the declared default.
+fn open_app_window(
+    app: &tauri::AppHandle,
+    url: WebviewUrl,
+    frame: Option<window_restore::Rect>,
+) -> Result<(), String> {
     let counter = WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
 
@@ -465,11 +671,36 @@ fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String
         .title("Lucidos")
         .inner_size(1024.0, 768.0)
         .disable_drag_drop_handler();
+    // The declared minimums too, which `main` takes from the config and a
+    // builder-made window otherwise has none of. See `declared_min_size`: a
+    // window draggable below the floor would lose its own size on restore.
+    let builder = match window_restore::declared_min_size(app) {
+        Some((width, height)) => builder.min_inner_size(width, height),
+        None => builder,
+    };
     #[cfg(target_os = "macos")]
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
-    builder.build().map_err(|e| format!("{e}"))?;
+    // A restored window is built HIDDEN and shown at the end. It then appears
+    // at its own frame rather than at the default and jumping.
+    //
+    // The builder cannot carry the frame itself: its `inner_size` and
+    // `position` are LOGICAL pixels and the record is physical. Converting
+    // needs the scale factor of the monitor the window lands on, which no one
+    // knows before it exists.
+    let builder = if frame.is_some() {
+        builder.visible(false)
+    } else {
+        builder
+    };
+    let window = builder.build().map_err(|e| format!("{e}"))?;
+    if let Some(frame) = frame {
+        place_window(&window, frame, &format!("the restored window {label}"));
+        // Same sanity pass `main` gets: a frame saved against a display that is
+        // no longer attached must not put a window somewhere unreachable.
+        window_restore::clamp_restored_geometry(app, &label);
+    }
     // Tint the bar now, so it is not black for the moment before this window's
     // frontend boots and calls `set_titlebar_color`. `build()` has registered
     // the window, so `paint_title_bars` covers it.
@@ -479,6 +710,16 @@ fn open_app_window(app: &tauri::AppHandle, url: WebviewUrl) -> Result<(), String
     // Same for the traffic lights, at the remembered bar height rather than
     // centred for the default scale.
     traffic_lights::place_all(app);
+    // Last, so a restored window's first frame is already the right size, in
+    // the right place, and tinted.
+    if frame.is_some() {
+        if let Err(e) = window.show() {
+            eprintln!("[Tauri] Failed to show the restored window {label}: {e}");
+        }
+    }
+    // Either way this window is now on screen, which is what the session gate
+    // waits for. See `PRESENTED`.
+    PRESENTED.note_presented();
     Ok(())
 }
 
@@ -554,7 +795,27 @@ fn open_workspace_window(
     let parsed = url
         .parse::<tauri::Url>()
         .map_err(|e| format!("could not open {url}: {e}"))?;
-    open_app_window(&app, WebviewUrl::External(parsed))
+    // No frame: this is the user opening a window now, not a launch restoring
+    // one. The session records the size it ends up at, for next time.
+    open_app_window(&app, WebviewUrl::External(parsed), None)
+}
+
+/// Reopen the extra windows this launch owes, at the frames they were left at.
+///
+/// `main` takes the first restored workspace and is navigated by the caller, so
+/// this covers everything after it. The URL is composed by the caller from a
+/// validated slug, never read off the record.
+pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::PlannedWindow]) {
+    for window in windows {
+        let url = &window.url;
+        let Ok(parsed) = url.parse::<tauri::Url>() else {
+            eprintln!("[Tauri] Cannot restore a window on an unparseable URL: {url}");
+            continue;
+        };
+        if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), window.frame) {
+            eprintln!("[Tauri] Failed to restore a window on {url}: {e}");
+        }
+    }
 }
 
 /// The difference between Tauri's window logical height and the CSS viewport
@@ -858,10 +1119,10 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     eprintln!("[Tauri] Restarting app: {:?} {:?}", exe, args);
 
     // The plugin's exit-time flush never runs on the exec path, so without this
-    // an in-session move or resize is lost across the restart.
-    if let Err(e) = app.save_window_state(window_state_flags()) {
-        eprintln!("[Tauri] Failed to persist window state before restart: {e}");
-    }
+    // an in-session move or resize is lost across the restart. The session
+    // record goes with it, or the restart comes back with one window.
+    persist_windows(&app);
+    begin_teardown();
 
     match desktop::schedule_relaunch_after_exit() {
         Ok(()) => {
@@ -899,9 +1160,8 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
     let handle = app.clone();
     if let Err(e) = app.run_on_main_thread(move || {
-        if let Err(e) = handle.save_window_state(window_state_flags()) {
-            eprintln!("[Tauri] Failed to persist window state before relaunch: {e}");
-        }
+        persist_windows(&handle);
+        begin_teardown();
         handle.cleanup_before_exit();
         std::process::exit(0);
     }) {
@@ -1087,8 +1347,27 @@ fn quit_lucidos(app: tauri::AppHandle) {
                 return;
             }
             QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
-            desktop::stop_service();
-            quit_app.exit(0);
+            // Everything from here goes over to the MAIN thread, in one
+            // closure. This callback runs on a worker: `tauri-plugin-dialog`
+            // spawns one to await the sheet. And `save_window_state` deadlocks
+            // off the main thread (see `persist_window_state_on_main`).
+            //
+            // One closure rather than three hops, because the order is the
+            // point. The record must be on disk, and the teardown flag set,
+            // before the exit destroys the windows.
+            let handle = quit_app.clone();
+            if let Err(e) = quit_app.run_on_main_thread(move || {
+                persist_windows(&handle);
+                begin_teardown();
+                desktop::stop_service();
+                handle.exit(0);
+            }) {
+                // The event loop is unreachable. Quit anyway, without the
+                // record: refusing to quit is worse than forgetting a window.
+                eprintln!("[Tauri] Could not marshal the quit onto the main thread: {e}");
+                desktop::stop_service();
+                quit_app.exit(0);
+            }
         });
 }
 
@@ -1277,6 +1556,9 @@ fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window) {
     // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit explicitly
     // so the reshow is deterministic regardless of event timing.
     emit_window_active(&app, window.label(), true);
+    // A window just reached the screen, which is the whole of what the session
+    // gate latches on. Every path that shows one says so. See `PRESENTED`.
+    PRESENTED.note_presented();
 }
 
 #[tauri::command]
@@ -1504,11 +1786,12 @@ fn show_startup_window(app: &tauri::AppHandle) -> bool {
         return false;
     }
     match app.get_webview_window("main") {
-        Some(win) => {
-            if let Err(e) = win.show() {
-                eprintln!("[Tauri] Failed to show the main window: {e}");
-            }
-        }
+        Some(win) => match win.show() {
+            // Only a window that actually reached the screen latches the gate,
+            // the same rule `front_window` follows.
+            Ok(()) => PRESENTED.note_presented(),
+            Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
+        },
         None => eprintln!("[Tauri] No main window to show at startup"),
     }
     true
@@ -1637,10 +1920,9 @@ fn close_all_to_tray(app: &tauri::AppHandle) {
         return;
     }
     // The plugin's exit-time write never runs, because we hide rather than
-    // exit, so this is the moment to remember size and position.
-    if let Err(e) = app.save_window_state(window_state_flags()) {
-        eprintln!("[Tauri] Failed to persist window state on close-to-tray: {e}");
-    }
+    // exit, so this is the moment to remember size and position. Taken BEFORE
+    // the loop, since a `Destroyed` fires once its window is already gone.
+    persist_windows(app);
     for (label, window) in app.webview_windows() {
         if label == "main" {
             let _ = window.hide();
@@ -1684,6 +1966,9 @@ fn front_window(app: &tauri::AppHandle, label: &str) {
         let _ = window.set_focus();
         activate_app_frontmost();
         emit_window_active(app, label, true);
+        // A login-started client shows nothing until the user asks, and this is
+        // where they ask. From here its window set is worth recording.
+        PRESENTED.note_presented();
     }
 }
 
@@ -1750,7 +2035,7 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
             match url.parse::<tauri::Url>() {
                 Ok(parsed) => {
                     set_menu_bar_only(app, false);
-                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed)) {
+                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), None) {
                         eprintln!("[Tauri] Failed to open a window for {url}: {e}");
                     }
                     activate_app_frontmost();
@@ -1891,6 +2176,7 @@ pub fn run() {
             window_ready_to_show,
             start_window_drag,
             toggle_window_maximize,
+            set_window_title,
             open_workspace_window,
             mobile::get_connect_info,
             mobile::tailscale_up,
@@ -1916,6 +2202,13 @@ pub fn run() {
                     if let Err(e) = app.save_window_state(window_state_flags()) {
                         eprintln!("[Tauri] Failed to persist window state on close: {e}");
                     }
+                    // The SESSION only when this close is the user's own. A
+                    // teardown queues one of these per window, and by the
+                    // second the first is already half torn down: its getters
+                    // fail and the capture would drop it.
+                    if !TEARING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        persist_window_session(app);
+                    }
                     if !tauri::is_dev() && window.label() == "main" {
                         // Keep the client resident: HIDE, for a fast reopen with
                         // page state preserved, then drop to the tray if this was
@@ -1938,6 +2231,10 @@ pub fn run() {
                 // builds. `main` never reaches here: its close is prevented.
                 tauri::WindowEvent::Destroyed if is_app_window(window.label()) => {
                     traffic_lights::unwatch(window.label());
+                    // The window is out of the map by now, so re-recording is
+                    // what drops it from the session. `CloseRequested` cannot
+                    // do it: the window is still there when that one fires.
+                    forget_closed_window(app);
                     if !tauri::is_dev() {
                         enter_menu_bar_only_if_no_windows(app, Some(window.label()));
                     }
@@ -2007,10 +2304,21 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // What this launch owes the user: a window per workspace that had
+            // one, at the size that workspace was left. Resolved BEFORE the
+            // clamp and the show, because `main` takes the first entry and must
+            // be sized before it appears rather than resized after.
+            let plan = resolve_window_session_plan();
+            if let Some((_, Some(frame))) = plan.first() {
+                size_main_window_for_its_workspace(app.handle(), *frame);
+            }
+
             // The plugin has already written the saved rect onto `main`, and
             // nothing has shown the window yet. This is therefore the one moment
             // a corrupt or now-impossible rect can be corrected off screen. A
-            // healthy rect makes it a no-op. See `window_restore`.
+            // healthy rect makes it a no-op. It runs AFTER the line above, so it
+            // judges the rect the window will actually wear. See
+            // `window_restore`.
             window_restore::clamp_restored_geometry(app.handle(), MAIN_WINDOW_LABEL);
 
             // Best-effort: a menu build failure must not block app startup.
@@ -2160,6 +2468,12 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
+                    } else {
+                        // An exit that is going ahead. Record the arrangement
+                        // before the teardown destroys the windows, and stop
+                        // re-recording once it does. See `TEARING_DOWN`.
+                        persist_windows(app_handle);
+                        begin_teardown();
                     }
                 }
                 // A reopen brings the client back only when nothing is on
@@ -2264,6 +2578,48 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── The session-write gate ───────────────────────────────────────────────
+
+    // A login start comes up menu-bar-only, and `desktop::launch` navigates the
+    // hidden `main` to the gateway root anyway. The navigation half therefore
+    // passes on its own, and writing then replaced the whole record with an
+    // empty one nobody was looking at.
+    #[test]
+    fn a_launch_that_never_showed_a_window_writes_nothing() {
+        let gate = PresentedGate::new();
+        assert!(!gate.may_write(true), "navigated is not enough on its own");
+        assert!(!gate.may_write(false));
+    }
+
+    // Boot: the startup geometry write arms the debounced flush while every
+    // window still sits on the splash.
+    #[test]
+    fn a_launch_still_on_the_splash_writes_nothing() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        assert!(
+            !gate.may_write(false),
+            "a shown window is not enough either"
+        );
+    }
+
+    #[test]
+    fn a_shown_and_navigated_launch_writes() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        assert!(gate.may_write(true));
+    }
+
+    // A latch, not a live visibility test. `main` is hidden rather than closed,
+    // so a trayed client must still be able to record a window closing.
+    #[test]
+    fn the_gate_stays_open_once_a_window_has_been_shown() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        gate.note_presented();
+        assert!(gate.may_write(true));
+    }
     use super::*;
     use std::time::Duration;
 

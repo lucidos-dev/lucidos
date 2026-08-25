@@ -83,6 +83,7 @@ import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 import {
   applyRestoreFile,
   createNote as buildCreateNote,
+  isFirstRun,
   nameTakenBy,
   nameTakenMessage,
   restoreBlocker,
@@ -118,7 +119,11 @@ const RESTORE_DONE_LINGER_MS = 6000;
 
 /** Quick-fill names offered in the create form while the name field is empty —
  *  the first-run "name your first workspace" nudge. Clicking one fills the
- *  (editable) field; the user still confirms with Create. */
+ *  (editable) field; the user still confirms with Create.
+ *
+ *  Offered on the FIRST run only. Someone who already has a workspace has
+ *  likely used one of these names, so the chip fills the field with a duplicate
+ *  Create then refuses. */
 const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
 
 /** A row's overflow trigger, so a right-click anywhere on the row can resolve
@@ -597,9 +602,8 @@ export function WorkspacePicker() {
   // stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {
-    const list = workspaces.value;
     if (firstRunPrompted.value) return;
-    if (list.status === 'loaded' && list.data.length === 0 && footerMode.value === 'none') {
+    if (isFirstRun(workspaces.value) && footerMode.value === 'none') {
       firstRunPrompted.value = true;
       footerMode.value = 'create';
     }
@@ -1272,7 +1276,7 @@ export function WorkspacePicker() {
           onName: (n) => (newName.value = n),
           onCreate,
           onCancelCreate: () => { footerMode.value = 'none'; newName.value = ''; },
-          suggestions: WORKSPACE_NAME_SUGGESTIONS,
+          suggestions: isFirstRun(v) ? WORKSPACE_NAME_SUGGESTIONS : [],
           onSuggestion: pickSuggestion,
           nameInputRef,
           createNote,

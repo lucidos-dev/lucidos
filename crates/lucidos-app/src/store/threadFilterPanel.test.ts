@@ -56,7 +56,7 @@ describe('thread filter panel state', () => {
     // close the menu and leave the panel standing.
     openThreadFilterPanel();
     let menuClosed = false;
-    pushOverlay({ id: 'menu', dismiss: () => { menuClosed = true; } });
+    pushOverlay({ id: 'menu', dismiss: () => { menuClosed = true; }, hasPanel: true });
     dismissTopOverlay();
     expect(menuClosed).toBe(true);
     expect(threadFilterPanelOpen.value).toBe(true);

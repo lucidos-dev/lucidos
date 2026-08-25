@@ -13,6 +13,7 @@ import {
   applyRestoreFile,
   collidingWorkspace,
   createNote,
+  isFirstRun,
   nameTakenBy,
   nameTakenMessage,
   restoreBlocker,
@@ -168,6 +169,25 @@ describe('display names are unique', () => {
 
   it('quotes the existing name as stored, not as typed', () => {
     expect(nameTakenMessage(RENAMED[0])).toContain('“personaal”');
+  });
+});
+
+describe('isFirstRun: only a loaded, empty list', () => {
+  it('is the first run when the list loaded with nothing in it', () => {
+    expect(isFirstRun({ status: 'loaded', data: [] })).toBe(true);
+  });
+
+  it('is not the first run once a workspace exists', () => {
+    expect(isFirstRun({ status: 'loaded', data: [ws('personal')] })).toBe(false);
+  });
+
+  it('is not the first run while the list is still loading', () => {
+    // A loading list has no data yet for a reason that says nothing about what
+    // the user has. Reading it as the first run flashes the name chips and the
+    // unfolded create form at a user who has five workspaces.
+    expect(isFirstRun({ status: 'not-loaded' })).toBe(false);
+    expect(isFirstRun({ status: 'loading' })).toBe(false);
+    expect(isFirstRun({ status: 'failed', error: 'boom' })).toBe(false);
   });
 });
 

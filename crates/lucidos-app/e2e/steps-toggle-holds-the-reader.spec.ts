@@ -39,6 +39,12 @@ const STEPS_PER_RUN = 40;
 /** How far the anchored line may move, in CSS px. A correction is written to a
  *  whole pixel, and a sub-pixel row height can round the other way. */
 const DRIFT_TOLERANCE_PX = 4;
+/** How far the LAST line may settle for a reader kept on the end of the thread.
+ *  Wider than the drift above, and for a different reason. The reveal changes
+ *  the last turn's own trailing chrome. So the line can sit a few pixels off
+ *  while the reader is exactly on the end. The gap to that end is the
+ *  contract, asserted at the tolerance above. */
+const TAIL_TOLERANCE_PX = 20;
 
 /** A line the test can find again after the DOM has changed under it. */
 const mark = (turn: number, chunk: number) => `MARK-${turn}-${chunk}`;
@@ -105,15 +111,16 @@ function dropThread(threadId: string): void {
   ].join(';\n'));
 }
 
-async function openThread(page: Page, threadId: string): Promise<void> {
+async function openThread(page: Page, threadId: string, disarm = true): Promise<void> {
   await page.addInitScript((tid: string) => {
     localStorage.setItem('lucidos-focused-thread', tid);
   }, threadId);
   // The seed ships ARMED, and a rider is carried back to the live edge by any
   // scroll that is not their own gesture. Parking them anywhere would be undone
-  // before the control was ever pressed. This spec is about the reader who is
-  // READING, so it starts them disarmed.
-  await disarmFollowSeed(page);
+  // before the control was ever pressed. Most of this spec is about the reader
+  // who is READING, so it starts them disarmed. The last case is the reader who
+  // never left the end of the thread, and it keeps the seeded arm.
+  if (disarm) await disarmFollowSeed(page);
   // Hide-on-scroll LIVE rather than inherited: see `disableMobileHeaderSticky`.
   await disableMobileHeaderSticky(page);
   await navigateToApp(page);
@@ -178,6 +185,21 @@ async function parkLineAtTop(page: Page, text: string): Promise<string> {
  *  moved. */
 async function lineOffsetFromTop(page: Page, text: string): Promise<number> {
   return (await measureLine(page, text)).offset;
+}
+
+/** How far the reader is from the END of the thread, and where the transcript's
+ *  last row sits on screen. Both readings describe the reader who is parked on
+ *  the newest content, for whom the last row is the line under their eye. */
+async function edgeState(page: Page): Promise<{ gap: number; lastRow: number | null }> {
+  return await page.evaluate(() => {
+    const el = document.querySelector('.thread-content') as HTMLElement;
+    const rows = el.querySelectorAll<HTMLElement>('.response-content > *');
+    const last = rows[rows.length - 1];
+    return {
+      gap: el.scrollHeight - el.clientHeight - el.scrollTop,
+      lastRow: last ? last.getBoundingClientRect().top - el.getBoundingClientRect().top : null,
+    };
+  });
 }
 
 function stepsToggle(page: Page, seq: string) {
@@ -306,6 +328,48 @@ test.describe('the step-log toggle holds the reader still', () => {
         Math.abs(after - before),
         `hiding the steps moved the reader's top line from ${before} to ${after}`,
       ).toBeLessThanOrEqual(DRIFT_TOLERANCE_PX);
+    } finally {
+      dropThread(threadId);
+    }
+  });
+
+  test('a reader on the newest content keeps it when the steps appear', async ({ page }) => {
+    await assertHealthy(page);
+    // The reader who never left the end of the thread, which is where the
+    // reveal's two "hold them still" answers disagree. A row added above the
+    // last line pushes that line down. So holding the topmost line is what
+    // carries the end of the thread off the bottom.
+    //
+    // Long runs, so the last turn's own tail gains screens of rows and the
+    // reader's topmost line is nowhere near the end. One step per chunk leaves
+    // a bite the growth branch absorbs on its own, which measures nothing.
+    const threadId = seedThread('Steps toggle holds the newest content', {
+      stepsPerChunk: STEPS_PER_RUN,
+      chunks: 6,
+      proseLines: 3,
+    });
+    try {
+      await openThread(page, threadId, /* disarm */ false);
+      // Steps OFF first, and the reader stays on the end across it: the thread
+      // opens on the live edge and this press is made from there.
+      await pressStepsOn(page, await lastTurnSeq(page), 'false');
+
+      const before = await edgeState(page);
+      expect(before.gap, 'the reader must start on the end of the thread').toBeLessThanOrEqual(2);
+      expect(before.lastRow, 'the seed must draw a last row to measure').not.toBeNull();
+
+      await pressStepsOn(page, await lastTurnSeq(page), 'true');
+
+      const after = await edgeState(page);
+      expect(
+        after.gap,
+        `showing the steps left the reader ${after.gap}px short of the end of the thread`,
+      ).toBeLessThanOrEqual(DRIFT_TOLERANCE_PX);
+      const moved = (after.lastRow ?? 0) - (before.lastRow ?? 0);
+      expect(
+        Math.abs(moved),
+        `showing the steps moved the last line from ${before.lastRow} to ${after.lastRow}`,
+      ).toBeLessThanOrEqual(TAIL_TOLERANCE_PX);
     } finally {
       dropThread(threadId);
     }

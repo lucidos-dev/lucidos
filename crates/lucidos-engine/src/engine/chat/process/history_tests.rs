@@ -5,7 +5,7 @@
 //! the first: a user turn is never represented by a summary alone.
 
 use super::context_mode::ContextMode;
-use super::history::{render_older_region, CoveredSummary, SummaryPlan};
+use super::history::{render_older_region, CoveredSummary, SummaryInFlight, SummaryPlan};
 use crate::core::store::{newest_conversation_summary, CachedSummary, SessionMessage};
 use crate::core::EventRow;
 use chrono::{TimeZone, Utc};
@@ -351,41 +351,89 @@ fn cached_through(older: &[SessionMessage], idx: usize, text: &str) -> CachedSum
     }
 }
 
-/// One success sticks. A later refresh that fails changes nothing, so the
-/// thread keeps the paragraph instead of falling back to a bare count line.
+/// The refresh is detached, so what this turn renders is settled before it
+/// starts. A turn owing a refresh still prints the paragraph it already had,
+/// at the width it already had.
+///
+/// That is also what makes ADR 0102's ratchet hold with no code: a call that
+/// fails, times out or comes back thin emits nothing, and the next turn reads
+/// this same cached row.
 #[test]
-fn a_failed_refresh_keeps_the_cached_paragraph() {
+fn a_turn_owing_a_refresh_renders_the_cache_it_already_had() {
     let older = alternating(20);
     let cached = cached_through(&older, 1, "What happened earlier.");
-    let mut plan = SummaryPlan::for_region(&older, Some(&cached));
+    let plan = SummaryPlan::for_region(&older, Some(&cached));
     assert!(
-        plan.needs_refresh(ContextMode::Off),
+        plan.refresh_boundary(&older, ContextMode::Off).is_some(),
         "19 uncovered turns is well past the bar"
     );
 
-    plan.apply_refresh(&older, None);
-
-    let covered = plan.covered().expect("the cached paragraph survives");
+    let covered = plan.covered().expect("the cached paragraph still renders");
     assert_eq!(covered.text, "What happened earlier.");
-    assert_eq!(covered.boundary, 1, "and it still covers what it covered");
+    assert_eq!(covered.boundary, 1, "unwidened, because nothing landed yet");
 }
 
-/// A successful refresh takes over, and now covers every assistant turn in
-/// the region.
+/// The paragraph a refresh produces reaches the next turn through the cache,
+/// where `for_region` reads it at the width the boundary records.
 #[test]
-fn a_successful_refresh_replaces_the_paragraph_and_widens_it() {
+fn next_turn_reads_the_fresh_paragraph_at_its_new_width() {
     let older = alternating(20);
-    let cached = cached_through(&older, 1, "stale");
-    let mut plan = SummaryPlan::for_region(&older, Some(&cached));
-
-    plan.apply_refresh(&older, Some("fresh".to_string()));
+    let newest = older.len() - 1;
+    let fresh = cached_through(&older, newest, "fresh");
+    let plan = SummaryPlan::for_region(&older, Some(&fresh));
 
     let covered = plan.covered().expect("the fresh paragraph");
     assert_eq!(covered.text, "fresh");
-    assert_eq!(covered.boundary, older.len() - 1);
+    assert_eq!(covered.boundary, newest);
     assert!(
-        !plan.needs_refresh(ContextMode::Off),
+        plan.refresh_boundary(&older, ContextMode::Off).is_none(),
         "nothing is uncovered right after one"
+    );
+}
+
+/// Only one refresh per thread runs at a time. A detached task outlives its
+/// turn, so a later turn can arrive while it is still going.
+#[test]
+fn a_second_refresh_on_one_thread_is_refused_while_the_first_runs() {
+    let threads = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let thread_id = Uuid::new_v4();
+
+    let first = SummaryInFlight::claim(&threads, thread_id).expect("the first claim wins");
+    assert!(
+        SummaryInFlight::claim(&threads, thread_id).is_none(),
+        "the second must not spawn a duplicate call"
+    );
+    assert!(
+        SummaryInFlight::claim(&threads, Uuid::new_v4()).is_some(),
+        "a different thread is unaffected"
+    );
+
+    drop(first);
+    assert!(
+        SummaryInFlight::claim(&threads, thread_id).is_some(),
+        "and the thread refreshes again once the task ends"
+    );
+}
+
+/// The claim releases on drop, so a task that panics does not lock its thread
+/// out of every future refresh.
+#[test]
+fn a_panicking_refresh_still_frees_its_thread() {
+    let threads = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let thread_id = Uuid::new_v4();
+
+    let panicked = std::panic::catch_unwind({
+        let threads = threads.clone();
+        move || {
+            let _claim = SummaryInFlight::claim(&threads, thread_id).expect("claimed");
+            panic!("the summariser task blew up");
+        }
+    });
+    assert!(panicked.is_err(), "the task really did panic");
+
+    assert!(
+        SummaryInFlight::claim(&threads, thread_id).is_some(),
+        "the thread is claimable again"
     );
 }
 
@@ -395,7 +443,7 @@ fn a_current_cache_needs_no_refresh() {
     let older = alternating(20);
     let cached = cached_through(&older, older.len() - 1, "current");
     let plan = SummaryPlan::for_region(&older, Some(&cached));
-    assert!(!plan.needs_refresh(ContextMode::Off));
+    assert!(plan.refresh_boundary(&older, ContextMode::Off).is_none());
     assert_eq!(plan.covered().expect("reused").text, "current");
 }
 
@@ -410,7 +458,7 @@ fn a_small_gap_waits_rather_than_calling_the_model() {
     let cached = cached_through(&older, boundary, "recent enough");
     let plan = SummaryPlan::for_region(&older, Some(&cached));
     assert!(
-        !plan.needs_refresh(ContextMode::Off),
+        plan.refresh_boundary(&older, ContextMode::Off).is_none(),
         "{gap} uncovered turns is at the bar"
     );
 }
@@ -427,7 +475,7 @@ fn a_cache_whose_boundary_left_the_region_is_dropped() {
     let plan = SummaryPlan::for_region(&older, Some(&stale));
     assert!(plan.covered().is_none());
     assert!(
-        plan.needs_refresh(ContextMode::Off),
+        plan.refresh_boundary(&older, ContextMode::Off).is_some(),
         "so the whole region is uncovered"
     );
 }
@@ -438,7 +486,7 @@ fn a_cache_whose_boundary_left_the_region_is_dropped() {
 fn a_short_older_region_never_summarises() {
     let older = alternating(2);
     let plan = SummaryPlan::for_region(&older, None);
-    assert!(!plan.needs_refresh(ContextMode::Off));
+    assert!(plan.refresh_boundary(&older, ContextMode::Off).is_none());
     assert!(plan.covered().is_none());
 }
 
@@ -451,11 +499,85 @@ fn the_context_mode_never_refreshes_the_summary() {
     let older = alternating(20);
     let plan = SummaryPlan::for_region(&older, None);
     assert!(
-        plan.needs_refresh(ContextMode::Off),
+        plan.refresh_boundary(&older, ContextMode::Off).is_some(),
         "the control arm still refreshes once the region piles up"
     );
     assert!(
-        !plan.needs_refresh(ContextMode::On),
+        plan.refresh_boundary(&older, ContextMode::On).is_none(),
         "the lean arm must never call the summariser"
+    );
+}
+
+/// The paragraph is cached against the NEWEST assistant turn it covers, and
+/// the decision names that turn before the call rather than after.
+#[test]
+fn the_refresh_names_the_newest_assistant_turn_it_will_cover() {
+    let older = alternating(20);
+    let newest = older
+        .iter()
+        .rposition(|m| m.role == "assistant")
+        .expect("an assistant turn");
+    let plan = SummaryPlan::for_region(&older, None);
+    let boundary = plan
+        .refresh_boundary(&older, ContextMode::Off)
+        .expect("a refresh is owed");
+    assert_eq!(
+        boundary.to_string(),
+        older[newest].event_id.clone().unwrap()
+    );
+}
+
+/// A region whose newest assistant turn carries no event id buys nothing. The
+/// cache is keyed on that address, so the paragraph would have nowhere to go.
+///
+/// Read after the call instead, this was a turn paying for a summary and then
+/// logging that it could not keep it.
+#[test]
+fn a_boundary_with_no_event_id_buys_no_paragraph() {
+    let mut older = alternating(20);
+    let newest = older
+        .iter()
+        .rposition(|m| m.role == "assistant")
+        .expect("an assistant turn");
+    older[newest].event_id = None;
+    let plan = SummaryPlan::for_region(&older, None);
+    assert!(plan.refresh_boundary(&older, ContextMode::Off).is_none());
+}
+
+/// An older region of user turns alone has nothing to summarise.
+#[test]
+fn a_region_with_no_assistant_turn_never_summarises() {
+    let older: Vec<SessionMessage> = (0..20)
+        .map(|i| {
+            msg(
+                "user",
+                &format!("ask-{i}|"),
+                Some(&Uuid::new_v4().to_string()),
+            )
+        })
+        .collect();
+    let plan = SummaryPlan::for_region(&older, None);
+    assert!(plan.refresh_boundary(&older, ContextMode::Off).is_none());
+}
+
+/// ADR 0124: a chat turn reads only its own thread's messages.
+///
+/// `get_recent_messages` returns every message from the 32 most recently
+/// active threads, since its limit bounds THREADS. A raw-new send used to seed
+/// itself from it, which put other conversations in this one's prompt. The
+/// reader stays for `/api/v1/messages`, so only a scan can hold the boundary.
+#[test]
+fn no_chat_turn_reads_another_threads_messages() {
+    let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
+        .into_iter()
+        .filter(|(rel, _)| rel.starts_with("engine/chat/"))
+        .filter(|(_, text)| text.contains("get_recent_messages"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the chat turn must read only its own thread, but these call \
+         get_recent_messages: {:?}",
+        offenders
     );
 }

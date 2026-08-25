@@ -128,6 +128,51 @@ test.describe('Welcome surface', () => {
     await assertUserMessagesVisible(page, ['Help me get the most out of Lucidos']);
   });
 
+  test('its text column lands on the composer box, both edges', async ({ page }) => {
+    // The welcome docks directly above the composer on the compose-empty view,
+    // so the two share one content edge. `.welcome-message` owns that box for
+    // both variants, which is what this measures: it wears `.response-content`
+    // (`max-width: 100%`), and that beats the `.thread-content > *` cap on
+    // source order, so without its own cap the surface runs the full pane.
+    // Only the real cascade at a real pane width resolves that, which is why
+    // the unit guard in styles/__tests__/welcome-content-box.test.ts is not
+    // enough on its own.
+    await navigateToApp(page);
+
+    const welcome = page.locator('.welcome-message:visible').first();
+    await expect(welcome).toBeVisible({ timeout: 10_000 });
+
+    const edges = await page.evaluate(() => {
+      const visible = <T extends Element>(els: NodeListOf<T>): T | null => {
+        for (let i = els.length - 1; i >= 0; i--) {
+          if (els[i].getBoundingClientRect().width > 0) return els[i];
+        }
+        return null;
+      };
+      const w = visible(document.querySelectorAll<HTMLElement>('.welcome-message'));
+      const box = visible(document.querySelectorAll<HTMLElement>('.prompt-box'));
+      if (!w || !box) return null;
+      const wRect = w.getBoundingClientRect();
+      const wStyle = getComputedStyle(w);
+      const boxRect = box.getBoundingClientRect();
+      return {
+        // The welcome's CONTENT edges: its own inset is --turn-body-inset, the
+        // same one `.prompt-input-container` puts around `.prompt-box`.
+        left: wRect.left + parseFloat(wStyle.paddingLeft),
+        right: wRect.right - parseFloat(wStyle.paddingRight),
+        boxLeft: boxRect.left,
+        boxRight: boxRect.right,
+      };
+    });
+    expect(edges, 'welcome / prompt box not laid out').not.toBeNull();
+    const e = edges!;
+
+    expect(e.left, `welcome left=${e.left} vs composer left=${e.boxLeft}`)
+      .toBeCloseTo(e.boxLeft, 0);
+    expect(e.right, `welcome right=${e.right} vs composer right=${e.boxRight}`)
+      .toBeCloseTo(e.boxRight, 0);
+  });
+
   test('"Don\'t show this again" dismisses it and it stays dismissed after reload', async ({ page }) => {
     await navigateToApp(page);
 

@@ -460,6 +460,13 @@ interface GroupFoldState {
   // 'awaiting-answer'. Route the resolution back to its divider by id.
   questionDividerOwners: Map<string, Exchange>;
   permissionDividerOwners: Map<string, Exchange>;
+  /** request_id to the tool call a permission card is holding: the exchange
+   *  owning the call step, plus that step's `seq`. Written when the request is
+   *  folded, read when its resolution is, so both ends mark the same row. It is
+   *  the resolution that needs it. The divider knows the tool identity, but on
+   *  a chat lane the call is found positionally and that position is long gone
+   *  by then. See `Exchange.blockedStepSeqs`. */
+  gatedCalls: Map<string, { exchange: Exchange; seq: number }>;
   // request_event_id to redirect target exchange. Set when a UPI is absorbed
   // mid-flight. The loop emits the UPI when it ingests the queued follow-up, so
   // every event after that answers the absorbed prompt rather than the original
@@ -495,6 +502,7 @@ function newFoldState(): GroupFoldState {
     chatToolCallOwners: new Map(),
     questionDividerOwners: new Map(),
     permissionDividerOwners: new Map(),
+    gatedCalls: new Map(),
     reqIdRedirect: new Map(),
     resolvedReqIds: new Set(),
     abortReqIds: new Set(),
@@ -733,6 +741,80 @@ function reanchorResolvedDivider(
   return divider;
 }
 
+/** The exchange holding the chat turn a permission request interrupted.
+ *
+ *  Normally `previousCurrent`, and NOT reliably so: a queued follow-up
+ *  `MessageReceived` folding between the call and the card makes `current` that
+ *  uningested MR instead, which holds no tool call at all. `lastChatTurnReqId`
+ *  is the turn's own id, tracked for exactly this shape, and the divider
+ *  redirect below resolves it the same way. It falls back to `previousCurrent`
+ *  on a thread with no routed chat event, which is every pure coding-agent
+ *  thread. */
+function chatTurnOwner(state: GroupFoldState, previousCurrent: Exchange | null): Exchange | null {
+  const reqId = state.lastChatTurnReqId;
+  if (!reqId) return previousCurrent;
+  return state.reqIdRedirect.get(reqId)
+    ?? findExchangeByAnchorId(state.exchanges, reqId)
+    ?? previousCurrent;
+}
+
+/** The step `seq` of the tool call a permission request is about, and the
+ *  exchange holding it. `null` when the call cannot be located. That degrade
+ *  covers a legacy row carrying no ids, and an orphan request whose call never
+ *  folded.
+ *
+ *  Two lookups, because the two lanes carry different identity. A coding-agent
+ *  request shares its `tool_use_id` with the call, on both Claude Code and
+ *  Codex, so `toolCallOwners` finds the exchange across any boundary between
+ *  them. A chat `ToolCalled` has no such id, so the chat lanes take the last
+ *  call step of the turn the request interrupted (`chatTurnOwner`). That is
+ *  exact because the chat agentic loop is sequential: one call at a time. */
+function gatedCallOf(
+  state: GroupFoldState,
+  event: StoredEvent,
+  previousCurrent: Exchange | null,
+): { exchange: Exchange; seq: number } | null {
+  const isCodingAgent = event.type === 'CodingAgentPermissionRequest';
+  const toolUseId = (event as { tool_use_id?: string }).tool_use_id;
+  const exchange = isCodingAgent
+    ? (toolUseId ? state.toolCallOwners.get(toolUseId) : undefined)
+    : chatTurnOwner(state, previousCurrent);
+  if (!exchange) return null;
+  for (let i = exchange.steps.length - 1; i >= 0; i--) {
+    const step = exchange.steps[i];
+    if (isCodingAgent) {
+      if (step.event.type === 'CodingAgentToolCalled' && toolUseIdOf(step.event) === toolUseId) {
+        return { exchange, seq: step.seq };
+      }
+    } else if (step.event.type === 'ToolCalled') {
+      return { exchange, seq: step.seq };
+    }
+  }
+  return null;
+}
+
+/** Move a gated call out of its held state once the user has decided. Allowing
+ *  it returns the row to the ordinary pending shimmer, which is truthful from
+ *  here on: the tool starts running now. Denying it ends the row instead.
+ *
+ *  A no-op for a resolution whose request was never marked, which covers an
+ *  orphan resolution and a request folded before this bookkeeping existed. */
+function settleGatedCall(
+  state: GroupFoldState,
+  requestId: string,
+  allowed: boolean,
+  touched: Set<Exchange> | null,
+): void {
+  const gated = state.gatedCalls.get(requestId);
+  if (!gated) return;
+  state.gatedCalls.delete(requestId);
+  gated.exchange.blockedStepSeqs?.delete(gated.seq);
+  if (!allowed) {
+    (gated.exchange.deniedStepSeqs ??= new Set()).add(gated.seq);
+  }
+  touched?.add(gated.exchange);
+}
+
 /** Fold one event into the state. `isLegacySupersededAbort` is decided by the
  *  caller. `touched` collects every exchange this event mutated or created, so
  *  the incremental path can re-run the question-divider marking on exactly
@@ -874,6 +956,9 @@ function foldEvent(
       || event.type === 'CommandPermissionResolved'
       || event.type === 'McpPermissionResolved'
     ) {
+      // Ahead of the divider routing below, which returns early. The held row
+      // must settle whether or not its card is still reachable by id.
+      settleGatedCall(state, event.request_id, event.allowed, touched);
       const dividerOwner = permissionDividerOwners.get(event.request_id);
       if (dividerOwner) {
         dividerOwner.steps.push({ seq, event });
@@ -938,6 +1023,15 @@ function foldEvent(
         && event.request_id
       ) {
         permissionDividerOwners.set(event.request_id, current);
+        // The card holds a tool call that has ALREADY opened a step row, one
+        // event earlier and so in `previousCurrent`. Mark that row, or it
+        // shimmers "In progress" over a tool blocked on a human.
+        const gated = gatedCallOf(state, event, previousCurrent);
+        if (gated) {
+          state.gatedCalls.set(event.request_id, gated);
+          (gated.exchange.blockedStepSeqs ??= new Set()).add(gated.seq);
+          touched?.add(gated.exchange);
+        }
       }
       // Three shapes reach this advance, all one thing: a turn INTERRUPTED by a
       // boundary that then resumes under its own, unchanged req_id. Without the

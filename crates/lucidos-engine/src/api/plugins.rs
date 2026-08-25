@@ -19,8 +19,10 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::AppState;
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_marketplaces::{
-    load_registry, scan_catalog, InstalledPluginSummary, MarketplaceCatalog, PluginMarketplace,
+    clone_urls, load_registry, scan_catalog, InstalledPluginSummary, MarketplaceCatalog,
+    PluginMarketplace,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
 use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
@@ -187,15 +189,18 @@ pub(super) async fn catalog(
             )
         })?;
     let workspace_path = state.workspace_path.clone();
-    let mut catalog =
-        tokio::task::spawn_blocking(move || scan_catalog(&workspace_path, &registry, &installed))
-            .await
-            .map_err(|e| {
-                err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("scan marketplaces: {e}"),
-                )
-            })?;
+    // The scan is synchronous, so its credentials are resolved out here.
+    let credentials = GitCredentials::resolve_many(&state.pool, &clone_urls(&registry)).await;
+    let mut catalog = tokio::task::spawn_blocking(move || {
+        scan_catalog(&workspace_path, &registry, &installed, &credentials)
+    })
+    .await
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("scan marketplaces: {e}"),
+        )
+    })?;
     mark_setup_complete(&state.pool, &mut catalog).await;
     Ok(Json(catalog))
 }

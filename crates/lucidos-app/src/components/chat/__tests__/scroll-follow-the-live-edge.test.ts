@@ -59,6 +59,23 @@ const STATUS_LINE_HEIGHT = 28;
  * is about. The landing line the old turn-anchored landing rested on belongs to
  * turn stepping now, and is pinned in `step-thread-turn.test.ts`. */
 
+/** A card body's `classList`, carrying the two state classes its component
+ *  renders: answered and terminated. `kind` keeps those names the ones the real
+ *  component writes, since a question body wears `question-body-answered` and a
+ *  permission body wears `permission-body-answered`.
+ *
+ *  It reads the owner's own flags, so a body that flips to answered cannot keep
+ *  a stale list. */
+function cardClassList(kind: 'question' | 'permission', owner: { answered?: boolean; terminated?: boolean }) {
+  return {
+    contains: (name: string) => (
+      name === `${kind}-body-answered` ? !!owner.answered
+        : name === `${kind}-body-terminated` ? !!owner.terminated
+          : false
+    ),
+  };
+}
+
 /** A `.thread-content` stand-in that clamps `scrollTop` the way a browser does,
  *  counts writes, and holds the panels and cards a landing measures. Counting
  *  writes is what fails a jump landing where the reader already was.
@@ -158,16 +175,19 @@ function makeEl(opts: {
       return mountStatusLine(panel.turn, rect.bottom + el.scrollTop);
     },
     /** Render a question card: a `.question-body` carrying the card's tool-use
-     *  id inside the `.initiator-panel` that is the answer's landing target. */
-    addQuestionCard(p: { toolUseId: string; top: number; height: number; status?: boolean; rows?: number }) {
-      return addCard(questionCards, 'data-tool-use-id', p.toolUseId, p);
+     *  id inside the `.initiator-panel` that is the answer's landing target.
+     *
+     *  `terminated` is the card an abort or a parallel tool call left dead.
+     *  `TerminatedQuestionBody` renders no id, since nobody can answer it. */
+    addQuestionCard(p: { toolUseId: string; top: number; height: number; status?: boolean; rows?: number; terminated?: boolean }) {
+      return addCard(questionCards, 'question', 'data-tool-use-id', p.toolUseId, p);
     },
     /** Render a permission-shaped card: a `.permission-body` carrying the card's
      *  REQUEST id, inside the same `.initiator-panel` a question card sits in.
      *  One shape covers all three, since the coding-agent tool permission, the
      *  command guard and the MCP tool consent share `PermissionBodyShell`. */
     addPermissionCard(p: { requestId: string; top: number; height: number; status?: boolean; rows?: number }) {
-      return addCard(permissionCards, 'data-request-id', p.requestId, p);
+      return addCard(permissionCards, 'permission', 'data-request-id', p.requestId, p);
     },
     /** Render the turn a Continue produces: a fresh `ContinuationStarted`
      *  exchange, which carries an agent status line and NO user message row (the
@@ -181,18 +201,23 @@ function makeEl(opts: {
     /** The live to answered swap, as Preact performs it. `QuestionBody` returns
      *  a DIFFERENT component once the answer lands, so the body node is
      *  remounted while the `.initiator-panel` around it is REUSED. The panel
-     *  object is therefore carried over and only the body is replaced. */
+     *  object is therefore carried over and only the body is replaced.
+     *
+     *  The new body wears `question-body-answered`, which is how a send tells a
+     *  card it may still answer from one it may not. */
     answerQuestionCard(card: { body: any; panel: any }) {
       card.body.isConnected = false;
       questionCards.splice(questionCards.indexOf(card.body), 1);
-      const answered = {
+      const answered: any = {
         ...card.body,
         isConnected: true,
+        answered: true,
         closest: (sel: string) => (
           sel === '.initiator-panel' ? card.panel
             : sel === '.chat-exchange' ? card.panel.turn : null
         ),
       };
+      answered.classList = cardClassList('question', answered);
       questionCards.push(answered);
       return { body: answered, panel: card.panel };
     },
@@ -261,9 +286,10 @@ function makeEl(opts: {
    *  on the panel cannot pass by measuring the body instead. */
   function addCard(
     into: any[],
+    kind: 'question' | 'permission',
     attr: string,
     value: string,
-    p: { top: number; height: number; status?: boolean; rows?: number },
+    p: { top: number; height: number; status?: boolean; rows?: number; terminated?: boolean },
   ) {
     const turn = makeTurn(p.top, p.height);
     const rect = (top: number, height: number) => () => ({
@@ -276,15 +302,18 @@ function makeEl(opts: {
       closest: (sel: string) => (sel === '.chat-exchange' ? turn : null),
       getBoundingClientRect: rect(p.top, p.height),
     };
-    const body = {
+    const body: any = {
       parentElement: null,
       isConnected: true,
-      getAttribute: (name: string) => (name === attr ? value : null),
+      answered: false,
+      terminated: !!p.terminated,
+      getAttribute: (name: string) => (name === attr && !p.terminated ? value : null),
       closest: (sel: string) => (
         sel === '.initiator-panel' ? panel : sel === '.chat-exchange' ? turn : null
       ),
       getBoundingClientRect: rect(p.top + 20, Math.max(0, p.height - 40)),
     };
+    body.classList = cardClassList(kind, body);
     // An UNANSWERED card divider renders no response panel: `awaiting-answer` is
     // not an active status and the turn has no steps, so `showResponsePanel` is
     // false (`ChatExchange`). `status: true` is the turn that already carried a
@@ -1504,33 +1533,30 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     expect(followingLiveEdge.value).toBe(true);
   });
 
-  it('defers to an anchor correction that moved them off the edge first', () => {
-    // A REVEAL is growth too, so the growth branch runs for one and must not
-    // undo `withScrollAnchor`'s correction. Expanding a turn's steps grows every
-    // turn ABOVE the reader. The correction holds them on the content they were
-    // reading, which takes them off the live edge.
+  it('lands them on the edge in one write when a reveal grows the thread', () => {
+    // A REVEAL grows every turn ABOVE the reader as well as below. It would
+    // leave a reader on the edge a screenful short of it. So they are put back
+    // in ONE held write, inside the frame that unfreezes the container.
     //
-    // Nothing here knows about reveals. The correction WRITES the container, and
-    // its scroll event is dispatched before the resize one in the same frame.
-    // So `recordAnchor` has already answered "off the edge" when growth asks.
+    // The caller hands down the reading it took BEFORE the mutation, because
+    // growth moves the edge while leaving `scrollTop` where it was. The anchor
+    // correction is skipped for the same reader, so this is the tap's one
+    // motion (`readerKeepsTheLiveEdge`).
     //
-    // The correction ANNOUNCES itself through `honourAnchoredMutation`, which
-    // carries the held stamp. Without that, a gesture-less scroll reads as the
-    // platform moving the reader, and `keepTheLiveEdge` writes them straight
-    // back to the edge. Modelled with no gesture on purpose: the ride has to
-    // survive a correction the app made.
+    // A reveal is growth too, so the branch below runs for one as well. It
+    // reads the same two terms, so it agrees rather than adding a motion.
     const { el, onScroll, onResize } = armedAtTheEdgeOnAnIdleThread();
 
-    el.scrollHeight = 5000;   // the steps unfold, above the reader and below
-    el.scrollTop = 3700;      // and the correction holds them on their own turn
-    honourAnchoredMutation(el);
-    onScroll();
-    el.writes = 0;
+    el.scrollHeight = 5000;            // the steps unfold, above the reader and below
+    honourAnchoredMutation(el, true);  // and the reveal puts them on the new edge
 
+    expect(el.writes).toBe(1);
+    expect(el.scrollTop).toBe(4500);
+
+    onScroll();
     onResize();
 
-    expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(3700);
+    expect(el.scrollTop).toBe(4500);
     expect(followingLiveEdge.value).toBe(true);
   });
 
@@ -2163,11 +2189,15 @@ describe('sending a message lands the reader on the live edge', () => {
       const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
       makeScrollObservers(el);
       setActiveScrollElement(el);
-      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
       followSentMessage(); // goes pending: its own turn has not rendered
       clock += 20_000;     // the backstop passes with nothing growing
 
+      // The card arrives AFTER the send, which is the order that keeps this a
+      // SEND landing. Seeded before it, the card would take the send's landing
+      // itself (`followSentMessage`) and the stale-landing case would go
+      // untested.
+      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
       followAnsweredQuestion('q1');
       vi.advanceTimersByTime(1500);
 
@@ -2523,8 +2553,8 @@ describe('answering a question card lands the same way', () => {
   /** Submitting an answer IS a send: the reader handed the agent something and
    *  is owed the sight of it being picked up. Which shape they used must not be
    *  something they can feel in the scroll. So this block is the send's block
-   *  above with the card in place of the message. Typing the answer is
-   *  literally a send and rides `followSentMessage`.
+   *  above with the card in place of the message. Typing the answer is literally
+   *  a send, and `followSentMessage` routes it to the card all the same.
    *
    *  Its mirror is the card ARRIVING, which is the agent's doing and moves
    *  nobody. That case lives in the `unmovedBy` block at the bottom of this
@@ -2652,6 +2682,90 @@ describe('answering a question card lands the same way', () => {
 
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(1200);
+  });
+
+  /** TYPING the answer is the third way to answer, and it is a SEND. The engine
+   *  routes the text to the open question as a `FreeText` answer. It emits no
+   *  `MessageReceived` for it, so what the reader submitted renders as the
+   *  card's own "Custom answer" block. The optimistic row the send inserted is
+   *  torn down again when that answer lands.
+   *
+   *  So the row is the wrong thing to wait for. Against a local engine the
+   *  answer arrives inside the frame the row was inserted in, and the row never
+   *  gets a box at all. The reader then kept their scroll position and never saw
+   *  their own answer, which is the report the two below pin. */
+  it('a TYPED answer lands on the card, not on the row the send inserts', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followSentMessage(); // the composer's own tap
+    followSentMessage(); // and `addPendingMessage`, for the same submit
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2500); // 3000 - 500, the live edge
+  });
+
+  it('holds that card while the answer and the reply render into it', () => {
+    // The Custom answer block lands inside the card a moment after the submit,
+    // and the agent's first row after that. Both are what the reader submitted
+    // to see, so the hold carries them exactly as a clicked option's does.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followSentMessage();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2500);
+
+    el.answerQuestionCard(card); // the Custom answer block grows the card
+    el.scrollHeight = 3200;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2700); // 3200 - 500, the live edge again
+  });
+
+  /** A card nobody can answer leaves the send a send. Anchoring on a dead card
+   *  would land the reader before the row they are waiting for, then hold them
+   *  there until the landing's backstop. */
+  function sendPastADeadCard(kill: (el: any) => void) {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    kill(el);
+    el.writes = 0;
+
+    followSentMessage();
+    // Timers advanced BEFORE the assertion, which is what makes it bite. A
+    // landing wrongly taken on the dead card resolves at once and glides, and
+    // its first frame is a rAF away. Asserted on the same tick, the wrong
+    // landing has painted nothing yet and reads exactly like the right one.
+    vi.advanceTimersByTime(300);
+    expect(el.writes).toBe(0); // its row has not rendered yet
+
+    el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2900); // 3400 - 500, the live edge
+  }
+
+  it('leaves an ANSWERED card alone, so a plain follow-up waits for its own row', () => {
+    // The engine serializes questions, so an answered newest card means nothing
+    // is pending.
+    sendPastADeadCard((el) => {
+      el.answerQuestionCard(el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 }));
+    });
+  });
+
+  it('leaves a TERMINATED card alone too, which an abort is how you get', () => {
+    sendPastADeadCard((el) => {
+      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300, terminated: true });
+    });
   });
 
   it('waits for a card that has no box yet, and moves nobody until it has one', () => {
@@ -2902,13 +3016,15 @@ describe('a submit holds the bottom until the agent draws', () => {
       const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
       const { onResize } = makeScrollObservers(el);
       setActiveScrollElement(el);
-      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
       followSentMessage();                                         // waits on a turn
       el.addUserMessage({ top: 2900, height: 120, visible: false }); // that has no box
       onResize();
       clock += 1500; // past the addressable deadline, well inside the hold's
 
+      // Seeded AFTER the send, so the send's landing is a SEND landing. See the
+      // same note in "a lapsed landing does not block the NEXT submit".
+      el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
       followAnsweredQuestion('q1');
       vi.advanceTimersByTime(1500);
 
@@ -3282,7 +3398,6 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
-    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
     followSentMessage();
     el.addUserMessage({ top: 2900, height: 120 });
@@ -3290,6 +3405,10 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     onResize();                    // the send's landing glide starts
     vi.advanceTimersByTime(60);
 
+    // The card arrives after the send, which is what keeps the first submit a
+    // SEND: seeded before it, `followSentMessage` would land on the card
+    // instead and the two submits would be the same shape.
+    el.addQuestionCard({ toolUseId: 'q1', top: 3400, height: 300 });
     el.scrollHeight = 3800;
     followAnsweredQuestion('q1');  // and the reader answers the card mid-glide
     vi.advanceTimersByTime(1500);

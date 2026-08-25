@@ -184,6 +184,13 @@ env:
   LUCIDOS_HOME: ${{ github.workspace }}
   LUCIDOS_WORKSPACE: ${{ github.workspace }}/.smoke-ws
   HEALTH_TIMEOUT_SECS: '2400'   # 40 min: first-run source build is slow
+  # Rung 4's budget, and it exists because rung 2 passing does not mean the
+  # frontend is there yet. run.sh starts the gateway and engine first and builds
+  # the frontend after, so the engine answers health as ok while dist/index.html
+  # does not exist and it correctly 404s the root. A one-shot `vite build` on a
+  # busy runner is well under a minute; ten is generous for it and still leaves
+  # most of the job's 60-minute ceiling to the 40-minute health poll above.
+  FRONTEND_TIMEOUT_SECS: '600'
   # dmg-verify's readiness deadline. Nothing compiles there (the DMG is already
   # built), but a FIRST launch on a clean runner still pays Gatekeeper's
   # first-launch verification of a several-hundred-megabyte notarized bundle,
@@ -240,6 +247,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The from-source install compiles the engine, and this leg is on the RC
+      # gate's critical path, 12m07s on the last release candidate. rust-cache
+      # restores third-party dependency artifacts only: it deletes the workspace
+      # members' artifacts before saving, so install.sh still builds all of
+      # crates/** from source and the thing under test is unchanged.
+      #
+      # The prefix fences these caches off from the release ones. A shipped
+      # binary must never be able to read something a test leg wrote, and the
+      # separation is what makes that structural rather than a habit.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-smoke
+          key: source-install-${{ matrix.os }}
 
       # macOS GitHub runners cannot run Docker Desktop. install.sh needs a
       # Docker daemon for Postgres, so provide one via Colima. (Ubuntu runners
@@ -361,11 +383,38 @@ jobs:
           echo "Version matches ($repo_version) and health shape is sane."
 
           # --- rung 4: frontend is reachable (engine serves dist/ on the same port) ---
+          # POLLED TO A DEADLINE, exactly as rung 2 is, and for the same reason.
+          # run.sh starts the gateway and engine FIRST and builds the frontend
+          # AFTER (start_vite then build_frontend_oneshot, in
+          # scripts/lib/workspace.sh). So the engine reports healthy while
+          # dist/index.html does not exist yet, and it correctly 404s the root.
+          #
+          # A single curl fired the instant rung 2 passed made this rung a coin
+          # toss on runner scheduling: the same rc tree passed or failed run to
+          # run, with rung 3 reporting the right release every time. That is not
+          # a cheap flake to live with, because a re-run costs 15 minutes of
+          # release wall clock.
+          #
           # Determine scheme from whichever one /health answered on.
           scheme="http"; curl -sk --max-time 5 "https://localhost:$port/api/v1/health" >/dev/null 2>&1 && scheme="https"
           fe_url="$scheme://localhost:$port/"
-          code="$(curl -k -s -o /dev/null -w '%{http_code}' "$fe_url" || echo 000)"
-          [ "$code" = "200" ] || { echo "::error::frontend $fe_url returned HTTP $code"; exit 1; }
+          echo "Polling $fe_url for the built frontend (timeout ${FRONTEND_TIMEOUT_SECS}s)…"
+          deadline=$(( $(date +%s) + FRONTEND_TIMEOUT_SECS ))
+          code=000
+          until [ "$(date +%s)" -ge "$deadline" ]; do
+            code="$(curl -k -s -o /dev/null -w '%{http_code}' "$fe_url" || echo 000)"
+            [ "$code" = "200" ] && break
+            if ! kill -0 "${INSTALL_PID:-0}" 2>/dev/null; then
+              echo "::error::the installer exited while the frontend was still not served (last HTTP $code)"
+              tail -n 150 "$RUNNER_TEMP/install.log"; exit 1
+            fi
+            sleep 5
+          done
+          [ "$code" = "200" ] || {
+            echo "::error::frontend $fe_url still returned HTTP $code after ${FRONTEND_TIMEOUT_SECS}s. Rung 3 already proved the engine is up on the right build, so read this as the frontend bundle failing to build, not as a slow install."
+            tail -n 200 "$RUNNER_TEMP/install.log"
+            exit 1
+          }
           echo "Frontend serving 200 at $fe_url"
 
           echo "OK — clean-machine smoke test passed on ${{ matrix.os }}"
@@ -904,6 +953,17 @@ jobs:
         with:
           node-version: '20'   # install.sh requires Node 18+; 20 is the current LTS
 
+      # Same build as the release matrix's Linux x86_64 leg, and 13m38s of this
+      # job's 15m01s. Its cache is deliberately SEPARATE from that leg's: this
+      # one runs on the bare 24.04 runner while the release one builds inside
+      # ubuntu:22.04, so sharing would hand a release build objects compiled
+      # against a different libc. The `smoke` prefix keeps them apart.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-smoke
+          key: tarball-${{ env.TRIPLE }}
+
       - name: Build the prebuilt headless tarball (the download artifact)
         shell: bash
         run: |
@@ -996,7 +1056,24 @@ jobs:
           # workspace, so create one, poll it healthy, then hit it through the gateway
           # proxy. Embedded Postgres (no Docker); first boot warms the embedding model,
           # so allow a generous window. Mirrors scripts/e2e-packaged.sh. ─────────────
-          create="$(curl -s --max-time 30 -X POST "$base/~/api/v1/control/workspaces" \
+          #
+          # The control plane is gated: the gateway authenticates every network caller,
+          # and `is_public_path` exact-matches only /~/api/v1/health and the two pairing
+          # endpoints. A workspace's own /<slug>/api/v1/health is NOT among them and
+          # answers 401 like everything else. A process on this machine proves itself
+          # with the local token rather than by pairing a device, which is what
+          # gateway_curl in scripts/e2e-packaged.sh does and what this used to omit.
+          # EVERY call below goes through gateway_curl for that reason, the engine
+          # health read included: unauthenticated it returns an empty body through
+          # `-fsS`, and rung 3 then reports "not ok" with nothing after the colon.
+          token_file="$HOME/.lucidos/local-token"
+          [ -r "$token_file" ] || {
+            echo "::error::local token missing at $token_file — the gateway writes it at startup, so the service did not come up as expected"
+            exit 1
+          }
+          gateway_curl() { curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"; }
+
+          create="$(gateway_curl -s --max-time 30 -X POST "$base/~/api/v1/control/workspaces" \
             -H 'Content-Type: application/json' -d '{"name":"smoke-ws"}' 2>/dev/null || true)"
           ws="$(printf '%s' "$create" | python3 -c 'import sys,json; print(json.load(sys.stdin)["workspace"]["id"])' 2>/dev/null || true)"
           [ -n "$ws" ] || { echo "::error::could not create workspace (response: $create)"; exit 1; }
@@ -1006,7 +1083,7 @@ jobs:
           deadline=$(( $(date +%s) + WS_HEALTH_TIMEOUT_SECS ))
           health=""
           until [ "$(date +%s)" -ge "$deadline" ]; do
-            list="$(curl -fsS --max-time 5 "$base/~/api/v1/control/workspaces" 2>/dev/null || true)"
+            list="$(gateway_curl -fsS --max-time 5 "$base/~/api/v1/control/workspaces" 2>/dev/null || true)"
             health="$(printf '%s' "$list" | WS="$ws" python3 -c 'import sys,json,os; s=os.environ["WS"]; d=json.load(sys.stdin); print(next((w.get("health","") for w in d.get("workspaces",[]) if w.get("id")==s), ""))' 2>/dev/null || true)"
             [ "$health" = "healthy" ] && break
             [ "$health" = "unhealthy" ] && { echo "::error::workspace '$ws' became unhealthy"; exit 1; }
@@ -1014,7 +1091,7 @@ jobs:
           done
           [ "$health" = "healthy" ] || { echo "::error::workspace '$ws' never became healthy within ${WS_HEALTH_TIMEOUT_SECS}s"; exit 1; }
 
-          body="$(curl -fsS --max-time 10 "$base/$ws/api/v1/health" 2>/dev/null || true)"
+          body="$(gateway_curl -fsS --max-time 10 "$base/$ws/api/v1/health" 2>/dev/null || true)"
           echo "$body" | grep -q '"status":"ok"'      || { echo "::error::engine /$ws/api/v1/health not ok: $body"; exit 1; }
           echo "$body" | grep -q "\"release\":\"$repo_version\"" || { echo "::error::engine release != RELEASE ($repo_version): $body"; exit 1; }
           echo "$body" | grep -q '"engine_version"'   || { echo "::error::engine health missing engine_version: $body"; exit 1; }

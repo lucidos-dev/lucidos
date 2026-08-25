@@ -131,12 +131,28 @@ function actorOf(data: Record<string, unknown>): { kind?: string; device_id?: st
   return (data.actor as { kind?: string; device_id?: string } | null | undefined) ?? null;
 }
 
-function refreshLlmConfigured(): void {
+export function refreshLlmConfigured(): void {
   void probeLlmConfigured();
   setTimeout(() => {
     void probeLlmConfigured();
   }, 600);
 }
+
+/** Preference keys that change which providers the engine has installed, and so
+ *  need the same `/health` re-probe a credential change gets. Mirrors
+ *  `PROVIDER_PREFERENCE_KEYS` in the engine's `llm/provider_build.rs`, which is
+ *  the set its config subscriber rebuilds on. Without the probe the model
+ *  picker keeps offering a provider the engine has already dropped. */
+export const PROVIDER_PREFERENCE_KEYS: ReadonlySet<string> = new Set([
+  'opencode_free_enabled',
+  'local_base_url',
+  'provider_enabled_vertex',
+  'provider_enabled_anthropic',
+  'provider_enabled_openai',
+  'provider_enabled_openrouter',
+  'provider_enabled_xai',
+  'provider_enabled_local',
+]);
 
 /** Process a raw SSE message for entity reference updates.
  *

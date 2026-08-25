@@ -683,6 +683,26 @@ impl LucidosEngine {
             })
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        // Which of Claude Code's permission modes this session runs in. Read
+        // only for Claude Code: Codex has no equivalent and ignores the field.
+        // An unreadable preference means the default, so a DB hiccup costs the
+        // user their opt-in for one spawn and never the spawn itself.
+        let permission_mode = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => crate::core::PreferenceStore::get(
+                self.pool(),
+                crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                log!(
+                    "[AgentSession] Failed to load {} preference: {}",
+                    crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+                    e
+                );
+                None
+            }),
+            crate::runtime::CodingAgent::Codex => None,
+        };
         let runtime = match spawn_or_resume(
             self,
             coding_agent,
@@ -700,6 +720,7 @@ impl LucidosEngine {
                 interactive: interactive_session,
                 user_env_vars: &user_env_vars,
                 binary_override: binary_override.as_deref(),
+                permission_mode: permission_mode.as_deref(),
                 // Override CLAUDE_CONFIG_DIR only on an actual resume (see
                 // `inject_config_dir` above); a fresh session passes None so its
                 // env / CC default is untouched.

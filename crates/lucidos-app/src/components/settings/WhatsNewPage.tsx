@@ -1,12 +1,29 @@
-import { useEffect, useState } from 'preact/hooks';
-import { changelogReleases, latestTauriAppNotes, lucidosRelease, lucidosReleaseDirty, whatsNewTargetRelease } from '../../store/store';
+import { useCallback, useEffect, useState } from 'preact/hooks';
+import {
+  appUpdateCheckInFlight,
+  appUpdateProgress,
+  changelogReleases,
+  latestTauriAppNotes,
+  lucidosRelease,
+  lucidosReleaseDirty,
+  whatsNewTargetRelease,
+} from '../../store/store';
 import { loadChangelog, markWhatsNewSeen } from '../../store/actions/whatsNew';
-import { packagedUpdateVersion } from '../../store/actions/app-update';
+import {
+  canInstallUpdateHere,
+  checkForUpdatesNow,
+  installAppUpdate,
+  packagedUpdateVersion,
+  reportUpdateCheck,
+  updateControlLabel,
+} from '../../store/actions/app-update';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { isNewerVersion } from '../../utils/version';
 import { lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
+import { ReleaseNoticesSection } from './ReleaseNoticesSection';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import type { VNode } from 'preact';
@@ -58,7 +75,56 @@ interface ReleaseMark {
   label: string;
   tooltip?: string;
   /** Distinguishes the offer from the installed release in CSS. */
-  kind: 'running' | 'available';
+  kind: 'running' | 'available' | 'newer';
+}
+
+/** What a release row IS, relative to the one running and the one on offer.
+ *
+ *  `newer` is the case this panel could not express before. The published
+ *  changelog can list a release the update check has not offered, because the
+ *  gateway polls periodically and the two sources are independent. */
+export type ReleaseRowStatus = 'available' | 'newer' | 'running' | 'none';
+
+/**
+ * Classify one row. Pure, and the whole of the rule.
+ *
+ * The offer wins over `running`, though the two can never name one release: an
+ * offer is newer than what is running by construction, on both the gateway path
+ * and the client one.
+ *
+ * A null `running` is the window before `/health` answers. It marks nothing
+ * rather than guessing, which is the same call {@link defaultOpenRelease}
+ * makes.
+ */
+export function releaseRowStatus(
+  version: string,
+  running: string | null,
+  offered: string | null,
+): ReleaseRowStatus {
+  if (offered && version === offered) return 'available';
+  if (!running) return 'none';
+  if (version === running) return 'running';
+  return isNewerVersion(version, running) ? 'newer' : 'none';
+}
+
+/**
+ * What a row lets the reader DO about its release.
+ *
+ * The updater installs whatever the manifest resolves, so a row can only offer
+ * an install for the version actually on offer. A release the changelog knows
+ * and the check has not seen gets the check instead, which is the honest
+ * action: it is what could turn that row into an offer.
+ *
+ * `canInstall` is `canInstallUpdateHere`, so a browser or PWA session and a
+ * headless install both fall through to no action. Their route is Settings,
+ * System, which carries the installer command.
+ */
+export function releaseRowAction(
+  status: ReleaseRowStatus,
+  canInstall: boolean,
+): 'install' | 'check' | null {
+  if (status === 'available') return canInstall ? 'install' : null;
+  return status === 'newer' ? 'check' : null;
 }
 
 /**
@@ -72,11 +138,16 @@ interface ReleaseMark {
 function ReleaseRow({
   release,
   mark,
+  action,
   open = false,
   onToggle,
 }: {
   release?: ChangelogRelease;
   mark?: ReleaseMark;
+  /** The control this row offers, already built by the parent. A rendered node
+   *  rather than a descriptor, so the row stays a renderer and the wording
+   *  lives beside the handler that acts on it. */
+  action?: VNode | null;
   open?: boolean;
   onToggle?: () => void;
 }) {
@@ -98,23 +169,29 @@ function ReleaseRow({
     // `data-release` is how a deep link finds its row: the panel brings the
     // release an update offer named into view once that row exists.
     <div class={`whats-new-release${mark ? ` is-${mark.kind}` : ''}`} data-release={release.version}>
-      <button
-        type="button"
-        class="whats-new-release-header"
-        aria-expanded={open}
-        onClick={onToggle}
-      >
-        <span class="whats-new-chevron" aria-hidden="true">
-          {open ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
-        </span>
-        <span class="whats-new-version">{release.version}</span>
-        {release.date && <span class="whats-new-date">{release.date}</span>}
-        {mark && (
-          <span class={`whats-new-mark is-${mark.kind}`} data-tooltip={mark.tooltip}>
-            {mark.label}
+      {/* The action is a SIBLING of the toggle, never inside it: the toggle is
+          itself a button, and a button nested in one is invalid markup that no
+          browser routes sensibly. */}
+      <div class="whats-new-release-row">
+        <button
+          type="button"
+          class="whats-new-release-header"
+          aria-expanded={open}
+          onClick={onToggle}
+        >
+          <span class="whats-new-chevron" aria-hidden="true">
+            {open ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
           </span>
-        )}
-      </button>
+          <span class="whats-new-version">{release.version}</span>
+          {release.date && <span class="whats-new-date">{release.date}</span>}
+          {mark && (
+            <span class={`whats-new-mark is-${mark.kind}`} data-tooltip={mark.tooltip}>
+              {mark.label}
+            </span>
+          )}
+        </button>
+        {action}
+      </div>
       {releaseNotesBody(release, open)}
     </div>
   );
@@ -222,6 +299,12 @@ export function WhatsNewPage() {
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
   const [target, setTarget] = useState<string | null>(null);
 
+  /** Ask for a check, and say what it found. The row that offers this names a
+   *  release the updater has not offered, so the answer is the point. */
+  const runCheck = useCallback(async () => {
+    reportUpdateCheck(await checkForUpdatesNow());
+  }, []);
+
   useEffect(() => {
     void loadChangelog();
   }, []);
@@ -269,14 +352,29 @@ export function WhatsNewPage() {
     if (loadable.status === 'loaded') markWhatsNewSeen(release);
   }, [release, loadable.status]);
 
+  // The two halves of this page are two fetches, so a dead changelog must not
+  // take the notices with it. The notices are the part that asks something of
+  // the reader. An engine flaky enough to fail one request is exactly when they
+  // come looking for the instruction.
   if (loadable.status === 'failed') {
-    return <LoadableError error={loadable.error} noun="the changelog" />;
+    return (
+      <>
+        <ReleaseNoticesSection />
+        <LoadableError error={loadable.error} noun="the changelog" />
+      </>
+    );
   }
 
   const releases = loadable.status === 'loaded' ? loadable.data : [];
+  const offeredVersion = packagedUpdateVersion();
   // Derived from the list, not just above it: the list can now carry a release
   // newer than the running one, the offered one included.
-  const offered = offeredRelease(packagedUpdateVersion(), latestTauriAppNotes.value, releases);
+  const offered = offeredRelease(offeredVersion, latestTauriAppNotes.value, releases);
+  const canInstall = canInstallUpdateHere();
+  const checking = appUpdateCheckInFlight.value;
+  // An install already under way owns every update control: the progress dialog
+  // narrates it, and a row offering to start another would be a lie.
+  const installing = appUpdateProgress.value !== null;
   // A running release with no section of its own marks nothing, rather than
   // marking the newest and claiming something untrue. Reachable whenever RELEASE
   // is bumped ahead of its changelog entry.
@@ -294,13 +392,70 @@ export function WhatsNewPage() {
     tooltip: lucidosVersionTooltip(release, dirty),
   };
 
-  function row(r: ChangelogRelease, mark: ReleaseMark | undefined, openByDefault: boolean) {
+  /** The chip a status wears. `running` is the only one needing state from
+   *  outside the row, which is why it is built above rather than here. */
+  function markFor(status: ReleaseRowStatus, version: string): ReleaseMark | undefined {
+    if (status === 'running') return runningMark;
+    if (status === 'available') {
+      return {
+        kind: 'available',
+        label: 'Available',
+        tooltip: `Lucidos ${version} is available to install`,
+      };
+    }
+    if (status === 'newer') {
+      return {
+        kind: 'newer',
+        label: 'Newer',
+        tooltip: `Lucidos ${version} is published, and you are running ${release}`,
+      };
+    }
+    return undefined;
+  }
+
+  /** The control a status earns, or `null`.
+   *
+   *  Both actions are the ones Settings → System uses. So the two surfaces
+   *  cannot disagree about what a click does, nor about what it found. */
+  function actionFor(status: ReleaseRowStatus): VNode | null {
+    if (installing) return null;
+    const action = releaseRowAction(status, canInstall);
+    if (action === 'install') {
+      return (
+        <button
+          class="action-btn whats-new-release-action"
+          onClick={() => { void installAppUpdate(); }}
+        >
+          {updateControlLabel(false, true)}
+        </button>
+      );
+    }
+    if (action === 'check') {
+      return (
+        <button
+          class="action-btn whats-new-release-action"
+          disabled={checking}
+          onClick={() => { void runCheck(); }}
+        >
+          {updateControlLabel(checking, false)}
+        </button>
+      );
+    }
+    return null;
+  }
+
+  function row(r: ChangelogRelease, openByDefault: boolean, forced?: ReleaseRowStatus) {
     const open = releaseRowIsOpen(r.version, openByDefault, toggled);
+    // The offered row FORCES its status. Its version comes from the manifest's
+    // own heading, which can name something `packagedUpdateVersion` does not,
+    // and that row is the offer whatever the two say. See {@link offeredRelease}.
+    const status = forced ?? releaseRowStatus(r.version, release, offeredVersion);
     return (
       <ReleaseRow
         key={r.version}
         release={r}
-        mark={mark}
+        mark={markFor(status, r.version)}
+        action={actionFor(status)}
         open={open}
         onToggle={() => setToggled({ ...toggled, [r.version]: !open })}
       />
@@ -308,6 +463,11 @@ export function WhatsNewPage() {
   }
 
   return (
+    <>
+      {/* Above the history, because it is the part that asks something of the
+          reader. It renders nothing when the workspace owes nothing, which is
+          the ordinary case. */}
+      <ReleaseNoticesSection />
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="whats-new:releases">
         Releases
@@ -323,7 +483,7 @@ export function WhatsNewPage() {
           the user followed the update notice here to read. */}
       {offered && (
         <div class="whats-new-list whats-new-offered">
-          {row(offered, { kind: 'available', label: 'Available', tooltip: `Lucidos ${offered.version} is available to install` }, true)}
+          {row(offered, true, 'available')}
         </div>
       )}
       <LoadingFade
@@ -332,10 +492,11 @@ export function WhatsNewPage() {
       >
         {loadable.status === 'loaded' ? (
           <div class="whats-new-list">
-            {releases.map((r) => row(r, r.version === release ? runningMark : undefined, r.version === openRelease))}
+            {releases.map((r) => row(r, r.version === openRelease))}
           </div>
         ) : null}
       </LoadingFade>
     </div>
+    </>
   );
 }

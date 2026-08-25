@@ -159,7 +159,7 @@ export function ModelSelectionPicker({
   useEffect(() => {
     const id = escapeId.current;
     if (stepBack.current === null) return;
-    pushOverlay({ id, dismiss: () => stepBack.current?.() });
+    pushOverlay({ id, dismiss: () => stepBack.current?.(), hasPanel: false });
     return () => removeOverlay(id);
   }, [openModel.value, !!back]);
 

@@ -48,6 +48,7 @@ const storeSignals = vi.hoisted(() => ({
   latestTauriAppVersion: { value: null as string | null },
   latestTauriAppNotes: { value: null as string | null },
   appUpdateCheckError: { value: null as string | null },
+  appUpdateCheckInFlight: { value: false },
   appUpdateProgress: { value: null as AppUpdateProgress | null },
   releaseCheck: { value: null as ReleaseCheck | null },
 }));
@@ -81,6 +82,7 @@ vi.mock('../store', () => ({
   latestTauriAppVersion: storeSignals.latestTauriAppVersion,
   latestTauriAppNotes: storeSignals.latestTauriAppNotes,
   appUpdateCheckError: storeSignals.appUpdateCheckError,
+  appUpdateCheckInFlight: storeSignals.appUpdateCheckInFlight,
   appUpdateProgress: storeSignals.appUpdateProgress,
   releaseCheck: storeSignals.releaseCheck,
 }));
@@ -88,11 +90,14 @@ vi.mock('../store', () => ({
 const {
   canInstallUpdateHere,
   checkAppUpdateViaClient,
+  checkForUpdatesNow,
   installAppUpdate,
   packagedUpdateVersion,
   refreshReleaseCheck,
+  reportUpdateCheck,
   startAppUpdateProgress,
   stopAppUpdateProgress,
+  updateControlLabel,
 } = await import('./app-update');
 
 /** Push a frame through the REAL subscription wiring — the handler is whatever
@@ -133,6 +138,7 @@ beforeEach(() => {
   storeSignals.latestTauriAppVersion.value = null;
   storeSignals.latestTauriAppNotes.value = null;
   storeSignals.appUpdateCheckError.value = null;
+  storeSignals.appUpdateCheckInFlight.value = false;
   storeSignals.appUpdateProgress.value = null;
   storeSignals.releaseCheck.value = null;
 });
@@ -701,6 +707,165 @@ describe('refreshReleaseCheck', () => {
     await refreshReleaseCheck();
     expect(mocks.showToast).not.toHaveBeenCalled();
     expect(storeSignals.releaseCheck.value?.latest?.version).toBe('9.8.0');
+  });
+});
+
+/**
+ * The one user-initiated check.
+ *
+ * Its whole reason to exist is that the verdict must come from the request the
+ * CLICK started. Settings used to await a check and then re-read
+ * `packagedUpdateVersion()`, which the background poll also writes: a click
+ * could report one request's state having awaited another's. On a `.dmg`
+ * install that showed "Lucidos is up to date" a moment before the offer toast
+ * for the release it had just found.
+ */
+describe('checkForUpdatesNow', () => {
+  it('reports the release the gateway announced', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.20.0', install: 'desktop-app' }),
+    );
+    expect(await checkForUpdatesNow()).toEqual({ kind: 'available', version: '9.20.0' });
+    expect(mocks.requestUpdateCheck).toHaveBeenCalledWith(true);
+  });
+
+  it('reports nothing newer as up to date', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
+    expect(await checkForUpdatesNow()).toEqual({ kind: 'up-to-date' });
+  });
+
+  // The verdict is the RESULT, so a signal write that lands after it cannot
+  // rewrite it. Reading `packagedUpdateVersion()` post-await is what could, and
+  // this asserts the two now disagree.
+  it('answers from its own result, not from signals a later poll rewrites', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
+    const verdict = await checkForUpdatesNow();
+    // The resume poll the click was racing, landing just after its own answer.
+    storeSignals.releaseCheck.value = releaseCheckOf({ version: '9.21.0' });
+    expect(packagedUpdateVersion()).toBe('9.21.0');
+    expect(verdict).toEqual({ kind: 'up-to-date' });
+  });
+
+  it('makes one request for two overlapping clicks, and answers both alike', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.22.0', install: 'desktop-app' }),
+    );
+    const [first, second] = await Promise.all([checkForUpdatesNow(), checkForUpdatesNow()]);
+    expect(mocks.requestUpdateCheck).toHaveBeenCalledTimes(1);
+    expect(first).toEqual(second);
+  });
+
+  it('raises the in-flight signal for the duration and lowers it after', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    let seen = false;
+    mocks.requestUpdateCheck.mockImplementation(async () => {
+      seen = storeSignals.appUpdateCheckInFlight.value;
+      return releaseCheckOf(null);
+    });
+    await checkForUpdatesNow();
+    expect(seen).toBe(true);
+    expect(storeSignals.appUpdateCheckInFlight.value).toBe(false);
+  });
+
+  it('lowers the in-flight signal even when the check fails', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockRejectedValue(new Error('connection refused'));
+    expect(await checkForUpdatesNow()).toEqual({
+      kind: 'failed',
+      reason: 'connection refused',
+    });
+    expect(storeSignals.appUpdateCheckInFlight.value).toBe(false);
+  });
+
+  // A gateway that answered but could not reach the origin has nothing newer to
+  // report BECAUSE it could not ask. Saying "up to date" would invent an answer.
+  it('reports a failed gateway poll as a failure, not as up to date', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf(null, { last_error: 'origin served markup, not JSON' }),
+    );
+    expect(await checkForUpdatesNow()).toEqual({
+      kind: 'failed',
+      reason: 'origin served markup, not JSON',
+    });
+  });
+
+  // The click is owed a reply. The dedupe exists to keep a resume quiet, and it
+  // used to swallow this too: dismiss the toast, click Check, get nothing.
+  it('re-offers a release it has already offered this session', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.23.0', install: 'desktop-app' }),
+    );
+    await checkForUpdatesNow();
+    mocks.showToast.mockClear();
+    await checkForUpdatesNow();
+    expect(lastToast().message).toBe('Lucidos 9.23.0 available');
+  });
+
+  // ADR 0105: a gateway too old to carry `release_check` announces nothing at
+  // all, and the client's own updater is the fallback.
+  it('falls back to the client updater when the gateway announces nothing', async () => {
+    storeSignals.releaseCheck.value = null;
+    mocks.checkAppUpdate.mockResolvedValue(offer('9.24.0'));
+    expect(await checkForUpdatesNow()).toEqual({ kind: 'available', version: '9.24.0' });
+    expect(mocks.requestUpdateCheck).not.toHaveBeenCalled();
+  });
+
+  // No gateway answer and no updater. Answering "up to date" here would be a
+  // guess: this session cannot learn about a release at all.
+  it('refuses to guess in a session with no check to run', async () => {
+    mocks.isTauri.mockReturnValue(false);
+    storeSignals.releaseCheck.value = null;
+    const verdict = await checkForUpdatesNow();
+    expect(verdict.kind).toBe('failed');
+  });
+
+  it('defers to an install already running', async () => {
+    storeSignals.appUpdateProgress.value = { version: '9.25.0', phase: 'downloading', downloaded: 1, total: null };
+    expect(await checkForUpdatesNow()).toEqual({ kind: 'installing' });
+    expect(mocks.requestUpdateCheck).not.toHaveBeenCalled();
+  });
+});
+
+describe('reportUpdateCheck', () => {
+  it('says so when there is nothing newer', () => {
+    reportUpdateCheck({ kind: 'up-to-date' });
+    expect(lastToast()).toMatchObject({ message: 'Lucidos is up to date', type: 'success' });
+  });
+
+  it('names the reason a check failed', () => {
+    reportUpdateCheck({ kind: 'failed', reason: 'connection refused' });
+    expect(lastToast()).toMatchObject({
+      message: "Couldn't check for updates: connection refused",
+      type: 'error',
+    });
+  });
+
+  // The offer toast has already named the release, and the progress dialog is
+  // already narrating the install. A second toast would just repeat them.
+  it('stays quiet where a more specific surface already answered', () => {
+    reportUpdateCheck({ kind: 'available', version: '9.30.0' });
+    reportUpdateCheck({ kind: 'installing' });
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+});
+
+describe('updateControlLabel', () => {
+  it('reports the check while one is running, whatever the control does', () => {
+    expect(updateControlLabel(true, false)).toBe('Checking…');
+    expect(updateControlLabel(true, true)).toBe('Checking…');
+  });
+
+  // Both idle words live here, so Settings and What's New cannot ship as
+  // "Check for Updates" and "Check for updates" at once, which they did.
+  it('owns both idle labels rather than taking one from the caller', () => {
+    expect(updateControlLabel(false, false)).toBe('Check for Updates');
+    expect(updateControlLabel(false, true)).toBe('Update & Restart');
   });
 });
 

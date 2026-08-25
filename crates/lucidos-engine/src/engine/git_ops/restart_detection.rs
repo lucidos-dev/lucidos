@@ -33,6 +33,10 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // panel showing the previous text with nothing saying why. The `.md`
         // exclusion above gates only the Rust-source and SDK-bundle arms, so
         // naming it here is enough.
+        // The release notices are the changelog's sibling and cost more when
+        // missed: `crate::engine::release_notices` include_str!s them, and an
+        // authored notice that never reaches a modal is an instruction the user
+        // is simply never given.
         // The font is the odd one: it lives in the APP crate (the host's
         // @font-face resolves it through Vite), which would otherwise read as a
         // frontend-only change, but the engine include_bytes!s that same file to
@@ -43,7 +47,8 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
             || f == "crates/lucidos-engine/src/api/sdk_fonts_fira_code.css"
             || f == "crates/lucidos-app/src/assets/fonts/FiraCode-VF.woff2"
             || f == "crates/lucidos-app/index.html"
-            || f == "CHANGELOG.md";
+            || f == "CHANGELOG.md"
+            || f == "release-notices.toml";
         (is_rust_source && !is_test_or_doc)
             || is_migration
             || is_sdk_bundle_source

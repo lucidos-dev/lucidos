@@ -157,6 +157,39 @@ describe('AnsweredBody — Canceled state', () => {
   });
 });
 
+/** A DEAD card says so in its class, and the scroll landing reads that straight
+ *  off the DOM. `followSentMessage` asks the newest `.question-body` whether it
+ *  is still open. A TYPED answer then lands on the card, rather than on the
+ *  optimistic row the send inserts and the answer removes again. See
+ *  `answerableQuestionId` in `scrollState.ts`.
+ *
+ *  The ANSWERED class is the load-bearing one, since an answered body KEEPS its
+ *  `data-tool-use-id` for `cardTurn` to find. Rename it and a plain follow-up
+ *  starts landing on a card nobody can answer, holding the reader at the bottom
+ *  until that landing's backstop. The terminated class is belt to that brace: a
+ *  terminated body carries no id either. */
+describe('a dead card says so to the scroll landing', () => {
+  it('an answered body wears question-body-answered', () => {
+    const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
+      question: 'q',
+      options: [],
+      multiSelect: false,
+      resolved: { kind: 'FreeText', text: 'hello' },
+    }));
+    expect(text).toContain('question-body-answered');
+  });
+
+  it('a terminated body wears question-body-terminated', () => {
+    const text = vnodeToText(TerminatedQuestionBody({
+      question: 'q',
+      options: [{ id: 'a', label: 'A' }],
+      multiSelect: false,
+    }));
+    expect(text).toContain('question-body-terminated');
+  });
+});
+
 describe('TerminatedQuestionBody', () => {
   it('renders every option as a disabled button (single-select)', () => {
     const text = vnodeToText(TerminatedQuestionBody({

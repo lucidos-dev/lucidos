@@ -207,27 +207,50 @@ pub(crate) fn gateway_origin(windows: &[(String, String)]) -> Option<&str> {
     windows.iter().find_map(|(_, url)| window_origin(url))
 }
 
+/// The workspace a window is serving, or `None` when it is serving none.
+///
+/// `None` covers both non-workspace shapes at once, because every caller here
+/// treats them alike: an unnavigated window still on the bundled app URL, and
+/// one on the gateway root or the `~` sigil. [`window_context`] is the same
+/// rule with the two told apart, for the one caller that needs it.
+///
+/// Compiled on every platform: `window_session` records a window's workspace
+/// from its URL, and that is not macOS-only the way the tap delegate is.
+pub(crate) fn window_workspace(url: &str) -> Option<&str> {
+    let after_scheme = strip_http_scheme(url)?;
+    // The authority runs to the first '/', '?' or '#'. Anything but a '/' means
+    // there is no path at all (`http://host`, `http://host?x`), i.e. the root.
+    let path = match after_scheme.find(['/', '?', '#']) {
+        Some(i) if after_scheme.as_bytes()[i] == b'/' => &after_scheme[i + 1..],
+        _ => return None,
+    };
+    let segment = &path[..path.find(['/', '?', '#']).unwrap_or(path.len())];
+    is_workspace_slug(segment).then_some(segment)
+}
+
+/// Has this window reached the gateway at all?
+///
+/// False for the bundled `tauri://localhost` every window starts on, and true
+/// from the moment it is navigated, workspace or picker alike. `window_session`
+/// needs the distinction: a window still on the splash says nothing about the
+/// user's arrangement, while one sitting on the picker says they left it there.
+pub(crate) fn window_is_navigated(url: &str) -> bool {
+    strip_http_scheme(url).is_some()
+}
+
 /// Classify a window by its URL. Pure + platform-independent so the whole
 /// targeting decision is unit-testable off macOS (the UN delegate that drives it
 /// is not).
 #[cfg(any(target_os = "macos", test))]
 fn window_context(url: &str) -> WindowContext<'_> {
-    let Some(after_scheme) = strip_http_scheme(url) else {
-        return WindowContext::Unnavigated;
-    };
-    // The authority runs to the first '/', '?' or '#'. Anything but a '/' means
-    // there is no path at all (`http://host`, `http://host?x`), i.e. the root.
-    let path = match after_scheme.find(['/', '?', '#']) {
-        Some(i) if after_scheme.as_bytes()[i] == b'/' => &after_scheme[i + 1..],
-        _ => return WindowContext::Neutral,
-    };
-    let segment = &path[..path.find(['/', '?', '#']).unwrap_or(path.len())];
-    if is_workspace_slug(segment) {
-        WindowContext::Workspace(segment)
-    } else {
-        // Empty (the root), the `~` sigil (the picker), or a path the gateway
-        // would not resolve to a workspace at all.
-        WindowContext::Neutral
+    if let Some(workspace) = window_workspace(url) {
+        return WindowContext::Workspace(workspace);
+    }
+    match strip_http_scheme(url) {
+        // On the gateway but inside no workspace: the root, the `~` sigil, or a
+        // path the gateway would not resolve to a workspace at all.
+        Some(_) => WindowContext::Neutral,
+        None => WindowContext::Unnavigated,
     }
 }
 

@@ -1,21 +1,23 @@
 import { useSignal } from '@preact/signals';
+import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { cancelThreadEventWait } from '../../api/client';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import {
   effectiveThreadStatus,
+  eventConditionDoor,
   focusedThreadId,
   isMidTurn,
   showToast,
   threadMap,
 } from '../../store/store';
-import type { EventWaitSummary, ThreadState } from '../../store/thread-events';
+import type { EventSubscription, EventWaitSummary, ThreadState } from '../../store/thread-events';
 import {
   awaitedSubject,
-  describeWaitSubscription,
   formatRemaining,
   secondsRemaining,
+  waitSubscriptionLabel,
 } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CloseIcon, EventWaitClockIcon } from '../shared/icons';
@@ -311,6 +313,41 @@ export function SubThreadRow({ child, onOpen }: { child: ThreadState; onOpen: ()
   );
 }
 
+/** The watched event types on one line, with a filtered one pressable so its
+ *  `condition` is one tap away.
+ *
+ *  Segments rather than `describeWaitSubscription`'s joined string, because a
+ *  string cannot carry a button. The joined LOOK is unchanged: still one muted
+ *  mono line reading `A or B`, and an entry with no condition stays plain text.
+ *
+ *  The modal it opens STACKS over this popover on `overlayStack`. Escape or an
+ *  outside click closes the modal and leaves the panel where it was. */
+export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
+  return on.flatMap((s, i) => {
+    const glue = i === 0 ? [] : [<span key={`glue${i}`}>{' or '}</span>];
+    const label = waitSubscriptionLabel(s);
+    const door = eventConditionDoor(s);
+    return [
+      ...glue,
+      door ? (
+        <button
+          key={`sub${i}`}
+          type="button"
+          class="event-wait-subscription-filter"
+          data-role="event-wait-condition"
+          aria-label={door.label}
+          data-tooltip={door.label}
+          onClick={door.open}
+        >
+          {label}
+        </button>
+      ) : (
+        <span key={`sub${i}`}>{label}</span>
+      ),
+    ];
+  });
+}
+
 /** One live subscription. The countdown lives in component-local state, never
  *  in a signal: a per-second store write would re-flush `threadMap` (and
  *  therefore every subscribed component, most expensively `ChatExchange`) once
@@ -341,7 +378,7 @@ function EventWaitRow({ threadId, wait }: { threadId: string; wait: EventWaitSum
     <li class="event-wait-item">
       <div class="event-wait-main">
         <span class="event-wait-reason">{wait.reason}</span>
-        <code class="event-wait-subscription">{describeWaitSubscription(wait.on)}</code>
+        <code class="event-wait-subscription">{subscriptionLine(wait.on)}</code>
       </div>
       <div class="event-wait-foot">
         <span class="event-wait-meta">

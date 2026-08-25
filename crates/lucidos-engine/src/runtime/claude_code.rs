@@ -307,14 +307,15 @@ impl AgentRuntime for ClaudeCodeRuntime {
         .await;
         ensure_workspace_bin_symlink(args.worktree_path, cli_dir);
 
-        // Materialize the PreToolUse hook config CC reads via --settings.
-        // Log-and-continue on failure: a missing hook degrades AskUserQuestion
-        // behavior but doesn't break the rest of the session.
+        // Materialize the config CC reads via --settings: the PreToolUse hooks
+        // and the widened directory scope. Log-and-continue on failure: the
+        // session then runs without its hooks and cards every reach into
+        // `data/`, but the rest of it still works.
         let cc_settings_path =
             crate::engine::cc_settings::cc_settings_path_for_workspace(args.workspace_path);
-        if let Err(e) = crate::engine::cc_settings::write_cc_settings(&cc_settings_path).await {
+        if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
             crate::log!(
-                "[ClaudeCode] failed to write cc-settings.json at {}: {} — AskUserQuestion hook will not fire",
+                "[ClaudeCode] failed to write cc-settings.json at {}: {}. Hooks will not fire and data/ is not granted",
                 cc_settings_path.display(),
                 e
             );
@@ -459,6 +460,12 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     let mut cmd = tokio::process::Command::new(claude_bin);
+    // The user's `coding_agent_claude_permission_mode`, defaulting to
+    // acceptEdits: in-cwd writes auto-approve, and out-of-cwd writes plus Bash
+    // route through --permission-prompt-tool to a PermissionCard. The flag is
+    // passed unconditionally, and CC takes the CLI value over any settings
+    // file. So this is the only place the mode can be chosen.
+    let permission_mode = resolve_permission_mode(args.permission_mode);
     if let Some(sid) = args.resume_session_id {
         cmd.arg("--print").arg("--resume").arg(sid);
     }
@@ -467,11 +474,8 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
-        // acceptEdits keeps in-cwd writes auto-approved (matching the previous
-        // --dangerously-skip-permissions behavior); out-of-cwd writes and
-        // Bash route through --permission-prompt-tool to a PermissionCard.
         .arg("--permission-mode")
-        .arg("acceptEdits")
+        .arg(permission_mode.flag())
         .arg("--permission-prompt-tool")
         .arg(CC_PERMISSION_PROMPT_TOOL)
         .arg("--mcp-config")
@@ -534,6 +538,13 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if let Some(dir) = args.claude_config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
+    // Auto mode's opt-in, for the same reason and by the same rule as the pin
+    // above: engine-owned, so it goes AFTER `apply_lucidos_env` and a stale
+    // user-managed value cannot strand a session whose preference says auto.
+    // Set ONLY for auto, so the variable stays an explicit opt-in.
+    if permission_mode.needs_auto_opt_in() {
+        cmd.env(AUTO_MODE_OPT_IN_ENV, "1");
+    }
     // Root-cause fix for the stray-SIGTERM truncation bug: give CC its OWN
     // process group so a group-wide signal to the engine never reaches it.
     // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
@@ -555,6 +566,52 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
     // only effective knob is never consulted. See ADR 0075.
     cmd
+}
+
+/// Which of Claude Code's own permission modes a session runs in, resolved
+/// from the `coding_agent_claude_permission_mode` preference.
+///
+/// Only two of CC's six are offered. `bypassPermissions` removes the card
+/// outright, `plan` cannot write, and `default` is strictly worse than
+/// `acceptEdits` here because it stops auto-approving in-worktree writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CcPermissionMode {
+    /// In-worktree writes auto-approve; everything else raises a card.
+    AcceptEdits,
+    /// CC's safety classifier approves routine actions instead of carding.
+    Auto,
+}
+
+/// Env var CC requires before it will enter auto mode on a non-first-party
+/// provider. We run on Vertex, and without it CC's gate drops the session to
+/// `default`, which cards MORE than `acceptEdits` does.
+const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
+
+impl CcPermissionMode {
+    /// CC's own spelling, for `--permission-mode`.
+    pub(crate) fn flag(self) -> &'static str {
+        match self {
+            Self::AcceptEdits => "acceptEdits",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Whether this mode needs [`AUTO_MODE_OPT_IN_ENV`] set.
+    pub(crate) fn needs_auto_opt_in(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Read the stored preference value as a mode.
+///
+/// Anything unrecognised falls back to [`CcPermissionMode::AcceptEdits`], which
+/// is what every session ran before the preference existed. Never to `auto`,
+/// which nobody asked for, and never to CC's `default`, which cards more.
+pub(crate) fn resolve_permission_mode(preference: Option<&str>) -> CcPermissionMode {
+    match preference.map(str::trim) {
+        Some("auto") => CcPermissionMode::Auto,
+        _ => CcPermissionMode::AcceptEdits,
+    }
 }
 
 /// MCP server name Claude Code mounts `lucidos mcp-permission-server` under

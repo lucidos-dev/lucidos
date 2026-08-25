@@ -244,7 +244,8 @@ Two settings files register hooks, and both apply.
 - **`.lucidos/cc-settings.json`** (generated per workspace by
   `crates/lucidos-engine/src/engine/cc_settings.rs`, passed with `--settings`):
   `PreToolUse` on `AskUserQuestion`, `Bash`, `Read`, `Edit` and `Write`, a
-  `Stop` hook, and the default model. These call `lucidos` subcommands.
+  `Stop` hook, the default model, and `permissions.additionalDirectories`.
+  The hooks call `lucidos` subcommands.
 
 `permissions.deny` in `.claude/settings.json` blocks reads of build output and
 one large generated fixture. Content searches already respect `.gitignore`, so
@@ -260,3 +261,35 @@ compiled default is empty and the effective list comes from
 `<workspace>/.lucidos/cc-allowed-tools`, which is **per workspace** (ADR 0095):
 a grant made in one workspace is asked again in the next. See `GrantFile` in
 `crates/lucidos-engine/src/core/grants/mod.rs`.
+
+**An allowlist entry does not outrank CC's own path check.** Its Bash evaluator
+runs exact rules, then prefix rules, then a path-validation layer, and only then
+the allow rules. The path layer returns immediately when it asks, unless it
+marked the ask rule-overridable. A `cd` outside the session's allowed working
+directories never is, so `Bash` in `cc-allowed-tools` cannot suppress that card.
+
+The engine grants two directories through `permissions.additionalDirectories`
+for exactly this reason. `<workspace>/data` holds the artifacts, knowhow, apps
+and triggers an agent reaches from a worktree that is their sibling. `/tmp` is
+the OS temp dir, where an `Edit` cards with reason `workingDir`. That card hides
+its "Always allow" button, because CC honours no bare `Edit` allow rule in any
+mode. Both directories live in `engine/cc_settings.rs`.
+
+Four shapes stay unsuppressable at any scope, because no rule reaches them:
+`cd` with an output redirection, `cd` with a write command, `cd` before `git`,
+and two `cd` in one command. Avoid them by not prefixing `cd`, rather than by
+adding rules. Background and the rejected wider scope:
+[`docs/plans/2026-08-25-cc-permission-cards-from-cd-outside-the-worktree.md`](plans/2026-08-25-cc-permission-cards-from-cd-outside-the-worktree.md).
+
+**The mode itself is a preference.** `coding_agent_claude_permission_mode` picks
+between `accept-edits` (the default, and what every session ran before the key
+existed) and `auto`, where CC's own safety classifier approves routine actions.
+Auto reaches the four shapes above. It also drops classifier-bypassing allow
+rules, bare `Bash` included, and denies rather than cards when the classifier is
+unreachable.
+
+The engine sets `CLAUDE_CODE_ENABLE_AUTO_MODE=1` alongside it. Without that, CC's
+provider gate downgrades the session to `default`, which cards more than
+`acceptEdits` does. The flag rides every spawn, and CC prefers a CLI value to any
+settings file. So this preference is the only way to choose the mode. Full
+reasoning: [`docs/plans/2026-08-25-claude-code-permission-mode-preference.md`](plans/2026-08-25-claude-code-permission-mode-preference.md).

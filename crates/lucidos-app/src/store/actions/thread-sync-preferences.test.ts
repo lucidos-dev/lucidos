@@ -67,7 +67,11 @@ vi.mock('./devices', () => ({ getDeviceId: vi.fn(), pendingDeviceRegistration: v
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
-vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
+vi.mock('./entityReferences', () => ({
+  processSSEForReferences: vi.fn(),
+  refreshLlmConfigured: vi.fn(),
+  PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
+}));
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn(async () => {}),
   refreshThreadEvents: vi.fn(async () => {}),
@@ -76,6 +80,7 @@ vi.mock('./thread-loading', () => ({
 const { handleGlobalEvent } = await import('./thread-sync');
 const { loadPreferences } = await import('./preferences');
 const { syncClientUpdateFromBuild } = await import('./client-update');
+const { refreshLlmConfigured } = await import('./entityReferences');
 
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
   beforeEach(() => {
@@ -159,5 +164,35 @@ describe('handleGlobalEvent: a backup preference change bumps the Backup page', 
     // it, which lists the remote folder. A retention edit must not.
     handleGlobalEvent('PreferencesChanged', { key: 'backup_retention', value: '10' });
     expect(backupStatusVersion.value).toBe(0);
+  });
+});
+
+/**
+ * A provider switch rebuilds the engine's active provider set in-process, the
+ * same way a credential change does. So it owes the same `/health` re-probe:
+ * `configuredProviders` is what filters the model picker, and without the probe
+ * the picker keeps offering a provider the engine has already dropped.
+ */
+describe('handleGlobalEvent: a provider preference re-probes /health', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(['opencode_free_enabled', 'provider_enabled_openai'])(
+    '%s re-probes',
+    (key) => {
+      handleGlobalEvent('PreferencesChanged', { key, value: 'false' });
+      expect(refreshLlmConfigured).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('leaves /health alone for every other key', () => {
+    // The probe is an HTTP round trip plus a delayed second one. A theme flip
+    // changes no provider, so it must not pay for them.
+    for (const key of ['theme', 'chat_model', '']) {
+      handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
+    }
+    handleGlobalEvent('PreferencesChanged', {});
+    expect(refreshLlmConfigured).not.toHaveBeenCalled();
   });
 });

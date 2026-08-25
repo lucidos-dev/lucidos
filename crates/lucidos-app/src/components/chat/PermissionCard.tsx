@@ -199,6 +199,9 @@ const CC_PROTECTED_PATH_MARKERS: readonly string[] = ['.claude/', '.git/'];
  *  permission routing (`.claude/` or `.git/`). The card hides Broad
  *  ("Always allow") and Narrow ("Always allow Bash(rm:*)") in that case —
  *  those buttons would persist patterns CC ignores for the same path.
+ *  Hiding them is not the only thing holding that line. The engine's gate
+ *  derives the same `null` and refuses to honour a stored pattern here. So a
+ *  broad `Bash` granted elsewhere still cards on these paths (ADR 0125).
  *  Session ("Allow for this thread") still works because the engine
  *  intercepts before CC's gate — and it now survives an engine restart, since
  *  the engine rehydrates the grant from the persisted resolution events.
@@ -289,9 +292,11 @@ const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
  *      reviewed by the user before the assistant continues.
  *  The "Always allow" broad button is hidden for these tools; users wanting
  *  in-thread persistence should use the session-allow button, which the engine
- *  intercepts before CC's gate. See `inputTouchesProtectedPath` for the
- *  per-input variant of the same rule (Bash commands targeting protected
- *  paths). Keep in sync with `BROAD_ALLOW_INEFFECTIVE` in `claude_code.rs`. */
+ *  intercepts before CC's gate. The engine's gate refuses a stored bare line
+ *  for these tools too, through the same derivation (ADR 0125). See
+ *  `inputTouchesProtectedPath` for the per-input variant of the same rule
+ *  (Bash commands targeting protected paths). Keep in sync with
+ *  `BROAD_ALLOW_INEFFECTIVE` in `claude_code.rs`. */
 export const BROAD_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set([
   'Edit',
   'ExitPlanMode',

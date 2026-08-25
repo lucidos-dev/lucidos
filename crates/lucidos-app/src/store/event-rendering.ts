@@ -24,8 +24,11 @@ export function isMeaningfulText(e: ResponseEvent): boolean {
 /** True when an in-progress step is actually rendered on screen — steps are
  *  expanded, the response panel is NOT collapsed, AND the visible set holds a
  *  pending step (`outcome === 'pending'`, the one that carries the
- *  `.running-shimmer` "live" affordance). Only `'pending'` counts: every other
- *  outcome, `'unfinished'` included, is terminal.
+ *  `.running-shimmer` "live" affordance). Only `'pending'` counts, and the
+ *  question is what SHIMMERS rather than what is terminal. `'unfinished'` is
+ *  terminal and does not. `'blocked'` is not terminal and still does not: a
+ *  call held on a permission card is waiting for the reader, so animating it
+ *  would claim the machine is busy.
  *
  *  Drives the "exactly one running-text shimmer at a time" rule: when a live
  *  step is on screen its own shimmer is the live signal, so the status label

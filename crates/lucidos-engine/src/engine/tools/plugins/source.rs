@@ -3,8 +3,10 @@
 //! scratch dir, and the per-file atomic copy used by the writer. Pure
 //! filesystem/network helpers — no engine or event-bus coupling.
 
+use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{
     is_git_url, validate_archive_entry_path, ValidationError, PLUGIN_ARCHIVE_EXT,
 };
@@ -97,6 +99,18 @@ fn parse_github_tree(rest: &str) -> Option<Source> {
     })
 }
 
+/// The stored credentials a [`fetch_source`] of `source_str` may present.
+///
+/// The fetch is synchronous, so its credentials are resolved out here. A
+/// local archive and an unparseable string need none: the fetch itself
+/// reports whatever is wrong with them.
+pub(crate) async fn credentials_for_source(pool: &PgPool, source_str: &str) -> GitCredentials {
+    match detect_source(source_str) {
+        Ok(Source::Git { url, .. }) => GitCredentials::resolve_one(pool, &url).await,
+        _ => GitCredentials::none(),
+    }
+}
+
 /// Fetch the source into a fresh `tempfile::TempDir` under
 /// `.lucidos/tmp/plugins/`. Returns the TempDir guard (auto-cleans on drop)
 /// and the plugin root inside it (where `manifest.toml` lives — for git-tree
@@ -104,6 +118,7 @@ fn parse_github_tree(rest: &str) -> Option<Source> {
 pub(crate) fn fetch_source(
     workspace: &Path,
     source: &Source,
+    credentials: &GitCredentials,
 ) -> Result<(tempfile::TempDir, PathBuf, SourceType), String> {
     let parent = workspace.join(crate::core::TMP_DIR).join("plugins");
     std::fs::create_dir_all(&parent).map_err(|e| format!("create scratch dir: {}", e))?;
@@ -117,26 +132,15 @@ pub(crate) fn fetch_source(
             subpath,
         } => {
             let clone_target = scratch.path().join("repo");
-            // git2 types are not Send — drop them before any await in the caller.
-            {
-                let mut builder = git2::build::RepoBuilder::new();
-                let mut fetch_opts = git2::FetchOptions::new();
-                // Shallow clones cut bandwidth for HTTPS/SSH but libgit2's
-                // local transport rejects them ("shallow fetch is not
-                // supported by the local transport"). Fall back to a full
-                // clone for `file://` URLs — they're already local so the
-                // bandwidth saving doesn't matter.
-                if !url.starts_with("file://") {
-                    fetch_opts.depth(1);
-                }
-                if let Some(b) = branch {
-                    builder.branch(b);
-                }
-                builder.fetch_options(fetch_opts);
-                builder
-                    .clone(url, &clone_target)
-                    .map_err(|e| format!("git clone failed: {}", e))?;
-            }
+            // The returned repo drops at the end of this statement: git2 types
+            // are not Send, and the caller awaits. `shallow_clone` handles
+            // credentials and the `file://` depth exception.
+            crate::core::git_auth::shallow_clone(
+                url,
+                branch.as_deref(),
+                &clone_target,
+                credentials,
+            )?;
             let _ = std::fs::remove_dir_all(clone_target.join(".git"));
 
             let plugin_root = match subpath {

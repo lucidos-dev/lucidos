@@ -40,7 +40,7 @@ What the split IS, then: a Rust type distinction and a column value. It is never
 
 ## Today the scheduler uses a blocklist
 
-The scheduler subscribes to the EventBus and forwards events to the trigger matcher. It has two branches, one per enum, and they are gated differently. The `BusEvent::Thread` branch is gated by a small **blocklist** (`ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`; the gate itself lives in `crates/lucidos-engine/src/scheduler/mod.rs`). Every other persisted `ThreadEvent` is forwarded to the matcher and can be subscribed to via an `on:` entry on a trigger.
+The scheduler subscribes to the EventBus and forwards events to the trigger matcher. It has two branches, one per enum, and they are gated differently. The `BusEvent::Thread` branch is gated by a small **blocklist** (`ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`; the gate itself lives in `crates/lucidos-engine/src/scheduler/mod.rs`). Every other persisted `ThreadEvent` is forwarded to the matcher and can be subscribed to via an `on:` entry on a trigger.
 
 The blocklist contains exactly the per-token streaming variants — many fires per turn (one event per text chunk), never appropriate to subscribe a trigger to:
 
@@ -113,7 +113,7 @@ The middle row is the one that matters for your own work. A domain event you are
 
 - **`engine`** is the closed set the validator checks against. A name read off this list always validates. A name that merely resembles one is refused.
 - **`workspace`** is what this workspace's store has seen and the engine does not emit: your own domain events.
-- **`retired`** is what the renames took away.
+- **`retired`** is what the renames took away. **This is the complete list**, read straight from `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, which a test holds to the names serde still accepts. The `Legacy alias:` notes in the tables below are prose for a human reader and cover only some of it. Never hand-assemble the retired set by reading them: ask the tool.
 
 For "has this ever actually happened, and how often", use the `count` action instead. With no `event_type` it returns the full per-type breakdown, so one call tells a name nobody has emitted from one that fired twice last year.
 
@@ -132,7 +132,7 @@ A trigger on a transient event can never fire — the scheduler's matcher only l
 
 ## Wire format and metadata
 
-Persisted events are stored with `event_type` set to the variant name and `payload` as the variant's JSON object. Cross-cutting fields merged into the payload at persist time by `EventMeta` (see `engine/thread_events.rs` `EventMeta::apply`):
+Persisted events are stored with `event_type` set to the variant name and `payload` as the variant's JSON object. Cross-cutting fields merged into the payload at persist time by `EventMeta` (see `crates/lucidos-engine/src/engine/thread_events/meta.rs` `EventMeta::apply`):
 
 - `request_event_id` — links response/terminal events back to the originating request.
 - `channel` — `"chat"` / `"claude_code"` / `"trigger"` (`EventChannel`). The `"claude_code"` wire string is the coding-agent channel for both Claude Code and Codex; the name is retained for compatibility with existing rows and clients.
@@ -206,7 +206,7 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
 | `CodingAgentIdled` | **The coding-agent turn-boundary marker.** Emitted at the end of every coding-agent turn whose Result wasn't an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `coding_agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`, `bg_bash_pending` (recorded-history flag: true when the turn idled with a chat-agent `run_bash_background` task still running; **no longer gates proposal or drives any UI** — the change proposes at idle regardless of background bash, and correctness is covered by harden-at-apply). | one-per-turn | yes | yes |
 | `CodingAgentSettingsChanged` | User changed model, reasoning effort, or permission mode mid-session — and also emitted once at backend init carrying `cc_session_id` (and `claude_config_dir`, the `CLAUDE_CONFIG_DIR` the session was created under) when available so both are durable before the first `CodingAgentIdled`. The session id lets a mid-turn engine restart still resume; the config dir lets the resume re-inject the right `CLAUDE_CONFIG_DIR` so CC finds the transcript even if the user toggled the env var mid-flight. | lifecycle (rare) | yes | yes |
-| `CodingAgentPermissionRequest` | A coding agent asked to confirm a tool call. Two raise paths: Claude Code's MCP permission-prompt subprocess (a path outside the worktree, or `.git/` inside it — an in-worktree file write, including under `.claude/`, is auto-allowed by the engine before a card is rendered) and the Codex app-server approval bridge (sandbox-escaping `command_execution` / out-of-worktree `file_change` under `approvalPolicy: on-request`; the exec escape-hatch protocol emits none). | per-action | yes | yes |
+| `CodingAgentPermissionRequest` | A coding agent asked to confirm a tool call, on one of two raise paths. Claude Code's MCP permission-prompt subprocess fires for a path outside the session's working directories, or `.git/` inside the worktree. Those directories are the worktree, the workspace's `data/` tree and `/tmp`; an in-worktree write, including under `.claude/`, is auto-allowed before any card. Under the `auto` permission mode CC's classifier decides instead. The Codex app-server approval bridge fires for a sandbox-escaping `command_execution` or an out-of-worktree `file_change` under `approvalPolicy: on-request`. The exec escape-hatch protocol emits none. | per-action | yes | yes |
 | `CodingAgentPermissionResolved` | The above request was answered, or auto-resolved by the engine: recovery (orphaned after restart), supersession (`allowed: false`, `reason: "Superseded by a new message"` when the user types instead of clicking), or a **session-ended clear** (`reason: "Coding agent session ended before answering — request expired"` when the turn idled with the card still dangling — e.g. a workflow whose parallel subagent's card outlived the main turn). Carries `allowed`, optional `reason`, optional `persist_scope` (`narrow` / `broad` / `session`). Flips the thread back to `running` **only from `waiting_for_user_answer`** — a resolution on an already-idle/terminal thread (a stale click hours after idle, or the session-ended clear) leaves the status unchanged, so it can't zombie a finished thread into a dead `running`. | per-action | yes | yes |
 | `MissingHardeningDetected` | Engine detected a coding-agent session ended without running `/harden` and auto-spawned a recovery hardening session. Not a session terminator — the thread stays active until hardening finishes. | lifecycle (rare) | yes | yes |
 | `ContinuationRequested` | Continuation marker, emitted when an interrupted coding-agent turn needs to resume without a new user message. Picked up by the spawn dispatcher; the event id is the spawn idempotency key. Delivery is guaranteed two ways: the dispatcher opens its bus subscription before its startup backfill runs (so a request emitted during startup is buffered, never lost), and at every engine start it re-dispatches any still-unactuated request (one with no later lifecycle or terminal event on a thread still `running`), so an emitted request can't silently strand the thread as a running zombie. `reason: String` is one of: `"user_clicked_continue"` (user clicked Continue after an engine restart), `"answered_after_idle"` (user answered an `AskUserQuestion` after the coding-agent subprocess was torn down at idle), `"auto_recovery_after_hang"` (a hung-subprocess watchdog detected the coding agent silent past its inactivity limit and auto-resumes without user intervention), `"auto_resume_after_switch"` (recovery auto-resumes an in-flight coding-agent thread after a user-initiated *Switch to new version*), `"auto_resume_after_api_error"` (the coding agent ended a turn on a transient upstream failure it reported itself, an `API Error: …` such as a connection closed mid-response, and the engine resumes the session instead of leaving the thread dead behind the `ResponseFailed`). The API-error resume is the only BOUNDED reason: at most 3 in a row, counted since the thread's last `MessageReceived` or `ResponseGenerated`, so a persistently broken upstream surfaces as a red dot instead of looping. It is deliberately skipped during engine shutdown (post-restart recovery owns those threads) and on a conflict-resolution session (an API drop mid-merge still aborts the merge and leaves the change pending). Two watchdogs can produce `auto_recovery_after_hang`: the in-loop one inside `run_session`'s `select!` (10 min, fast first line) and an external scanner task (12 min, ticks every 30 s from outside any per-thread loop, which catches the case where the `select!` itself is wedged in an event-handler await). The two share a gate, the 2-min grace ensures the in-loop fires first when it can. The gate normally skips while a tool is in flight (legitimate silence: a long `Bash`, an unanswered `AskUserQuestion`), but that skip is bounded by a 45-min hung-tool ceiling: a tool that never returns (a hung sub-agent) past the ceiling fires anyway, after re-confirming the thread is still `running` so a pending user answer is never euthanized. When the thread has an in-flight *conflict resolution* (a pending change whose latest merge-lifecycle event is an unpaired `MergeConflictDetected`, see that row), a **recovery-shaped** continuation (`user_clicked_continue` / `auto_recovery_after_hang` / `auto_resume_after_switch`, never `answered_after_idle`, which is a different interaction and must not silently land a change) re-attaches the merge duty: the resumed session runs in the merge worktree with the change bound, so its completion finishes the apply (`ChangeApplied`) or aborts for real. A stray-killed merge session's cleanup deliberately skips the failure events so this pairing stays open for the hand-off instead of failing the apply the user is watching. A duty the continuation cannot carry (merge worktree gone, resume failed before settling it) is closed loudly with the deferred `MergeResolutionCleared` + `ChangeApplyFailed` pair. Past name `ContinueSignal` is kept as a serde alias for old DB rows. | lifecycle | yes | yes |
@@ -636,18 +636,23 @@ holds: a later failure reuses this paragraph instead of losing it.
 
 `covers_through_event_id` addresses the newest assistant turn the paragraph
 accounts for. `load_chat_history` compares it against the current older segment.
-It re-summarises only when no such event exists, or when the assistant turns
-past that boundary exceed `HISTORY_SUMMARY_REFRESH_AFTER`. Otherwise it reuses
-the paragraph and renders the uncovered assistant turns compacted, so nothing
-between refreshes is silently dropped.
+It re-summarises only when the assistant turns past that boundary exceed
+`HISTORY_SUMMARY_REFRESH_AFTER`. Otherwise it reuses the paragraph and renders
+the uncovered assistant turns compacted, so nothing between refreshes is
+silently dropped.
+
+**The refresh runs detached, so this event lands one turn late.** The turn that
+decides one is owed has already chosen what it renders, from the cache as it
+stood. Awaiting the call put its whole deadline in front of that turn's first
+step, for a paragraph only the next turn could use.
 
 **User turns are never summarised** (ADR 0102). They render verbatim in the
 older region, so a constraint stated 40 turns ago is still in the prompt word
 for word. This event therefore only ever stands in for assistant work.
 
-**A new thread never writes one.** Its older region is a global window over
-other threads, so a row written from it would file their content here. Only a
-follow-up turn, reading this thread's own history, may cache.
+**Every row covers its own thread** (ADR 0124). A chat turn reads only its own
+events, so nothing here can file another conversation's content under this
+thread.
 
 ### `ResponseGenerated`
 
@@ -783,7 +788,7 @@ On almost every section the two are equal, because nothing else counts that sect
 
 Both are character counts, never a token count. The sections carry no per-section token number.
 
-**Pre-rename rows spell the delta `char_count`**, and carry no `content_chars` at all. (Not written as a `Legacy alias:` note: that form is reserved for a retired EVENT name, and the workspace audit reads it as one.) The engine renames the key on the way out of `GET /api/v1/events/:event_id/context`, so a client never sees it, but a direct SQL query over history does: read `coalesce(x->>'budget_delta_chars', x->>'char_count')`.
+**Pre-rename rows spell the delta `char_count`**, and carry no `content_chars` at all. (Not written as a `Legacy alias:` note: that form is reserved for a retired EVENT name, and this is a renamed payload key.) The engine renames the key on the way out of `GET /api/v1/events/:event_id/context`, so a client never sees it, but a direct SQL query over history does: read `coalesce(x->>'budget_delta_chars', x->>'char_count')`.
 
 `trimmed` means the LLM was given less than the assembled context. It covers **both** ways that happens. The trimmer's removal pass evicts whole messages, and its stubbing passes replace an individual body with a note. The note opens `[cut to fit the context budget:` and states the original size. Where the body carried an event address, it also names the `events(action="query", event_id=...)` call that reads the whole thing back. It previously reported only the eviction case, so turns whose tool results had been gutted showed as untrimmed.
 

@@ -11,10 +11,13 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::mcp::{McpCostTotals, McpStartOutcome, McpStopOutcome};
 
 /// Dispatch an "Always allow" grant to the right storage. `Narrow` / `Broad`
-/// append to `<workspace>/.lucidos/cc-allowed-tools` (CC reads it on next spawn);
-/// `Session` records into the per-thread in-memory allow set the engine
-/// checks before each prompt. Returns silently for tools whose scope yields
+/// append to `<workspace>/.lucidos/cc-allowed-tools`; `Session` records into the
+/// per-thread in-memory allow set. Returns silently for tools whose scope yields
 /// no derivable pattern (e.g. `Edit` with `Broad` — `BROAD_ALLOW_INEFFECTIVE`).
+///
+/// Both storages bind the CURRENT session. CC reads the file at its next spawn,
+/// but the engine's own gate reads it on every prompt. That is what makes an
+/// "Always allow" click take effect where it was clicked (ADR 0125).
 fn record_allow_grant(state: &AppState, entry: &PermissionEntry, scope: AllowScope) {
     let Some(pattern) = derive_allow_pattern(&entry.tool_name, &entry.input, scope) else {
         return;
@@ -41,11 +44,12 @@ pub(super) struct McpConsentResponse {
     /// from the original prompt's tool_name + input and remembers it so
     /// future identical-pattern requests skip the prompt. Where the pattern
     /// is recorded depends on scope:
-    ///   * `narrow` / `broad`: appended to `<workspace>/.lucidos/cc-allowed-tools`
-    ///     and handed to CC via `--allowedTools` on every spawn.
-    ///   * `session` — inserted into the engine's in-memory per-thread
-    ///     allow set; lost on engine restart but works for tools/paths CC
-    ///     itself never auto-approves (notably `.claude/` and `.git/`).
+    ///   * `narrow` / `broad`: appended to `<workspace>/.lucidos/cc-allowed-tools`,
+    ///     handed to CC via `--allowedTools` on every spawn AND read by the
+    ///     engine's own gate on every prompt.
+    ///   * `session`: inserted into the engine's in-memory per-thread allow
+    ///     set, and rehydrated from the resolution events after a restart. The
+    ///     one scope reaching tools and paths CC never auto-approves.
     ///
     /// Absent (the Allow-once path) records nothing. Unknown wire values
     /// cause a 4xx via serde — match the engine's typed enum exactly.

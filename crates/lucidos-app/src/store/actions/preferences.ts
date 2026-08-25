@@ -879,6 +879,38 @@ export function setOpenCodeFreeEnabled(enabled: boolean): Promise<void> {
   return savePreference('opencode_free_enabled', enabled ? 'true' : 'false');
 }
 
+// --- Per-provider enable switches ---
+
+/** Providers whose switch is the `provider_enabled_<id>` preference. OpenCode
+ *  Free is deliberately absent: it is opt-IN under its own key (ADR 0104),
+ *  where these six are opt-OUT. Ids match the engine's `ProviderKind`. */
+export type SwitchableProvider =
+  | 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local';
+
+function providerEnabledKey(id: SwitchableProvider): string {
+  return `provider_enabled_${id}`;
+}
+
+/** Whether the user has explicitly switched this provider OFF.
+ *
+ *  Not the inverse of "is it running". Absent means enabled, so this is false
+ *  both for a provider left alone and for one that was never configured. What
+ *  it distinguishes is "switched off" from "never set up", which is the only
+ *  thing the raw preference can tell you that `/health` cannot. */
+export function providerSwitchedOff(id: SwitchableProvider): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data[providerEnabledKey(id)] === 'false';
+}
+
+/** Switch a provider on or off. Off leaves the stored credential alone: the
+ *  switch is how a user parks a key they still want. */
+export function setProviderEnabled(
+  id: SwitchableProvider,
+  enabled: boolean,
+): Promise<void> {
+  return savePreference(providerEnabledKey(id), enabled ? 'true' : 'false');
+}
+
 // --- Capture context ---
 
 /** Per-step ContextAssembled capture toggle. Defaults to false (off) — the
@@ -1068,6 +1100,26 @@ export async function saveModelSelection(
  *  write this back (draft-only), so there is no `setCodingAgentDefault`. */
 export function currentCodingAgentDefault(): CodingAgent {
   return currentPreference('coding_agent_default', ['claude-code', 'codex'], 'claude-code');
+}
+
+/** The two Claude Code permission modes Lucidos offers. CC has six; the other
+ *  four are withheld deliberately (see the engine's `CcPermissionMode`). */
+export const CC_PERMISSION_MODES = ['accept-edits', 'auto'] as const;
+export type CcPermissionMode = (typeof CC_PERMISSION_MODES)[number];
+
+/** Which of Claude Code's own permission modes coding-agent threads run in.
+ *  Workspace-scoped. Defaults to `accept-edits`, the mode every session ran
+ *  before the key existed, so the engine's NULL fallback and this agree. */
+export function currentCodingAgentPermissionMode(): CcPermissionMode {
+  return currentPreference(
+    'coding_agent_claude_permission_mode',
+    CC_PERMISSION_MODES,
+    'accept-edits',
+  );
+}
+
+export function setCodingAgentPermissionMode(mode: CcPermissionMode): Promise<void> {
+  return savePreference('coding_agent_claude_permission_mode', mode);
 }
 
 // --- New-workspace welcome + starter suggestions ---

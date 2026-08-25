@@ -201,8 +201,10 @@ pub(crate) struct AuxBudget {
 /// summary. It ran at 30s and landed 3 times in 19 eligible turns.
 ///
 /// The attempt cap is generous because the input is: 83k tokens of assistant
-/// turns. The deadline leaves room for a retry after a fast failure. It also
-/// stops a hung call from stalling the turn past a minute and a half.
+/// turns. The deadline leaves room for a retry after a fast failure.
+///
+/// **It is the only thing that stops the call.** The refresh runs in a detached
+/// task (ADR 0102), so no turn is waiting on it and nothing else cancels it.
 const SUMMARY_BUDGET: AuxBudget = AuxBudget {
     deadline: Duration::from_secs(90),
     attempt_timeout: Duration::from_secs(45),

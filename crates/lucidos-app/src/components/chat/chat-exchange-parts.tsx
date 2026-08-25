@@ -4,19 +4,19 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
 import { ensureEventTargetResolved, eventHasTarget, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_LABEL, awaitedSubject, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus, waitSubscriptionLabel } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
-import type { EventWaitCancelCause, Exchange } from '../../store/thread-events';
-import type { Loadable, ResponseEvent } from '../../store/types';
+import type { EventSubscription, EventWaitCancelCause, Exchange } from '../../store/thread-events';
+import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { eventNameChip, eventRowBody } from './EventRow';
-import type { EventRowFact, EventRowMark, EventRowTone } from './EventRow';
+import type { EventRowChip, EventRowFact, EventRowMark, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
 import { ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon } from '../shared/icons';
@@ -791,6 +791,14 @@ export function contextLabel(
   return `${formatTokens(used)} tokens${messages != null ? `, ${messages} msgs` : ''}`;
 }
 
+/** Outcomes whose row carries its `stepStatus` label as a tooltip. See the
+ *  `data-tooltip` comment in `InlineStep` for what earns membership. */
+const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
+  'unfinished',
+  'blocked',
+  'denied',
+]);
+
 /** One action, as one row: the model's thinking and the call it produced share
  *  a row rather than taking two (see `nameThinkingRow` in the projection).
  *
@@ -839,10 +847,11 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
     <div
       class={`inline-step ${className}`}
       data-role="inline-step"
-      /* A row the user can't read at a glance needs naming: a killed-mid-call
-         step is struck and muted, and the tooltip says what that means without
-         a trip through the detail modal. */
-      data-tooltip={event.outcome === 'unfinished' ? label : undefined}
+      /* A row the user can't read at a glance needs naming, and the tooltip
+         says what the mark means without a trip through the detail modal. The
+         three that earn one are the three that are neither a green check nor a
+         live shimmer: killed mid-call, held on a permission card, refused. */
+      data-tooltip={NAMED_STEP_OUTCOMES.has(event.outcome) ? label : undefined}
     >
       <button
         type="button"
@@ -1005,18 +1014,35 @@ export function eventWaitRowBody({
       // belongs on a card about that event, which is the delivery below
       // (`EventDeliveryBody`). Naming the matched type here is still right,
       // since it says how this wait ended.
+      //
+      // A filtered subscription chip is pressable and does not break that:
+      // what it opens is the condition armed at this moment, not a route out
+      // to something that happened later. See `subscriptionFacts`.
     ],
   });
 }
 
 /** The watched event types as chips, joined by the word the subscription
  *  language itself uses. "or" is `glue` rather than a fact, so the row's middot
- *  separator steps over it: three items, one fact. */
-function subscriptionFacts(subscriptions: string[]): EventRowFact[] {
-  return subscriptions.flatMap((name, i) =>
-    i === 0
-      ? [{ kind: 'chip' as const, name }]
-      : [{ kind: 'glue' as const, text: 'or' }, { kind: 'chip' as const, name }],
+ *  separator steps over it: three items, one fact.
+ *
+ *  A chip whose subscription carries a `condition` is the door to it. The chip
+ *  says "(filtered)", which reports that a filter exists and nothing about what
+ *  it says. The raw operator JSON is far too wide for a facts line. So the
+ *  summary stays on the row and the condition opens in a modal. */
+function subscriptionFacts(subscriptions: EventSubscription[]): EventRowFact[] {
+  const chip = (s: EventSubscription): EventRowChip => {
+    const name = waitSubscriptionLabel(s);
+    // `eventConditionDoor` reads the same truthiness the label does, so the
+    // chip is pressable exactly when it says "(filtered)". The waiting panel
+    // asks the same question through it, which is what keeps the two surfaces
+    // from drifting apart.
+    const door = eventConditionDoor(s);
+    if (!door) return { kind: 'chip', name };
+    return { kind: 'chip', name, action: door.label, onClick: door.open };
+  };
+  return subscriptions.flatMap((s, i) =>
+    i === 0 ? [chip(s)] : [{ kind: 'glue' as const, text: 'or' }, chip(s)],
   );
 }
 

@@ -440,11 +440,11 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     call) picks it up immediately, no engine restart needed. The currently-running subprocess \
     keeps its frozen `--allowedTools` flag, so a freshly-persisted entry only takes effect on \
     the next session. \
-    Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted via the broad button — CC's \
-    `acceptEdits` mode routes them through `--permission-prompt-tool` for its protected paths \
-    (`.claude/`, `.git/`, which never auto-approve in any mode) and auto-approves them \
-    everywhere else, so a bare `Edit` line in `cc-allowed-tools` does nothing useful in either \
-    case. The UI hides the broad button for those tools. \
+    Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted via the broad button: CC routes them \
+    through `--permission-prompt-tool` for its protected paths (`.claude/`, `.git/`, which \
+    never auto-approve in any mode) and settles them without a rule everywhere else, so a bare \
+    `Edit` line in `cc-allowed-tools` does nothing useful in either case. The UI hides the \
+    broad button for those tools. \
     (3) `Allow <scope> for this thread` (session) records the pattern in the engine's \
     in-memory per-thread allow set — the engine intercepts before CC's gate, so it works for \
     every tool and every path including the CC-protected ones. Lost on engine restart, scoped \

@@ -786,6 +786,141 @@ describe('makeDismissHandlers', () => {
     makeDismissHandlers({ current: panel }, anchor, () => false as const, armNoop).onPointerDown(pointerDownAt(elsewhere));
     expect(armNoop).not.toHaveBeenCalled();
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Stacked overlays. Each open overlay installs its own document listener,
+  // and each asks only whether the target sits outside ITS panel. A SIBLING
+  // overlay's panel is outside, so the lower one dismissed itself invisibly
+  // behind whatever the user had just opened. `isTop` is the gate.
+  //
+  // A dropdown nested INSIDE a modal never showed this, because the modal's
+  // panel contains it. The pair that does is the event-wait condition modal
+  // opened from the waiting panel, which are siblings in the overlay layer.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('when another overlay is stacked on top', () => {
+    it('does not dismiss on a pointerdown meant for the overlay above', () => {
+      const panel = elWith();
+      const upperPanel = elWith();
+      const onDismiss = vi.fn();
+      const arm = vi.fn();
+      const h = makeDismissHandlers({ current: panel }, null, onDismiss, arm, () => false);
+
+      // A click landing on the upper overlay's panel, and one on its scrim.
+      h.onPointerDown(pointerDownAt(upperPanel));
+      h.onPointerDown(pointerDownAt(elWith()));
+      expect(onDismiss).not.toHaveBeenCalled();
+      // Nor may it arm the swallow: the top overlay owns that half too, and
+      // two armed one-shots would eat a later unrelated tap.
+      expect(arm).not.toHaveBeenCalled();
+    });
+
+    it('does not dismiss on a synthetic click either', () => {
+      const onDismiss = vi.fn();
+      const h = makeDismissHandlers({ current: elWith() }, null, onDismiss, undefined, () => false);
+      const click = clickEvent(elWith());
+      h.onClickCapture(click);
+      expect(onDismiss).not.toHaveBeenCalled();
+      expect(click.preventDefault).not.toHaveBeenCalled();
+    });
+
+    /** Escape is dispatched LIFO by `useKeyboardShortcuts` against the same
+     *  stack, so this handler is the fallback. It must agree. */
+    it('does not answer Escape', () => {
+      const onDismiss = vi.fn();
+      const h = makeDismissHandlers({ current: elWith() }, null, onDismiss, undefined, () => false);
+      h.onKey({ key: 'Escape' } as KeyboardEvent);
+      expect(onDismiss).not.toHaveBeenCalled();
+    });
+
+    /** The top overlay is unaffected, which is what keeps the single-overlay
+     *  case (every other caller in the app) exactly as it was. */
+    it('still dismisses the overlay that IS on top', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      const h = makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => true);
+      h.onPointerDown(pointerDownAt(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    /** **The gate alone was not enough, because a mouse gesture is two events
+     *  in two tasks.** The upper overlay consumes the pointerdown and unmounts
+     *  on the microtask between them. So by the time the paired click lands,
+     *  the lower overlay IS the top panel. It read that click as unpaired,
+     *  took the synthetic-click fallback, and closed anyway, one task after
+     *  the gate had correctly held it shut.
+     *
+     *  Touch never showed it: the swallow's `preventDefault` on `touchend`
+     *  cancels the synthetic click, so the fallback never runs. */
+    it('ignores the paired click of a pointerdown the overlay above consumed', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      // Not top while the pointerdown lands, top by the time its click does.
+      let top = false;
+      const h = makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => top);
+
+      const elsewhere = elWith();
+      h.onPointerDown(pointerDownAt(elsewhere));
+      top = true;
+      const click = clickEvent(elsewhere);
+      h.onClickCapture(click);
+
+      expect(onDismiss).not.toHaveBeenCalled();
+      expect(click.preventDefault).not.toHaveBeenCalled();
+    });
+
+    /** The flag is one gesture wide. A genuinely synthetic click arriving
+     *  later, with no pointerdown of its own, still dismisses. */
+    it('still answers a synthetic click once the gesture is spent', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      let top = false;
+      const h = makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => top);
+
+      h.onPointerDown(pointerDownAt(elWith()));
+      top = true;
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).not.toHaveBeenCalled();
+
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    /** **A pairing must never outlive the gesture that announced it.** Stranded
+     *  set, it eats the next synthetic click's dismiss. That click then neither
+     *  closes this overlay nor is swallowed, so it activates whatever sits
+     *  under it. Two gestures end without the click they promised. */
+    it.each([
+      ['a secondary button, which dispatches contextmenu and no click', (h: ReturnType<typeof makeDismissHandlers>, t: Node) => h.onPointerDown(pointerDownAt(t, 2))],
+      ['a cancelled gesture, taken over by a scroll or a drag', (h: ReturnType<typeof makeDismissHandlers>, t: Node) => { h.onPointerDown(pointerDownAt(t)); h.onCancel(); }],
+    ])('does not strand the pairing after %s', (_name, gesture) => {
+      const onDismiss = vi.fn();
+      let top = false;
+      const h = makeDismissHandlers({ current: elWith() }, null, onDismiss, undefined, () => top);
+
+      gesture(h, elWith());
+      top = true;
+      // A synthetic click with no pointerdown of its own must still dismiss.
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    /** Touch ends the gesture at `touchend`, since the swallow cancels the
+     *  click that would otherwise clear the flag. */
+    it('clears the pairing on a touch that produces no click', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      let top = false;
+      const h = makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => top);
+
+      const elsewhere = elWith();
+      h.onPointerDown(pointerDownAt(elsewhere));
+      h.onTouchEnd(touchEndAt(elsewhere));
+      top = true;
+
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────

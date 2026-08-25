@@ -375,7 +375,7 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
     //   * resolves symlinks, which the macOS seatbelt matches on (`/var` →
     //     `/private/var` is the classic one).
     match std::fs::canonicalize(&data_dir).ok().filter(|d| d.is_dir()) {
-        Some(dir) if widens_past_the_workspace(&dir, workspace) => crate::log!(
+        Some(dir) if grants_more_than_the_data_tree(&dir, workspace) => crate::log!(
             "[Codex] {} resolves to {}, which contains the workspace — refusing \
              to grant it; the sandbox will block direct writes into the parent \
              workspace's data/ tree (`lucidos data path --mkdir`, editor writes \
@@ -396,19 +396,36 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
     roots
 }
 
-/// Does this resolved `data/` path grant MORE than the data tree — the
-/// workspace root itself, or an ancestor of it (`/` included)?
+/// Does this resolved `data/` path reach past the data tree, into the engine's
+/// own state or a sibling's?
 ///
 /// Resolving symlinks is what the sandbox needs (see `sandbox_writable_roots`),
-/// but it also means a `data` symlink decides the hole's width. Relocating the
-/// tree (`data -> /Volumes/ext/lucidos-data`) is legitimate and stays allowed;
-/// WIDENING it (`data -> .`, `data -> /`) is not, because it silently grants
-/// the `.lucidos/` runtime and every sibling worktree — the exact scoping this
-/// function's doc comment promises it withholds. Cheaper to make impossible
-/// than to document as a footgun.
-fn widens_past_the_workspace(resolved_data: &Path, workspace: &Path) -> bool {
+/// but it also means a `data` symlink decides what the hole covers. Relocating
+/// the tree (`data -> /Volumes/ext/lucidos-data`) is legitimate and stays
+/// allowed. Two shapes are not, and both grant `.lucidos/` runtime state or a
+/// sibling thread's worktree:
+///   * **up**, to the workspace root or an ancestor (`data -> .`, `data -> /`);
+///   * **in**, to the engine's own [`GRANTS_DIR`] (`data -> .lucidos/…`).
+///
+/// Cheaper to make impossible than to document as a footgun. Named for what it
+/// answers rather than for the first of the two, which is what it used to be.
+///
+/// Shared with Claude Code's `cc_settings::widened_directories`, which grants
+/// the same tree through a different mechanism. Both back ends must agree on
+/// which `data` layouts are supported, or a relocated tree works under one and
+/// cards under the other.
+pub(crate) fn grants_more_than_the_data_tree(resolved_data: &Path, workspace: &Path) -> bool {
     let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    workspace.starts_with(resolved_data)
+    if workspace.starts_with(resolved_data) {
+        return true;
+    }
+    let runtime_dir = crate::core::grants::grants_dir(&workspace);
+    match std::fs::canonicalize(&runtime_dir) {
+        Ok(resolved_runtime) => resolved_data.starts_with(&resolved_runtime),
+        // No runtime dir yet means nothing to reach into. Fall back to the
+        // unresolved path so a probe failure still refuses the obvious shape.
+        Err(_) => resolved_data.starts_with(&runtime_dir),
+    }
 }
 
 /// `git rev-parse --git-common-dir` for the worktree. `None` (log + degrade)

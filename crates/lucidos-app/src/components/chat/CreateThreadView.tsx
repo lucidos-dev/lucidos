@@ -13,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, followIsCarrying } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, followIsCarrying, readerKeepsTheLiveEdge } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -713,6 +713,10 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   // Read BEFORE the mutation, while the container is still where the last
   // correction left it: after `fn` a shrink may have clamped it somewhere else.
   const carried = carriedAnchorDebt(container);
+  // Also before, and for a sharper reason: growth moves the live edge away
+  // while leaving `scrollTop` exactly where it was, so afterwards nothing can
+  // tell that the reader was resting on it. See `readerKeepsTheLiveEdge`.
+  const onTheLiveEdge = readerKeepsTheLiveEdge(container);
   const overflowBefore = container.style.overflow;
   let restored = false;
 
@@ -724,19 +728,20 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     restored = true;
     observer.disconnect();
 
-    // A reader being CARRIED to the live edge asked for the opposite of an
-    // anchor correction: hold me on the newest content, not on what I was
-    // looking at. Correcting them and then letting `honourAnchoredMutation`
-    // bring them back down moves the transcript UP and then DOWN for one tap.
-    // The freeze has kept the container at `scrollBefore` through the mutation,
-    // so skipping the correction leaves the live-edge write as the ONE motion.
+    // A reader who belongs on the NEWEST content asked for the opposite of an
+    // anchor correction: hold me on the last line, not on what was at the top.
+    // Correcting them and then letting `honourAnchoredMutation` bring them back
+    // down moves the transcript UP and then DOWN for one tap. The freeze has
+    // kept the container at `scrollBefore` through the mutation, so skipping the
+    // correction leaves the live-edge write as the ONE motion.
     //
-    // `followIsCarrying` and not the bare armed flag. This and
-    // `honourAnchoredMutation` are ONE decision split across the DOM/layout
-    // line, and the follow stands down on an idle thread. An armed reader
-    // clicking around a finished thread would otherwise get neither the
-    // correction nor the snap, and drift on whatever grew above them.
-    const riding = followIsCarrying();
+    // The two terms are the two such readers, and `honourAnchoredMutation` is
+    // handed the same pair: this and it are ONE decision split across the
+    // DOM/layout line. `followIsCarrying` is the ride, and it stands down on an
+    // idle thread, which is why the edge reading is a term of its own. An armed
+    // reader clicking around a finished thread gets neither the correction nor
+    // the snap otherwise, and drifts on whatever grew above them.
+    const keepsTheLiveEdge = followIsCarrying() || onTheLiveEdge;
     // The first candidate the mutation left standing. A detached element does
     // not say so: it measures as a zero rect, which reads as a turn that moved
     // to the top of the thread and moves the reader somewhere meaningless. With
@@ -775,10 +780,10 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
       const height = settled.atBottom ? settled.el.getBoundingClientRect().height : 0;
       return reachableScrollTop(offset + height - readerEdgeInset(container));
     };
-    // A riding reader owes and is owed nothing: the live edge is always
-    // reachable, and they are about to be put on it. Nor does a reader whose
-    // every candidate left the DOM, since declining to correct is declining to
-    // know what the clamp would have eaten.
+    // A reader kept on the live edge owes and is owed nothing: that edge is
+    // always reachable, and they are about to be put on it. Nor does a reader
+    // whose every candidate left the DOM, since declining to correct is
+    // declining to know what the clamp would have eaten.
     const wanted = targetNow();
     // The unfreeze is the one step that MUST happen, so it goes in a `finally`.
     // `restored` is already true and the observer already gone, so the rAF
@@ -788,7 +793,7 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // extensible call inside the freeze. The throw still propagates, since a
     // subscriber failing silently is its own bug (`frontend.md`).
     try {
-      if (riding || !anchored) {
+      if (keepsTheLiveEdge || !anchored) {
         clearAnchorDebt();
       } else {
         markAnchorScroll(container, wanted);
@@ -805,19 +810,20 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
 
     // Tell the transcript that THIS correction was ours, so it cannot read as
     // the reader scrolling away and retire their standing follow. Only a scroll
-    // may do that (ADR 0064). It also lands a riding reader on the live edge.
-    // Placed after the unfreeze and the repaint nudge, so any write it makes
-    // fights neither. Still inside this frame, so the reader never sees the
-    // position the mutation left them at.
-    honourAnchoredMutation(container);
+    // may do that (ADR 0064). It also lands the live-edge reader back on the
+    // newest content, which is why it is handed the reading taken before the
+    // mutation. Placed after the unfreeze and the repaint nudge, so any write it
+    // makes fights neither. Still inside this frame, so the reader never sees
+    // the position the mutation left them at.
+    honourAnchoredMutation(container, onTheLiveEdge);
 
     // iOS may adjust after unfreeze, so re-check in the next frame. Skipped
     // while the app is driving this container's scroll: a tween may be in
     // flight, and re-asserting a pre-tween offset against it is a frame of
-    // jitter for a correction the tween makes moot. Skipped for a RIDING reader
-    // for the stronger version of the same reason: there was no correction to
-    // re-assert, and asserting one would drag them off the live edge.
-    if (wanted !== scrollBefore && !riding && el) {
+    // jitter for a correction the tween makes moot. Skipped for a reader kept on
+    // the live edge, for the stronger version of the same reason: there was no
+    // correction to re-assert, and asserting one would drag them off it.
+    if (wanted !== scrollBefore && !keepsTheLiveEdge && el) {
       requestAnimationFrame(() => {
         if (!el.isConnected || isOtherNavigationScroll(container)) return;
         const target = targetNow();

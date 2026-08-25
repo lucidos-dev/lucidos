@@ -337,7 +337,7 @@ A persisted **system event** is the same case. `BackupFailed` belongs to no thre
 
 ### What a condition can say
 
-A key is a **field path**. A bare name reads a top-level field, and dots read downwards: `{ "workflow_run.event": "schedule" }` matches a GitHub payload whose `workflow_run` object says `schedule`.
+A key is a **field path**. A bare name reads a top-level field, and dots read downwards: `{ "payload.workflow_run.event": "schedule" }` reads `event` inside the `workflow_run` object of a GitHub delivery. The leading `payload.` is not decoration; see § "The envelope" below.
 
 Two rules keep a path honest. A key that exists verbatim wins at every level, so a webhook field literally named `a.b` is still nameable, even nested under another key. A path that resolves to nothing is null, exactly like a missing top-level field, so `{ "x": { "$ne": null } }` reads as "x exists and is not null".
 
@@ -361,15 +361,49 @@ Operators, every one of which reads a field path:
 
 ```json
 {
-  "action": "completed",
+  "payload.action": "completed",
   "$or": [
-    { "workflow_run.conclusion": "failure" },
-    { "workflow_run.conclusion": "timed_out" }
+    { "payload.workflow_run.conclusion": "failure" },
+    { "payload.workflow_run.conclusion": "timed_out" }
   ]
 }
 ```
 
 A bad condition is refused when you create or update the trigger, naming what is wrong. An unknown operator, an unparseable `$regex` and a malformed `$or` are all errors rather than a trigger that arms and never fires.
+
+### The envelope: a webhook's body lands under `payload`
+
+A webhook does not store what the sender posted. It stores a three-key envelope, so a GitHub `workflow_run` delivery arrives like this:
+
+```json
+{
+  "summary": "github webhook fired",
+  "headers": { "X-GitHub-Event": "workflow_run" },
+  "payload": { "action": "completed", "workflow_run": { "conclusion": "failure" } }
+}
+```
+
+The sender's entire body sits under `payload`, and the request headers you allow-listed sit under `headers`. So GitHub's own `action` field is `payload.action`, and its `workflow_run` object is `payload.workflow_run`.
+
+| Condition | What it does |
+|---|---|
+| `{ "action": "completed" }` | matches nothing, ever |
+| `{ "payload.action": "completed" }` | correct |
+
+`delivery_payload` in `crates/lucidos-engine/src/api/webhooks.rs` builds the envelope. Two tests pin it: `a_senders_own_fields_land_under_payload` beside it, and `a_delivery_becomes_summary_headers_and_payload` in `crates/lucidos-e2e/tests/api_support/webhook_delivery_test.rs`, which reads the stored row back.
+
+**Nothing warns you, and that is what makes this expensive.** A path that resolves to nothing is null. So is a field that is present and null, and the matcher cannot tell them apart. A subscription that can never match looks exactly like one that is patiently waiting. The trigger arms clean, its panel row stays healthy, and `last_run` keeps the timestamp of the last real fire.
+
+**So diagnose by comparison, not by reading the panel.** Query the event store for the event type you subscribed to, and hold its newest row against the trigger's `last_run`. Deliveries arriving with no runs beside them is the tell.
+
+**The general rule: write the condition against the STORED event, not the upstream payload you think you are subscribing to.** Only the shape of the row in the event store decides what a field path resolves to. So read one real stored event first, with the `events` tool's `query` action and `limit` 1, then write every path from what you see. A path copied out of the sender's API docs is a guess.
+
+**Script triggers inherit the same envelope.** `TRIGGER_EVENT_PAYLOAD` holds the whole event payload, wrapper included, so a script has to reach through `payload` too. A hand-emitted test event is usually written flat, so a script can pass your test and still fail on the real delivery. Read it defensively:
+
+```python
+raw = json.loads(os.environ.get("TRIGGER_EVENT_PAYLOAD", "{}"))
+body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+```
 
 ## Notification discipline
 
@@ -762,6 +796,7 @@ in `list_triggers`.
 - **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. Almost always because the knowhow file was never written first. See "Write the knowhow file FIRST, then the intent" above.
+- **A webhook condition without the `payload.` prefix.** The delivery is wrapped, so `{"action": "completed"}` matches nothing. Nothing warns you: the trigger stays healthy and never fires again. See § "The envelope: a webhook's body lands under `payload`".
 - **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Picking a trigger per event to maintain an aggregate without measuring first.** A trigger fire is a thread, not a callback, and a rollup's cost is usually dominated by the window it recomputes rather than by the rows that just arrived. Weigh it against a projection. See § "Aggregating events: cron, per event, or a projection".
 - **Assuming day-of-month and day-of-week are ORed.** They are ANDed, so `0 0 9 1 * Mon` is "the 1st when it falls on a Monday", not "the 1st and every Monday". Vixie cron behaves the other way, which is where the assumption comes from. See § "Writing cron expressions".

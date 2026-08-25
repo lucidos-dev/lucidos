@@ -9,7 +9,7 @@
 //!   3. Blocks until POST /api/v1/mcp/consent resolves the entry, then emits
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
-use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary};
+use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary, workspace_path};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::LazyLock;
@@ -26,6 +26,40 @@ static CC_ALLOWED_TOOLS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(
 
 async fn lock_cc_allowed_tools() -> MutexGuard<'static, ()> {
     CC_ALLOWED_TOOLS_LOCK.lock().await
+}
+
+/// Restores this workspace's `cc-allowed-tools` when it goes out of scope, on
+/// the panicking path as well as the clean one.
+///
+/// Any test that empties the file needs this. The engine's gate reads the file
+/// on every prompt (ADR 0125), so a test that leaves it emptied has taken the
+/// workspace's real grants away. Drop cannot await, so it writes the snapshot
+/// straight to disk rather than through the settings endpoint. The gate reads
+/// the file fresh, so nothing caches a stale copy.
+struct CcAllowlistRestore {
+    snapshot: String,
+}
+
+impl Drop for CcAllowlistRestore {
+    fn drop(&mut self) {
+        let path = workspace_path().join(".lucidos").join("cc-allowed-tools");
+        if let Err(e) = std::fs::write(&path, &self.snapshot) {
+            eprintln!("failed to restore {}: {e}", path.display());
+        }
+    }
+}
+
+/// Empty the workspace's allowlist for the duration of one test, and restore it
+/// afterwards whatever happens.
+///
+/// A card only renders for a request the allowlist does not already cover, and
+/// this workspace's file inherited real grants (bare `Bash`, `Skill`, …). A test
+/// about what a CLICK persists must therefore start from nothing granted. Its
+/// prompt would otherwise be auto-allowed before any card exists.
+async fn empty_cc_allowed_tools(client: &reqwest::Client) -> CcAllowlistRestore {
+    let snapshot = read_cc_allowed_tools(client).await;
+    restore_cc_allowed_tools(client, "").await;
+    CcAllowlistRestore { snapshot }
 }
 
 #[tokio::test]
@@ -216,8 +250,12 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
 }
 
 /// `persist_scope: "narrow"` on a Skill prompt → engine appends
-/// `Skill(<plugin>:*)` to the workspace's cc-allowed-tools and a second identical
-/// click is a no-op (no duplicate line).
+/// `Skill(<plugin>:*)` to the workspace's cc-allowed-tools, and no later skill
+/// from that plugin raises a card.
+///
+/// The second half used to click a second time and assert the line was not
+/// doubled. It cannot: the grant now answers that prompt before a card exists,
+/// which is the point. `core::grants` unit-tests the append's idempotence.
 #[tokio::test]
 async fn permission_prompt_persists_narrow_skill_pattern() {
     let _lock = lock_cc_allowed_tools().await;
@@ -225,11 +263,11 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
+    let _restore = empty_cc_allowed_tools(&client).await;
 
     // Unique plugin name per run so concurrent / repeat runs never collide.
     let plugin = format!("test-{}", Uuid::new_v4().simple());
     let pattern = format!("Skill({}:*)", plugin);
-    let snapshot = read_cc_allowed_tools(&client).await;
 
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "running").await;
@@ -249,27 +287,31 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
         line_present(&after_first, &pattern),
         "after first allow, file must contain {pattern}; got:\n{after_first}"
     );
-
-    // Repeat — must not duplicate the line.
-    let thread_id2 = Uuid::new_v4();
-    seed_cc_thread_summary(&pool, thread_id2, "running").await;
-    persist_via_consent(
-        &client,
-        &pool,
-        thread_id2,
-        "Skill",
-        json!({ "skill": format!("{}:demo", plugin) }),
-        "narrow",
-    )
-    .await;
-    let after_second = read_cc_allowed_tools(&client).await;
     assert_eq!(
-        count_line(&after_second, &pattern),
+        count_line(&after_first, &pattern),
         1,
-        "duplicate Always-allow click must not double-write the pattern; file:\n{after_second}"
+        "one click writes one line; file:\n{after_first}"
     );
 
-    restore_cc_allowed_tools(&client, &snapshot).await;
+    // A DIFFERENT skill from the granted plugin: covered, so no card at all.
+    let thread_id2 = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id2, "running").await;
+    let second = prompt_once(
+        &client,
+        thread_id2,
+        "Skill",
+        json!({ "skill": format!("{}:other", plugin) }),
+    )
+    .await;
+    assert_eq!(
+        second["allowed"], true,
+        "the plugin grant must cover its other skills in the same session"
+    );
+    assert_eq!(
+        card_count(&pool, thread_id2).await,
+        0,
+        "a covered request renders no card"
+    );
 }
 
 /// `persist_scope: "broad"` on a Bash prompt → engine appends bare `Bash`.
@@ -281,10 +323,11 @@ async fn permission_prompt_persists_broad_bash_pattern() {
         .await
         .expect("Failed to connect to E2E workspace database");
 
+    let _restore = empty_cc_allowed_tools(&client).await;
+
     // Use a unique sentinel inside the input so we never accidentally match
     // a pre-existing canonical request from the e2e workspace.
     let sentinel = format!("echo {}", Uuid::new_v4().simple());
-    let snapshot = read_cc_allowed_tools(&client).await;
 
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "running").await;
@@ -304,8 +347,92 @@ async fn permission_prompt_persists_broad_bash_pattern() {
         line_present(&after, "Bash"),
         "broad Bash always-allow must append bare 'Bash'; got:\n{after}"
     );
+}
 
-    restore_cc_allowed_tools(&client, &snapshot).await;
+/// The reported bug: an "Always allow" click bound the NEXT coding-agent
+/// session, not the one it was clicked in, so the same tool carded again
+/// seconds later. The grant reaches Claude Code as `--allowedTools`, frozen at
+/// spawn, and the engine's own gate never read the file.
+///
+/// Clicks narrow on one command, then raises a SECOND prompt for a DIFFERENT
+/// command with the same head. It must answer allowed with no new card.
+#[tokio::test]
+async fn permission_prompt_narrow_grant_binds_the_same_session() {
+    let _lock = lock_cc_allowed_tools().await;
+    let client = http_client();
+    let pool = PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let _restore = empty_cc_allowed_tools(&client).await;
+
+    // A head nothing else can grant, so the second prompt is answered by the
+    // grant this test just made and by nothing else.
+    let head = format!("zzgrant{}", Uuid::new_v4().simple());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    persist_via_consent(
+        &client,
+        &pool,
+        thread_id,
+        "Bash",
+        json!({ "command": format!("{head} --first") }),
+        "narrow",
+    )
+    .await;
+
+    let after = read_cc_allowed_tools(&client).await;
+    assert!(
+        line_present(&after, &format!("Bash({head}:*)")),
+        "narrow always-allow must append the head pattern; got:\n{after}"
+    );
+
+    let second = prompt_once(
+        &client,
+        thread_id,
+        "Bash",
+        json!({ "command": format!("{head} --second --different") }),
+    )
+    .await;
+    assert_eq!(
+        second["allowed"], true,
+        "the grant clicked in this session must cover the next command"
+    );
+    assert_eq!(
+        card_count(&pool, thread_id).await,
+        1,
+        "only the first prompt may render a card; the granted one is silent"
+    );
+
+    // The grant names a HEAD, so it does not carry an unrelated command.
+    let ungranted = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, ungranted, "running").await;
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
+                .json(&json!({
+                    "thread_id": ungranted.to_string(),
+                    "tool_use_id": format!("tu_{}", Uuid::new_v4()),
+                    "tool_name": "Bash",
+                    "input": { "command": "zzother --nope" }
+                }))
+                .send()
+                .await
+        })
+    };
+    let request_id =
+        wait_for_permission_request(&pool, ungranted, std::time::Duration::from_secs(10)).await;
+    client
+        .post(format!("{}/api/v1/mcp/consent", base_url()))
+        .json(&json!({ "request_id": request_id, "allowed": false }))
+        .send()
+        .await
+        .expect("consent request failed");
+    let _ = waiter.await.expect("waiter task panicked");
 }
 
 /// `persist_scope: "broad"` on `Edit` (and Write/NotebookEdit) must NOT write
@@ -361,6 +488,8 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
         .await
         .expect("Failed to connect to E2E workspace database");
 
+    let _restore = empty_cc_allowed_tools(&client).await;
+
     let plugin = format!("test-{}", Uuid::new_v4().simple());
     let pattern = format!("Skill({}:*)", plugin);
     let before = read_cc_allowed_tools(&client).await;
@@ -411,6 +540,50 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
         !line_present(&after, &pattern),
         "no persist_scope must not append {pattern}"
     );
+}
+
+/// Raise one permission prompt and return the handler's JSON, for a request the
+/// caller expects to be answered WITHOUT a card.
+///
+/// Timed, because that expectation is the assertion: a request that still needs
+/// a human blocks here forever, and nothing in the test answers it. The timeout
+/// turns that into a failure instead of a hung suite.
+async fn prompt_once(
+    client: &reqwest::Client,
+    thread_id: Uuid,
+    tool_name: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client
+            .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": format!("tu_{}", Uuid::new_v4()),
+                "tool_name": tool_name,
+                "input": input
+            }))
+            .send(),
+    )
+    .await
+    .expect("a covered request must not wait for a card")
+    .expect("prompt request failed")
+    .json::<serde_json::Value>()
+    .await
+    .expect("invalid JSON body")
+}
+
+/// How many permission cards this thread has persisted.
+async fn card_count(pool: &PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest'",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .expect("count permission cards")
 }
 
 /// Read the workspace's current cc-allowed-tools via the settings endpoint.

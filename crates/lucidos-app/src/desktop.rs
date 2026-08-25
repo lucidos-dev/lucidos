@@ -967,25 +967,131 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             );
         }
 
-        // A notification tap that arrived while we were waiting names the
-        // workspace to land on; otherwise the gateway root (the picker).
-        navigate_main_window(
-            &handle,
-            take_launch_target().unwrap_or_else(|| gateway_url(port)),
-        );
+        // Where the windows go. A notification tap outranks the restored
+        // session for `main`: the user asked for that workspace just now, and
+        // the session is only what they had last time.
+        let origin = gateway_url(port);
+        let restore = crate::resolve_window_session_plan();
+        let mut plan = launch_plan(take_launch_target(), restore, &origin);
+        navigate_main_window(&handle, &plan.main);
         // A tap that landed between the take above and the navigate would
         // otherwise be stranded on a window already pointed elsewhere. Cheap to
         // re-check, and it closes the only window in which the aim can be lost.
+        //
+        // The whole plan is recomputed, not just `main`. The tap displaces the
+        // workspace `main` was about to take, which has to go back to the
+        // extras. And the tapped workspace has to leave them, or it opens twice.
         if let Some(url) = take_launch_target() {
-            navigate_main_window(&handle, url);
+            plan = launch_plan(Some(url), restore, &origin);
+            navigate_main_window(&handle, &plan.main);
+        }
+        // The rest of the session. Building a window is a main-thread call, and
+        // this runs on the launch thread.
+        if !plan.extra.is_empty() {
+            let extra = plan.extra;
+            let windows = handle.clone();
+            if let Err(e) = handle.run_on_main_thread(move || {
+                crate::restore_extra_windows(&windows, &extra);
+            }) {
+                eprintln!("[desktop] could not restore the other windows: {e}");
+            }
         }
     });
+}
+
+/// One additional window this launch opens.
+///
+/// A distinct type from the `(slug, frame)` pairs `window_session::restore_plan`
+/// answers with, so the two cannot be swapped. The slug-to-URL step in
+/// [`launch_plan`] is the security boundary (ADR 0028). These types are what
+/// keep a slug read off disk from reaching a webview verbatim.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlannedWindow {
+    /// The URL to load, composed here from a validated slug.
+    pub url: String,
+    /// The frame the workspace was last left at, when one is remembered.
+    pub frame: Option<crate::window_restore::Rect>,
+}
+
+/// Where `main` goes, and what other windows this launch opens.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LaunchPlan {
+    /// The URL to navigate `main` to.
+    pub main: String,
+    pub extra: Vec<PlannedWindow>,
+}
+
+/// Decide the launch's windows. Pure, so the precedence is testable.
+///
+/// Three rules, in order.
+///
+/// A notification `tap` wins `main`, because the user asked for that workspace
+/// a moment ago. Its workspace is then skipped in the restored list, or the tap
+/// would open a second window on the one it just landed.
+///
+/// Otherwise `main` takes the first restored workspace. With none it falls back
+/// to the gateway root, the picker, which is the behaviour before any of this.
+///
+/// Every URL is composed here from a slug `window_session::restore_plan`
+/// already validated, so nothing read off disk reaches a webview verbatim.
+///
+/// A tap also DROPS the first restored workspace's frame. `setup` sized `main`
+/// from it before the tap existed, so leaving it would open the extra window
+/// exactly on top of `main`.
+pub(crate) fn launch_plan(
+    tap: Option<String>,
+    restore: &[(String, Option<crate::window_restore::Rect>)],
+    origin: &str,
+) -> LaunchPlan {
+    let tapped = tap
+        .as_deref()
+        .and_then(crate::notifications::window_workspace)
+        .map(str::to_string);
+    let mut wanted: Vec<(&String, Option<crate::window_restore::Rect>)> = restore
+        .iter()
+        .filter(|(id, _)| Some(id) != tapped.as_ref())
+        .map(|(id, frame)| (id, *frame))
+        .collect();
+
+    let main = match tap {
+        Some(url) => {
+            // `setup` sized `main` from `restore[0]` before this tap existed.
+            // When THAT workspace survives as an extra, its window must not
+            // reuse the frame `main` now wears, or the two land exactly on top.
+            //
+            // Keyed on `restore[0]`, not on whatever is first after filtering:
+            // a tap ON `restore[0]` displaces nothing, and clearing the next
+            // entry's frame would shrink a window for no reason.
+            let sized_for = restore.first().map(|(id, _)| id);
+            if let Some(entry) = wanted.first_mut() {
+                if Some(entry.0) == sized_for {
+                    entry.1 = None;
+                }
+            }
+            url
+        }
+        None if wanted.is_empty() => origin.to_string(),
+        None => {
+            let (id, _) = wanted.remove(0);
+            crate::notifications::workspace_url(origin, id)
+        }
+    };
+    LaunchPlan {
+        main,
+        extra: wanted
+            .into_iter()
+            .map(|(id, frame)| PlannedWindow {
+                url: crate::notifications::workspace_url(origin, id),
+                frame,
+            })
+            .collect(),
+    }
 }
 
 /// Point the declared main window at `url`. Best-effort: a missing window or
 /// an unparseable URL is logged, never fatal. The alternative is stranding the
 /// user on the boot splash with no explanation.
-fn navigate_main_window(app: &AppHandle, url: String) {
+fn navigate_main_window(app: &AppHandle, url: &str) {
     match (
         app.get_webview_window(crate::MAIN_WINDOW_LABEL),
         url.parse::<tauri::Url>(),
@@ -2140,6 +2246,210 @@ fn parse_unread_total(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What a launch reopens ────────────────────────────────────────────────
+
+    fn rect(x: i64, y: i64, width: i64, height: i64) -> crate::window_restore::Rect {
+        crate::window_restore::Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    const ORIGIN: &str = "http://localhost:3210";
+
+    /// A `PlannedWindow`, so each expectation reads as one line.
+    fn planned(url: &str, frame: Option<crate::window_restore::Rect>) -> PlannedWindow {
+        PlannedWindow {
+            url: url.to_string(),
+            frame,
+        }
+    }
+
+    // Before any of this, `main` went to the gateway root and the page
+    // redirected to whatever `localStorage` remembered. That is still the
+    // answer when there is nothing to restore.
+    #[test]
+    fn an_empty_session_leaves_main_on_the_picker() {
+        let plan = launch_plan(None, &[], ORIGIN);
+        assert_eq!(plan.main, ORIGIN);
+        assert!(plan.extra.is_empty());
+    }
+
+    // The reported defect: two workspaces open, one came back.
+    #[test]
+    fn every_recorded_workspace_gets_a_window() {
+        let plan = launch_plan(
+            None,
+            &[
+                ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
+                ("dev".to_string(), Some(rect(10, 20, 900, 700))),
+            ],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/myws/");
+        assert_eq!(
+            plan.extra,
+            vec![planned(
+                "http://localhost:3210/dev/",
+                Some(rect(10, 20, 900, 700))
+            )]
+        );
+    }
+
+    // A workspace with no remembered frame still gets its window, at the
+    // default size. Forgetting the size must not cost the window.
+    #[test]
+    fn a_workspace_with_no_remembered_frame_still_gets_a_window() {
+        let plan = launch_plan(
+            None,
+            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/myws/");
+        assert_eq!(
+            plan.extra,
+            vec![planned("http://localhost:3210/dev/", None)]
+        );
+    }
+
+    // The user asked for that workspace a moment ago. The session is only what
+    // they had last time, so the tap outranks it.
+    #[test]
+    fn a_notification_tap_wins_the_main_window() {
+        let plan = launch_plan(
+            Some("http://localhost:3210/tapped/".to_string()),
+            &[("myws".to_string(), None)],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/tapped/");
+        assert_eq!(
+            plan.extra,
+            vec![planned("http://localhost:3210/myws/", None)]
+        );
+    }
+
+    // Otherwise the tap's own workspace would come back twice: once because it
+    // was tapped, once because it was open last time.
+    #[test]
+    fn the_tapped_workspace_is_not_restored_a_second_time() {
+        let plan = launch_plan(
+            Some("http://localhost:3210/myws/".to_string()),
+            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/myws/");
+        assert_eq!(
+            plan.extra,
+            vec![planned("http://localhost:3210/dev/", None)]
+        );
+    }
+
+    // A tap can name no workspace at all: the picker, or a URL the gateway
+    // would not resolve. It still aims `main`, and nothing is skipped.
+    #[test]
+    fn a_tap_on_no_workspace_skips_nothing() {
+        let plan = launch_plan(
+            Some("http://localhost:3210/~/".to_string()),
+            &[("myws".to_string(), None)],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/~/");
+        assert_eq!(
+            plan.extra,
+            vec![planned("http://localhost:3210/myws/", None)]
+        );
+    }
+
+    // A tap can land between the first `take_launch_target` and the navigate,
+    // and `launch` recomputes the WHOLE plan for it rather than only `main`.
+    // Recomputing is what these two assert: the displaced workspace comes back
+    // as an extra, and the tapped one leaves the extras.
+    #[test]
+    fn a_late_tap_returns_the_workspace_it_displaced_to_the_extras() {
+        let restore = [
+            ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
+            ("dev".to_string(), None),
+        ];
+        let first = launch_plan(None, &restore, ORIGIN);
+        assert_eq!(first.main, "http://localhost:3210/myws/");
+
+        let after = launch_plan(
+            Some("http://localhost:3210/tapped/".to_string()),
+            &restore,
+            ORIGIN,
+        );
+        assert_eq!(after.main, "http://localhost:3210/tapped/");
+        assert_eq!(
+            after.extra,
+            vec![
+                // Frameless on purpose: `setup` already sized `main` from this
+                // workspace's rect, so reusing it would stack the two windows
+                // exactly on top of each other.
+                planned("http://localhost:3210/myws/", None),
+                planned("http://localhost:3210/dev/", None),
+            ],
+            "the workspace the tap displaced must still get a window",
+        );
+    }
+
+    #[test]
+    fn a_late_tap_on_a_restored_workspace_does_not_open_it_twice() {
+        let restore = [("myws".to_string(), None), ("dev".to_string(), None)];
+        let after = launch_plan(
+            Some("http://localhost:3210/dev/".to_string()),
+            &restore,
+            ORIGIN,
+        );
+        assert_eq!(after.main, "http://localhost:3210/dev/");
+        assert_eq!(
+            after.extra,
+            vec![planned("http://localhost:3210/myws/", None)]
+        );
+    }
+
+    // A tap on `restore[0]` displaces nobody: `main` was sized for that same
+    // workspace and now shows it. Clearing the NEXT entry's frame, which is
+    // what keying the drop on the filtered list did, shrinks a window for
+    // nothing.
+    #[test]
+    fn a_tap_on_the_first_restored_workspace_costs_no_other_window_its_size() {
+        let restore = [
+            ("myws".to_string(), Some(rect(0, 0, 1200, 800))),
+            ("dev".to_string(), Some(rect(50, 60, 900, 700))),
+        ];
+        let plan = launch_plan(
+            Some("http://localhost:3210/myws/".to_string()),
+            &restore,
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/myws/");
+        assert_eq!(
+            plan.extra,
+            vec![planned(
+                "http://localhost:3210/dev/",
+                Some(rect(50, 60, 900, 700))
+            )]
+        );
+    }
+
+    // A client reached over a tailnet address opens its restored windows there
+    // too, the same rule `workspace_window_url` follows.
+    #[test]
+    fn the_restored_windows_follow_the_origin_they_are_given() {
+        let plan = launch_plan(
+            None,
+            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            "https://box.tail1234.ts.net",
+        );
+        assert_eq!(plan.main, "https://box.tail1234.ts.net/myws/");
+        assert_eq!(
+            plan.extra,
+            vec![planned("https://box.tail1234.ts.net/dev/", None)]
+        );
+    }
 
     // ── Waiting for a freshly-spawned gateway ────────────────────────────────
 

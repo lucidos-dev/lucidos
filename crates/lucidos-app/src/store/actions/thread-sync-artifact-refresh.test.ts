@@ -45,7 +45,11 @@ vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn()
 vi.mock('./repositories', () => ({
   refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false),
 }));
-vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
+vi.mock('./entityReferences', () => ({
+  processSSEForReferences: vi.fn(),
+  refreshLlmConfigured: vi.fn(),
+  PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
+}));
 
 const { handleThreadEvent } = await import('./thread-sync');
 

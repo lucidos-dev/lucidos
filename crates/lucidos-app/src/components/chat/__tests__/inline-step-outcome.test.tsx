@@ -56,6 +56,30 @@ describe('InlineStep rendering per step outcome', () => {
     expect(text).toContain('⚠');
     expect(text).not.toContain('⊘');
   });
+
+  // The reported bug: a command waiting on a permission card rendered exactly
+  // like one that was running. Nothing is running, so nothing may shimmer.
+  it('blocked: a pause mark, no shimmer, no checkmark', () => {
+    const { text, props } = row('blocked');
+    expect(props.class).toContain('blocked');
+    expect(text).toContain('‖');
+    expect(text).not.toContain('running-shimmer');
+    expect(text).not.toContain('✓');
+    expect(props['data-tooltip']).toBe('Needs approval');
+  });
+
+  // The other half: a refused command used to carry the same green check as one
+  // that ran and succeeded.
+  it('denied: the cross, never the success check', () => {
+    const { text, props } = row('denied');
+    expect(props.class).toContain('denied');
+    expect(text).toContain('✗');
+    expect(text).not.toContain('✓');
+    expect(text).not.toContain('running-shimmer');
+    // Distinct from the killed-mid-call row, which is struck instead.
+    expect(text).not.toContain('⊘');
+    expect(props['data-tooltip']).toBe('Denied');
+  });
 });
 
 /** Thinking and the call it produced share one row, so the reasoning ticker has

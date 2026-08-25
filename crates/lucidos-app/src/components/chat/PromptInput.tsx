@@ -416,12 +416,14 @@ export function PromptInput() {
     } else {
       el.style.height = 'auto';
     }
-    // Show the reader what they just wrote being picked up: the live edge if
-    // they were riding it, their own message otherwise (ADR 0064). Here as well
-    // as in `addPendingMessage`, because this is the composer's own tap and must
-    // not wait on the awaited send below. The second call is a no-op refresh of
-    // the same request. A reader already at the live edge is not scrolled, and a
-    // send into a thread entirely on screen writes nothing at all.
+    // Show the reader what they just wrote being picked up. That rests them on
+    // the live edge, armed or not (ADR 0080). It covers a typed ANSWER too,
+    // landing that on the card the text goes to. Here as well as in
+    // `addPendingMessage`, because this is the composer's own tap and must not
+    // wait on the awaited send below. Both calls describe the same submit, so
+    // the second either keeps the first's request or restates it. A reader
+    // already at the live edge is not scrolled, and a send into a thread
+    // entirely on screen writes nothing.
     followSentMessage();
     if (isMobile()) el.blur();
 

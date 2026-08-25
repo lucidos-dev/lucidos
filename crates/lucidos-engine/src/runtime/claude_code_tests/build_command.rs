@@ -30,6 +30,7 @@ fn test_spawn_args<'a>(
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
+        permission_mode: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn test_spawn_args_with_event<'a>(
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
+        permission_mode: None,
     }
 }
 
@@ -80,6 +82,7 @@ fn test_spawn_args_with_repo<'a>(
         user_env_vars: &[],
         claude_config_dir: None,
         binary_override: None,
+        permission_mode: None,
     }
 }
 
@@ -110,6 +113,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         user_env_vars: &user_env,
         claude_config_dir: None,
         binary_override: None,
+        permission_mode: None,
     };
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
@@ -869,5 +873,112 @@ fn build_command_lets_a_workspace_env_var_override_the_byte_idle_deadline() {
             .map(|v| v.as_os_str()),
         Some(std::ffi::OsStr::new("900000")),
         "a workspace env var must override the engine's default byte-idle deadline"
+    );
+}
+
+/// The argv `--permission-mode` value, for the mode assertions below.
+fn permission_mode_arg(cmd: &tokio::process::Command) -> Option<String> {
+    let args: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let at = args.iter().position(|a| a == "--permission-mode")?;
+    args.get(at + 1).cloned()
+}
+
+fn auto_opt_in(cmd: &tokio::process::Command) -> Option<std::ffi::OsString> {
+    collect_envs(cmd)
+        .get(std::ffi::OsStr::new("CLAUDE_CODE_ENABLE_AUTO_MODE"))
+        .cloned()
+}
+
+#[test]
+fn an_unset_preference_keeps_the_pre_existing_accept_edits_mode() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    assert_eq!(
+        permission_mode_arg(&cmd).as_deref(),
+        Some("acceptEdits"),
+        "no preference must spawn the mode every session ran before it existed",
+    );
+    assert!(
+        auto_opt_in(&cmd).is_none(),
+        "the opt-in var must stay absent unless auto was asked for",
+    );
+}
+
+#[test]
+fn an_unrecognised_preference_falls_back_rather_than_reaching_cc() {
+    // Passing a junk value straight through would let CC reject the flag and
+    // fail the spawn. Anything unrecognised is the default instead.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    for stored in ["", "  ", "garbage", "default", "bypassPermissions", "plan"] {
+        let mut args = test_spawn_args(p, p, thread_id);
+        args.permission_mode = Some(stored);
+        let cmd = build_command(&args, None);
+        assert_eq!(
+            permission_mode_arg(&cmd).as_deref(),
+            Some("acceptEdits"),
+            "{stored:?} must resolve to acceptEdits",
+        );
+        assert!(auto_opt_in(&cmd).is_none(), "{stored:?} must not opt in");
+    }
+}
+
+#[test]
+fn the_stored_default_value_resolves_to_accept_edits() {
+    // The kebab-case value the UI writes and CC's own spelling live in
+    // different crates. Nothing else ties them, and the catch-all arm that
+    // maps this one also swallows garbage, so a mistyped rename stays green.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.permission_mode = Some("accept-edits");
+    let cmd = build_command(&args, None);
+    assert_eq!(
+        permission_mode_arg(&cmd).as_deref(),
+        Some("acceptEdits"),
+        "the catalog's default value must reach CC as its own spelling",
+    );
+    assert!(auto_opt_in(&cmd).is_none());
+}
+
+#[test]
+fn auto_ships_the_flag_and_its_opt_in_together() {
+    // CC's gate downgrades auto to `default` on a non-first-party provider
+    // without the opt-in var, and `default` cards MORE than acceptEdits. So the
+    // two must never be separable.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.permission_mode = Some("auto");
+    let cmd = build_command(&args, None);
+    assert_eq!(permission_mode_arg(&cmd).as_deref(), Some("auto"));
+    assert_eq!(
+        auto_opt_in(&cmd).as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "auto must carry its opt-in var",
+    );
+}
+
+#[test]
+fn a_user_env_var_cannot_strand_a_session_that_asked_for_auto() {
+    // Engine-owned, so it is written AFTER apply_lucidos_env. A stale
+    // workspace env var set to zero would otherwise silently downgrade the
+    // mode the user just chose.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![("CLAUDE_CODE_ENABLE_AUTO_MODE".to_string(), "0".to_string())];
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.permission_mode = Some("auto");
+    args.user_env_vars = &user_env;
+    let cmd = build_command(&args, None);
+    assert_eq!(
+        auto_opt_in(&cmd).as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "the engine-owned opt-in must win over a user env var",
     );
 }

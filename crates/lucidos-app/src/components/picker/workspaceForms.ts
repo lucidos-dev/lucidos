@@ -16,7 +16,16 @@
  */
 
 import { parseWorkspaceNameFromArchive, type WorkspaceStatus } from '../../api/client/control';
+import type { Loadable } from '../../store/types';
 import { slugifyWorkspaceName, uniqueWorkspaceSlug } from '../../utils/slug';
+
+/** The first run: the list has loaded and there is no workspace yet. Two things
+ *  key off it, so it is one predicate: the create form unfolds itself, and it
+ *  offers the quick-fill name chips. A LOADING list is not the first run, since
+ *  it is empty for a reason that says nothing about what the user has. */
+export function isFirstRun(list: Loadable<WorkspaceStatus[]>): boolean {
+  return list.status === 'loaded' && list.data.length === 0;
+}
 
 /** What the user has filled in on the restore form so far. */
 export interface RestoreDraft {

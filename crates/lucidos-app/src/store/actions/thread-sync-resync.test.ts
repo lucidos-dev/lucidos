@@ -74,7 +74,11 @@ vi.mock('./devices', () => ({ getDeviceId: vi.fn(), pendingDeviceRegistration: v
 vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
-vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
+vi.mock('./entityReferences', () => ({
+  processSSEForReferences: vi.fn(),
+  refreshLlmConfigured: vi.fn(),
+  PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
+}));
 
 const { resyncLoadedThreads } = await import('./thread-sync');
 

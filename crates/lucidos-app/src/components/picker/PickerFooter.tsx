@@ -35,7 +35,8 @@ export interface PickerFooterProps {
   onName: (name: string) => void;
   onCreate: () => void;
   onCancelCreate: () => void;
-  /** Quick-fill chips, shown while the name is empty. */
+  /** Quick-fill chips, shown while the name is empty. Empty once the user has a
+   *  workspace, and the whole row (its "Try" label included) goes with them. */
   suggestions: readonly string[];
   onSuggestion: (name: string) => void;
   nameInputRef?: Ref<HTMLInputElement>;
@@ -89,7 +90,7 @@ export function pickerFooter(p: PickerFooterProps): VNode {
 
       {p.mode === 'create' && (
         <div class="ws-picker-create">
-          {!p.name.trim() && (
+          {!p.name.trim() && p.suggestions.length > 0 && (
             <div class="ws-picker-suggestions">
               <span class="ws-picker-suggestions-label">Try</span>
               {p.suggestions.map((s) => (

@@ -24,7 +24,7 @@ export function OpenCodeFreeSettings() {
 
   return (
     <>
-      <div class="settings-row" data-search-anchor="providers:opencode-free">
+      <div class="settings-row" data-search-anchor="models:opencode-free">
         <span class="settings-row-label">
           OpenCode Free (keyless)
           <Explainer title="OpenCode Free (keyless)">

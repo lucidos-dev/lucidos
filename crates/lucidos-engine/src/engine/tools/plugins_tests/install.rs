@@ -45,7 +45,7 @@ async fn update_plugin_impl(
         }
     };
 
-    let remote = match fetch_remote_manifest(workspace_path, &source).await {
+    let remote = match fetch_remote_manifest(workspace_path, pool, &source).await {
         Ok(m) => m,
         Err(e) => return format!("Error: fetch latest manifest: {}", e),
     };
@@ -148,6 +148,7 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
         &pending,
         archive.to_str().unwrap(),
         &Default::default(),
+        &GitCredentials::none(),
     );
 
     assert!(
@@ -194,6 +195,7 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         &pending,
         archive.to_str().unwrap(),
         &Default::default(),
+        &GitCredentials::none(),
     );
     let payload = parse_sentinel_payload(&result);
     let overwrites: Vec<&str> = payload["overwrites"]
@@ -217,8 +219,13 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
     let scratch = fresh_workspace();
     let pending = fresh_pending_map();
 
-    let result =
-        prepare_install_request(&scratch, &pending, "not-a-real-source", &Default::default());
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        "not-a-real-source",
+        &Default::default(),
+        &GitCredentials::none(),
+    );
 
     assert!(result.starts_with("Error:"), "got: {}", result);
     assert!(
@@ -247,6 +254,7 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
         &pending,
         archive.to_str().unwrap(),
         &Default::default(),
+        &GitCredentials::none(),
     );
     let payload = parse_sentinel_payload(&result);
     let install_id = payload["install_id"].as_str().unwrap().to_string();

@@ -945,8 +945,8 @@ function dropNonComposingFocus(): void {
 
 /** Apply a suggested sentence to the compose input on the user's behalf.
  *
- *  Its one caller today is {@link startSetupInterview}. It stays a separate
- *  step because the interview reuses every part of it and only adds the send.
+ *  Its one caller is {@link sendSeededPrompt}. It stays a separate step because
+ *  the send reuses every part of it and only adds the send itself.
  *
  *  A suggested sentence is conversational, so the destination is forced to the
  *  Lucidos Agent, a coding-agent draft flipping back to chat. It REPLACES the
@@ -1014,23 +1014,34 @@ export const SETUP_INTERVIEW_PROMPT =
  *  sentence is what appears in the transcript, on the same code path a typed
  *  message takes.
  *
- *  Reuses `applySuggestion` for the identical parts, so the draft-protection
- *  rule cannot drift between the two.
- *
  *  Returns true when the interview was sent, false when the user declined the
  *  draft override or no draft resolved. */
 export async function startSetupInterview(): Promise<boolean> {
-  if (!(await applySuggestion(SETUP_INTERVIEW_PROMPT))) return false;
+  return sendSeededPrompt(SETUP_INTERVIEW_PROMPT, 'start the setup interview');
+}
+
+/** Seed `text` into the composer and SEND it, as the user.
+ *
+ *  The gesture behind every button that starts a conversation on the user's
+ *  behalf: the first-run welcome's setup interview, and a *release notice*
+ *  action. Both hand the reader a sentence they can see, reword and re-send by
+ *  typing, which is the prompt-first side of `docs/philosophy.md` principle 3.
+ *
+ *  `what` completes "Failed to …" in the error toast, so write it as a verb
+ *  phrase. Returns false when the user declined the draft override, when no
+ *  draft resolved, or when the send failed. */
+export async function sendSeededPrompt(text: string, what: string): Promise<boolean> {
+  if (!(await applySuggestion(text))) return false;
   const threadId = focusedThreadId.value;
   if (!threadId) return false;
   try {
     await sendCompose(threadId, { focus: true });
   } catch (err) {
     // `sendCompose` rethrows after rolling the draft back, and its other callers
-    // toast (see `beginSend` in PromptInput). Both entry points here fire this
-    // as `void`, so swallowing would surface a failed first-run click as
-    // nothing happening at all.
-    showToast(`Failed to start the setup interview: ${errorDetail(err)}`, 'error');
+    // toast (see `beginSend` in PromptInput). Every entry point here fires this
+    // as `void`, so swallowing would surface a failed click as nothing
+    // happening at all.
+    showToast(`Failed to ${what}: ${errorDetail(err)}`, 'error');
     return false;
   }
   return true;

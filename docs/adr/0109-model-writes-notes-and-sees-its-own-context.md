@@ -714,6 +714,12 @@ context is full.
 One stated credit is worth nothing here. The conversation summariser the mode
 retires has produced no auxiliary capture in 90 days.
 
+**That last sentence has since been overtaken, and the credit is smaller than
+it looks.** ADR 0107's deadline split made the summariser land: 19 calls in the
+three days after it shipped, on threads long enough to reach the older region.
+So the mode does retire a call that runs. But ADR 0102's amendment then detached
+that call, so what the mode saves is tokens rather than a turn's latency.
+
 ### The verdict
 
 **Keep the mechanism, cap the pad, and do not graduate on cost.** The region

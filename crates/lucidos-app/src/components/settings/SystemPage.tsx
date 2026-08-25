@@ -1,6 +1,7 @@
 import { useCallback, useEffect } from 'preact/hooks';
 import {
   appUpdateCheckError,
+  appUpdateCheckInFlight,
   appUpdateProgress,
   connectionStatus,
   enginePackaged,
@@ -23,10 +24,11 @@ import {
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import {
   canInstallUpdateHere,
-  checkAppUpdateViaClient,
+  checkForUpdatesNow,
   installAppUpdate,
   packagedUpdateVersion,
-  refreshReleaseCheck,
+  reportUpdateCheck,
+  updateControlLabel,
 } from '../../store/actions/app-update';
 import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
@@ -134,23 +136,15 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
    *  without it the only way to ask "is there something newer?" right now was to
    *  quit and relaunch.
    *
-   *  The gateway owns the check (ADR 0108) and this forces it to poll. The
-   *  client's own updater is the fallback, taken only where the gateway
-   *  announces nothing at all, which means one too old to carry the field. */
+   *  The check itself belongs to `checkForUpdatesNow`, which owns the in-flight
+   *  state and the single flight. This reports the verdict IT returned, rather
+   *  than re-reading signals a concurrent background poll also writes. */
   const handleAppUpdate = useCallback(async () => {
     if (canInstallUpdateHere()) {
       await installAppUpdate();
       return;
     }
-    if (releaseCheck.value) await refreshReleaseCheck(true);
-    else await checkAppUpdateViaClient();
-    // Runs on USER intent, so unlike the background poll this reports both
-    // outcomes rather than staying silent.
-    if (appUpdateCheckError.value) {
-      showToast(`Couldn't check for updates: ${appUpdateCheckError.value}`, 'error');
-    } else if (!packagedUpdateVersion()) {
-      showToast('Lucidos is up to date', 'success');
-    }
+    reportUpdateCheck(await checkForUpdatesNow());
   }, []);
 
   /** Turn the machine-global release check off or back on. Writes
@@ -186,6 +180,10 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   // so this is non-null exactly while a run is live.
   const updateRun = appUpdateProgress.value;
   const updateNarration = updateRun ? appUpdateNarration(updateRun) : null;
+  // A check the USER started, so the button says so and refuses a second. The
+  // background poll never sets this, which is what keeps the button still while
+  // a resume re-reads the gateway.
+  const checking = appUpdateCheckInFlight.value;
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
   const clientBehindLabel = tauriClientVersion ? ` (latest: ${offeredVersion})` : ' (update available)';
 
@@ -392,8 +390,8 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
                   ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
                   : <button class="action-btn" disabled>Updating…</button>)
               : (
-                <button class="action-btn" onClick={handleAppUpdate}>
-                  {canInstallHere ? 'Update & Restart' : 'Check for Updates'}
+                <button class="action-btn" onClick={handleAppUpdate} disabled={checking}>
+                  {updateControlLabel(checking, canInstallHere)}
                 </button>
               ))}
             {ownsRestart && (

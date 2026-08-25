@@ -94,6 +94,26 @@ describe('both entry points are always on screen', () => {
   });
 });
 
+describe('the quick-fill chips', () => {
+  it('offers them while the name field is empty', () => {
+    const text = render({ mode: 'create' });
+    expect(text).toContain('ws-picker-suggestions-label');
+    expect(text).toContain('personal');
+  });
+
+  it('drops the whole row, label included, when there are none', () => {
+    // The picker sends no chips once the user has a workspace. A bare "Try"
+    // with nothing after it is what a `suggestions.length` gate prevents.
+    const text = render({ mode: 'create', suggestions: [] });
+    expect(text).not.toContain('ws-picker-suggestions');
+    expect(text).toContain('ws-picker-input');
+  });
+
+  it('hides them once the user types a name', () => {
+    expect(render({ mode: 'create', name: 'fresh' })).not.toContain('ws-picker-suggestions');
+  });
+});
+
 describe('the restore form explains itself', () => {
   const ready: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'fresh' };
 

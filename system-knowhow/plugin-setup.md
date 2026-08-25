@@ -25,6 +25,23 @@ Turn the author's instructions into a `todo_write` list (one item per concrete s
 - **Do it yourself** wherever the step is something you can carry out (writing a config file, pasting an `apis.json` snippet for a signer plugin, creating a trigger, etc.).
 - **Ask the user directly** for anything only they can provide — credentials, account choices, confirmations. Prefer `ask_user_question` for choice-shaped questions; use `request_credential` (never chat) for secrets.
 
+### Webhooks: the plugin cannot ship one, so you create it here
+
+A plugin ships files. A webhook is a row in the `webhooks` table, so it never travels in the bundle. When the plugin ships a trigger that subscribes to an event a third party sends, creating the hook is your job.
+
+That trigger is already live. Install auto-registers it, subscribed to an event type nothing emits until you finish. Nothing warns anyone if you stop halfway, so treat the hook as the step that makes the plugin work at all.
+
+Work in this order:
+
+1. **Get the shared secret.** Use `request_credential`, never chat. The sender generates it or the user invents one. Either way the same value must sit on both sides.
+2. **Create the hook.** Run `lucidos webhooks create --name "<plugin> <sender>" --event-type <TheEventTheTriggerSubscribesTo> --hmac '{...}'`, with `credential` naming the credential you just saved. Take the event type from the plugin's `trigger.toml`, not from your reading of the author's prose. A subscription matches the string exactly, and a near miss fires nothing.
+3. **Read back the URL.** `lucidos webhooks list` prints the delivery path. The full address is `{host}:{hook_port}/<workspace-slug>/<webhook-id>`, and the id is minted at create time, so the value the sender needs does not exist before step 2.
+4. **Check the hook socket is reachable.** Deliveries land on the gateway hook socket, not the main surface. On a machine with no remote access set up, nothing outside can reach it and every delivery fails at the sender. See `system-knowhow/remote-access` for exposing that one port.
+5. **Hand the user the sender-side steps.** Only they can paste the URL into GitHub, Stripe or whatever sends the event, under an account you cannot reach. Give the URL in a `<copy>` tag, with the content type, the name of the secret field, and which events to subscribe to.
+6. **Verify before you report done.** `lucidos webhooks list` must show the hook, and the plugin's trigger must name the same event type. State both. An unverified hook leaves a silent trigger behind.
+
+An unsigned hook prints a bearer token once, at create time, because only the digest is stored. Pass it to the user the same way, and say plainly that it cannot be read back.
+
 ## 4. Communicate in-thread — no notifications
 
 The user is watching this thread. Communicate entirely through your normal replies here. Do **NOT** call `send_notification` — a toast or push for setup steps they are already reading is noise.

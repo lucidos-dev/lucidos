@@ -46,7 +46,7 @@ describe('hasRenderableResponseContent', () => {
       {
         type: 'event_wait',
         wait_id: 'w1',
-        subscriptions: ['E2ETestsFailed'],
+        subscriptions: [{ event_type: 'E2ETestsFailed' }],
         reason: 'waiting for the suite',
         expires_at: TS,
         state: 'waiting',

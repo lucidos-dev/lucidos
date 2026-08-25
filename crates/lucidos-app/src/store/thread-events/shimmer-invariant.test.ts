@@ -111,6 +111,25 @@ describe('exactly-one-shimmer invariant while working', () => {
     expect(s.labelShimmers).toBe(true);
   });
 
+  // The other direction, and the one this invariant must not be read as
+  // requiring. A turn held on a permission card is NOT working, so zero
+  // shimmers is right there. A `blocked` row must not be counted as the live
+  // one. The whole-transcript version is in
+  // `store/__tests__/gated-tool-step.test.ts`, which drives the real fold.
+  it('a held call is not a live step, so it cannot satisfy the invariant', () => {
+    const held = ccExchange([
+      ev({ type: 'SessionStarted', session_id: 's1' }),
+      ev({ type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'rm -rf /tmp/x' }, tool_use_id: 'tu-A' }),
+    ]);
+    held.blockedStepSeqs = new Set(held.steps.map(s => s.seq));
+    const events = exchangeResponseEvents(held, true, false);
+    expect(events.filter(e => e.type === 'step' && e.outcome === 'blocked')).toHaveLength(1);
+    expect(hasVisibleLiveStep(true, false, events)).toBe(false);
+    // And no derived Thinking row was added beside it: the held row IS the
+    // turn's current row (`needsLiveThinkingRow`'s `anyLive`).
+    expect(events.filter(e => e.type === 'step' && e.description === 'Thinking')).toHaveLength(0);
+  });
+
   it('collapsed panel with a pending step still shimmers the Working label', () => {
     const working = chatExchange([
       ev({ type: 'ThoughtStreamed' }),

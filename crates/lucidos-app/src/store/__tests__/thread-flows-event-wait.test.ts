@@ -47,7 +47,7 @@ describe('a turn parked on an event wait', () => {
     const events = exchangeResponseEvents(getExchanges(map, id)[0]);
     expect(waits(events)).toHaveLength(1);
     expect(steps(events)).toHaveLength(0);
-    expect(waits(events)[0]).toMatchObject({ wait_id: 'w1', state: 'waiting', subscriptions: ['ChangeProposed'] });
+    expect(waits(events)[0]).toMatchObject({ wait_id: 'w1', state: 'waiting', subscriptions: [{ event_type: 'ChangeProposed' }] });
   });
 
   /** The park is a transcript marker, not step mechanics, so a turn whose ONLY
@@ -409,7 +409,7 @@ describe('a turn parked on an event wait', () => {
         wait_id: 'w1',
         state: 'canceled',
         cause: 'agent_stand_down',
-        subscriptions: ['ChangeProposed'],
+        subscriptions: [{ event_type: 'ChangeProposed' }],
         reason: REASON,
       },
     ]);

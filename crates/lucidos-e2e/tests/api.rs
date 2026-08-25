@@ -14,6 +14,9 @@ mod health_test;
 #[path = "api_support/changelog_test.rs"]
 mod changelog_test;
 
+#[path = "api_support/release_notices_test.rs"]
+mod release_notices_test;
+
 #[path = "api_support/fonts_test.rs"]
 mod fonts_test;
 

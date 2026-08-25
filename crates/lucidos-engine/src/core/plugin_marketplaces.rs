@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{self, compare_versions, validate_tree, UpdateDecision};
 use crate::core::DATA_DIR;
 
@@ -209,10 +210,25 @@ pub fn remove_marketplace(registry: &mut PluginMarketplaceRegistry, id: &str) ->
     before != registry.marketplaces.len()
 }
 
+/// Every URL a scan of `registry` would clone.
+///
+/// The scan is synchronous, so a caller resolves credentials for these before
+/// handing the work to `spawn_blocking`. A source that does not parse is left
+/// out: the scan reports that error itself.
+pub fn clone_urls(registry: &PluginMarketplaceRegistry) -> Vec<String> {
+    registry
+        .marketplaces
+        .iter()
+        .filter_map(|m| parse_marketplace_source(&m.source).ok())
+        .map(|source| source.clone_url)
+        .collect()
+}
+
 pub fn scan_catalog(
     workspace_path: &Path,
     registry: &PluginMarketplaceRegistry,
     installed: &[InstalledPluginSummary],
+    credentials: &GitCredentials,
 ) -> MarketplaceCatalog {
     let installed_by_id: BTreeMap<String, InstalledPluginSummary> = installed
         .iter()
@@ -224,7 +240,7 @@ pub fn scan_catalog(
     let mut errors = Vec::new();
 
     for marketplace in &registry.marketplaces {
-        match scan_one_marketplace(workspace_path, marketplace, &installed_by_id) {
+        match scan_one_marketplace(workspace_path, marketplace, &installed_by_id, credentials) {
             Ok((mut found, mut warns)) => {
                 plugins.append(&mut found);
                 errors.append(&mut warns);
@@ -278,9 +294,10 @@ fn scan_one_marketplace(
     workspace_path: &Path,
     marketplace: &PluginMarketplace,
     installed_by_id: &BTreeMap<String, InstalledPluginSummary>,
+    credentials: &GitCredentials,
 ) -> Result<(Vec<MarketplacePlugin>, Vec<MarketplaceScanError>), String> {
     let parsed = parse_marketplace_source(&marketplace.source)?;
-    let (scratch, root, actual_branch) = clone_marketplace(workspace_path, &parsed)?;
+    let (scratch, root, actual_branch) = clone_marketplace(workspace_path, &parsed, credentials)?;
     let manifest_roots = find_manifest_roots(&root)?;
     if manifest_roots.is_empty() {
         drop(scratch);
@@ -423,7 +440,7 @@ fn parse_marketplace_source(source: &str) -> Result<MarketplaceSource, String> {
         }
     }
 
-    if trimmed.starts_with("file://") || plugins::is_git_url(trimmed) {
+    if crate::core::git_auth::is_local_url(trimmed) || plugins::is_git_url(trimmed) {
         return Ok(MarketplaceSource {
             clone_url: trimmed.to_string(),
             github_owner: None,
@@ -489,6 +506,7 @@ fn parse_github_path(path: &str) -> Option<(String, String)> {
 fn clone_marketplace(
     workspace_path: &Path,
     source: &MarketplaceSource,
+    credentials: &GitCredentials,
 ) -> Result<(tempfile::TempDir, PathBuf, Option<String>), String> {
     let parent = workspace_path
         .join(".lucidos")
@@ -499,20 +517,12 @@ fn clone_marketplace(
         tempfile::TempDir::new_in(&parent).map_err(|e| format!("create scratch dir: {e}"))?;
     let clone_target = scratch.path().join("repo");
 
-    let repo = {
-        let mut builder = git2::build::RepoBuilder::new();
-        let mut fetch_opts = git2::FetchOptions::new();
-        if !source.clone_url.starts_with("file://") {
-            fetch_opts.depth(1);
-        }
-        if let Some(branch) = &source.branch {
-            builder.branch(branch);
-        }
-        builder.fetch_options(fetch_opts);
-        builder
-            .clone(&source.clone_url, &clone_target)
-            .map_err(|e| format!("git clone failed: {e}"))?
-    };
+    let repo = crate::core::git_auth::shallow_clone(
+        &source.clone_url,
+        source.branch.as_deref(),
+        &clone_target,
+        credentials,
+    )?;
 
     let actual_branch = source.branch.clone().or_else(|| {
         repo.head()

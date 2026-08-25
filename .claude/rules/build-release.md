@@ -77,7 +77,7 @@ artifact**, and that is the complete list of what belongs there:
 | workflow | fires on | verifies |
 |---|---|---|
 | `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
-| `release-tarballs.yml` | `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
+| `release-tarballs.yml` | `rc/**` push, `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
 **Nothing in there DEPLOYS, and that is a second rule, not a coincidence of the
 first.** Publishing to a `lucidos.dev` origin runs on the maintainer's machine off
@@ -170,6 +170,41 @@ what lets the fmt gate be stock defaults with no `rustfmt.toml`.
 - **`rustup show active-toolchain`** in a CI log is the cheap way to see which
   toolchain a build actually used; `release-tarballs.yml` prints it.
 
+### CI caches DEPENDENCIES only, and the release legs sit in their own namespace
+
+`Swatinem/rust-cache`, in `release-tarballs.yml`'s matrix and in
+`install-smoke.yml`'s `smoke` and `tarball-smoke` jobs. cargo is 94% of a
+tarball job, and third-party dependencies are 12m25s of the Intel Mac's 32m16s.
+
+**A release build may have one only because the cache is dependency-only.** The
+action deletes the workspace members' artifacts from `target/` before saving, so
+every release still compiles all of `crates/**` from source. What returns is
+third-party code plus the cargo registry, and cargo integrity-checks the
+registry against `Cargo.lock`. Cache a workspace crate here and that stops being
+true.
+
+Four rules, and each is asserted by `release_tarballs_gate_test.sh`:
+
+- **Pin the action by commit, never by tag.** A release build must not follow a
+  ref somebody else can move.
+- **Key per leg.** The target triple and the container image go in the key. The
+  action already folds in the rustc version, the job id and the lockfile hashes.
+  Two legs must never alias, and a container bump must invalidate.
+- **Only the `rc/**` arm writes** (`save-if`). The tag-push fallback and the
+  backfill dispatch then read a cache written by a run of the same commit.
+- **`prefix-key` fences release from smoke.** A poisoned cache in a test leg is
+  a red run; in a release build it is a shipped binary. Nothing `install-smoke`
+  writes may be readable by `release-tarballs`, and that is structural rather
+  than a habit. For the same reason `tarball-smoke` does NOT share the Linux
+  release leg's cache, though it runs the same script: one builds inside
+  `ubuntu:22.04`, the other on the bare runner image.
+
+The step goes **after** the first post-checkout cargo call. The action runs
+`rustc -vV` to build its key, and the container legs install rustup with
+`--default-toolchain none`, so nothing answers that until the pin is
+materialised. `zstd` is in the container's apt list, or the cache falls back to
+gzip.
+
 ### Lockfile determinism — builds are fail-closed (ADR 0020)
 
 The committed lockfiles (`Cargo.lock`, root `package-lock.json`) are the single source of truth for exact dependency versions — the whole tree, direct **and** transitive. Every build consumes them **strictly**, so a build **errors** rather than silently rewriting a lockfile on manifest drift:
@@ -222,9 +257,23 @@ Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `luc
 
 **Headless tarball — Linux + macOS unsigned (`build-headless.sh`).** The Tauri-free build path (step 2 of `docs/plans/2026-06-30-installer-step2-linux-tarball.md`). Runs the shared staging for the **host** triple — no `cargo tauri build`, no `.app`, no DMG, no codesigning — then reuses `headless_tarball_emit` for the same `lucidos-<version>-<triple>.tar.gz` + `.sha256`. On **Linux** this is THE release build path; on **macOS** it produces an UNSIGNED tarball (use `build-dmg.sh --emit-tarball` for the signed one). It compiles natively, so `--triple` must equal the host — cross-arch artifacts come from the CI matrix's per-arch runners. Flags: `--triple`, `--out-dir` (default `.lucidos/release-staging/<version>/`), `--version` (default RELEASE → tauri.conf.json → 0.0.0), `--check`. Offline-tested by `scripts/lib/build_headless_test.sh`.
 
-**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner, with the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Every entry uploads the tarball + `.sha256` as a **workflow artifact**, and then ATTACHES them to the release carrying the pushed tag. It never creates or tags a Release.
+**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `rc/**`-branch-`push` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner, with the Linux entries INSIDE an `ubuntu:22.04` container. Every entry uploads the tarball + `.sha256` as a **workflow artifact**, and then ATTACHES them to the release carrying the pushed tag. It never creates or tags a Release.
+
+That container is the **glibc 2.35 floor**. A binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04, Debian 12 or RHEL 9, with `GLIBC_2.3x not found`. The same-machine tarball-smoke cannot see that. An "Assert portability floor" step guards it, failing the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor.
 
 **The TAG PUSH is what attaches, and the release it attaches to is a DRAFT (2026-08-04).** There used to be a third trigger, `release: types: [published]`, and it produced the whole problem: the Release went public with only the DMG, that publish event started a SECOND full build of the same four tarballs (v0.21.0 ran 30926097107 on the tag push and 30926100020 on the release event, two seconds apart), and the tarballs landed 11 to 35 minutes later. Inside that window the advertised `curl … | sh` genuinely 404s. Now `release-to-lucidos.sh` creates the Release as a draft, this run attaches to it, and the publish waits for all four (ADR 0042, and Phase B under "the release candidate IS the published artifact" below). The `release:` trigger is gone: it cannot start the build any more (a draft fires no webhook) and keeping it would mean publishing the draft kicked off a duplicate 35-minute build that re-attached over files already there. A manual `workflow_dispatch` with `attach_to_release=true` (+ `attach_tag`, or a tag ref) is the backfill arm, and it is what `release_draft_wait_for_assets` dispatches when a run finishes having attached nothing.
+
+**The rc BRANCH builds the same tarballs an hour earlier, and Phase B attaches them.** The tag push is the last thing a release does. Waiting for that build put a whole uncached Intel-Mac cargo compile on Phase B's serial path, 34m23s of its 35m32s on v0.29.0. The tree already exists at Phase A: the wrapper pushes the deterministic stripped orphan commit to `rc/<version>`, and Phase B force-pushes **that same object** to `main`. So an `rc/**` push builds precisely what ships, while Apple notarizes. That arm stops at the workflow artifact, because the attach step's `if:` admits only a `v*` tag push or an opt-in dispatch.
+
+`release_draft_wait_then_publish` is where the two meet, so both Phase B entry points get it from one function. It calls `release_draft_attach_from_rc_run` first and then waits exactly as before. **The pin is the commit.** `release_tarball_rc_run_id` returns a run only when its `head_sha` equals the object being published and its head branch begins `rc/`. It re-asserts the `head_sha` the caller already filtered on, so a filter that silently stops applying cannot promote an unrelated build. Then it proves the bytes: every expected name resolves to exactly one file, and every tarball verifies against the sidecar its own build wrote.
+
+**The updater trio has no route from CI onto a release.** The uploaded set is derived from `release_draft_expected_assets`, which names only the eight tarball assets. Anything else in the downloaded artifact is reported and left where it is.
+
+**Every refusal is a fallback, never a failed release.** No rc run, a run still going, a failed one, expired artifacts, a sha256 that does not verify, a missing platform: each says why, and the tag-triggered wait takes over unchanged. Degrade to slow, never to wrong.
+
+Two consequences hold that together. `release_tarball_run_verdict` **ignores `rc/`-branch runs**, because both runs carry the same head commit. A finished rc run beside an unregistered tag run would otherwise read as success-with-nothing-attached, and dispatch a needless backfill.
+
+And the CI attach step **never deletes an asset from a PUBLISHED release**, only from a draft. The fallback run now reaches a live release half an hour late, and the gap between DELETE and POST is a window where `curl … | sh` 404s. Retention splits the same way: 7 days on the rc arm, which Phase B downloads, against the tag arm's 1-day inspection copy.
 
 **Finding the release needs a LISTING, not the tag endpoint.** `GET /repos/{owner}/{repo}/releases/tags/{tag}` does not resolve a DRAFT (a draft has no tag ref), so the step pages `GET /releases` and matches `tag_name`, which also means `permissions: contents: write` is load-bearing for READING: GitHub lists drafts only to a caller with push access. Two refusals keep the rc gate out of it: a resolved tag beginning `rc-`, and a release whose `prerelease` is true. Upload goes through the raw GitHub REST API with `curl`, NOT `gh release upload`: the Linux matrix entries run inside the `ubuntu:22.04` container, which has no `gh`. Offline-tested by `scripts/lib/release_tarballs_gate_test.sh`, which also asserts the matrix triples equal `release_draft_triples` so a platform cannot be added to one and silently missed by the other.
 
@@ -314,10 +363,11 @@ irreversible push), and pushes **that same object** to the mirror's `main`
 under a lease + tags it `v<version>` **by SHA**, creates the GA Release as a
 **DRAFT**, attaches the staged artifacts, WAITS for `release-tarballs.yml` to
 attach the four per-platform tarballs, publishes the draft and only then emits
-`LucidosReleased`; the rc branch + rc draft release are deleted afterwards. That
-wait is where a release now spends 25 to 45 minutes, and it is resumable:
-nothing is public while it runs, so an interrupted one costs
-`release.sh --publish-draft <version>` and no rebuild (ADR 0042).
+`LucidosReleased`; the rc branch + rc draft release are deleted afterwards. It
+attaches the rc build's tarballs first, so that wait normally returns on its
+first poll. Where it falls back, the wait is the old 25 to 45 minutes. Either
+way it is resumable: nothing is public while it runs, so an interrupted one
+costs `release.sh --publish-draft <version>` and no rebuild (ADR 0042).
 
 The legacy one-shot (`release.sh <version>`, no phase flag) still builds its own
 tree from HEAD through the same lib and has no rc gate; it resolves its parent
@@ -675,6 +725,10 @@ hold it together:
 **The `.app` inside the DMG is stapled (F5).** See ADR 0033: two notary submissions in Apple's order, the app's identity re-asserted by **cdhash** (what a ticket is issued for, and the only workable choice since `ditto -c -k` is not byte-reproducible), and the staple proved afterwards with both `stapler validate` and `codesign --verify --deep --strict`. The ticket lands in `Contents/CodeResources`, outside the sealed set at `Contents/_CodeSignature/CodeResources`, which is why stapling does not break the signature.
 
 Banner + changelog-section text live in `scripts/lib/release_notes.sh` — **one** extractor shared by the publish and the attach step, so the body the attach step rewrites is byte-identical to the one the publish wrote. Offline-tested by `release_notes_test.sh` (banner content, the compose that never touches `$NOTES_FILE`, and that latest.json's notes stay plain) and the deferred sections of `build_dmg_test.sh` + `release_staging_test.sh`.
+
+**Ask once per release: does this one need a *release notice*?** The changelog says what changed. A release notice says what the USER has to do about it. It is the only surface that reaches them unprompted, as a modal on their first open after upgrading. Nothing derives one, so a release that needed one and shipped without it never tells anybody: the drift it introduced sits in every workspace, silent. The test is narrow, and most releases fail it and correctly carry none.
+
+Write one when the release leaves existing content or settings **stale rather than broken**, so nothing errors and nobody notices. A renamed event that stops a *trigger* firing, a schema an app should migrate off, a setting that now wants configuring. Not for a new feature, which the changelog covers. Author it in `release-notices.toml` at the repo root, whose header owns the field rules, with `since` set to the release in hand. Adding one is an ordinary change on `main` before the cut, never a step inside `release.sh`.
 
 ## Installer (`install.sh` + `uninstall.sh`)
 
