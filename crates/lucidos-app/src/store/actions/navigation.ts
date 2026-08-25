@@ -173,42 +173,6 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
   };
 }
 
-/** Whether a panel overlay is a transient, request-backed form that must NOT be
- *  resurrected from the persisted nav stack on reload. These overlays are backed
- *  by an engine-staged request whose id (a fresh-per-prepare-call UUID) is dead
- *  the moment the page reloads — restoring the panel would show a stale form
- *  whose Confirm/Cancel resolves a request that no longer exists. Covers a
- *  *pending* plugin install/uninstall, a *pending* email-confirm, and an
- *  *engine-prompted* credential request (a `credential` form WITH a `request`).
- *  A `credential` form WITHOUT a request is a Settings-driven edit of a stored
- *  credential and restores normally, as do the persistent forms (app-edit,
- *  new-app, trigger). Mirrors the url-preview suppression guard in
- *  `restoreState`. */
-function isTransientForm(overlay: PanelOverlay): boolean {
-  if (overlay?.type !== 'form') return false;
-  const form = overlay.form;
-  switch (form.type) {
-    // A completed install/uninstall is a receipt, not a staged request: the
-    // files already landed or went, so there is nothing left to resolve and the
-    // entry is a real destination. Only the pending form dies with the page.
-    // Same carve-out as email's `sentAt`, below.
-    case 'plugin-install':
-      return form.installed == null;
-    case 'plugin-uninstall':
-      return form.removed == null;
-    case 'email-confirm':
-      // A SENT email is a receipt, not a staged request — nothing is left to
-      // resolve, so it restores like any other destination. That's what makes it
-      // a real history entry rather than a session artifact. Only the pending
-      // confirmation dies with the page.
-      return form.sentAt == null;
-    case 'credential':
-      return form.request != null;
-    default:
-      return false;
-  }
-}
-
 function restoreState(entry: NavEntry): void {
   _restoring = true;
   try {
@@ -218,20 +182,16 @@ function restoreState(entry: NavEntry): void {
     activeMenuItem.value = menuItem;
     localStorage.setItem('lucidos-active-menu-item', menuItem);
     settingsSubview.value = migrated.settingsSubview;
-    // Don't restore a url-preview overlay when the in-app browser isn't the
-    // active path: in Chrome/PWA it uses a broken iframe, and under Tauri the
+    // The one overlay guard, and it asks about THIS device rather than about
+    // the entry: don't restore a url-preview when the in-app browser isn't the
+    // active path. In Chrome/PWA it uses a broken iframe, and under Tauri the
     // experimental in-app webview is off by default (URLs open in the system
-    // browser, so there's no panel to resurrect on reload).
+    // browser, so there's no panel to resurrect). Every other overlay restores
+    // on every path, a pending form included: see ADR 0127. It resolves to null
+    // so the localStorage side effects below key off the final overlay value.
     const suppressUrlPreview = migrated.overlay?.type === 'url-preview'
       && !inAppBrowserAvailable();
-    // Drop any transient, request-backed form overlay (plugin install/uninstall,
-    // email-confirm, engine-prompted credential) — its staged request is dead
-    // after a reload, so resurrecting the panel would show a stale form (see
-    // isTransientForm). Persistent forms (app-edit, new-app, trigger, credential
-    // edit) still restore. Both guards resolve to null so the localStorage side
-    // effects below key off the final overlay value.
-    const overlay = suppressUrlPreview || isTransientForm(migrated.overlay)
-      ? null : migrated.overlay;
+    const overlay = suppressUrlPreview ? null : migrated.overlay;
     panelOverlay.value = overlay;
     if (overlay?.type === 'file-preview') {
       localStorage.setItem('file-preview-open', overlay.path);

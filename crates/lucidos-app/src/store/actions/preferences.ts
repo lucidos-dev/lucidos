@@ -945,12 +945,9 @@ export function setInAppBrowser(enabled: boolean): Promise<void> {
 /** Whether the in-app browser is the live URL target in this client: the native
  *  webview exists only in the desktop app, AND the experimental toggle has to be
  *  on. The single definition of that pair, so the surfaces that must agree about
- *  it cannot drift: the menu drawer's Browser row (its only entry point) and
- *  `restoreState`'s refusal to resurrect a url-preview overlay on reload.
- *
- *  `openUrl` deliberately does NOT use this: it branches three ways, because
- *  web/PWA opens a tab while the desktop app with the toggle off goes to the OS
- *  opener. */
+ *  it cannot drift: the menu drawer's Browser row (its only entry point),
+ *  `restoreState`'s refusal to resurrect a url-preview overlay, and `openUrl`
+ *  deciding between the panel and `openUrlOutsideApp`. */
 export function inAppBrowserAvailable(): boolean {
   return isTauri() && currentInAppBrowser();
 }

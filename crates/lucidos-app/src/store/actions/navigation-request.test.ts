@@ -33,6 +33,9 @@ const openUrl = vi.fn();
 const normalizeDataPath = vi.fn((p: string) => p);
 vi.mock('./artifacts', () => ({ openFilePreview, openUrl, normalizeDataPath }));
 
+const openOAuthAuthorizationUrl = vi.fn();
+vi.mock('./oauth', () => ({ openOAuthAuthorizationUrl }));
+
 const navigateToTrigger = vi.fn();
 vi.mock('./triggers', () => ({ navigateToTrigger }));
 
@@ -320,6 +323,49 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(selectedLines.value).toBeNull();
     expect(lineScrollTarget.value).toBeNull();
     expect(showToast).toHaveBeenCalledWith('Navigation target missing file_path', 'error');
+  });
+});
+
+// The reported bug arrived on this branch. The engine's `connect_oauth_account`
+// emits a `NavigationRequested` carrying `purpose: 'oauth'`. The desktop app had
+// the experimental in-app browser on, so the sign-in page was mounted in the
+// url-preview panel and rendered nothing.
+describe('handleNavigationRequest: url target', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('sends an oauth-marked url to the authorization opener, never openUrl', () => {
+    handleNavigationRequest({
+      target: 'url',
+      url: 'https://accounts.google.com/o/oauth2/auth',
+      purpose: 'oauth',
+    });
+
+    expect(openOAuthAuthorizationUrl).toHaveBeenCalledWith(
+      'https://accounts.google.com/o/oauth2/auth',
+    );
+    expect(openUrl).not.toHaveBeenCalled();
+  });
+
+  // An ordinary link out of an email still follows the user's preferences, the
+  // in-app browser included. Only a sign-in page is forced out of the app.
+  it('sends an ordinary url to openUrl, with the source that asked', () => {
+    handleNavigationRequest(
+      { target: 'url', url: 'https://example.com/report' },
+      { source: 'thread "Weekly report"' },
+    );
+
+    expect(openUrl).toHaveBeenCalledWith('https://example.com/report', 'thread "Weekly report"');
+    expect(openOAuthAuthorizationUrl).not.toHaveBeenCalled();
+  });
+
+  it('reports a url target with no url instead of opening nothing quietly', () => {
+    handleNavigationRequest({ target: 'url', purpose: 'oauth' });
+
+    expect(showToast).toHaveBeenCalledWith('Navigation target missing url', 'error');
+    expect(openOAuthAuthorizationUrl).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
   });
 });
 

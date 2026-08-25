@@ -2,7 +2,6 @@ import { signal } from '@preact/signals';
 import {
   knownOAuthProviders,
   oauthAccounts,
-  panelOverlay,
   showToast,
   showConfirm,
 } from '../store';
@@ -15,17 +14,14 @@ import {
   completeOAuth,
 } from '../../api/client';
 import { openCredentialRequest } from './credentials';
-import { openUrl } from './artifacts';
+import { openUrlOutsideApp } from './artifacts';
 import { getDeviceId } from './devices';
 import { isIOSPwa, isTauri } from '../../utils/platform';
 import { focusCallingWindow } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 
-/** The OAuth authorization THIS PAGE last handed to `openUrl`, or null. */
+/** The OAuth authorization THIS PAGE last opened, or null. */
 export interface OAuthAuthFlow {
-  /** The authorization URL, so the in-app browser panel showing it can be
-   *  matched and closed once the flow lands. */
-  url: string;
   /** Which provider this flow is authorizing, when the caller knew. The
    *  Settings buttons do; the engine's `NavigationRequested` carries no
    *  provider, so that path records null and any completion counts as this
@@ -35,27 +31,26 @@ export interface OAuthAuthFlow {
 
 /** The authorization this page last opened, or null.
  *
- *  Exists so the in-app browser panel can be closed once the flow lands. When
- *  the user has the in-app browser on, the authorization page opens in the
- *  url-preview panel and the provider redirects it to the loopback callback, so
- *  when the connection completes the user is left looking at a dead callback
- *  page inside the app with no reason to still be there. It is also what tells
- *  `handleOAuthAccountConnected` that THIS page started the flow, which is
- *  narrower than the device the engine stamps on the event.
+ *  It tells `handleOAuthAccountConnected` that THIS page started the flow, which
+ *  is narrower than the device the engine stamps on the event. It also tells
+ *  `grantOAuthScope` whether that handler already reported the result, so the
+ *  fallback toast fires only when nobody did.
  *
- *  The panel is matched by URL rather than by a boolean "flow in flight" flag
- *  deliberately: a flag goes stale when a flow times out or is abandoned, and
- *  would then close an unrelated page the user opened later. A stale URL can
- *  only ever match the authorization page itself, so it needs no fuse. */
+ *  One slot, matching the engine's one live callback flow
+ *  (`ACTIVE_CALLBACK_FLOW`): a second Connect supersedes the first. */
 export const oauthAuthFlow = signal<OAuthAuthFlow | null>(null);
 
-/** Record the authorization about to be opened, then open it. Both entry points
- *  route through here (the Settings Connect / Reconnect buttons, and the
- *  engine's `NavigationRequested` when the agent runs `connect_oauth_account`)
- *  so neither can forget the half that lets the panel close itself later. */
+/** Record the authorization about to be opened, then open it outside the app.
+ *  Both entry points route through here: the Settings Connect / Reconnect
+ *  buttons, and the engine's `NavigationRequested` when the agent runs
+ *  `connect_oauth_account`. Neither can then forget the marker.
+ *
+ *  `openUrlOutsideApp`, never `openUrl`: a sign-in page must not land in the
+ *  in-app browser panel, whatever the toggle says. Providers refuse a sign-in
+ *  flow inside an embedded webview. See ADR 0128 for the alternatives. */
 export function openOAuthAuthorizationUrl(authUrl: string, provider: string | null = null): void {
-  oauthAuthFlow.value = { url: authUrl, provider };
-  openUrl(authUrl);
+  oauthAuthFlow.value = { provider };
+  openUrlOutsideApp(authUrl);
 }
 
 /** SSE handler for `OAuthAccountConnected`, the moment an authorization the user
@@ -63,13 +58,11 @@ export function openOAuthAuthorizationUrl(authUrl: string, provider: string | nu
  *
  *  Everything past the accounts reload is scoped to the device that STARTED the
  *  flow (the engine stamps it as the event's actor; see `prepare_oauth_flow`).
- *  An account connected from a phone must not front a desktop window, and the
- *  desktop's dead callback panel is not the phone's problem either. An event
+ *  An account connected from a phone must not front a desktop window. An event
  *  with no actor (an engine-internal reconnect) scopes to nobody.
  *
- *  For the initiating device: close the callback page if it is sitting in the
- *  in-app browser panel, say which account connected, and bring the window back
- *  to the front. That last part is why the whole actor thread exists: the user's
+ *  For the initiating device: say which account connected, and bring the window
+ *  back to the front. That is why the whole actor thread exists: the user's
  *  attention is in a browser at that moment, and without it they approve the
  *  consent screen and are left staring at a callback tab.
  *
@@ -85,9 +78,9 @@ export function openOAuthAuthorizationUrl(authUrl: string, provider: string | nu
  *  be fronted on. A flow recorded without a provider keeps the looser "any
  *  completion is mine", which is all the agent path can say.
  *
- *  The CLEAR stays unconditional, on purpose. The window whose flow was
- *  superseded is exactly the one left with a dead authorization page in its
- *  panel, and dropping the marker is what closes it.
+ *  The CLEAR stays unconditional, on purpose. A superseded flow is dead, and
+ *  leaving its marker up would let `grantOAuthScope`'s fallback toast fire for a
+ *  connection this page did not make.
  *
  *  The toast deliberately stays device-scoped rather than following the
  *  fronting. It costs nothing in a second window, and a page that reloaded
@@ -106,10 +99,6 @@ export function handleOAuthAccountConnected(payload: {
   const flow = oauthAuthFlow.value;
   const startedHere =
     flow !== null && (flow.provider === null || flow.provider === payload.provider);
-  const overlay = panelOverlay.value;
-  if (flow && overlay?.type === 'url-preview' && overlay.url === flow.url) {
-    panelOverlay.value = null;
-  }
   oauthAuthFlow.value = null;
 
   const provider = payload.provider || 'Account';
@@ -207,12 +196,11 @@ export async function grantOAuthScope(provider: string, scopes: string): Promise
       return false;
     }
 
-    // Phase 2: Open the auth URL wherever the user has configured links to open.
-    // Not a bare `window.open`: the desktop app with the in-app browser
-    // preference on wants the panel, and the OS opener is the correct target
-    // when it's off. A raw `window.open` ignored both. The provider is the same
-    // string the engine stores and echoes on `OAuthAccountConnected`, so the
-    // completion can be matched back to this flow.
+    // Phase 2: Open the auth URL outside the app. Not a bare `window.open`: the
+    // desktop app needs the OS opener, and a browser that refuses the tab needs
+    // the toast `openExternalUrl` owns. The provider is the same string the
+    // engine stores and echoes on `OAuthAccountConnected`, so the completion can
+    // be matched back to this flow.
     openOAuthAuthorizationUrl(startResult.auth_url, provider);
 
     // Phase 3: Wait for the callback to complete (blocks until user authorizes)
@@ -220,8 +208,8 @@ export async function grantOAuthScope(provider: string, scopes: string): Promise
     if (completeResult.success) {
       await loadOAuthAccounts();
       // `handleOAuthAccountConnected` normally owns the success toast (it also
-      // closes the panel and fronts the window, and it knows the email, which
-      // this response does not). But it is device-scoped, so it stays silent if
+      // fronts the window, and it knows the email, which this response does
+      // not). But it is device-scoped, so it stays silent if
       // the event's actor isn't this device or the SSE never arrived, and a
       // user who CLICKED Connect must not be left with a button that merely
       // stopped spinning. Fall back only when the handler didn't run for us:

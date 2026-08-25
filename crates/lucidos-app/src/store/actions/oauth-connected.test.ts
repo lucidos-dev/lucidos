@@ -46,8 +46,8 @@ vi.mock('../../api/client', () => ({
   completeOAuth,
 }));
 
-const openUrl = vi.hoisted(() => vi.fn());
-vi.mock('./artifacts', () => ({ openUrl }));
+const openUrlOutsideApp = vi.hoisted(() => vi.fn());
+vi.mock('./artifacts', () => ({ openUrlOutsideApp }));
 
 const {
   handleOAuthAccountConnected,
@@ -74,7 +74,7 @@ describe('handleOAuthAccountConnected', () => {
     toasts.value = [];
     platformMocks.isTauri = true;
     focusCallingWindow.mockClear();
-    openUrl.mockClear();
+    openUrlOutsideApp.mockClear();
     listOAuthAccounts.mockClear();
     reauthorizeOAuth.mockClear();
     completeOAuth.mockClear();
@@ -104,17 +104,13 @@ describe('handleOAuthAccountConnected', () => {
   // The engine keeps ONE live callback flow (`core::oauth ACTIVE_CALLBACK_FLOW`),
   // so a second Connect supersedes the first and the window holding the dead one
   // is still carrying a marker. It must not ride the survivor's completion
-  // forward. Its panel still closes, which is the point of clearing the marker
-  // for every page: that window is the one left on a dead authorization page.
+  // forward. The marker is still cleared for every page, so a dead flow cannot
+  // later be read as one nobody reported.
   it('does not front a window whose own flow was superseded by another provider', () => {
-    const dead = 'https://accounts.google.com/o/oauth2/auth';
-    openOAuthAuthorizationUrl(dead, 'google');
-    panelOverlay.value = { type: 'url-preview', url: dead };
+    openOAuthAuthorizationUrl('https://accounts.google.com/o/oauth2/auth', 'google');
 
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).not.toHaveBeenCalled();
-    // …but its dead authorization page is still cleaned up.
-    expect(panelOverlay.value).toBeNull();
     expect(oauthAuthFlow.value).toBeNull();
   });
 
@@ -128,8 +124,8 @@ describe('handleOAuthAccountConnected', () => {
 
   // The regression that put a second Lucidos window on screen when an
   // authorization landed. Every window of the desktop app reports the same
-  // device id, so the device gate above cannot tell them apart; the page that
-  // handed the authorization URL to `openUrl` is the one that may come forward.
+  // device id, so the device gate above cannot tell them apart. The page that
+  // called `openOAuthAuthorizationUrl` is the one that may come forward.
   it('does not front a window that never opened an authorization page', () => {
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).not.toHaveBeenCalled();
@@ -169,22 +165,24 @@ describe('handleOAuthAccountConnected', () => {
     expect(toasts.value[0].message).toBe('dropbox connected');
   });
 
-  describe('the in-app browser panel', () => {
-    it('closes the panel showing the authorization page it opened', () => {
+  // The reported bug. The authorization page was routed into the experimental
+  // in-app browser, which providers refuse to run a sign-in flow inside. It now
+  // always leaves the app, so there is no panel of ours to close afterwards.
+  describe('the authorization page leaves the app', () => {
+    it('hands the URL to the outside-the-app opener, never the in-app panel', () => {
       openOAuthAuthorizationUrl(AUTH_URL);
-      expect(openUrl).toHaveBeenCalledWith(AUTH_URL);
-      // openUrl is mocked, so stand the panel up the way the real one would.
-      panelOverlay.value = { type: 'url-preview', url: AUTH_URL };
-
-      handleOAuthAccountConnected(connected(THIS_DEVICE));
+      expect(openUrlOutsideApp).toHaveBeenCalledWith(AUTH_URL);
       expect(panelOverlay.value).toBeNull();
-      expect(oauthAuthFlow.value).toBeNull();
     });
 
-    // Matching on the URL rather than a "flow in flight" flag is what makes
-    // this safe: an abandoned flow's stale URL can only ever match the
-    // authorization page, never whatever the user opened afterwards.
-    it('leaves an unrelated page open', () => {
+    it('still records the flow marker, which is what fronts this window later', () => {
+      openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
+      expect(oauthAuthFlow.value).toEqual({ provider: 'dropbox' });
+    });
+
+    // Whatever the panel shows is the user's own business now: an authorization
+    // never puts anything there, so nothing lands that is ours to take away.
+    it('leaves whatever the panel is showing alone', () => {
       openOAuthAuthorizationUrl(AUTH_URL);
       panelOverlay.value = { type: 'url-preview', url: 'https://example.com/other' };
 
@@ -193,14 +191,6 @@ describe('handleOAuthAccountConnected', () => {
         type: 'url-preview',
         url: 'https://example.com/other',
       });
-    });
-
-    it('leaves a non-url overlay alone', () => {
-      openOAuthAuthorizationUrl(AUTH_URL);
-      panelOverlay.value = { type: 'app-ui', app: { id: 'habit-tracker' } } as never;
-
-      handleOAuthAccountConnected(connected(THIS_DEVICE));
-      expect(panelOverlay.value).not.toBeNull();
     });
   });
 });

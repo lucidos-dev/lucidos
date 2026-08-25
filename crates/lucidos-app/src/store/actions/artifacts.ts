@@ -20,7 +20,7 @@ import { openExternalUrl } from '../../utils/openExternalUrl';
 import { DATA_PATH_PREFIXES } from '../../utils/linkifyPaths';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
-import { currentInAppBrowser } from './preferences';
+import { inAppBrowserAvailable } from './preferences';
 
 // The file-preview restore is a page-reload re-hydration step — it belongs to
 // the FIRST loadArtifacts() after a fresh load, never to the SSE-driven
@@ -221,12 +221,19 @@ export function normalizeUrl(url: string): string {
   try { return new URL(url).href; } catch { return url; }
 }
 
-/** `source` says where a navigate that the user did NOT click originated (a
- *  thread label, or "an app"), so a "couldn't open it" toast names what asked
+/** Open a URL AWAY from the app: a browser tab, or the OS default browser under
+ *  Tauri. Never the in-app url-preview panel, whatever the toggle says.
+ *
+ *  `openUrl` delegates here whenever the in-app browser is not the live target,
+ *  so each branch has one copy. Call it directly when the destination must not
+ *  be embedded at all. An OAuth authorization page is the case that named it:
+ *  providers refuse a sign-in flow inside an embedded webview.
+ *
+ *  `source` says where a navigate the user did NOT click came from (a thread
+ *  label, or "an app"). A "couldn't open it" toast then names what asked,
  *  instead of appearing out of nowhere. Same shape as `openAppById`'s. */
-export function openUrl(url: string, source?: string): void {
+export function openUrlOutsideApp(url: string, source?: string): void {
   const normalized = normalizeUrl(url);
-  const from = source ? ` (requested by ${source})` : '';
   if (!isTauri()) {
     // Browser + PWA: a new tab, except on an installed iOS PWA where that would
     // be the inescapable in-app web view. See utils/openExternalUrl.ts, which
@@ -234,16 +241,22 @@ export function openUrl(url: string, source?: string): void {
     openExternalUrl(normalized, source);
     return;
   }
-  // Experimental in-app browser (the Tauri native webview) is opt-in. Off by
-  // default → open in the system browser via the OS opener, the same path
-  // openLocalFile uses. Only when the user has enabled it do we mount the
-  // in-app url-preview panel below.
-  if (!currentInAppBrowser()) {
-    void openExternal(normalized).catch((err) =>
-      showToast(`Couldn't open ${normalized}${from}: ${errorDetail(err)}`, 'error'),
-    );
+  // The OS opener, the same path openLocalFile uses.
+  const from = source ? ` (requested by ${source})` : '';
+  void openExternal(normalized).catch((err) =>
+    showToast(`Couldn't open ${normalized}${from}: ${errorDetail(err)}`, 'error'),
+  );
+}
+
+/** Open a URL wherever the user's preferences point it. The experimental in-app
+ *  browser is opt-in and desktop-only, so it mounts the url-preview panel only
+ *  when it is the live target. Everything else goes to `openUrlOutsideApp`. */
+export function openUrl(url: string, source?: string): void {
+  if (!inAppBrowserAvailable()) {
+    openUrlOutsideApp(url, source);
     return;
   }
+  const normalized = normalizeUrl(url);
   localStorage.removeItem('file-preview-open');
   panelOverlay.value = { type: 'url-preview', url: normalized };
   webviewInitialUrl.value = normalized;

@@ -119,8 +119,8 @@ export function handleNavigationRequest(nav: {
   line_end?: number;
   url?: string;
   /** Why this URL is being opened. Only `'oauth'` is meaningful today: it marks
-   *  an authorization page whose in-app panel should close once the flow lands.
-   *  Absent for every ordinary link. */
+   *  an authorization page, which always leaves the app and is recorded so the
+   *  completion can front this window. Absent for every ordinary link. */
   purpose?: string;
   id?: string;
   event_id?: string;
@@ -335,10 +335,11 @@ export function handleNavigationRequest(nav: {
         break;
       }
       // `purpose: 'oauth'` marks the one URL that has an end: an authorization
-      // page the provider will redirect to the loopback callback. Recording it
-      // is what lets `handleOAuthAccountConnected` close the in-app browser
-      // panel afterwards, instead of leaving the user on a dead callback page
-      // inside the app. Every other URL is just opened.
+      // page the provider will redirect to the loopback callback. It always
+      // goes to the OS browser, since providers refuse a sign-in flow in an
+      // embedded webview. Recording it is what lets
+      // `handleOAuthAccountConnected` front this window afterwards. Every other
+      // URL opens wherever the user's preferences point it.
       if (nav.purpose === 'oauth') {
         openOAuthAuthorizationUrl(nav.url);
       } else {

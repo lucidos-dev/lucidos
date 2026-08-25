@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.30.1 — 2026-08-25
+
+### Fixed
+- Navigating back to a pending form returns to the form. Email confirmations, credential requests and plugin install or uninstall prompts all restore over the panel they were raised from.
+- An OAuth authorization page opens in your browser when the experimental in-app browser is on.
 ## v0.30.0 — 2026-08-25
 
 ### Added

@@ -20,7 +20,7 @@ type SaveResult = { success: boolean; error?: string };
 const createCredential = vi.fn(async (..._a: unknown[]): Promise<SaveResult> => ({ success: true }));
 const updateCredential = vi.fn(async (..._a: unknown[]): Promise<SaveResult> => ({ success: true }));
 const listCredentials = vi.fn(async () => ({ credentials: [] }));
-const openUrl = vi.fn();
+const openUrlOutsideApp = vi.fn();
 
 vi.mock('../../api/client', () => ({
   reauthorizeOAuth: (...a: unknown[]) => reauthorizeOAuth(...a),
@@ -33,7 +33,7 @@ vi.mock('../../api/client', () => ({
   deleteCredentialApi: vi.fn(),
   listCredentials: () => listCredentials(),
 }));
-vi.mock('./artifacts', () => ({ openUrl: (...a: unknown[]) => openUrl(...a) }));
+vi.mock('./artifacts', () => ({ openUrlOutsideApp: (...a: unknown[]) => openUrlOutsideApp(...a) }));
 vi.mock('./devices', () => ({ getDeviceId: () => 'device-1' }));
 vi.mock('../../utils/platform', () => ({ isIOSPwa: () => false, isTauri: () => false }));
 vi.mock('../../utils/tauri', () => ({ focusCallingWindow: vi.fn() }));
@@ -64,7 +64,7 @@ describe('a saved registration continues the connection it was blocking', () => 
   it('runs the authorization the user actually pressed Connect for', async () => {
     reauthorizeOAuth.mockResolvedValueOnce(needsCredentials());
     expect(await grantOAuthScope('dropbox', 'files.content.write')).toBe(false);
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(openUrlOutsideApp).not.toHaveBeenCalled();
 
     reauthorizeOAuth.mockResolvedValueOnce(AUTHORIZES);
     await submitRequestedCredential(
@@ -78,7 +78,7 @@ describe('a saved registration continues the connection it was blocking', () => 
     // The same provider and the same scopes: a continuation that dropped the
     // purpose would connect a bare sign-in and send the user back to Backup.
     expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', 'files.content.write');
-    expect(openUrl).toHaveBeenCalledWith('https://dropbox.test/authorize?x=1');
+    expect(openUrlOutsideApp).toHaveBeenCalledWith('https://dropbox.test/authorize?x=1');
   });
 
   it('does not fire twice for one press', async () => {
@@ -99,7 +99,7 @@ describe('a saved registration continues the connection it was blocking', () => 
 
     // One queued continuation, consumed once. Re-running would race the
     // engine's single live authorization and open a second browser tab.
-    expect(openUrl).toHaveBeenCalledTimes(1);
+    expect(openUrlOutsideApp).toHaveBeenCalledTimes(1);
   });
 
   it('starts nothing when the user dismisses the form', async () => {
@@ -116,7 +116,7 @@ describe('a saved registration continues the connection it was blocking', () => 
       '{"client_id":"abc"}',
     );
 
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(openUrlOutsideApp).not.toHaveBeenCalled();
   });
 
   it('is not consumed by an unrelated credential saved later', async () => {
@@ -135,7 +135,7 @@ describe('a saved registration continues the connection it was blocking', () => 
       'secret',
     );
 
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(openUrlOutsideApp).not.toHaveBeenCalled();
   });
 
   it('does not continue when the save failed', async () => {
@@ -152,7 +152,7 @@ describe('a saved registration continues the connection it was blocking', () => 
       '{"client_id":"abc"}',
     );
 
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(openUrlOutsideApp).not.toHaveBeenCalled();
   });
 });
 

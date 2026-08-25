@@ -528,12 +528,14 @@ describe('wipPreviewThreadId is a nav-tracked axis', () => {
 // Unlike the pure-logic suites above (which duplicate the stack math), this one
 // exercises the REAL restoreState() path: seed the persisted nav stack in
 // localStorage, import the navigation + store modules fresh, then trigger
-// ensureInitialized() → restoreState() by reading a nav computed. It pins the
-// fix that a transient, request-backed form overlay (plugin install/uninstall,
-// email-confirm, engine-prompted credential) is NOT resurrected on reload — its
-// staged request id is dead — while persistent forms and the scalar nav fields
-// still restore.
-describe('restoreState suppresses transient request-backed form overlays on reload', () => {
+// ensureInitialized() → restoreState() by reading a nav computed.
+//
+// Every entry restores its overlay, a PENDING form included. There are no
+// transient navigations (ADR 0127). The guard that used to null a pending form
+// claimed its staged request died with the page. Nothing of the sort is staged:
+// the email and credential forms carry no request id at all, and the plugin
+// ones are staged on the engine, which a reload never touches.
+describe('restoreState restores every entry overlay on reload', () => {
   // Mirrors NAV_KEY in entityReferences.ts (the key restoreState reads/writes).
   const NAV_KEY = 'lucidos-nav-history';
 
@@ -569,14 +571,14 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     return store;
   }
 
-  it('drops a stale plugin-uninstall overlay while still restoring menuItem + settingsSubview', async () => {
+  it('restores a PENDING plugin-uninstall, with its menuItem + settingsSubview', async () => {
     const store = await restoreWithOverlay(
       {
         type: 'form',
         form: {
           type: 'plugin-uninstall',
           request: {
-            uninstall_id: 'u-dead-uuid',
+            uninstall_id: 'u-live-uuid',
             plugin_id: 'habit-tracker',
             plugin_version: '1.0.0',
             plugin_name: 'Habit Tracker',
@@ -587,20 +589,20 @@ describe('restoreState suppresses transient request-backed form overlays on relo
       },
       { menuItem: 'settings', settingsSubview: 'accounts' },
     );
-    // The stale uninstall panel is NOT resurrected …
-    expect(store.panelOverlay.value).toBeNull();
-    // … but the scalar nav fields still restore.
+    // The staged uninstall lives in the engine's `pending_uninstalls` map, which
+    // a browser reload does not touch, so Confirm still resolves it.
+    expect(store.activeInlineForm.value?.type).toBe('plugin-uninstall');
     expect(store.activeMenuItem.value).toBe('settings');
     expect(store.settingsSubview.value).toBe('accounts');
   });
 
-  it('drops a stale plugin-install overlay', async () => {
+  it('restores a PENDING plugin-install', async () => {
     const store = await restoreWithOverlay({
       type: 'form',
       form: {
         type: 'plugin-install',
         request: {
-          install_id: 'i-dead-uuid',
+          install_id: 'i-live-uuid',
           source: 'git://example.com/habit-tracker',
           source_type: 'git',
           manifest: {},
@@ -612,25 +614,24 @@ describe('restoreState suppresses transient request-backed form overlays on relo
         },
       },
     });
-    expect(store.panelOverlay.value).toBeNull();
+    expect(store.activeInlineForm.value?.type).toBe('plugin-install');
   });
 
-  it('restores a plugin-uninstall RECEIPT, which has nothing left to resolve', async () => {
+  it('restores a plugin-uninstall RECEIPT', async () => {
     const store = await restoreWithOverlay({
       type: 'form',
       form: {
         type: 'plugin-uninstall',
         request: {
-          uninstall_id: 'u-dead-uuid',
+          uninstall_id: 'u-spent-uuid',
           plugin_id: 'habit-tracker',
           plugin_version: '1.0.0',
           plugin_name: 'Habit Tracker',
           files_present: ['data/apps/habit-tracker/manifest.json'],
           files_missing: [],
         },
-        // The files are already gone, so the dead `uninstall_id` costs nothing:
-        // the panel is a record, not a request, and the row is a real
-        // destination the user can walk back to.
+        // The files are already gone, so the panel is a record rather than a
+        // request. It restores like every other entry, for a second reason.
         removed: {
           at: '2026-08-06T10:00:00.000Z',
           summary: 'Removed Habit Tracker',
@@ -649,7 +650,7 @@ describe('restoreState suppresses transient request-backed form overlays on relo
       form: {
         type: 'plugin-install',
         request: {
-          install_id: 'i-dead-uuid',
+          install_id: 'i-spent-uuid',
           source: 'git://example.com/habit-tracker',
           source_type: 'git',
           manifest: {},
@@ -670,24 +671,25 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     expect(store.activeInlineForm.value?.type).toBe('plugin-install');
   });
 
-  it('drops a stale PENDING email-confirm overlay', async () => {
-    const store = await restoreWithOverlay({
-      type: 'form',
-      form: {
-        type: 'email-confirm',
-        request: {
-          to: ['someone@example.com'],
-          subject: 'Hello',
-          body: 'staged body',
-          account: 'work',
-          from: 'me@example.com',
-        },
+  // The bug the user reported, in its reload form. The draft IS the request:
+  // `EmailConfirmRequest` has no id, and Send posts the whole draft. So there is
+  // nothing on either side to go stale.
+  it('restores a PENDING email-confirm', async () => {
+    const form = {
+      type: 'email-confirm' as const,
+      request: {
+        to: ['someone@example.com'],
+        subject: 'Hello',
+        body: 'the draft, still unsent',
+        account: 'work',
+        from: 'me@example.com',
       },
-    });
-    expect(store.panelOverlay.value).toBeNull();
+    };
+    const store = await restoreWithOverlay({ type: 'form', form });
+    expect(store.panelOverlay.value).toEqual({ type: 'form', form });
   });
 
-  it('restores a SENT email-confirm receipt — nothing is left to resolve', async () => {
+  it('restores a SENT email-confirm receipt', async () => {
     const form = {
       type: 'email-confirm' as const,
       request: {
@@ -700,18 +702,18 @@ describe('restoreState suppresses transient request-backed form overlays on relo
       sentAt: '2026-07-29T09:15:00.000Z',
     };
     const store = await restoreWithOverlay({ type: 'form', form });
-    // A receipt is a record of a completed send, not a staged request — it is a
-    // real history destination and must survive a reload. (The pending case
-    // above is the one whose engine-side draft dies with the page.)
     expect(store.panelOverlay.value).toEqual({ type: 'form', form });
   });
 
-  it('drops an engine-prompted credential request (credential form WITH a request)', async () => {
-    const store = await restoreWithOverlay({
+  // `CredentialRequest` is a pre-fill descriptor and carries no id either. The
+  // form is filled and saved locally, so it survives a reload like any other.
+  it('restores an engine-prompted credential request (credential form WITH a request)', async () => {
+    const overlay: PanelOverlay = {
       type: 'form',
       form: { type: 'credential', request: { service: 'example-service' } },
-    });
-    expect(store.panelOverlay.value).toBeNull();
+    };
+    const store = await restoreWithOverlay(overlay);
+    expect(store.panelOverlay.value).toEqual(overlay);
   });
 
   it('restores a Settings-driven credential edit (credential form WITHOUT a request)', async () => {
@@ -737,5 +739,91 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     const store = await restoreWithOverlay(overlay);
     expect(store.panelOverlay.value).toEqual(overlay);
     expect(localStorage.getItem('file-preview-open')).toBe(overlay.path);
+  });
+});
+
+// The reported bug, at the layer it lives in. A pending email confirm opened on
+// top of Settings, Access. Walking history back to it showed Access instead: the
+// overlay was nulled while `menuItem` and `settingsSubview` still applied, so
+// the user landed on the bare panel underneath. A SENT confirm walked correctly,
+// which is what isolated the guard.
+describe('walking history reaches a pending email-confirm', () => {
+  const NAV_KEY = 'lucidos-nav-history';
+
+  const PENDING_CONFIRM: PanelOverlay = {
+    type: 'form',
+    form: {
+      type: 'email-confirm',
+      request: {
+        to: ['someone@example.com'],
+        subject: 'Quarterly numbers',
+        body: 'the draft, still unsent',
+        account: 'work',
+        from: 'me@example.com',
+      },
+    },
+  };
+
+  /** The stack the report describes: Settings/Access bare, the confirm opened on
+   *  top of it, then the user moves on to Files. Cursor starts at Files. */
+  const STACK = [
+    { menuItem: 'settings', settingsSubview: 'accounts', overlay: null, wipPreviewThreadId: null },
+    { menuItem: 'settings', settingsSubview: 'accounts', overlay: PENDING_CONFIRM, wipPreviewThreadId: null },
+    { menuItem: 'files', settingsSubview: 'main', overlay: null, wipPreviewThreadId: null },
+  ];
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  async function seeded(cursor: number) {
+    localStorage.setItem(NAV_KEY, JSON.stringify({ stack: STACK, cursor }));
+    const nav = await import('./navigation');
+    const store = await import('../store');
+    void nav.canGoBack.value;
+    return { nav, store };
+  }
+
+  it('navBack lands on the confirm, not the panel underneath', async () => {
+    const { nav, store } = await seeded(2);
+    nav.navBack();
+    expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
+    expect(store.activeMenuItem.value).toBe('settings');
+    expect(store.settingsSubview.value).toBe('accounts');
+  });
+
+  it('navForward lands on the confirm', async () => {
+    const { nav, store } = await seeded(0);
+    nav.navForward();
+    expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
+  });
+
+  // The path the user actually took: the nav-history popover, which jumps to an
+  // absolute index rather than stepping.
+  it('navGoTo lands on the confirm', async () => {
+    const { nav, store } = await seeded(2);
+    nav.navGoTo(1);
+    expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
+  });
+
+  it('walking away and back returns to the confirm', async () => {
+    const { nav, store } = await seeded(1);
+    nav.navForward();
+    expect(store.panelOverlay.value).toBeNull();
+    nav.navBack();
+    expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
+  });
+
+  // Nothing sanitizes the persisted stack at load: no entry is stripped, none is
+  // dropped, and the cursor is exactly what was written.
+  it('leaves the persisted stack and cursor untouched at load', async () => {
+    const { nav } = await seeded(2);
+    expect(nav.navHistory.value.stack).toEqual(STACK);
+    expect(nav.navHistory.value.cursor).toBe(2);
   });
 });

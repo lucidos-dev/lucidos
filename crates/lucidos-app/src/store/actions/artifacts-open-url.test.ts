@@ -18,7 +18,7 @@ vi.mock('../../utils/platform', () => ({
 }));
 
 // openExternal is the OS opener (system browser). setTitlebarColor is unused
-// here but the real preferences module (loaded via artifacts → currentInAppBrowser)
+// here but the real preferences module (loaded via artifacts → inAppBrowserAvailable)
 // imports it from this module, so the mock must provide it.
 const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
@@ -33,7 +33,7 @@ const postClientLog = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
 // Imports must come after vi.mock so the mocked deps are wired in.
-const { openUrl } = await import('./artifacts');
+const { openUrl, openUrlOutsideApp } = await import('./artifacts');
 
 // jsdom doesn't implement window.open, so stub it as a global rather than
 // spying on a non-existent property. It returns a window handle by default:
@@ -48,7 +48,7 @@ const TARGET_URL = 'https://example.com/';
 const APP_URL = 'https://app.example.com/ws/dev/';
 let fakeLocation: { href: string };
 
-describe('openUrl — system browser vs in-app webview routing', () => {
+describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing', () => {
   beforeEach(() => {
     panelOverlay.value = null;
     webviewInitialUrl.value = null;
@@ -148,5 +148,43 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     expect(pushNavState).toHaveBeenCalledTimes(1);
     expect(openExternal).not.toHaveBeenCalled();
     expect(window.location.href).toBe(APP_URL);
+  });
+
+  // The reported bug: an OAuth authorization page opened inside the in-app
+  // browser and rendered nothing. Providers refuse a sign-in flow in an
+  // embedded webview, so `openOAuthAuthorizationUrl` calls this instead of
+  // `openUrl` and the toggle gets no vote.
+  it('openUrlOutsideApp, Tauri + toggle ON: the OS opener, and no panel', () => {
+    platformMocks.isTauri = true;
+    preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+
+    openUrlOutsideApp(TARGET_URL);
+
+    expect(openExternal).toHaveBeenCalledWith(TARGET_URL);
+    expect(panelOverlay.value).toBeNull();
+    expect(webviewInitialUrl.value).toBeNull();
+    expect(pushNavState).not.toHaveBeenCalled();
+    expect(window.open).not.toHaveBeenCalled();
+  });
+
+  // Web and PWA are unchanged: still a tab, still `openExternalUrl`'s toast on
+  // a refused popup.
+  it('openUrlOutsideApp, non-Tauri: a new tab, never the OS opener', () => {
+    platformMocks.isTauri = false;
+
+    openUrlOutsideApp(TARGET_URL);
+
+    expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank');
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(panelOverlay.value).toBeNull();
+  });
+
+  it('openUrlOutsideApp, non-Tauri + popup blocked: the toast names the source', () => {
+    platformMocks.isTauri = false;
+    windowOpen.mockReturnValue(null);
+
+    openUrlOutsideApp(TARGET_URL, 'thread "Weekly report"');
+
+    expect(toasts.value[0].message).toContain('(requested by thread "Weekly report")');
   });
 });

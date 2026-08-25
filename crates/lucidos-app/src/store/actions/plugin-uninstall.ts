@@ -45,10 +45,9 @@ export function uninstallMarketplacePlugin(plugin: MarketplacePlugin): Promise<v
 
 /** The uninstall succeeded: turn the open panel into a read-only receipt in
  *  place, instead of closing it and revealing whatever was underneath. That
- *  receipt is what makes the uninstall a real destination in the content nav
- *  history. Without it the row keeps pointing at a staged `uninstall_id` the
- *  engine has already popped, so walking back onto it lands on the bare menu
- *  item and a reload drops it entirely (`isTransientForm`).
+ *  receipt is what the nav-history row shows from then on, on a Back walk and
+ *  on a reload alike. Without it the row keeps pointing at a staged
+ *  `uninstall_id` the engine has already popped.
  *
  *  The engine's own partition is baked into the marker, not recomputed from
  *  `form.request`: `files_present` was only what existed at prepare time, and
