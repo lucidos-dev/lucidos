@@ -11,6 +11,7 @@ import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
 import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
+import { installNativeCursor } from './utils/nativeCursor';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
@@ -70,6 +71,9 @@ installActionBtnBlurListener();
 installNoAutofill();
 installNoDrag();
 installNoFunctionKeyText();
+// Packaged desktop only: hand the native window the cursor the hovered element
+// asks for, so AppKit stops overwriting WebKit's (utils/nativeCursor.ts).
+installNativeCursor();
 // Both render roots, so a near-miss drop cannot navigate the picker document
 // either (utils/strayFileDrop.ts).
 installStrayFileDropGuard();

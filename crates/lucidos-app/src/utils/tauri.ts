@@ -137,6 +137,18 @@ export function toggleWindowMaximize(): Promise<void> {
 }
 
 /**
+ * Point the CALLING window's native cursor at a CSS cursor keyword (Rust
+ * `cursor::set_window_cursor`). The keyword travels verbatim, because the one
+ * table that turns it into a native icon lives in `src/cursor.rs` and this side
+ * deliberately holds none.
+ *
+ * Called by the reconciler in `utils/nativeCursor.ts`, which is where the whole
+ * mechanism is explained. Only call when isTauri() is true. */
+export function setWindowCursor(cursor: string): Promise<void> {
+  return invoke('set_window_cursor', { cursor });
+}
+
+/**
  * Name the CALLING window (lib.rs `set_window_title`), so the macOS Window menu
  * tells two windows apart by the workspace each is showing.
  *

@@ -10,6 +10,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 mod config_scalar;
+mod cursor;
 mod desktop;
 mod device_id_store;
 mod mobile;
@@ -2177,6 +2178,7 @@ pub fn run() {
             start_window_drag,
             toggle_window_maximize,
             set_window_title,
+            cursor::set_window_cursor,
             open_workspace_window,
             mobile::get_connect_info,
             mobile::tailscale_up,

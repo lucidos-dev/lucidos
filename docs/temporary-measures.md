@@ -675,6 +675,30 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   requires surfacing.
 - **Status:** active
 
+### Native cursor mirroring
+
+- **Added:** 2026-08-25
+- **Lives in:** five sites, all under `crates/lucidos-app/`.
+  - `src/cursor.rs`, the keyword table and the `set_window_cursor` command
+  - that command's entries in `permissions/app-ipc.json` and `generate_handler!`
+  - `src/utils/nativeCursor.ts`, the reconciler, and its two test files
+  - the `installNativeCursor()` call in `src/main.tsx`
+  - the `setWindowCursor` wrapper in `src/utils/tauri.ts`
+- **Impermanent because:** `tao` gives its content view a cursor rect spanning
+  the whole view, carrying the window's own icon, which is the arrow. AppKit
+  re-asserts that rect as the mouse moves, while WebKit sets the cursor from CSS
+  on the same moves. Two writers, one cursor, so the glyph flickers and the
+  arrow usually wins. A trackpad reports far more movement than a mouse, which
+  is why a pane divider read as an arrow almost always. Upstream tracks it as
+  wry #175 and tao #386, both labelled blocked on upstream.
+- **Removal / resolution condition:** When the `tao` we ship stops laying an
+  arrow cursor rect over the webview, or otherwise lets WebKit own the cursor.
+  Verify by deleting the `installNativeCursor()` call, then hovering a divider,
+  a button and a text field. In the packaged app each glyph must hold still
+  under trackpad movement. Then drop every site above. ADR 0129 records the
+  design and the alternatives.
+- **Status:** active
+
 ---
 
 ## 2. Model-tolerance measures

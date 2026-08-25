@@ -178,6 +178,8 @@ export function UrlPreviewInline({ url, layout }: Props) {
         <iframe
           src={url}
           class="url-preview-frame"
+          // No allow-downloads: this frame renders an arbitrary EXTERNAL page,
+          // never our own app content, so it must not be able to start one.
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
           referrerpolicy="no-referrer"
         />

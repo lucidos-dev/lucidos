@@ -37,6 +37,7 @@
           "start_window_drag",
           "toggle_window_maximize",
           "set_window_title",
+          "set_window_cursor",
           "open_workspace_window",
           "get_connect_info",
           "tailscale_up",

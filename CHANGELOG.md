@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.30.2 — 2026-08-25
+
+### Fixed
+- Downloads work from inside an app UI. A download link in an app saves the file, whether it points at a same-origin URL, a blob, or a data URL.
+- The desktop window shows the cursor the page asks for. A pane divider gives the resize cursor, a text field the I-beam, and a link the pointing hand, however you move the mouse.
 ## v0.30.1 — 2026-08-25
 
 ### Fixed

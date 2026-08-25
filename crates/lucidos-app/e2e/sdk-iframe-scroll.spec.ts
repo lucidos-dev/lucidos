@@ -16,7 +16,7 @@ let fixture: { cleanup: () => void };
 const iframeHtml = (appId: string) => `<!DOCTYPE html>
 <html><body>
 <iframe id="app-frame" src="${appPath(appId)}"
-  sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
+  sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox allow-downloads"
   style="width:600px;height:400px;border:0"></iframe>
 </body></html>`;
 

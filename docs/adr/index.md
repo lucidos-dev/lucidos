@@ -136,3 +136,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0126: A git clone credential comes from the credential store, never an environment variable](0126-git-clone-credentials-come-from-the-credential-store.md)
 - [0127: Every panel-nav entry restores its overlay; there are no transient navigations](0127-nav-entries-are-never-transient.md)
 - [0128: An OAuth authorization page always opens outside the app, whatever the in-app browser toggle says](0128-oauth-authorization-always-leaves-the-app.md)
+- [0129: Mirror the page's CSS cursor onto the native window](0129-native-cursor-mirroring.md)

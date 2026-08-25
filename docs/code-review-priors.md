@@ -796,6 +796,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only with a client that demonstrably types such a glyph, or with
   evidence the fallthrough cannot reach a browser.
 
+- **The native cursor mirror needs no blur reset, and a blur reset would be
+  worse than the gap it closes.** A reviewer reading `utils/nativeCursor.ts`
+  observes that a Cmd-Tab away fires no `pointerout`, so a `col-resize` ask can
+  outlive the hover. Codex flagged it as P2 on the branch that added the file.
+
+  An `NSWindow` cursor rect governs that window alone, so nothing our window
+  asked for can reach another application's window. Whatever is under the
+  pointer over there sets its own. Coming back cannot land the pointer on a
+  different element either, because a Cmd-Tab moves no pointer, so the ask is
+  still the right one.
+
+  The proposed remedy introduces the wrong state it was meant to prevent. On
+  blur the pointer is still over the divider. Resetting to the arrow therefore
+  makes the glyph wrong the moment focus returns, until the user moves a pixel.
+  Every case a blur listener could catch is one where a pointer move follows,
+  and a move re-resolves the cursor on its own. Re-flag with a path that leaves
+  the window's cursor wrong AFTER a pointer move.
+
 ## Frontend
 
 - **`answerableQuestionId` reads the DOM rather than the thread projection, and

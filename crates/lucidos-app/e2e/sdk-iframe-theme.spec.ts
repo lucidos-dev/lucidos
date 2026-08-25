@@ -74,7 +74,7 @@ waitForLucidos();
 <iframe
   id="app-frame"
   src="${appPath(APP_ID)}"
-  sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
+  sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox allow-downloads"
   style="width:600px;height:400px;border:0"></iframe>
 <script>
   // Mirror the parent Lucidos app — open an EventSource so connection-limit

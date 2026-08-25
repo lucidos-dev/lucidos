@@ -82,7 +82,7 @@ function AppFrame({ src }: { src: string }) {
         data-role="app-ui-frame"
         class="app-ui-iframe"
         src={initialSrc}
-        sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
+        sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox allow-downloads"
         allow="autoplay; fullscreen; encrypted-media"
         onLoad={() => setLoaded(true)}
       />
