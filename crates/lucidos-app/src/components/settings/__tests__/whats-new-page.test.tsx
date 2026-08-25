@@ -2,9 +2,9 @@
 // This file renders markdown, and the sanitizer runs on a real DOM.
 // The default `node` environment has none.
 /**
- * Settings > System > What's New: the four decisions the panel makes, all
- * pulled out as pure functions so they can be held here rather than inferred
- * from a component that reads a hook.
+ * Settings > System > What's New: every decision the panel makes. Each is a
+ * pure function, so a test can hold it rather than infer it from a component
+ * that reads a hook.
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -12,6 +12,7 @@ import {
   releaseNotesBody,
   offeredRelease,
   releaseRowAction,
+  releaseRowMark,
   releaseRowStatus,
   stripReleaseHeading,
   defaultOpenRelease,
@@ -277,15 +278,35 @@ describe('releaseRowAction', () => {
     expect(releaseRowAction('available', false)).toBeNull();
   });
 
-  // The updater installs whatever the manifest resolves, so a row cannot ask
-  // for a version by name. A check is what could turn this row into an offer.
-  it('offers a check for a published release the updater has not offered', () => {
-    expect(releaseRowAction('newer', true)).toBe('check');
-    expect(releaseRowAction('newer', false)).toBe('check');
+  // A check is a global question, so per row it repeats itself down the list
+  // and answers nothing the Available row above has not. The one check is in
+  // Settings, System.
+  it('offers nothing on a published release the updater has not offered', () => {
+    expect(releaseRowAction('newer', true)).toBeNull();
+    expect(releaseRowAction('newer', false)).toBeNull();
   });
 
   it('offers nothing on the running release or an older one', () => {
     expect(releaseRowAction('running', true)).toBeNull();
     expect(releaseRowAction('none', true)).toBeNull();
+  });
+});
+
+describe('releaseRowMark', () => {
+  // The report: an Available chip beside an Update button says one thing twice.
+  it('drops the chip from a row that carries the install', () => {
+    expect(releaseRowMark('available', 'install')).toBeNull();
+  });
+
+  // A browser or PWA session has no button, so the chip is the only thing left
+  // saying the release is there.
+  it('keeps the chip where the row has no control', () => {
+    expect(releaseRowMark('available', null)).toBe('available');
+    expect(releaseRowMark('newer', null)).toBe('newer');
+    expect(releaseRowMark('running', null)).toBe('running');
+  });
+
+  it('marks nothing on a release older than the running one', () => {
+    expect(releaseRowMark('none', null)).toBeNull();
   });
 });

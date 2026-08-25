@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import { releaseNoticeRows } from '../ReleaseNoticesSection';
 import type { ReleaseNotice, ReleaseNoticeView } from '../../../api/client';
+
+const SECTION = readFileSync(
+  fileURLToPath(new URL('../ReleaseNoticesSection.tsx', import.meta.url)), 'utf8',
+);
 
 function notice(id: string, since: string, resolved: boolean): ReleaseNotice {
   return { id, since, title: `Notice ${id}`, body: 'Do the thing.', resolved };
@@ -52,5 +60,39 @@ describe('the What you need to do rows', () => {
 
   it('has nothing to show for a workspace with no notices', () => {
     expect(shape(view([], null))).toEqual([]);
+  });
+});
+
+/**
+ * Every unresolved notice can be answered from here, action or no action.
+ *
+ * `action_label` is optional in `release-notices.toml`, and the actions block
+ * used to hang off it. A notice carrying none could then be answered only in
+ * the modal, which Escape closes for the page's life. The *What's New badge*
+ * points at this panel, so the reader would have arrived at a dot with nothing
+ * to press.
+ *
+ * A source scan rather than a render: the section fetches on mount and pulls
+ * the store in, the reason `settings-nav-structure.test.ts` gives.
+ */
+describe('answering a notice from the panel', () => {
+  it('offers Got it on every unresolved row, not only one carrying an action', () => {
+    expect(SECTION).toContain("{state !== 'resolved' && (");
+    expect(SECTION).toContain('acknowledgeReleaseNotice(notice)');
+  });
+
+  it('keeps the action button conditional on the notice authoring one', () => {
+    expect(SECTION).toContain('{notice.action_label && (');
+  });
+
+  // The glossary promises an answered notice keeps its button: "Answered
+  // notices stay readable under What you need to do, with their buttons."
+  it('leaves a resolved row its action button', () => {
+    expect(SECTION).toContain("{(notice.action_label || state !== 'resolved') && (");
+  });
+
+  it('leaves both buttons dead while the row is queued', () => {
+    // The ordering rule: a later notice cannot be answered before its turn.
+    expect(SECTION.match(/disabled=\{state === 'queued'\}/g) ?? []).toHaveLength(2);
   });
 });

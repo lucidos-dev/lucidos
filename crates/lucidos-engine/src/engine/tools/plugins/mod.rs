@@ -1122,16 +1122,28 @@ pub async fn confirm_pending_install(
     // `PluginInstalled` event isn't emitted until `install_from_unpacked_with_bus`
     // below. A read error is non-fatal: fall back to treating the staged setup
     // as new (spawn) so a transient DB hiccup never silently skips real setup.
-    let prior_setup = match latest_install(&engine.pool, &pending.plugin_id).await {
-        Ok(rec) => rec.and_then(|r| r.setup().map(str::to_string)),
+    // One lookup answers two questions: whether the setup text is new, and
+    // whether this is a re-run. A record at all is what makes it a re-run, and
+    // the setup thread's seed says so. A failed read costs both answers, so an
+    // update then seeds the first-install line. That is the same direction as
+    // the fallback above: run the setup in full rather than half of it.
+    let prior = match latest_install(&engine.pool, &pending.plugin_id).await {
+        Ok(rec) => rec,
         Err(e) => {
             log!(
-                "[Plugins] prior-setup lookup failed for '{}' (treating setup as new): {}",
+                "[Plugins] prior-install lookup failed for '{}' (treating setup as new): {}",
                 pending.plugin_id,
                 e
             );
             None
         }
+    };
+    let prior_setup = prior.as_ref().and_then(|r| r.setup()).map(str::to_string);
+    let occasion = match &prior {
+        Some(rec) => SetupOccasion::Update {
+            from: rec.version().map(str::to_string),
+        },
+        None => SetupOccasion::FreshInstall,
     };
     let setup_thread_id =
         setup_is_new(pending.setup.as_deref(), prior_setup.as_deref()).then(uuid::Uuid::new_v4);
@@ -1204,7 +1216,7 @@ pub async fn confirm_pending_install(
     // `system-knowhow/plugin-setup`, see `build_setup_thread_request`); the id
     // flows back so the frontend can navigate the user straight to it.
     if let (Some(_setup), Some(thread_id)) = (pending.setup.as_deref(), setup_thread_id) {
-        spawn_plugin_setup_thread(engine, thread_id, &pending.plugin_name, actor).await;
+        spawn_plugin_setup_thread(engine, thread_id, &pending.plugin_name, &occasion, actor).await;
     }
 
     Ok(ConfirmedInstall {
@@ -1434,10 +1446,29 @@ async fn spawn_plugin_setup_thread(
     engine: &LucidosEngine,
     thread_id: uuid::Uuid,
     plugin_name: &str,
+    occasion: &SetupOccasion,
     actor: Option<MessageOrigin>,
 ) {
-    let request = build_setup_thread_request(thread_id, plugin_name);
+    let request = build_setup_thread_request(thread_id, plugin_name, occasion);
     engine.thread_queue.submit(request, actor, None).await;
+}
+
+/// Why a setup thread is being spawned, which is what its seed and title say.
+///
+/// A separate type rather than an `Option<version>`, because the version is
+/// decoration and the occasion is the fact. A legacy `PluginInstalled` row can
+/// name no version at all, and `installed_plugin_summaries` shows those as
+/// `unknown`. Collapsing the two would seed such an update as a first install.
+/// The agent would then skip the whole reuse step and re-ask everything, which
+/// is the failure this occasion exists to prevent.
+#[derive(Debug)]
+enum SetupOccasion {
+    FreshInstall,
+    /// The plugin was already installed. `from` is the version it was on, when
+    /// the prior record names one.
+    Update {
+        from: Option<String>,
+    },
 }
 
 /// Build the Thread Queue request for a plugin setup thread. Pure (no engine,
@@ -1451,18 +1482,44 @@ async fn spawn_plugin_setup_thread(
 /// prompt's load-knowhow nudge), and the plugin author's own `setup` text is
 /// referenced from the durable `PluginInstalled` event — neither is embedded
 /// here, so the user isn't shown a wall of agent instructions.
+///
+/// An update says so in both the seed and the title. The agent then picks up
+/// where the last run left off instead of starting over, and the thread list
+/// stops showing the same name twice.
+///
+/// Two words are load-bearing across layers. Every seed keeps the verb `set
+/// up`, which the system-prompt route and the knowhow's `description` key on.
+/// Every update seed says `again`, which is how the knowhow tells the two
+/// occasions apart.
 fn build_setup_thread_request(
     thread_id: uuid::Uuid,
     plugin_name: &str,
+    occasion: &SetupOccasion,
 ) -> crate::engine::thread_queue::ThreadQueueRequest {
-    let prompt = format!("Set up the newly installed {plugin_name} plugin.");
+    let (prompt, title) = match occasion {
+        SetupOccasion::Update { from: Some(prior) } => (
+            format!(
+                "Set up {plugin_name} again: its setup instructions changed \
+                 since version {prior}."
+            ),
+            format!("Update {plugin_name} setup"),
+        ),
+        SetupOccasion::Update { from: None } => (
+            format!("Set up {plugin_name} again: this update changed its setup instructions."),
+            format!("Update {plugin_name} setup"),
+        ),
+        SetupOccasion::FreshInstall => (
+            format!("Set up the newly installed {plugin_name} plugin."),
+            format!("Set up {plugin_name}"),
+        ),
+    };
 
     crate::engine::thread_queue::ThreadQueueRequest::SubThread {
         prompt,
         child_thread_id: thread_id,
         parent_thread_id: None,
         spawning_event_id: None,
-        title: Some(format!("Set up {plugin_name}")),
+        title: Some(title),
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
@@ -1760,6 +1817,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
     }
 
     bus.emit(BusEvent::System(SystemEvent::PluginInstalled {
+        id: manifest.id.clone(),
         manifest: serde_json::Value::Object(payload),
         files: installed_files.clone(),
         installed_at,

@@ -50,11 +50,15 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         .build()?;
 
     let base = match args.port {
-        Some(p) => find_gateway(&client, &[p])
+        Some(p) => find_gateways(&client, &[p])
+            .into_iter()
+            .next()
+            .map(|g| g.base)
             .ok_or_else(|| -> BoxError { format!("no gateway answered on port {p}").into() })?,
-        None => find_gateway(&client, &candidate_ports()).ok_or_else(|| -> BoxError {
-            "no gateway found. Start one, or pass --port if it is on an unusual port".into()
-        })?,
+        None => {
+            let found = find_gateways(&client, &candidate_ports());
+            choose_gateway(&found, dev_port_override())?
+        }
     };
 
     let token = lucidos_local_token::read().ok_or_else(|| -> BoxError {
@@ -273,11 +277,17 @@ fn colorize(block: &str, plain: bool) -> String {
 
 /// Ports to probe: the dev override from the environment, then the defaults.
 fn candidate_ports() -> Vec<u16> {
-    candidate_ports_from(
-        std::env::var("LUCIDOS_DEV_GATEWAY_PORT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u16>().ok()),
-    )
+    candidate_ports_from(dev_port_override())
+}
+
+/// The port `LUCIDOS_DEV_GATEWAY_PORT` names, when it names a valid one.
+///
+/// Setting it is a deliberate pick, so [`choose_gateway`] takes that gateway
+/// even with another one answering beside it.
+fn dev_port_override() -> Option<u16> {
+    std::env::var("LUCIDOS_DEV_GATEWAY_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
 }
 
 /// The pure half, so the ordering is table-tested without touching the
@@ -296,12 +306,22 @@ fn candidate_ports_from(override_port: Option<u16>) -> Vec<u16> {
     ports
 }
 
-/// The base URL of the first gateway that answers its health endpoint.
+/// One gateway that answered its health endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FoundGateway {
+    port: u16,
+    base: String,
+}
+
+/// Every gateway that answers, in probe order.
 ///
 /// Both schemes are tried per port. The dev gateway serves TLS and the packaged
-/// one serves plain HTTP, and this command cannot know which it faces.
-fn find_gateway(client: &reqwest::blocking::Client, ports: &[u16]) -> Option<String> {
-    for port in ports {
+/// one serves plain HTTP, and this command cannot know which it faces. All of
+/// them rather than the first, because [`choose_gateway`] has to see a second
+/// one to refuse it.
+fn find_gateways(client: &reqwest::blocking::Client, ports: &[u16]) -> Vec<FoundGateway> {
+    let mut found = Vec::new();
+    for &port in ports {
         for scheme in ["https", "http"] {
             let base = format!("{scheme}://127.0.0.1:{port}");
             if client
@@ -309,11 +329,43 @@ fn find_gateway(client: &reqwest::blocking::Client, ports: &[u16]) -> Option<Str
                 .send()
                 .is_ok_and(|r| r.status().is_success())
             {
-                return Some(base);
+                found.push(FoundGateway { port, base });
+                // One gateway per port. The other scheme is the same process
+                // refusing a handshake, never a second gateway.
+                break;
             }
         }
     }
-    None
+    found
+}
+
+/// Pure: which gateway to mint on, or why the caller has to say.
+///
+/// Ambiguity is refused rather than guessed. A code and the device it enrols
+/// both live on the gateway that minted them. Minting on the wrong one hands
+/// the user a code their phone is then told has expired. That is invisible:
+/// both gateways answer, and the refusal names no port.
+///
+/// `preferred` is a port the caller chose, through `--port` or the dev
+/// override. It wins whenever it answered.
+fn choose_gateway(found: &[FoundGateway], preferred: Option<u16>) -> Result<String, BoxError> {
+    if let Some(hit) = preferred.and_then(|p| found.iter().find(|g| g.port == p)) {
+        return Ok(hit.base.clone());
+    }
+    match found {
+        [] => Err("no gateway found. Start one, or pass --port if it is on an unusual port".into()),
+        [only] => Ok(only.base.clone()),
+        many => {
+            let ports: Vec<String> = many.iter().map(|g| g.port.to_string()).collect();
+            Err(format!(
+                "{} gateways are running (ports {}). A pairing code only works on the gateway \
+                 that minted it, so pass --port to name the one the new device will reach",
+                many.len(),
+                ports.join(", ")
+            )
+            .into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +389,64 @@ mod tests {
     fn the_defaults_are_probed_when_nothing_is_set() {
         // Packaged first: it is the one an ordinary install has.
         assert_eq!(candidate_ports_from(None), vec![5252, 5251]);
+    }
+
+    fn found(ports: &[u16]) -> Vec<FoundGateway> {
+        ports
+            .iter()
+            .map(|&port| FoundGateway {
+                port,
+                base: format!("https://127.0.0.1:{port}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_running_gateway_is_used_without_asking() {
+        let only = found(&[5252]);
+        assert_eq!(
+            choose_gateway(&only, None).unwrap(),
+            "https://127.0.0.1:5252"
+        );
+    }
+
+    #[test]
+    fn two_running_gateways_are_refused_rather_than_guessed() {
+        // The reported bug. Both answer, the first wins, and the code is minted
+        // on a gateway the new device may never reach. Its own store holds the
+        // device, so the phone is told the code expired.
+        let both = found(&[5252, 5251]);
+        let err = choose_gateway(&both, None).unwrap_err().to_string();
+        assert!(err.contains("5252") && err.contains("5251"), "{err}");
+        assert!(err.contains("--port"), "the refusal must say what to do");
+    }
+
+    #[test]
+    fn a_preferred_port_wins_over_a_second_gateway() {
+        // `--port` and the dev override are both the caller saying which one.
+        let both = found(&[5252, 5251]);
+        assert_eq!(
+            choose_gateway(&both, Some(5251)).unwrap(),
+            "https://127.0.0.1:5251"
+        );
+    }
+
+    #[test]
+    fn a_preferred_port_that_did_not_answer_falls_back_to_the_rules() {
+        // A stale override must not mint on a gateway nobody chose either.
+        let both = found(&[5252, 5251]);
+        assert!(choose_gateway(&both, Some(5999)).is_err());
+        let one = found(&[5252]);
+        assert_eq!(
+            choose_gateway(&one, Some(5999)).unwrap(),
+            "https://127.0.0.1:5252"
+        );
+    }
+
+    #[test]
+    fn no_gateway_at_all_says_how_to_start_one() {
+        let err = choose_gateway(&[], None).unwrap_err().to_string();
+        assert!(err.contains("no gateway found"), "{err}");
     }
 
     #[test]

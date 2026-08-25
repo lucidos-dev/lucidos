@@ -283,6 +283,30 @@ pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
      it says to ask, then act. Skip the load if you already loaded that \
      knowhow earlier in this thread.";
 
+/// Routes a plugin *setup thread* to the `plugin-setup` knowhow.
+///
+/// The engine seeds that thread itself, so the opening request has a KNOWN
+/// shape: `build_setup_thread_request` in `engine::tools::plugins` writes one
+/// line for a fresh install and another for an update. Both keep the verb "set
+/// up", and this route has to recognise both. Reword either side alone and the
+/// thread still starts, still looks right, and quietly gets a generic answer
+/// instead of the recipe. Pinned by
+/// `both_setup_seeds_route_to_the_plugin_setup_knowhow`.
+///
+/// Named rather than inline so that test can read it. The re-run clause reads
+/// as filler and is not: it is what stops an update re-asking everything the
+/// last run already settled.
+///
+/// It is also SHORTER than the install-only line it replaces, because this text
+/// is billed on every turn of every thread. Naming a second occasion bought the
+/// room by dropping the summary of steps the knowhow itself owns.
+pub(crate) const PLUGIN_SETUP_RULE: &str =
+    "SETTING UP A NEW OR UPDATED PLUGIN, LOAD KNOWHOW FIRST:\n\
+     When asked to set up a newly installed or updated plugin, FIRST \
+     load_knowhow('system-knowhow/plugin-setup') and follow it: it owns reusing \
+     an earlier run, the author's instructions, and doing the steps with the \
+     user. Skip the load if you already loaded it in this thread.";
+
 /// Routes "set Lucidos up around my life" to the *setup interview* knowhow.
 ///
 /// The first-run entry point sends a fixed sentence as an ordinary user
@@ -405,8 +429,7 @@ UNCERTAINTY: USE web_search when answering trivia, identifying something, or ver
 
 __WORKSPACE_ASSETS_KNOWHOW_RULE__
 
-SETTING UP A NEWLY-INSTALLED PLUGIN, LOAD KNOWHOW FIRST:
-When the request is to set up a newly-installed plugin, FIRST load_knowhow('system-knowhow/plugin-setup') and follow it: it owns how to find the author's setup instructions, plan the steps, and complete them with the user. Skip the load if you already loaded it in this thread.
+__PLUGIN_SETUP_RULE__
 
 __SETUP_INTERVIEW_RULE__
 
@@ -555,6 +578,7 @@ fn static_prompt_body(
             "__WORKSPACE_ASSETS_KNOWHOW_RULE__",
             WORKSPACE_ASSETS_KNOWHOW_RULE,
         )
+        .replace("__PLUGIN_SETUP_RULE__", PLUGIN_SETUP_RULE)
         .replace("__SETUP_INTERVIEW_RULE__", SETUP_INTERVIEW_RULE)
         .replace("__TODO_LIST_RULE__", todo_list_rule)
         .replace("__TRIGGER_VS_EVENT_WAIT_RULE__", TRIGGER_VS_EVENT_WAIT_RULE)

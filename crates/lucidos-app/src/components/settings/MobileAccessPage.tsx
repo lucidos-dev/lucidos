@@ -280,7 +280,14 @@ function originOf(url: string): string | null {
  *  `lan` is whatever the Local network row resolved to. It reaches here on the
  *  packaged desktop app alone, since detecting a LAN address needs the bridge.
  *  `null` is a real answer: the section then shows the code by itself, for a
- *  device that already knows an address. */
+ *  device that already knows an address.
+ *
+ *  Every branch must reach the gateway THIS page is served by. A gateway keeps
+ *  its own paired devices and its own pending codes, and two run on one
+ *  machine. A QR aimed at the other one carries a code it never minted. The
+ *  two plain-HTTP branches hold that by keeping this gateway's port. The serve
+ *  URL holds it because the engine publishes one only after proving it reached
+ *  this very workspace (`verified_workspace_serve_url`). */
 export function pairingOrigin(input: TailnetInput & { lan: LanRowState | null }): string | null {
   return tailnetOrigin(input) ?? (input.lan?.kind === 'url' ? input.lan.url : null);
 }

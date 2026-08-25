@@ -3,11 +3,13 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import {
   acknowledgeReleaseNotice,
   dismissReleaseNoticeModal,
+  takeReleaseNoticeAction,
+} from '../../store/actions/releaseNotices';
+import {
   owedReleaseNotice,
   owedReleaseNoticeCount,
   releaseNoticeDismissed,
-  takeReleaseNoticeAction,
-} from '../../store/actions/releaseNotices';
+} from '../../store/releaseNotices';
 
 /**
  * The one *release notice* this workspace still owes an answer to.

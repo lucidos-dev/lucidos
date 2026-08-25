@@ -488,15 +488,11 @@ async fn set_release_check_config(
     Json(body): Json<ReleaseCheckBody>,
 ) -> Result<Json<Value>, ApiError> {
     let check = state.release_check();
-    let mut cfg = check.config();
-    if let Some(enabled) = body.enabled {
-        cfg.enabled = enabled;
-    }
-    if let Some(acknowledged) = body.notice_acknowledged {
-        cfg.notice_acknowledged = acknowledged;
-    }
+    // The merge belongs to the writer, not here: it re-reads the file so a
+    // field this request says nothing about keeps whatever another gateway on
+    // this machine wrote.
     check
-        .set_config(&cfg)
+        .update_config(body.enabled, body.notice_acknowledged)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(check.snapshot()))
 }

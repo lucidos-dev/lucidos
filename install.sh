@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.30.2"
+LUCIDOS_DEFAULT_VERSION="0.30.3"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.

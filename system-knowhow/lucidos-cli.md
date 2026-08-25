@@ -1237,6 +1237,12 @@ lucidos pair --port 5300            # a gateway on an unusual port.
 Run it in a terminal on the machine Lucidos runs on, then type the code into the
 device you want to let in. It works once and expires in five minutes.
 
+**With two gateways running it refuses rather than guessing.** A device pairs to
+a gateway, so a code only works on the one that minted it (ADR 0132). This
+command finds a gateway by probing 5252 then 5251, which is the packaged app
+then a dev checkout. Both answering is ambiguous, so it stops and names the
+ports. Pass `--port` to say which one the new device will reach.
+
 **Reach for it only when nothing is paired yet, and know where it lives.** The
 desktop app pairs its own window on launch. Any paired device can add the next
 one from **Settings → Access → Add a device**. `lucidos` is on no `PATH`

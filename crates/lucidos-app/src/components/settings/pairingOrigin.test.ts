@@ -100,6 +100,20 @@ describe('pairingOrigin', () => {
     expect(pairingOrigin({ ...base, tailnetIp: null, lan })).toBe('http://192.168.1.5:5252');
   });
 
+  it("keeps this gateway's port, so the code is redeemed where it was minted", () => {
+    // Each gateway keeps its own paired-device store and its own pending
+    // codes, and two run on one machine. An origin that dropped the reader's
+    // port would send the phone to the other gateway, which never saw the
+    // code. The phone would then be told a fresh code had expired.
+    const devGateway = {
+      ...base,
+      here: { protocol: 'https:', hostname: 'localhost', port: '5251' },
+    };
+    expect(pairingOrigin({ ...devGateway, lan: null })).toBe(
+      'https://mymac.tailnet-name.ts.net:5251',
+    );
+  });
+
   it('answers nothing rather than an address a phone cannot reach', () => {
     // The bug the whole derivation exists to avoid. Off any tailnet and bound
     // to loopback, this machine has no address to hand out. A QR aimed at the

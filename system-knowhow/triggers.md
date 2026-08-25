@@ -343,6 +343,8 @@ Two rules keep a path honest. A key that exists verbatim wins at every level, so
 
 A numeric segment is an ordinary object key, never an array index. There is no way to say "any element of this array matches", so filter arrays inside the run.
 
+**A path you guessed is reported when you write it.** Every field path is checked against the twenty most recent stored payloads of that event type. A path in none of them gets a warning naming the real one. It is a warning rather than a refusal, because an optional field is legitimately absent from a sample. An event type this workspace has never emitted says nothing, having nothing to check against.
+
 Operators, every one of which reads a field path:
 
 | Operator | Matches when |

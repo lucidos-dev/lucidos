@@ -1458,3 +1458,63 @@ html[data-theme="dark"] .split-button.open::before {
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
 }
+
+/* ── The What's New badge ─────────────────────────────────────────────────
+ * The mark on every step of the path into Settings > System > What's New,
+ * while there is an update to take or a release notice to answer. Host chrome:
+ * an app iframe has no menu drawer and no settings, so none of this ships to
+ * one. The rule and the words are in store/whatsNewBadge.ts.
+ */
+
+/* A dot, not a count: an available update and an owed notice do not add up to
+   one number. The accent is the same blue every other attention mark in the
+   app wears, and the size is the version pill's unread dot, which marks the
+   same panel one step further in. */
+.whats-new-badge {
+    display: inline-block;
+    width: 0.375rem;
+    height: 0.375rem;
+    border-radius: 50%;
+    background: var(--accent);
+}
+
+/* On an icon-only button, hugging the corner every counted badge hugs. It
+   WEARS `.badge`, so `.app-header .badge` repaints it for the bar and gives it
+   the ring that stops a mark fusing with the glyph it rides. What is left here
+   is the dot's own shape: `.badge` pads and line-boxes for a glyph, and both
+   would stretch an empty box out of round.
+
+   COMPOUND with `.badge`, and that is load-bearing rather than decorative.
+   `.badge` lives in `header.css`, which `main.tsx` imports AFTER this sheet, so
+   a single-class modifier ties on specificity and loses on source order. The
+   dot then renders at the full counted-badge size, as an empty pill.
+
+   Bigger than the inline dot, at the pending brand badge's size. Both sizes
+   follow the app's own precedent: 0.375rem where a dot sits beside text at the
+   body step, 0.5rem where it sits on a glyph and has to read across a whole
+   header row. */
+.badge.whats-new-badge-corner {
+    top: 0.25rem;
+    right: 0.25rem;
+    min-width: 0.5rem;
+    min-height: 0.5rem;
+    padding: 0;
+    line-height: 0;
+    border-radius: 50%;
+}
+
+/* Glues the dot to the label it marks, which is the word-joiner pattern
+   `.explainer-slot` above is the worked example of: `display: inline` so the
+   wrapper is not itself an atomic inline, and generated content so the joiner
+   stays out of `textContent`. Its own rule rather than a shared selector list,
+   because the two are separate components that may drift apart, and because
+   `explainer.test.ts` pins the explainer's copy by selector. */
+.whats-new-badge-slot {
+    display: inline;
+    line-height: 0;
+    margin-left: 0.375rem;
+}
+
+.whats-new-badge-slot::before {
+    content: '\2060';
+}

@@ -52,19 +52,37 @@ use lucidos_local_token::{read as local_token, HEADER_LOCAL_TOKEN};
 /// wins: reqwest fills default headers into vacant entries only, so a
 /// per-request header is never overwritten by a default of the same name.
 fn default_headers_from_env() -> reqwest::header::HeaderMap {
+    headers_from(
+        std::env::var(ENV_AGENT_ORIGIN_TOKEN).ok().as_deref(),
+        self_workspace_name().as_deref(),
+        local_token().as_deref(),
+    )
+}
+
+/// The pure half: exactly the headers these three inputs imply.
+///
+/// Split out because the local token comes from a FILE, not the environment.
+/// Every machine that has ever run a gateway has one. A test that set the two
+/// env vars and then asserted on the whole map was therefore asserting on
+/// whoever ran it. It failed on a developer machine and passed on a fresh one.
+fn headers_from(
+    origin_token: Option<&str>,
+    workspace_name: Option<&str>,
+    local: Option<&str>,
+) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
-    if let Ok(token) = std::env::var(ENV_AGENT_ORIGIN_TOKEN) {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&token) {
+    if let Some(token) = origin_token {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(token) {
             h.insert(HEADER_AGENT_ORIGIN_TOKEN, v);
         }
     }
-    if let Some(name) = self_workspace_name() {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&name) {
+    if let Some(name) = workspace_name {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(name) {
             h.insert(HEADER_TARGET_WORKSPACE, v);
         }
     }
-    if let Some(token) = local_token() {
-        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&token) {
+    if let Some(token) = local {
+        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(token) {
             v.set_sensitive(true);
             h.insert(HEADER_LOCAL_TOKEN, v);
         }
@@ -358,15 +376,27 @@ mod tests {
     /// popover links back to the spawning thread.
     #[test]
     fn default_headers_from_env_forwards_the_origin_token() {
+        let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
+        let headers = headers_from(Some(token), None, None);
+        assert_eq!(
+            headers
+                .get(HEADER_AGENT_ORIGIN_TOKEN)
+                .and_then(|v| v.to_str().ok()),
+            Some(token),
+            "agent-origin-token header missing when the token is in scope"
+        );
+    }
+
+    /// The env var the token actually comes from, which the pure test above
+    /// cannot prove. Asserts the one header rather than the whole map, so a
+    /// machine that has a local token file does not fail it.
+    #[test]
+    fn the_origin_token_header_is_read_from_its_own_env_var() {
         let _guard = env_lock().lock().unwrap();
         let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
         // SAFETY: process-wide env mutation gated by env_lock().
-        // `LUCIDOS_WORKSPACE` is cleared because the suite itself often runs
-        // inside a Lucidos-spawned subprocess, where it IS set; leaving it
-        // would make the header count depend on who ran the tests.
         unsafe {
             std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, token);
-            std::env::remove_var(ENV_WORKSPACE);
         }
         let headers = default_headers_from_env();
         unsafe {
@@ -377,7 +407,20 @@ mod tests {
                 .get(HEADER_AGENT_ORIGIN_TOKEN)
                 .and_then(|v| v.to_str().ok()),
             Some(token),
-            "agent-origin-token header missing when env var is set"
+            "the env var name drifted from what the CLI reads"
+        );
+    }
+
+    /// The local token rides along whenever this machine has one. It is what
+    /// proves the caller is local, since a loopback peer address does not.
+    #[test]
+    fn the_local_token_rides_along_and_is_marked_sensitive() {
+        let headers = headers_from(None, None, Some("abc123"));
+        let value = headers.get(HEADER_LOCAL_TOKEN).expect("local token header");
+        assert_eq!(value.to_str().ok(), Some("abc123"));
+        assert!(
+            value.is_sensitive(),
+            "a bearer secret must not reach a debug log"
         );
     }
 
@@ -387,18 +430,9 @@ mod tests {
     /// is exactly the capability the thread binding removes.
     #[test]
     fn default_headers_from_env_does_not_rewrite_the_token() {
-        let _guard = env_lock().lock().unwrap();
         // Deliberately not a well-formed token. The CLI has no opinion.
         let opaque = "whatever.the.engine.minted";
-        // SAFETY: process-wide env mutation gated by env_lock().
-        unsafe {
-            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, opaque);
-            std::env::remove_var(ENV_WORKSPACE);
-        }
-        let headers = default_headers_from_env();
-        unsafe {
-            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-        }
+        let headers = headers_from(Some(opaque), None, None);
         assert_eq!(
             headers
                 .get(HEADER_AGENT_ORIGIN_TOKEN)
@@ -414,13 +448,7 @@ mod tests {
     /// renders "API caller".
     #[test]
     fn default_headers_from_env_yields_empty_when_env_unset() {
-        let _guard = env_lock().lock().unwrap();
-        // SAFETY: process-wide env mutation gated by env_lock().
-        unsafe {
-            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-            std::env::remove_var(ENV_WORKSPACE);
-        }
-        let headers = default_headers_from_env();
+        let headers = headers_from(None, None, None);
         assert!(
             headers.is_empty(),
             "no origin header may be sent outside a Lucidos-spawned subprocess"
@@ -474,13 +502,7 @@ mod tests {
     /// as it did before the header existed.
     #[test]
     fn no_workspace_env_asserts_nothing() {
-        let _guard = env_lock().lock().unwrap();
-        // SAFETY: process-wide env mutation gated by env_lock().
-        unsafe {
-            std::env::remove_var(ENV_WORKSPACE);
-            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-        }
-        let headers = default_headers_from_env();
+        let headers = headers_from(None, None, None);
         assert!(
             headers.is_empty(),
             "a terminal user outside a subprocess sends neither header"

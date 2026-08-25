@@ -65,6 +65,11 @@ use crate::llm::provider::ToolDefinition;
 
 pub use images::{get_image_generation_tool, get_save_thread_image_tool, get_view_image_tool};
 pub use misc::get_navigate_ui_tool;
+/// The Settings sub-sections a deep link may name. Re-exported so a notification
+/// producer's test can hold its own tap destination to this list, rather than
+/// keeping a copy that drifts.
+#[cfg(test)]
+pub(crate) use misc::NAVIGABLE_SETTINGS_VIEWS;
 pub use notifications::get_notification_tool;
 
 /// Synchronous `run_bash` defaults. Both the JSON schema (described to the

@@ -185,6 +185,28 @@ pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
     }
 }
 
+/// A tap that deep-links to one Settings sub-section, the same way the LLM's
+/// `navigate_ui` does.
+///
+/// `view` must be one of `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`), which
+/// is the set the frontend router renders. Anything else toasts "Unknown
+/// settings section" instead of navigating, turning the tap back into the dead
+/// end it replaced.
+///
+/// The body shipping with the tap must NAME the same page. A reader who met the
+/// notification where the tap is not to hand, a dismissed lock-screen banner,
+/// has only the written route. Spell it the way the UI's own breadcrumbs read:
+/// a System subpanel is "Settings → System → X", not "Settings → X".
+pub fn settings_tap(view: &str) -> Tap {
+    Tap::Navigate {
+        to: NavigateUi {
+            target: NavigateTarget::Settings,
+            settings_view: Some(view.to_string()),
+            ..Default::default()
+        },
+    }
+}
+
 /// A notification sent to the user
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notification {

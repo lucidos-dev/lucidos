@@ -119,6 +119,14 @@ For "has this ever actually happened, and how often", use the `count` action ins
 
 **The rename trap.** Old rows keep the old name, because an event is immutable once written. So `query_events({ event_type: "ClaudeCodeIdled" })` still returns history, and the name looks alive. Nothing emits it again. A subscription on it can only ever match the past, which is why a retired name is refused outright rather than warned about. Two live renames each took a live subscription with them: `ClaudeCodeIdled` to `CodingAgentIdled`, and `MemorySearched` to `MemoryRecalled`.
 
+### The path is checked too, not just the name
+
+A `condition` is the other half of a subscription, and it fails the same silent way. `{"version": "0.1.0"}` on `PluginInstalled` is syntactically perfect and matches nothing: that value sits at `manifest.manifest.version`. So every field path in a condition is checked against the twenty most recent stored payloads of that type. A path in none of them gets a warning, and the warning names the same leaf found deeper down.
+
+It is a warning, never a refusal, because the sample is evidence rather than a schema. An optional field is legitimately absent from twenty rows, and `{"conclusion": {"$ne": "success"}}` deliberately matches an event carrying no `conclusion`. An event type with no stored rows says nothing at all.
+
+**A condition names the unwrapped payload.** A persisted system event is stored as `{type, data}` and the matcher strips that envelope, so a condition writes `filename`, never `data.filename`. The `events` tool's `query` action gives you the stored row instead, envelope and all. Read a path there, then drop the leading `payload.data.` before writing it into a condition.
+
 ## Persisted vs transient
 
 The enum splits into two halves, mirrored by `ThreadEvent::is_persisted()`:

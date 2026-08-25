@@ -515,7 +515,15 @@ pub enum SystemEvent {
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
     /// ownership without a schema change.
+    ///
+    /// `id` is the plugin id, at the top level where every sibling `Plugin*`
+    /// frame carries it. It is also inside `manifest.manifest.id`, two layers
+    /// down, which is where `InstalledRecord` still reads it and where rows
+    /// written before this field carry it alone. A subscription filtering on
+    /// the nested path went dead once, unseen, which is what this field ends.
     PluginInstalled {
+        #[serde(default)]
+        id: String,
         manifest: serde_json::Value,
         files: Vec<String>,
         installed_at: String,
@@ -1609,13 +1617,7 @@ impl SystemEvent {
             } => notification_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "all".to_string()),
-            // Raw manifest is nested one layer in — see `InstalledRecord` for the path.
-            Self::PluginInstalled { manifest, .. } => manifest
-                .get("manifest")
-                .and_then(|m| m.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
+            Self::PluginInstalled { id, .. } => id.clone(),
             Self::PluginLocalChangesMerged { id, .. } => id.clone(),
             Self::PluginUninstalled { id, .. } => id.clone(),
             Self::PluginInstallCanceled { id, .. } => id.clone(),

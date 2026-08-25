@@ -145,8 +145,9 @@ surface):
   the last *release notice* this workspace answered, and everything after it in
   the authored order is still owed. Workspace-global (`device_id IS NULL`), so
   answering on one device settles it on every device. Written by the engine when
-  the user answers a notice, and seeded once at startup. Never via
-  `set_preference`: clearing it re-shows every notice the user has already read.
+  the user answers a notice. A workspace with no threads is also stamped once at
+  startup, so nothing lands over its first run. Never via `set_preference`:
+  clearing it re-shows every notice the user has already read.
 - `provider_enabled_vertex`, `provider_enabled_anthropic`,
   `provider_enabled_openai`, `provider_enabled_openrouter`,
   `provider_enabled_xai`, `provider_enabled_local`: the per-provider enable

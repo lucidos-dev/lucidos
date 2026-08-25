@@ -65,7 +65,7 @@ The flat one-to-one mapping means there is no separate "install destination" que
 
 ## `manifest.toml` schema
 
-Four required fields, three optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest` so future additive fields stay compatible with old install records.
+Four required fields, four optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest` so future additive fields stay compatible with old install records.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
@@ -75,6 +75,7 @@ Four required fields, three optional. Unknown extra fields are accepted and roun
 | `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install") so the install-time LLM offers to wire one up -- see "What doesn't belong in a plugin" below. |
 | `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing -- the plugin still installs and uninstalls correctly, but updates cannot be fetched (the update tools will return an explanatory error). When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
 | `engine` | no | string | Semver constraint (e.g. `">=0.5.0"`). Parsed and stored but the v1 install path does not enforce it -- use it as documentation for now. |
+| `setup` | no | string | Markdown wiring instructions, written **to the agent about what to do with the user**. It renders in the install confirmation panel before the user confirms, and on confirm it drives a spawned Lucidos Agent setup thread. The engine never interprets it. This is the only way to ship workspace state rather than a file, a webhook above all. See "Install confirmation panel" below and `plugin-setup.md`. |
 | `categories` | no | array of string | Topical tags for browsing the **Store** (the Plugins panel's category filter). A **controlled vocabulary** (see below) — pick from the allowed set. Normalised to lowercase on parse; an unknown value is **dropped and flagged** at catalog-scan time (it appears in the catalog's `errors`), never blocking install. |
 
 **Plugin categories — the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that actually appears in the catalog, and each card shows its category chips. The set is intentionally small and curated so categories stay browsable — a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit; omit `categories` entirely if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
@@ -106,6 +107,8 @@ The user clicks **Confirm** (writes files, **commits them to the workspace git r
 **Confirming does not close the panel: it becomes a receipt.** The same panel turns into a read-only record of what the engine actually wrote or deleted, with a timestamp and no buttons. The header's back arrow is how you leave it. It keeps the nav-history row the pending confirmation already held (relabelled "Installed <name>" / "Uninstalled <name>"). So the user can walk Back to it, or reload, and still see what happened. Cancel closes as before, since nothing happened.
 
 **Setup runs on confirm — but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. The thread's first message is a short line — `Set up the newly installed <name> plugin.` — **not** a wall of agent instructions: the "how to run a plugin setup" guidance lives in `system-knowhow/plugin-setup` (the agent loads it — the chat system prompt nudges it to), and the agent reads your `setup` text by referencing the durable `PluginInstalled` event (that knowhow names the exact nested payload path). So the user sees a clean thread while the agent still gets everything it needs. This fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the plugin's card can resolve it later. On an **update**, the setup thread spawns only when the new version's `setup` text actually **differs** (after trimming) from the currently-installed version's — a version bump that left `setup` unchanged re-runs nothing and navigates nowhere, since re-doing identical setup on every update is noise. A fresh install (or an update whose `setup` is new/changed) always spawns. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
+
+**An update's setup thread starts from the last run, not from scratch.** Its seed says so (`Set up <name> again: its setup instructions changed since version <prior>.`, titled `Update <name> setup`), and `system-knowhow/plugin-setup` § 1 acts on it. That section diffs your two `setup` texts, reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So a reworded `setup` costs the user a couple of questions rather than the whole interview.
 
 What this means for plugin authors:
 
@@ -572,13 +575,15 @@ Emitted on every successful install (including overwrites and updates -- the var
 {
   "type": "PluginInstalled",
   "data": {
+    "id": "browser-learning",
     "manifest": {
       "summary": "Installed Browser Learning v0.1.0 from github.com/lucidos-dev/plugins/tree/main/browser-learning",
-      "manifest": { "id": "browser-learning", "version": "0.1.0", "name": "...", "description": "...", "source": "https://github.com/lucidos-dev/plugins/tree/main/browser-learning", "engine": "..." },
+      "manifest": { "id": "browser-learning", "version": "0.1.0", "name": "...", "description": "...", "source": "https://github.com/lucidos-dev/plugins/tree/main/browser-learning", "engine": "...", "setup": "..." },
       "files": ["knowhow/browser-skills.md", "..."],
       "installed_at": "2026-04-29T12:34:56+00:00",
       "source_type": "git",
-      "commit": "<workspace-repo sha of the install commit>"
+      "commit": "<workspace-repo sha of the install commit>",
+      "setup_thread_id": "<uuid of the spawned setup thread, when one was spawned>"
     },
     "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
     "installed_at": "2026-04-29T12:34:56+00:00",
@@ -588,7 +593,18 @@ Emitted on every successful install (including overwrites and updates -- the var
 }
 ```
 
-The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`id`, `version`, `source`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer.
+The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`version`, `source`, `setup`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer. `setup_thread_id` sits one level up, at `payload.data.manifest.setup_thread_id`, because the engine records it rather than the author.
+
+`id` is the exception, and deliberately so: it is at `payload.data.id`, where every sibling `Plugin*` frame carries it. It is still inside the manifest too. Rows written before the top-level field existed carry it only there, so a reader that must cover history falls back to `payload.data.manifest.manifest.id`.
+
+**Two paths name the same value, and which one you write depends on who is reading.**
+
+| You are… | Path to the plugin id | Why |
+|---|---|---|
+| reading an event with the `events` tool (`action=query`) | `payload.data.id` | You get the stored row, envelope and all. |
+| writing a `condition` on a trigger or an `await_event`, or reading `TRIGGER_EVENT_PAYLOAD` in a script trigger | `id` | Both see the payload with the `type` / `data` envelope already stripped, so neither names those two keys. |
+
+Same rule for anything deeper: `payload.data.manifest.manifest.version` when reading, `manifest.manifest.version` in a condition. Getting this wrong is silent at match time. So the engine checks every condition path against recent stored payloads when you subscribe. It names the real path when yours is in none of them. See `system-knowhow/triggers.md` § "What a condition can say".
 
 `source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs. `files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`) -- the nested copy is what `latest_install` reads when looking up "what files belong to this plugin?" for the uninstall guide. `commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit -- the baseline the Modified badge diffs against (see "Local modifications" below). Legacy rows installed before this field was recorded simply never show as modified.
 

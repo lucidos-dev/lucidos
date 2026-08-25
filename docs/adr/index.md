@@ -137,3 +137,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0127: Every panel-nav entry restores its overlay; there are no transient navigations](0127-nav-entries-are-never-transient.md)
 - [0128: An OAuth authorization page always opens outside the app, whatever the in-app browser toggle says](0128-oauth-authorization-always-leaves-the-app.md)
 - [0129: Mirror the page's CSS cursor onto the native window](0129-native-cursor-mirroring.md)
+- [0130: A workspace entering the release-notice sequence owes the whole backlog](0130-release-notice-backlog-on-entering-the-sequence.md)
+- [0131: A condition's field path is corroborated against stored payloads when you subscribe, and warned about rather than refused](0131-a-condition-path-is-corroborated-at-subscription-time.md)
+- [0132: Auth state is per gateway; the local token stays machine-wide](0132-gateway-auth-state-is-per-gateway.md)

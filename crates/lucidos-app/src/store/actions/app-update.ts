@@ -1,7 +1,9 @@
 import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, releaseCheck } from '../store';
+// The READ lives a layer up, where a surface can ask "is there an update?"
+// without importing this module's toasts, IPC and menu navigation.
+import { packagedUpdateVersion } from '../packagedUpdate';
 import { openWhatsNew, openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
-import { isNewerVersion } from '../../utils/version';
 import { errorDetail } from '../../utils/errorDetail';
 import { requestUpdateCheck } from '../../api/client/control';
 import {
@@ -336,24 +338,6 @@ export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
     clientOwnsLatestVersion = false;
   }
   return { kind: 'up-to-date' };
-}
-
-/** The newer version available to install, or `null`.
- *
- *  One derivation of "is there an update?", shared by the notice, the button
- *  label and the button's action, so the three cannot drift apart. It reads the
- *  signals at call time, so calling it during render subscribes the caller.
- *
- *  The gateway's answer wins where there is one, because it covers every install
- *  shape. The fallback covers two cases. A dev client reads
- *  `latestTauriAppVersion` from the engine's `/health`, and a client on an older
- *  gateway reads its own Tauri check. */
-export function packagedUpdateVersion(): string | null {
-  const announced = releaseCheck.value?.latest;
-  if (announced) return announced.version;
-  const latest = latestTauriAppVersion.value;
-  const current = window.__LUCIDOS_APP_VERSION__;
-  return latest && current && isNewerVersion(latest, current) ? latest : null;
 }
 
 /** Can THIS session install the offered update itself?

@@ -194,7 +194,7 @@ async fn soft_threshold_breach_emits_low_disk_notification() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Low disk space on your machine")
+        .filter(|n| n.title == "Low disk space on your machine")
         .collect();
     assert_eq!(
         alerts.len(),
@@ -202,7 +202,7 @@ async fn soft_threshold_breach_emits_low_disk_notification() {
         "expected exactly one low-disk notification, got: {:?}",
         alerts
     );
-    let (_, body) = &alerts[0];
+    let body = &alerts[0].message;
     assert!(
         !body.contains("Lucidos disk space"),
         "body must not lead with the old 'Lucidos disk space' framing: {}",
@@ -213,6 +213,9 @@ async fn soft_threshold_breach_emits_low_disk_notification() {
         "body must explicitly call out the volume, not Lucidos itself: {}",
         body,
     );
+    // A tap has to land on the page that answers the alert. `Tap::Modal` made
+    // the notification a dead end.
+    assert_eq!(alerts[0].settings_view(), Some("disk-usage"));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -238,10 +241,10 @@ async fn soft_threshold_with_tiny_lucidos_footprint_blames_the_machine() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Low disk space on your machine")
+        .filter(|n| n.title == "Low disk space on your machine")
         .collect();
     assert_eq!(alerts.len(), 1);
-    let (_, body) = &alerts[0];
+    let body = &alerts[0].message;
     assert!(
         body.contains("other apps")
             || body.contains("not Lucidos")
@@ -254,7 +257,8 @@ async fn soft_threshold_with_tiny_lucidos_footprint_blames_the_machine() {
     teardown_test_db(&db_name).await;
 }
 
-/// Large Lucidos footprint + low volume → message steers to Settings → Disk Usage.
+/// Large Lucidos footprint + low volume: the message steers to the Disk Usage
+/// page, and names the route to it.
 #[tokio::test]
 async fn soft_threshold_with_large_lucidos_footprint_suggests_cleanup() {
     let (pool, db_name) = setup_test_db().await;
@@ -281,13 +285,13 @@ async fn soft_threshold_with_large_lucidos_footprint_suggests_cleanup() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Low disk space on your machine")
+        .filter(|n| n.title == "Low disk space on your machine")
         .collect();
     assert_eq!(alerts.len(), 1);
-    let (_, body) = &alerts[0];
+    let body = &alerts[0].message;
     assert!(
-        body.contains("Settings") && body.contains("Disk Usage"),
-        "large-footprint body must point at Settings → Disk Usage: {}",
+        body.contains("Settings → System → Disk Usage"),
+        "large-footprint body must point at the Disk Usage page: {}",
         body,
     );
 
@@ -400,7 +404,9 @@ async fn ample_free_disk_emits_no_notification() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let alerts: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t.contains("disk") || t.contains("Disk") || t.contains("auto-cleanup"))
+        .filter(|n| {
+            n.title.contains("disk") || n.title.contains("Disk") || n.title.contains("auto-cleanup")
+        })
         .collect();
     assert!(
         alerts.is_empty(),

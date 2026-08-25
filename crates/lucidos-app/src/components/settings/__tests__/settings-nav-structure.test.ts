@@ -93,12 +93,22 @@ describe('Settings nav structure', () => {
 
   it('renders every nav item on every platform: no category is platform-gated', () => {
     // The home list maps SETTINGS_NAV_ITEMS directly. A `.filter(...)` over it,
-    // or any `key === '…'` predicate, is the regression: it gives the app a
-    // different nav shape per device and hides a whole page from the platform
-    // that needs it.
+    // or a predicate deciding whether the ROW renders, is the regression: it
+    // gives the app a different nav shape per device and hides a whole page
+    // from the platform that needs it.
     expect(stripped).toMatch(/SETTINGS_NAV_ITEMS\.map\(/);
     expect(stripped).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
-    expect(stripped).not.toMatch(/key === '[a-z-]+'/);
+    // Reachability is the BUTTON, the only way into a category, so a gate is
+    // any `key` comparison between the map and it. A decoration the row hangs
+    // off its own label is not one: the What's New badge picks its category
+    // out that way and hides nothing.
+    const map = stripped.indexOf('SETTINGS_NAV_ITEMS.map(');
+    const row = stripped.indexOf('<div class="settings-section settings-nav-item"', map);
+    const button = stripped.indexOf('<button', row);
+    expect(row, 'the nav row element').toBeGreaterThan(map);
+    expect(button, 'the row\'s button').toBeGreaterThan(row);
+    expect(stripped.slice(map, button)).not.toMatch(/key === '[a-z-]+'/);
+    expect(stripped.slice(map, button)).not.toMatch(/key !== '[a-z-]+'/);
   });
 
   it('has a renderSubview case for every nav key, so no row opens onto nothing', () => {

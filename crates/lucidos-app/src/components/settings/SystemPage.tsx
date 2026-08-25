@@ -26,10 +26,10 @@ import {
   canInstallUpdateHere,
   checkForUpdatesNow,
   installAppUpdate,
-  packagedUpdateVersion,
   reportUpdateCheck,
   updateControlLabel,
 } from '../../store/actions/app-update';
+import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
@@ -49,6 +49,8 @@ import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
+import { WhatsNewBadge } from '../shared/WhatsNewBadge';
+import { whatsNewBadge } from '../../store/whatsNewBadge';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -70,6 +72,8 @@ const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsN
 ];
 
 function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
+  // Read once for the row of tabs: one answer, and only What's New spends it.
+  const news = whatsNewBadge();
   return (
     <div class="settings-section system-subpanel-switcher">
       <div class="settings-row-options system-subpanel-options">
@@ -78,9 +82,16 @@ function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
             key={item.key}
             class={`settings-option${activePanel === item.key ? ' active' : ''}`}
             aria-current={activePanel === item.key ? 'page' : undefined}
+            // The mark is decorative, so the tab says the words. Only the
+            // badged tab carries a label, for the reason the Settings nav row
+            // gives.
+            aria-label={item.key === 'whats-new' && news ? `${item.label} · ${news}` : undefined}
             onClick={() => openSettingsSubview(item.subview)}
           >
             {item.label}
+            {/* The last step of the path. This switcher renders above Overview
+                too, so the mark is on screen the moment System opens. */}
+            {item.key === 'whats-new' && <WhatsNewBadge placement="inline" />}
           </button>
         ))}
       </div>

@@ -139,7 +139,8 @@ struct GatewayInner {
     /// The machine-local token proving a caller is a process on this machine
     /// (`crate::auth`). Minted at startup, never logged, never sent anywhere.
     local_token: String,
-    /// Where the paired-device store lives, so tests can point it elsewhere.
+    /// This gateway's own paired-device store, under its data dir. Never shared
+    /// with another gateway on the machine (`auth::paired_devices_path`).
     paired_devices_path: PathBuf,
     /// Paired devices, the source of truth for who may reach this gateway over
     /// the network. Held in memory and written through on every change.
@@ -2699,9 +2700,22 @@ pub async fn run() -> Result<(), BoxError> {
     // CLI, the dev scripts and both e2e suites would then fail one request at a
     // time. Failing here says why, once.
     let local_token = auth::ensure_local_token()?;
-    let paired_devices_path = auth::paired_devices_path()
-        .ok_or_else(|| -> BoxError { "HOME is not set, so there is nowhere to pair to".into() })?;
-    let paired_devices = auth::PairedDevices::load(&paired_devices_path)?;
+    // Per gateway, under this process's own data dir, so the packaged app and a
+    // dev checkout stop overwriting one machine-global file. The legacy path
+    // seeds this store once, which is what keeps an already-paired device in.
+    let paired_devices_path = auth::paired_devices_path(&app_data);
+    let seeded = auth::load_or_seed(
+        &paired_devices_path,
+        auth::legacy_paired_devices_path().as_deref(),
+    )?;
+    if let Some(count) = seeded.seeded_from_legacy {
+        crate::log!(
+            "[Gateway] seeded {} paired device(s) from the shared store into {}",
+            count,
+            paired_devices_path.display()
+        );
+    }
+    let paired_devices = seeded.devices;
     crate::log!(
         "[Gateway] inbound auth ready: {} paired device(s), local token at {}",
         paired_devices.devices.len(),
@@ -3808,6 +3822,102 @@ fn raise_fd_limit() {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    // ── Two gateways on one machine keep their auth state apart ─────────────
+
+    /// Two states over two data dirs, the in-process model of the dev gateway
+    /// and the packaged app running side by side.
+    fn two_gateways() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        GatewayState,
+        GatewayState,
+    ) {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = GatewayState::for_tests_with_static_dir(Some(dir_a.path().to_path_buf()));
+        let b = GatewayState::for_tests_with_static_dir(Some(dir_b.path().to_path_buf()));
+        assert_ne!(a.inner.paired_devices_path, b.inner.paired_devices_path);
+        (dir_a, dir_b, a, b)
+    }
+
+    fn cookie_header(credential: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            format!("{}={credential}", auth::COOKIE_DEVICE_CREDENTIAL)
+                .parse()
+                .unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn one_gateway_s_pairing_never_touches_another_s_store() {
+        // The reported bug. Both owned one machine-global file, each loaded it
+        // once and rewrote it whole, so every write deleted the other's rows.
+        let (_a_dir, _b_dir, a, b) = two_gateways();
+
+        let code = a.mint_pairing_code(Some("My iPhone".into())).unwrap();
+        let credential = a.redeem_pairing_code(&code, None).unwrap().expect("paired");
+        assert_eq!(a.paired_devices().devices.len(), 1);
+        assert!(b.paired_devices().devices.is_empty());
+        assert!(!b.inner.paired_devices_path.exists());
+
+        // B pairing its own device must leave A's file exactly as it was.
+        let code_b = b.mint_pairing_code(None).unwrap();
+        b.redeem_pairing_code(&code_b, Some("My MacBook")).unwrap();
+        let a_store = auth::PairedDevices::load(&a.inner.paired_devices_path).unwrap();
+        assert_eq!(a_store.devices.len(), 1);
+        assert_eq!(a_store.devices[0].label, "My iPhone");
+        assert_eq!(
+            auth::PairedDevices::load(&b.inner.paired_devices_path)
+                .unwrap()
+                .devices
+                .len(),
+            1
+        );
+
+        // And the credential names its own gateway, nobody else's.
+        let headers = cookie_header(&credential);
+        assert!(matches!(
+            a.authorize(&headers),
+            auth::Authorization::Device { .. }
+        ));
+        assert_eq!(b.authorize(&headers), auth::Authorization::Unauthorized);
+    }
+
+    #[test]
+    fn a_code_minted_on_one_gateway_is_unknown_to_the_other() {
+        // Pinned because it is the CHOSEN behaviour, not an accident. A device
+        // pairs to a gateway, so `lucidos pair` refuses to guess which one.
+        let (_a_dir, _b_dir, a, b) = two_gateways();
+        let code = a.mint_pairing_code(None).unwrap();
+        assert!(b.redeem_pairing_code(&code, None).unwrap().is_none());
+        assert!(a.redeem_pairing_code(&code, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn revoking_on_one_gateway_leaves_the_other_s_device_alone() {
+        let (_a_dir, _b_dir, a, b) = two_gateways();
+        let code_a = a.mint_pairing_code(None).unwrap();
+        a.redeem_pairing_code(&code_a, Some("My iPhone")).unwrap();
+        let code_b = b.mint_pairing_code(None).unwrap();
+        let cred_b = b
+            .redeem_pairing_code(&code_b, Some("My iPhone"))
+            .unwrap()
+            .expect("paired");
+
+        let id_a = a.paired_devices().devices[0].id.clone();
+        assert!(a.revoke_device(&id_a).unwrap());
+
+        assert!(a.paired_devices().devices.is_empty());
+        assert_eq!(b.paired_devices().devices.len(), 1);
+        assert!(matches!(
+            b.authorize(&cookie_header(&cred_b)),
+            auth::Authorization::Device { .. }
+        ));
+    }
 
     // ── The paired-device store publishes memory, never a stale snapshot ─────
 

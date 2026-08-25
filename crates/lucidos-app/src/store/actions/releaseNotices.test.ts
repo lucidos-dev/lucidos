@@ -17,12 +17,17 @@ vi.mock('./compose', () => ({
 const {
   acknowledgeReleaseNotice,
   dismissReleaseNoticeModal,
+  takeReleaseNoticeAction,
+} = await import('./releaseNotices');
+// The reads live a layer up, away from anything that can send a prompt. Both
+// halves are exercised together here: they are one behaviour, and the split is
+// about the import graph rather than about what a notice does.
+const {
   owedReleaseNotice,
   owedReleaseNoticeCount,
   releaseNoticeDismissed,
   releaseNoticeModalOpen,
-  takeReleaseNoticeAction,
-} = await import('./releaseNotices');
+} = await import('../releaseNotices');
 const { releaseNoticeView } = await import('../store');
 
 function notice(id: string, resolved: boolean, action = false): ReleaseNotice {

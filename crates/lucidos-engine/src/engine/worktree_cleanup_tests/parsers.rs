@@ -186,7 +186,7 @@ async fn soft_threshold_does_not_re_emit_on_subsequent_ticks() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let lows: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Low disk space on your machine")
+        .filter(|n| n.title == "Low disk space on your machine")
         .collect();
     assert_eq!(
         lows.len(),
@@ -223,7 +223,7 @@ async fn soft_threshold_re_arms_after_recovery() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let lows: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Low disk space on your machine")
+        .filter(|n| n.title == "Low disk space on your machine")
         .collect();
     assert_eq!(
         lows.len(),
@@ -261,7 +261,7 @@ async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let cleanups: Vec<_> = notifications
         .into_iter()
-        .filter(|(t, _)| t == "Lucidos reclaimed disk space")
+        .filter(|n| n.title == "Lucidos reclaimed disk space")
         .collect();
     assert_eq!(
         cleanups.len(),
@@ -269,6 +269,8 @@ async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
         "expected an auto-cleanup notification when forced Tier 1 freed bytes, got: {:?}",
         cleanups
     );
+    // The sibling alert deep-links to the same page, so this one must too.
+    assert_eq!(cleanups[0].settings_view(), Some("disk-usage"));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -294,7 +296,7 @@ async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
     let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
     let cleanups: usize = notifications
         .iter()
-        .filter(|(t, _)| t == "Lucidos reclaimed disk space")
+        .filter(|n| n.title == "Lucidos reclaimed disk space")
         .count();
     assert_eq!(
         cleanups, 0,
@@ -304,6 +306,66 @@ async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Disk notifications: where a tap lands, and the route the body names.
+// ---------------------------------------------------------------------------
+
+const GB: u64 = 1024 * 1024 * 1024;
+
+/// Every body this module can produce, so a rule about the copy covers all of
+/// them rather than the one branch a test remembered.
+fn every_disk_body() -> Vec<String> {
+    use super::{auto_cleanup_body, disk_low_body};
+    vec![
+        disk_low_body(3 * GB, 40 * GB, 5 * GB), // large Lucidos footprint
+        disk_low_body(3 * GB, GB, 5 * GB),      // pressure is elsewhere
+        auto_cleanup_body(2 * GB, 7 * GB),
+    ]
+}
+
+/// Disk Usage is a subpanel of System. A body stopping at "Settings → Disk
+/// Usage" names a page with no Disk Usage on it. Someone who met the
+/// notification away from the tap has only this route.
+#[test]
+fn every_disk_body_names_the_page_the_tap_opens() {
+    const PATH: &str = "Settings → System → Disk Usage";
+    for body in every_disk_body() {
+        assert!(body.contains(PATH), "{body}");
+    }
+}
+
+/// The remedy still has to differ. One shared destination must not collapse
+/// into one shared piece of advice: cleaning here reclaims real space only when
+/// Lucidos is the one holding it.
+#[test]
+fn the_two_low_disk_branches_keep_their_own_remedy() {
+    use super::disk_low_body;
+    let large = disk_low_body(3 * GB, 40 * GB, 5 * GB);
+    let small = disk_low_body(3 * GB, GB, 5 * GB);
+    assert!(large.contains("clean idle ones"), "{large}");
+    assert!(
+        !large.contains("other apps"),
+        "a large footprint is not somebody else's problem: {large}"
+    );
+    assert!(small.contains("other apps"), "{small}");
+    assert!(
+        !small.contains("clean idle ones"),
+        "cleaning 1 GB does not answer a 3 GB shortfall: {small}"
+    );
+}
+
+/// The destination has to be one the frontend router renders. An id outside
+/// `NAVIGABLE_SETTINGS_VIEWS` toasts "Unknown settings section" instead of
+/// navigating, which is the dead end the tap replaced.
+#[test]
+fn the_tap_destination_is_a_renderable_settings_view() {
+    let view = super::DISK_USAGE_SETTINGS_VIEW;
+    assert!(
+        crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS.contains(&view),
+        "{view} is not a settings view the router renders"
+    );
 }
 
 // ---------------------------------------------------------------------------

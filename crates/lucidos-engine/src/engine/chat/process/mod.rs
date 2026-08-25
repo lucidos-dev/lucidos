@@ -44,8 +44,10 @@ pub(super) mod workspace_payload;
 // locally), so the re-exports are `cfg(test)`-gated to avoid unused warnings.
 #[cfg(test)]
 pub(crate) use context_build::{build_capture_sections, build_loaded_knowhow_block};
+// `PLUGIN_SETUP_RULE` also travels to `tools::plugins_tests`, whose seed test
+// pins the route against the two lines the engine actually sends.
 #[cfg(test)]
-pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, REPEATED_ACTION_RULE};
+pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, PLUGIN_SETUP_RULE, REPEATED_ACTION_RULE};
 #[cfg(test)]
 pub(crate) use turn_tail::TurnTail;
 

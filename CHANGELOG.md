@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.30.3 — 2026-08-25
+
+### Changed
+
+- A dot marks the way to What's New when an update is waiting or a release notice is unanswered. It rides the menu button, the Settings row, the System row and the What's New tab, and clears when the update is installed or the notice answered.
+- A plugin setup thread after an update starts from the previous run. It reads what is already wired and asks only about what changed.
+- A trigger or event wait whose condition names a field no event of that type carries says so when you set it up, instead of quietly matching nothing.
+- A workspace audit offers to do every suggested fix in one answer, rather than asking batch by batch.
+
+### Fixed
+
+- A low-disk notification taps through to Settings > System > Disk Usage, and its text names that route.
+- Two Lucidos gateways on one machine each keep their own paired devices, so pairing a phone to one no longer unpairs it from the other.
+- A release notice with no button of its own can be answered from Settings > System > What's New, and an answered notice keeps its button.
 ## v0.30.2 — 2026-08-25
 
 ### Fixed

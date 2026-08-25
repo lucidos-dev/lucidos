@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::engine::thread_events::ThreadEvent;
+use crate::scheduler::notifications::{NavigateTarget, Tap};
 
 use super::{ActiveThreads, WorktreeCleanup};
 
@@ -380,11 +381,33 @@ pub(crate) async fn drain_cleaned_events(
     out
 }
 
+/// A `NotificationCreated` as the tests read it: what the user is told, plus
+/// where a tap on it lands.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedNotification {
+    pub(crate) title: String,
+    pub(crate) message: String,
+    pub(crate) tap: Tap,
+}
+
+impl CapturedNotification {
+    /// The Settings sub-section this notification deep-links to, or `None` when
+    /// its tap only opens the inbox detail.
+    pub(crate) fn settings_view(&self) -> Option<&str> {
+        match &self.tap {
+            Tap::Navigate { to } if to.target == NavigateTarget::Settings => {
+                to.settings_view.as_deref()
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Drain a pre-existing receiver for SystemEvent::NotificationCreated events.
 pub(crate) async fn drain_notifications(
     rx: tokio::sync::broadcast::Receiver<EmittedEvent>,
     deadline: Duration,
-) -> Vec<(String, String)> {
+) -> Vec<CapturedNotification> {
     let mut stream = BroadcastStream::new(rx);
     let mut out = Vec::new();
     let until = tokio::time::Instant::now() + deadline;
@@ -392,8 +415,18 @@ pub(crate) async fn drain_notifications(
         let Ok(EmittedEvent { typed, .. }) = item else {
             continue;
         };
-        if let BusEvent::System(SystemEvent::NotificationCreated { title, message, .. }) = typed {
-            out.push((title, message));
+        if let BusEvent::System(SystemEvent::NotificationCreated {
+            title,
+            message,
+            tap,
+            ..
+        }) = typed
+        {
+            out.push(CapturedNotification {
+                title,
+                message,
+                tap,
+            });
         }
     }
     out

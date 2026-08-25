@@ -439,6 +439,129 @@ pub fn never_emitted_warning(event_type: &str) -> String {
     )
 }
 
+/// How many recent rows [`uncorroborated_path_warnings`] reads per event type.
+///
+/// Enough that an optional field present most of the time still shows up. Small
+/// enough that the probe is one indexed page inside a synchronous tool call.
+const FIELD_PATH_SAMPLE_ROWS: i64 = 20;
+
+/// How many unresolved paths get a warning of their own. Any beyond this are
+/// counted in one more line, never dropped in silence.
+const MAX_PATH_WARNINGS: usize = 3;
+
+/// The most recent stored payloads for `event_type`, **as the matcher will see
+/// them**.
+///
+/// Built through [`matchable_payload`], so the envelope is unwrapped and
+/// `thread_id` is injected exactly as at match time. A probe reading the raw
+/// row would report a path the matcher resolves fine, which is worse than not
+/// probing at all.
+///
+/// An unreadable store yields no samples, which yields no warning. A probe that
+/// could not run is unknown, never a no.
+///
+/// Ordered by `(created DESC, id DESC)` to match `idx_events_type_created_id`
+/// exactly, so the LIMIT streams off the index. Any recency proxy would do for
+/// a payload sample, and this one is the one that is indexed: `sequence DESC`
+/// reads the same but makes a million-row event type scan and sort, inside a
+/// synchronous tool call.
+async fn recent_matchable_payloads(pool: &sqlx::PgPool, event_type: &str) -> Vec<Value> {
+    let rows: Vec<(Value, Option<Uuid>)> = match sqlx::query_as(
+        "SELECT payload, thread_id FROM events \
+         WHERE event_type = $1 ORDER BY created DESC, id DESC LIMIT $2",
+    )
+    .bind(event_type)
+    .bind(FIELD_PATH_SAMPLE_ROWS)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            crate::log!("[EventSubscription] payload sample for {event_type} failed: {e}");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .map(|(payload, thread_id)| matchable_payload(event_type, payload, thread_id))
+        .collect()
+}
+
+/// **Does the payload actually carry what this condition names?**
+///
+/// The second half of the silent-failure class [`check_subscriptions`] exists
+/// to end. A misspelled event type is refused by name. A field path naming
+/// something no payload of that type carries arms just as clean and matches
+/// just as little, and nothing said so. `{"id": …}` on `PluginInstalled` is the
+/// case that cost a day: the plugin id sits at `manifest.manifest.id`.
+///
+/// **A warning, never a refusal.** The sample is evidence, not a schema. An
+/// optional field is legitimately missing from twenty rows, and
+/// `{"conclusion": {"$ne": "success"}}` deliberately matches an event carrying
+/// no `conclusion` at all. Refusing either would block correct work.
+///
+/// The suggestion is what makes it actionable: the sample is in hand, so the
+/// same leaf found deeper down is named outright.
+pub async fn uncorroborated_path_warnings(
+    pool: &sqlx::PgPool,
+    event_type: &str,
+    condition: Option<&Value>,
+) -> Vec<String> {
+    let Some(condition) = condition else {
+        return Vec::new();
+    };
+    let paths = condition::field_paths(condition);
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let samples = recent_matchable_payloads(pool, event_type).await;
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let unresolved: Vec<&String> = paths
+        .iter()
+        .filter(|path| !samples.iter().any(|s| condition::resolves(s, path)))
+        .collect();
+
+    // The rows actually read, never the cap: a type with two rows would
+    // otherwise claim twenty, overstating the evidence tenfold on exactly the
+    // young event type whose sample is weakest.
+    let inspected = samples.len();
+    let mut warnings: Vec<String> = unresolved
+        .iter()
+        .take(MAX_PATH_WARNINGS)
+        .map(|path| {
+            // Every sample, not just the newest: one row of a shape that
+            // happens to lack the leaf would otherwise cost the suggestion.
+            let elsewhere = samples
+                .iter()
+                .map(|s| condition::same_leaf_paths(s, path))
+                .find(|paths| !paths.is_empty())
+                .unwrap_or_default();
+            let advice = match elsewhere.as_slice() {
+                [] => "Read one with the events tool's query action, limit 1, and name a \
+                       path you see there. An optional field may simply be absent from \
+                       those rows."
+                    .to_string(),
+                [one] => format!("Did you mean '{one}'?"),
+                many => format!("Did you mean one of {}?", many.join(", ")),
+            };
+            format!(
+                "condition for '{event_type}': '{path}' resolves in none of \
+                 {inspected} sampled {event_type} payload(s), so this subscription \
+                 may never match. {advice}"
+            )
+        })
+        .collect();
+    if unresolved.len() > MAX_PATH_WARNINGS {
+        warnings.push(format!(
+            "condition for '{event_type}': {} further field path(s) are in none of them \
+             either.",
+            unresolved.len() - MAX_PATH_WARNINGS
+        ));
+    }
+    warnings
+}
+
 /// Has this workspace ever emitted an event by this name?
 ///
 /// **An unreadable store answers "seen".** Every caller uses the answer to
@@ -465,6 +588,12 @@ pub async fn event_type_ever_emitted(pool: &sqlx::PgPool, event_type: &str) -> b
 /// refusal turns that into something the caller can fix in the same turn.
 /// [`condition::validate`] owns the second half's rules.
 ///
+/// The condition gets a third check, and it is the only one that cannot be
+/// decided from the subscription alone. A syntactically perfect field path may
+/// still name something no payload of that type carries, so
+/// [`uncorroborated_path_warnings`] asks the event store. That one warns rather
+/// than refuses, for the reason stated there.
+///
 /// The first failure refuses the whole call. A partly armed subscription reads
 /// as a success while watching for less than the caller asked. That is the
 /// failure this module exists to end.
@@ -480,17 +609,18 @@ pub async fn check_subscriptions(
         if let Some(cond) = &sub.condition {
             condition::validate(cond).map_err(|e| format!("condition for '{name}': {e}"))?;
         }
-        if verdict != SubscriptionVerdict::UnknownName {
-            continue;
-        }
         // The store is the escape hatch, so it is consulted BEFORE the
         // heuristic. A name this workspace has emitted is real by proof, and no
         // edit-distance rule may take it away.
-        if event_type_ever_emitted(pool, name).await {
+        if verdict == SubscriptionVerdict::UnknownName && !event_type_ever_emitted(pool, name).await
+        {
+            refuse_near_miss(name)?;
+            warnings.push(never_emitted_warning(name));
+            // Nothing stored to corroborate a path against, and the warning
+            // above already says the harder thing.
             continue;
         }
-        refuse_near_miss(name)?;
-        warnings.push(never_emitted_warning(name));
+        warnings.extend(uncorroborated_path_warnings(pool, name, sub.condition.as_ref()).await);
     }
     Ok(warnings)
 }

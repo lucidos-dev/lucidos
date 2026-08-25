@@ -134,9 +134,8 @@ fn applies_to(notice: &ReleaseNotice, running: &Version) -> bool {
 /// Where the cursor sits in `notices`: the count of entries it has answered.
 ///
 /// An id the file no longer carries reads as nothing answered. That needs an
-/// entry deleted or renamed, which the file's header forbids, and the startup
-/// seed repairs the stored value on the next boot. Showing a notice twice is
-/// the recoverable direction. Swallowing one silently is not.
+/// entry deleted or renamed, which the file's header forbids. Showing a notice
+/// twice is the recoverable direction. Swallowing one silently is not.
 fn answered_count(notices: &[ReleaseNotice], cursor: Option<&str>) -> usize {
     cursor
         .and_then(|id| notices.iter().position(|n| n.id == id))
@@ -178,27 +177,17 @@ pub fn view(notices: &[ReleaseNotice], running: &Version, cursor: Option<&str>) 
     }
 }
 
-/// The cursor a workspace with none starts at, or `None` when it starts owing
-/// every notice.
+/// The stamp a workspace with no content starts at, or `None` when the running
+/// release has reached no notice yet.
 ///
-/// The two cases differ by one comparison, deliberately. A workspace with
-/// threads holds content this release may have changed, so it owes the current
-/// release's notices. A workspace with none has nothing to audit and no
-/// settings to migrate. It starts level and hears from the NEXT release
-/// instead, which is what keeps a modal off the first-run welcome.
-pub fn seed_cursor(
-    notices: &[ReleaseNotice],
-    running: &Version,
-    has_threads: bool,
-) -> Option<String> {
+/// A fresh workspace has nothing to audit and no settings to migrate, so it
+/// starts level and hears from the NEXT release instead. Only it is stamped:
+/// [`place_workspace`] owns the other half of that decision.
+fn fresh_workspace_stamp(notices: &[ReleaseNotice], running: &Version) -> Option<String> {
     notices
         .iter()
         .rev()
-        .find(|n| match Version::parse(&n.since) {
-            Ok(since) if has_threads => since < *running,
-            Ok(since) => since <= *running,
-            Err(_) => false,
-        })
+        .find(|n| applies_to(n, running))
         .map(|n| n.id.clone())
 }
 
@@ -243,7 +232,7 @@ pub async fn stored_cursor(pool: &PgPool) -> Option<String> {
     }
 }
 
-/// Give a workspace its starting cursor, and repair one this build cannot read.
+/// Place a workspace in the sequence, on the first boot that finds it outside.
 ///
 /// Runs once per boot, because both inputs are boot facts: the release this
 /// binary reports, and whether the workspace has ever held a thread. A
@@ -258,8 +247,17 @@ pub async fn seed_cursor_at_startup(pool: &PgPool, notices: &[ReleaseNotice]) {
     }
 }
 
-/// The seed itself, with the running release passed in so it can be exercised
-/// against a release the build is not on.
+/// The placement itself, with the running release passed in so it can be
+/// exercised against a release the build is not on.
+///
+/// Only a workspace with NO content is stamped, past everything visible. That
+/// is what keeps a modal off the first-run welcome.
+///
+/// A used workspace is left with no cursor, so it owes every visible notice,
+/// oldest first. The alternative stamps it past the releases it has run. That
+/// reads `since` as the release a notice shipped with, and it is a floor. The
+/// sequence starts the day this engine first boots, whatever release the
+/// workspace is on, so nothing told it anything before that. See ADR 0130.
 async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Version) {
     if notices.is_empty() {
         return;
@@ -276,20 +274,24 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
         {
             Ok(has_threads) => has_threads,
             Err(e) => {
-                // Seeding on a guess would either stamp a real workspace silent or
-                // open a modal over a first run. Skip, and let the next boot ask.
+                // Placing on a guess would either stamp a real workspace silent
+                // or open a modal over a first run. Skip, and let the next boot
+                // ask again.
                 crate::log!(
                     "[ReleaseNotices] could not tell whether the workspace has threads: {e}"
                 );
                 return;
             }
         };
-    let Some(seed) = seed_cursor(notices, running, has_threads) else {
+    if has_threads {
+        return;
+    }
+    let Some(stamp) = fresh_workspace_stamp(notices, running) else {
         return;
     };
-    match PreferenceStore::set_silent(pool, CURSOR_PREF_KEY, &seed).await {
-        Ok(()) => crate::log!("[ReleaseNotices] seeded the cursor at {seed}"),
-        Err(e) => crate::log!("[ReleaseNotices] could not seed the cursor: {e}"),
+    match PreferenceStore::set_silent(pool, CURSOR_PREF_KEY, &stamp).await {
+        Ok(()) => crate::log!("[ReleaseNotices] stamped a fresh workspace at {stamp}"),
+        Err(e) => crate::log!("[ReleaseNotices] could not stamp the workspace: {e}"),
     }
 }
 
@@ -509,37 +511,28 @@ mod tests {
         assert_eq!(view.next_id.as_deref(), Some("a"));
     }
 
-    /// A workspace with content owes the notices of the release it just took.
-    #[test]
-    fn a_workspace_with_threads_is_seeded_behind_the_current_release() {
-        let seed = seed_cursor(&three(), &v("3.0.0"), true);
-        assert_eq!(seed.as_deref(), Some("b"));
-        let view = view(&three(), &v("3.0.0"), seed.as_deref());
-        assert_eq!(view.next_id.as_deref(), Some("c"));
-    }
-
     /// A workspace with nothing in it has nothing to audit, so it starts level.
     #[test]
-    fn a_fresh_workspace_is_seeded_past_the_current_release() {
-        let seed = seed_cursor(&three(), &v("3.0.0"), false);
-        assert_eq!(seed.as_deref(), Some("c"));
-        assert_eq!(view(&three(), &v("3.0.0"), seed.as_deref()).next_id, None);
+    fn a_fresh_workspace_is_stamped_past_the_current_release() {
+        let stamp = fresh_workspace_stamp(&three(), &v("3.0.0"));
+        assert_eq!(stamp.as_deref(), Some("c"));
+        assert_eq!(view(&three(), &v("3.0.0"), stamp.as_deref()).next_id, None);
     }
 
     /// Its silence covers only the notices it started level with. The next
-    /// release still reaches it, which is what makes the stamp safe.
+    /// release still reaches it, which is what makes the stamp safe. A notice
+    /// the running release has not reached is never stamped over.
     #[test]
     fn a_fresh_workspace_still_hears_from_the_next_release() {
-        let seed = seed_cursor(&three(), &v("2.0.0"), false);
-        assert_eq!(seed.as_deref(), Some("b"));
-        let view = view(&three(), &v("3.0.0"), seed.as_deref());
+        let stamp = fresh_workspace_stamp(&three(), &v("2.0.0"));
+        assert_eq!(stamp.as_deref(), Some("b"));
+        let view = view(&three(), &v("3.0.0"), stamp.as_deref());
         assert_eq!(view.next_id.as_deref(), Some("c"));
     }
 
     #[test]
-    fn a_release_older_than_every_notice_seeds_nothing() {
-        assert_eq!(seed_cursor(&three(), &v("0.9.0"), true), None);
-        assert_eq!(seed_cursor(&three(), &v("0.9.0"), false), None);
+    fn a_release_older_than_every_notice_stamps_nothing() {
+        assert_eq!(fresh_workspace_stamp(&three(), &v("0.9.0")), None);
     }
 
     #[test]
@@ -613,7 +606,7 @@ mod tests {
         .expect("insert thread_summary");
     }
 
-    /// The invariant the whole seed exists for: nothing stacks over a first run.
+    /// The invariant the stamp exists for: nothing stacks over a first run.
     #[tokio::test]
     async fn a_workspace_with_no_threads_is_stamped_and_owes_nothing() {
         let (pool, db_name) = setup_test_db().await;
@@ -624,17 +617,23 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// The bug this rule replaced. A used workspace was stamped past every
+    /// notice older than the release it booted on, so the only notice authored
+    /// so far reached nobody. It has been told nothing, so it owes the whole
+    /// backlog, oldest first.
     #[tokio::test]
-    async fn a_workspace_that_has_been_used_owes_the_current_release() {
+    async fn a_used_workspace_is_left_owing_the_oldest_visible_notice() {
         let (pool, db_name) = setup_test_db().await;
         add_a_thread(&pool).await;
         place_workspace(&pool, &three(), &v("3.0.0")).await;
-        assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
+        assert_eq!(stored_cursor(&pool).await, None);
+        let view = view(&three(), &v("3.0.0"), stored_cursor(&pool).await.as_deref());
+        assert_eq!(view.next_id.as_deref(), Some("a"));
         teardown_test_db(&db_name).await;
     }
 
-    /// The seed runs on every boot, so it has to be a no-op after the first.
-    /// Re-deriving would walk a workspace back through notices it answered.
+    /// The placement runs on every boot, so it has to be a no-op after the
+    /// first. Re-deriving would walk a workspace back through what it answered.
     #[tokio::test]
     async fn a_workspace_already_in_the_sequence_is_left_alone() {
         let (pool, db_name) = setup_test_db().await;
@@ -645,17 +644,97 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// A stored id this build cannot place reads as nothing answered. So the
-    /// next boot repairs the value, rather than leaving it owing every notice.
+    /// A stored id this build cannot place reads as nothing answered, so the
+    /// workspace owes everything visible again. The value itself is left as it
+    /// is: a used workspace has no stamp to correct it with, and rewriting it
+    /// could only invent a position nobody reached.
     #[tokio::test]
-    async fn a_cursor_naming_an_unknown_notice_is_repaired() {
+    async fn a_used_workspace_with_an_unplaceable_cursor_owes_everything_again() {
         let (pool, db_name) = setup_test_db().await;
         PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "gone")
             .await
             .expect("the cursor key must be writable without announcing");
         add_a_thread(&pool).await;
         place_workspace(&pool, &three(), &v("3.0.0")).await;
+        let view = view(&three(), &v("3.0.0"), stored_cursor(&pool).await.as_deref());
+        assert_eq!(view.next_id.as_deref(), Some("a"));
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The repair migration's own SQL, so the fixtures below check what ships
+    /// rather than a copy of it that can drift.
+    const REPAIR_SQL: &str =
+        include_str!("../../migrations/20260825153250_clear_seeded_release_notice_cursor.sql");
+
+    async fn run_the_repair(pool: &PgPool) {
+        sqlx::raw_sql(REPAIR_SQL)
+            .execute(pool)
+            .await
+            .expect("the repair migration must run");
+    }
+
+    /// The only durable trace of a real answer, and what the repair reads to
+    /// tell one from a stamp nobody asked for.
+    async fn add_an_answer_event(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id) \
+             VALUES ($1, 'ReleaseNoticeResolved', $2, 'release_notice', 'b')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(serde_json::json!({ "notice_id": "b" }))
+        .execute(pool)
+        .await
+        .expect("insert ReleaseNoticeResolved");
+    }
+
+    /// The workspaces this fix exists for. The stamp goes, and the placement
+    /// that runs later in the same boot leaves them owing the backlog.
+    #[tokio::test]
+    async fn the_repair_clears_a_stamp_a_used_workspace_never_answered() {
+        let (pool, db_name) = setup_test_db().await;
+        add_a_thread(&pool).await;
+        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "b")
+            .await
+            .expect("the cursor key must be writable without announcing");
+
+        run_the_repair(&pool).await;
+        place_workspace(&pool, &three(), &v("3.0.0")).await;
+
+        assert_eq!(stored_cursor(&pool).await, None);
+        let view = view(&three(), &v("3.0.0"), None);
+        assert_eq!(view.next_id.as_deref(), Some("a"));
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Re-asking somebody who already did the work is the one thing the repair
+    /// must never do.
+    #[tokio::test]
+    async fn the_repair_keeps_a_cursor_the_user_answered() {
+        let (pool, db_name) = setup_test_db().await;
+        add_a_thread(&pool).await;
+        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "b")
+            .await
+            .expect("the cursor key must be writable without announcing");
+        add_an_answer_event(&pool).await;
+
+        run_the_repair(&pool).await;
+
         assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A fresh workspace's stamp is correct, so the repair leaves it. Clearing
+    /// it would open a modal over the first-run welcome.
+    #[tokio::test]
+    async fn the_repair_keeps_a_fresh_workspaces_stamp() {
+        let (pool, db_name) = setup_test_db().await;
+        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "c")
+            .await
+            .expect("the cursor key must be writable without announcing");
+
+        run_the_repair(&pool).await;
+
+        assert_eq!(stored_cursor(&pool).await.as_deref(), Some("c"));
         teardown_test_db(&db_name).await;
     }
 

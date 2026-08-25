@@ -83,11 +83,15 @@ function invalidateArtifactPreview(data: Record<string, unknown>): void {
   if (artifactPath) invalidateFilePreview(`artifacts/${artifactPath}`);
 }
 
-/** The plugin id, wherever the frame carries it. `PluginInstalled` nests it in
- *  the manifest; every other `Plugin*` frame has it at the top level. */
+/** The plugin id. Every `Plugin*` frame carries it at the top level, including
+ *  `PluginInstalled`. A row written before it gained the field keeps the id
+ *  only inside the manifest, two layers down. */
 function pluginIdOf(data: Record<string, unknown>): string | undefined {
-  const manifest = data.manifest as Record<string, unknown> | undefined;
-  return (data.id as string | undefined) ?? (manifest?.id as string | undefined);
+  const top = data.id as string | undefined;
+  if (top) return top;
+  const record = data.manifest as Record<string, unknown> | undefined;
+  const manifest = record?.manifest as Record<string, unknown> | undefined;
+  return manifest?.id as string | undefined;
 }
 
 /** Close a plugin install / uninstall panel whose pending entry somebody else

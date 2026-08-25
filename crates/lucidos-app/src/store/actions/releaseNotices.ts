@@ -7,49 +7,19 @@
  *
  * Answering is explicit: the action button, or Got it. Escape and the X close
  * the modal and resolve nothing, so an unanswered notice returns on the next
- * open. {@link releaseNoticeDismissed} is what makes that possible without
- * lying to the engine, and it deliberately lives only for this page's life.
+ * open. `releaseNoticeDismissed` is what makes that possible without lying to
+ * the engine, and it deliberately lives only for this page's life.
+ *
+ * The READS live in `store/releaseNotices.ts`, and that file says why they are
+ * apart from these actions.
  */
-import { signal } from '@preact/signals';
 import { releaseNoticeView, showToast } from '../store';
+import { releaseNoticeDismissed } from '../releaseNotices';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { releaseNotices, resolveReleaseNotice } from '../../api/client';
 import type { ReleaseNotice } from '../../api/client';
 import { sendSeededPrompt } from './compose';
 import { errorDetail } from '../../utils/errorDetail';
-
-/** Has the reader closed the modal without answering the notice in it?
- *
- *  Page-local and never persisted. Escape means "not now", and the next open is
- *  when the question is asked again. Persisting it would turn a dismissal into
- *  an answer, which is the one thing the explicit-resolution rule forbids. */
-export const releaseNoticeDismissed = signal(false);
-
-/** The notice the modal owes an answer for, or `null`. */
-export function owedReleaseNotice(): ReleaseNotice | null {
-  const view = releaseNoticeView.value;
-  if (view.status !== 'loaded' || !view.data.next_id) return null;
-  return view.data.notices.find((n) => n.id === view.data.next_id) ?? null;
-}
-
-/** Should the modal be up?
- *
- *  The App-level slot reads this, so the modal's own chunk is fetched only by a
- *  workspace that owes something. That is a minority of loads. The component
- *  re-checks, because it needs the notice itself anyway. */
-export function releaseNoticeModalOpen(): boolean {
-  return !releaseNoticeDismissed.value && owedReleaseNotice() !== null;
-}
-
-/** How many notices are still owed, counting the one on screen.
- *
- *  Drives the modal's "1 of 3". Everything from the owed one onward is
- *  unanswered by construction, so this is a count of the tail. */
-export function owedReleaseNoticeCount(): number {
-  const view = releaseNoticeView.value;
-  if (view.status !== 'loaded') return 0;
-  return view.data.notices.filter((n) => !n.resolved).length;
-}
 
 export async function loadReleaseNotices(): Promise<void> {
   setLoadingIfFresh(releaseNoticeView);

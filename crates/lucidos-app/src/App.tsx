@@ -36,7 +36,7 @@ import {
   filePreviewModal,
 } from './store/store';
 import { scaleModalOpen } from './components/shared/scaleModalState';
-import { releaseNoticeModalOpen } from './store/actions/releaseNotices';
+import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { viewportIsMobile } from './utils/viewport';
 
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));

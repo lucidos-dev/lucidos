@@ -3,6 +3,7 @@
 //! notification dedup helper.
 
 use crate::api::SharedEngine;
+use crate::scheduler::notifications::settings_tap;
 
 use super::push;
 
@@ -243,21 +244,6 @@ async fn emit_backup_notification(
     }
 
     push::send_push_to_all(engine, title, message, Some(notification_id)).await;
-}
-
-/// A tap that deep-links to one Settings sub-section, the same way the LLM's
-/// `navigate_ui` does. `view` must be one of `NAVIGABLE_SETTINGS_VIEWS`
-/// (`llm/tools/misc.rs`), which is the set the frontend router renders.
-fn settings_tap(view: &str) -> crate::scheduler::notifications::Tap {
-    use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
-
-    Tap::Navigate {
-        to: NavigateUi {
-            target: NavigateTarget::Settings,
-            settings_view: Some(view.to_string()),
-            ..Default::default()
-        },
-    }
 }
 
 /// Settings → System → Backup: the page carrying the health card with the last
@@ -652,7 +638,7 @@ mod tests {
     /// into the dead end it replaced.
     #[test]
     fn every_tap_destination_is_a_renderable_settings_view() {
-        const RENDERABLE: &[&str] = &["accounts", "backup"];
+        let renderable = crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS;
         let taps = [
             backup_settings_tap(),
             backup_failure_tap(Some(&not_connected())),
@@ -662,7 +648,7 @@ mod tests {
         ];
         for tap in taps {
             let view = tapped_view(tap).expect("a deep link");
-            assert!(RENDERABLE.contains(&view.as_str()), "{view}");
+            assert!(renderable.contains(&view.as_str()), "{view}");
         }
     }
 }

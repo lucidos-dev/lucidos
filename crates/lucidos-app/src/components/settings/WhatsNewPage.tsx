@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import {
-  appUpdateCheckInFlight,
   appUpdateProgress,
   changelogReleases,
   latestTauriAppNotes,
@@ -11,12 +10,10 @@ import {
 import { loadChangelog, markWhatsNewSeen } from '../../store/actions/whatsNew';
 import {
   canInstallUpdateHere,
-  checkForUpdatesNow,
   installAppUpdate,
-  packagedUpdateVersion,
-  reportUpdateCheck,
   updateControlLabel,
 } from '../../store/actions/app-update';
+import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { isNewerVersion } from '../../utils/version';
@@ -75,8 +72,11 @@ interface ReleaseMark {
   label: string;
   tooltip?: string;
   /** Distinguishes the offer from the installed release in CSS. */
-  kind: 'running' | 'available' | 'newer';
+  kind: ReleaseRowMarkKind;
 }
+
+/** Which chip a row can wear. Every status but `none`, which marks nothing. */
+export type ReleaseRowMarkKind = Exclude<ReleaseRowStatus, 'none'>;
 
 /** What a release row IS, relative to the one running and the one on offer.
  *
@@ -110,10 +110,12 @@ export function releaseRowStatus(
 /**
  * What a row lets the reader DO about its release.
  *
- * The updater installs whatever the manifest resolves, so a row can only offer
- * an install for the version actually on offer. A release the changelog knows
- * and the check has not seen gets the check instead, which is the honest
- * action: it is what could turn that row into an offer.
+ * One action, on one row. The updater installs whatever the manifest resolves,
+ * so a row cannot ask for a version by name.
+ *
+ * No row offers a CHECK. A check is a global question, so per row it repeats
+ * itself down the list. It also answers nothing the Available row above has
+ * not answered already. The one check lives in Settings, System.
  *
  * `canInstall` is `canInstallUpdateHere`, so a browser or PWA session and a
  * headless install both fall through to no action. Their route is Settings,
@@ -122,9 +124,24 @@ export function releaseRowStatus(
 export function releaseRowAction(
   status: ReleaseRowStatus,
   canInstall: boolean,
-): 'install' | 'check' | null {
-  if (status === 'available') return canInstall ? 'install' : null;
-  return status === 'newer' ? 'check' : null;
+): 'install' | null {
+  return status === 'available' && canInstall ? 'install' : null;
+}
+
+/**
+ * Which chip a row wears, or `null` for none.
+ *
+ * The control supersedes the chip. An Update button already says the release is
+ * available, so an `Available` chip beside it states one fact twice. A session
+ * that cannot install keeps the chip, which is then the only thing on the row
+ * saying so.
+ */
+export function releaseRowMark(
+  status: ReleaseRowStatus,
+  action: 'install' | null,
+): ReleaseRowMarkKind | null {
+  if (status === 'none' || action) return null;
+  return status;
 }
 
 /**
@@ -299,12 +316,6 @@ export function WhatsNewPage() {
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
   const [target, setTarget] = useState<string | null>(null);
 
-  /** Ask for a check, and say what it found. The row that offers this names a
-   *  release the updater has not offered, so the answer is the point. */
-  const runCheck = useCallback(async () => {
-    reportUpdateCheck(await checkForUpdatesNow());
-  }, []);
-
   useEffect(() => {
     void loadChangelog();
   }, []);
@@ -371,7 +382,6 @@ export function WhatsNewPage() {
   // newer than the running one, the offered one included.
   const offered = offeredRelease(offeredVersion, latestTauriAppNotes.value, releases);
   const canInstall = canInstallUpdateHere();
-  const checking = appUpdateCheckInFlight.value;
   // An install already under way owns every update control: the progress dialog
   // narrates it, and a row offering to start another would be a lie.
   const installing = appUpdateProgress.value !== null;
@@ -392,56 +402,36 @@ export function WhatsNewPage() {
     tooltip: lucidosVersionTooltip(release, dirty),
   };
 
-  /** The chip a status wears. `running` is the only one needing state from
+  /** The chip a kind wears. `running` is the only one needing state from
    *  outside the row, which is why it is built above rather than here. */
-  function markFor(status: ReleaseRowStatus, version: string): ReleaseMark | undefined {
-    if (status === 'running') return runningMark;
-    if (status === 'available') {
+  function markFor(kind: ReleaseRowMarkKind, version: string): ReleaseMark {
+    if (kind === 'running') return runningMark;
+    if (kind === 'available') {
       return {
-        kind: 'available',
+        kind,
         label: 'Available',
         tooltip: `Lucidos ${version} is available to install`,
       };
     }
-    if (status === 'newer') {
-      return {
-        kind: 'newer',
-        label: 'Newer',
-        tooltip: `Lucidos ${version} is published, and you are running ${release}`,
-      };
-    }
-    return undefined;
+    return {
+      kind,
+      label: 'Newer',
+      tooltip: `Lucidos ${version} is published, and you are running ${release}`,
+    };
   }
 
-  /** The control a status earns, or `null`.
-   *
-   *  Both actions are the ones Settings → System uses. So the two surfaces
-   *  cannot disagree about what a click does, nor about what it found. */
-  function actionFor(status: ReleaseRowStatus): VNode | null {
-    if (installing) return null;
-    const action = releaseRowAction(status, canInstall);
-    if (action === 'install') {
-      return (
-        <button
-          class="action-btn whats-new-release-action"
-          onClick={() => { void installAppUpdate(); }}
-        >
-          {updateControlLabel(false, true)}
-        </button>
-      );
-    }
-    if (action === 'check') {
-      return (
-        <button
-          class="action-btn whats-new-release-action"
-          disabled={checking}
-          onClick={() => { void runCheck(); }}
-        >
-          {updateControlLabel(checking, false)}
-        </button>
-      );
-    }
-    return null;
+  /** The one control a row can offer. Its wording and its click are both
+   *  Settings → System's, so the two surfaces cannot disagree about what taking
+   *  the update does. */
+  function installButton(): VNode {
+    return (
+      <button
+        class="action-btn whats-new-release-action"
+        onClick={() => { void installAppUpdate(); }}
+      >
+        {updateControlLabel(false, true)}
+      </button>
+    );
   }
 
   function row(r: ChangelogRelease, openByDefault: boolean, forced?: ReleaseRowStatus) {
@@ -450,12 +440,14 @@ export function WhatsNewPage() {
     // own heading, which can name something `packagedUpdateVersion` does not,
     // and that row is the offer whatever the two say. See {@link offeredRelease}.
     const status = forced ?? releaseRowStatus(r.version, release, offeredVersion);
+    const action = installing ? null : releaseRowAction(status, canInstall);
+    const markKind = releaseRowMark(status, action);
     return (
       <ReleaseRow
         key={r.version}
         release={r}
-        mark={markFor(status, r.version)}
-        action={actionFor(status)}
+        mark={markKind ? markFor(markKind, r.version) : undefined}
+        action={action ? installButton() : null}
         open={open}
         onToggle={() => setToggled({ ...toggled, [r.version]: !open })}
       />

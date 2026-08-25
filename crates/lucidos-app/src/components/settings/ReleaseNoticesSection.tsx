@@ -1,6 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { releaseNoticeView } from '../../store/store';
 import {
+  acknowledgeReleaseNotice,
   loadReleaseNotices,
   takeReleaseNoticeAction,
 } from '../../store/actions/releaseNotices';
@@ -42,9 +43,19 @@ export function releaseNoticeRows(view: ReleaseNoticeView): NoticeRow[] {
   return [...outstanding, ...resolved];
 }
 
-/** One row. The button is live except on a queued notice, whose turn has not
+/** One row. A button is live except on a queued notice, whose turn has not
  *  come. The modal keeps the order by drawing no later notice at all, and this
- *  is that same rule where every row is visible at once. */
+ *  is that same rule where every row is visible at once.
+ *
+ *  An unresolved row ALWAYS offers Got it, and any row with an action keeps
+ *  that button, answered or not. Two separate conditions, and each is load
+ *  bearing.
+ *
+ *  `action_label` is optional. Without the first, a notice carrying no action
+ *  could be answered nowhere but the modal, which Escape closes for the page's
+ *  life. The *What's New badge* points here, so the reader would arrive at a
+ *  dot with nothing to press. The second keeps an answered notice's button, for
+ *  the reader who took one action and came back for the rest. */
 function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: string }) {
   return (
     <div class="release-notice-row" data-state={state}>
@@ -57,16 +68,30 @@ function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: strin
         class="markdown-content release-notice-body"
         dangerouslySetInnerHTML={{ __html: renderMarkdown(notice.body) }}
       />
-      {notice.action_label && (
+      {(notice.action_label || state !== 'resolved') && (
         <div class="release-notice-row-actions">
-          <button
-            type="button"
-            class="action-btn"
-            disabled={state === 'queued'}
-            onClick={() => void takeReleaseNoticeAction(notice)}
-          >
-            {notice.action_label}
-          </button>
+          {notice.action_label && (
+            <button
+              type="button"
+              class="action-btn"
+              disabled={state === 'queued'}
+              onClick={() => void takeReleaseNoticeAction(notice)}
+            >
+              {notice.action_label}
+            </button>
+          )}
+          {/* The same word the modal uses, for the same act: it answers this
+              notice and nothing else. */}
+          {state !== 'resolved' && (
+            <button
+              type="button"
+              class="action-btn"
+              disabled={state === 'queued'}
+              onClick={() => void acknowledgeReleaseNotice(notice)}
+            >
+              Got it
+            </button>
+          )}
           {state === 'queued' && blockedBy && (
             <span class="release-notice-row-hint">Work through "{blockedBy}" first.</span>
           )}

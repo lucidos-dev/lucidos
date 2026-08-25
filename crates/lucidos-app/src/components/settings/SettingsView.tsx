@@ -66,6 +66,8 @@ import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { WhatsNewBadge } from '../shared/WhatsNewBadge';
+import { whatsNewBadge } from '../../store/whatsNewBadge';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
@@ -1555,6 +1557,10 @@ export function SettingsView() {
   //
   // Groups are contiguous in SETTINGS_NAV_ITEMS, so a heading is emitted
   // whenever the group changes rather than by pre-bucketing the list.
+  //
+  // `news` is read once for the whole list rather than per row: it is the same
+  // answer for every one of them, and only the System row spends it.
+  const news = whatsNewBadge();
   return (
     <div class="content-view active settings-panel">
       {SETTINGS_NAV_ITEMS.map(({ key, label, group }, i) => (
@@ -1569,8 +1575,15 @@ export function SettingsView() {
             type="button"
             class="settings-section-title settings-nav-row"
             onClick={() => openSettingsSubview(key)}
+            // The mark is decorative, so the row says the words. Only the
+            // badged row carries a label at all: everywhere else the visible
+            // text already names the row, and repeating it would be noise.
+            aria-label={key === 'system' && news ? `${label} · ${news}` : undefined}
           >
-            <span>{label}</span>
+            {/* The third step of the path into What's New. Inside the label
+                span, so the mark hugs the word and the chevron keeps the
+                row's trailing edge. */}
+            <span>{label}{key === 'system' && <WhatsNewBadge placement="inline" />}</span>
             <ChevronRightIcon />
           </button>
         </div>

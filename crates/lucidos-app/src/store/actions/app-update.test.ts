@@ -92,13 +92,15 @@ const {
   checkAppUpdateViaClient,
   checkForUpdatesNow,
   installAppUpdate,
-  packagedUpdateVersion,
   refreshReleaseCheck,
   reportUpdateCheck,
   startAppUpdateProgress,
   stopAppUpdateProgress,
   updateControlLabel,
 } = await import('./app-update');
+// The read lives a layer up, and is exercised here because the actions above
+// all branch on it. It reads the same mocked signals.
+const { packagedUpdateVersion } = await import('../packagedUpdate');
 
 /** Push a frame through the REAL subscription wiring — the handler is whatever
  *  `startAppUpdateProgress` registered, so these tests exercise the actual path

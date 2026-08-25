@@ -17,9 +17,18 @@ import { webviewGoBack, webviewGoForward } from '../../utils/tauri';
 import { MenuIcon, CloseIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { NavChevron, type NavHistoryItem } from '../shared/NavChevron';
+import { WhatsNewBadge } from '../shared/WhatsNewBadge';
+import { whatsNewBadge } from '../../store/whatsNewBadge';
 
 export function HamburgerButton() {
   const isOpen = drawerOpen.value && !drawerClosing.value;
+  // The first step of the path into What's New, so it carries the mark. The
+  // Settings row inside the menu drawer carries the next one. The mark itself
+  // is decorative, so this button speaks the sentence in its own name (see
+  // `WhatsNewBadge`).
+  const news = whatsNewBadge();
+  const action = isOpen ? 'Close menu' : 'Open menu';
+  const label = news ? `${action} · ${news}` : action;
 
   return (
     <button
@@ -28,10 +37,11 @@ export function HamburgerButton() {
         if (isOpen) closeDrawer();
         else openDrawer(e.currentTarget as HTMLElement);
       }}
-      aria-label={isOpen ? 'Close menu' : 'Open menu'}
-      data-tooltip={isOpen ? 'Close menu' : 'Open menu'}
+      aria-label={label}
+      data-tooltip={label}
     >
       {isOpen ? <CloseIcon /> : <MenuIcon />}
+      <WhatsNewBadge placement="corner" />
     </button>
   );
 }

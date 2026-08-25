@@ -491,9 +491,17 @@ describe('processSSEForReferences', () => {
       panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request, installed } };
     }
 
-    it('closes when the peer confirmed, and the id is inside the manifest', () => {
+    it('closes when the peer confirmed', () => {
       openInstallPanel();
-      processSSEForReferences('PluginInstalled', { manifest: { id: 'habit-tracker' } });
+      processSSEForReferences('PluginInstalled', { id: 'habit-tracker' });
+      expect(panelOverlay.value).toBeNull();
+    });
+
+    it('closes on a row written before the frame carried a top-level id', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginInstalled', {
+        manifest: { manifest: { id: 'habit-tracker' } },
+      });
       expect(panelOverlay.value).toBeNull();
     });
 
@@ -515,7 +523,7 @@ describe('processSSEForReferences', () => {
       // `markPluginInstalled` to the overlay and lose the receipt.
       openInstallPanel();
       processSSEForReferences('PluginInstalled', {
-        manifest: { id: 'habit-tracker' },
+        id: 'habit-tracker',
         actor: { kind: 'device', device_id: 'this-device' },
       });
       expect(panelOverlay.value).not.toBeNull();
@@ -524,7 +532,7 @@ describe('processSSEForReferences', () => {
     it('closes when another device is the actor', () => {
       openInstallPanel();
       processSSEForReferences('PluginInstalled', {
-        manifest: { id: 'habit-tracker' },
+        id: 'habit-tracker',
         actor: { kind: 'device', device_id: 'some-other-device' },
       });
       expect(panelOverlay.value).toBeNull();
@@ -532,7 +540,7 @@ describe('processSSEForReferences', () => {
 
     it('leaves a receipt standing, actor or not', () => {
       openInstallPanel(receipt);
-      processSSEForReferences('PluginInstalled', { manifest: { id: 'habit-tracker' } });
+      processSSEForReferences('PluginInstalled', { id: 'habit-tracker' });
       // A receipt is a `plugin-install` form too, so the id still matches. It
       // survives because the panel it would replace has already been resolved.
       expect(panelOverlay.value).not.toBeNull();

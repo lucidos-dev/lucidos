@@ -32,6 +32,14 @@ const OPERATORS: &[&str] = &[
     "$eq", "$ne", "$lt", "$lte", "$gt", "$gte", "$in", "$nin", "$regex",
 ];
 
+/// How deep [`same_leaf_paths`] descends, and how many nodes it may visit.
+/// A sample payload is a third party's data, so the search is bounded at both.
+const MAX_SUGGESTION_DEPTH: usize = 8;
+const MAX_SUGGESTION_NODES: usize = 2_000;
+
+/// How many paths [`same_leaf_paths`] offers.
+const MAX_SUGGESTIONS: usize = 3;
+
 /// What a field path resolves to when nothing is there.
 ///
 /// A `static`, because the resolver hands out a `&'static Value` for the absent
@@ -62,7 +70,7 @@ fn evaluate_condition(condition: &Value, payload: &Value, depth: usize) -> bool 
             if key.starts_with('$') {
                 return false;
             }
-            evaluate_op(op, resolve(payload, key))
+            evaluate_op(op, resolve(payload, key).unwrap_or(&ABSENT))
         }),
     }
 }
@@ -91,29 +99,115 @@ fn evaluate_or(branches: &Value, payload: &Value, depth: usize) -> bool {
 /// The split is at the FIRST dot, so the rule is "the whole remaining key, or a
 /// left-to-right walk" rather than "the longest matching prefix".
 ///
-/// Anything unresolvable is [`ABSENT`], the same JSON null a missing top-level
-/// key has always produced. That covers a segment naming a scalar, an object
-/// without the key, and any array on the path: a numeric segment is an ordinary
-/// object key and never an index.
+/// `None` where nothing is there. [`evaluate`] reads that as [`ABSENT`], the
+/// same JSON null a missing top-level key has always produced. That covers a
+/// segment naming a scalar, an object without the key, and any array on the
+/// path: a numeric segment is an ordinary object key and never an index.
+///
+/// The `Option` is what lets [`resolves`] tell an absent path from a stored
+/// null, which the evaluator deliberately cannot.
 ///
 /// Iterative rather than recursive, because the number of segments is
 /// caller-supplied.
-fn resolve<'a>(payload: &'a Value, key: &str) -> &'a Value {
+fn resolve<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
     let mut current = payload;
     let mut rest = key;
     loop {
         if let Some(found) = current.get(rest) {
-            return found;
+            return Some(found);
         }
-        let Some((head, tail)) = rest.split_once('.') else {
-            return &ABSENT;
-        };
-        let Some(child) = current.get(head) else {
-            return &ABSENT;
-        };
-        current = child;
+        let (head, tail) = rest.split_once('.')?;
+        current = current.get(head)?;
         rest = tail;
     }
+}
+
+/// **Does `payload` carry `path` at all?**
+///
+/// The question the write surface asks and the matcher cannot. [`evaluate`]
+/// reads an absent path as JSON null, so to it a stored `null` and a path that
+/// was never there are the same value. That is deliberate and stays
+/// (ADR 0119), which is why present-versus-absent needs its own function.
+pub fn resolves(payload: &Value, path: &str) -> bool {
+    resolve(payload, path).is_some()
+}
+
+/// **Every field path a condition names**, `$or` branches included, without
+/// repeats. Key order is the JSON map's own, so it is stable but not the order
+/// the author typed.
+///
+/// A `$`-prefixed key in field position is a combinator or a reservation, never
+/// a path, so none appears here. The `$or` recursion carries the same depth cap
+/// [`evaluate`] does, so a hand-crafted condition cannot walk it off the stack.
+pub fn field_paths(condition: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_field_paths(condition, 0, &mut paths);
+    paths
+}
+
+fn collect_field_paths(condition: &Value, depth: usize, out: &mut Vec<String>) {
+    let Some(fields) = condition.as_object() else {
+        return;
+    };
+    for (key, op) in fields {
+        if key == OR {
+            if depth >= MAX_OR_DEPTH {
+                continue;
+            }
+            for branch in op.as_array().into_iter().flatten() {
+                collect_field_paths(branch, depth + 1, out);
+            }
+            continue;
+        }
+        if key.starts_with('$') {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == key) {
+            out.push(key.clone());
+        }
+    }
+}
+
+/// **Where else in `payload` a path's last segment appears**, shortest first.
+///
+/// What to say to someone whose path resolved to nothing. `id` against a
+/// `PluginInstalled` payload answers `manifest.manifest.id`, which is the whole
+/// point: the mistake is almost always the right leaf at the wrong depth.
+///
+/// Breadth-first, so the shallowest match leads. Arrays are not descended,
+/// because a numeric segment is an ordinary object key and a path through an
+/// array can never resolve. `path` itself is never offered back.
+pub fn same_leaf_paths(payload: &Value, path: &str) -> Vec<String> {
+    let leaf = path.rsplit_once('.').map_or(path, |(_, tail)| tail);
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(String::new(), payload, 0usize)]);
+    let mut visited = 0usize;
+    while let Some((prefix, node, depth)) = queue.pop_front() {
+        let Some(fields) = node.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            visited += 1;
+            if visited > MAX_SUGGESTION_NODES {
+                return found;
+            }
+            let full = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if key == leaf && full != path {
+                found.push(full.clone());
+                if found.len() == MAX_SUGGESTIONS {
+                    return found;
+                }
+            }
+            if value.is_object() && depth + 1 < MAX_SUGGESTION_DEPTH {
+                queue.push_back((full, value, depth + 1));
+            }
+        }
+    }
+    found
 }
 
 fn evaluate_op(op: &Value, actual: &Value) -> bool {
@@ -821,5 +915,85 @@ mod tests {
             assert!(validate(cond).is_ok(), "{op} is refused by validate");
             assert!(evaluate(Some(cond), payload), "{op} matches nothing");
         }
+    }
+
+    // ── What the write surface asks ─────────────────────────────────
+
+    /// The distinction `evaluate` cannot draw: it reads both as null.
+    #[test]
+    fn resolves_tells_an_absent_path_from_a_stored_null() {
+        assert!(resolves(&json!({"a": null}), "a"));
+        assert!(!resolves(&json!({"a": 1}), "b"));
+        assert!(resolves(&json!({"a": {"b": 1}}), "a.b"));
+        assert!(!resolves(&json!({"a": {}}), "a.b"));
+        assert!(!resolves(&json!({"a": 5}), "a.b"), "a scalar mid-path");
+        assert!(!resolves(&json!({"a": [{"b": 1}]}), "a.b"), "an array");
+    }
+
+    #[test]
+    fn field_paths_names_every_key_once_and_no_operator() {
+        assert_eq!(field_paths(&json!({"a": 1, "b": {"$gt": 2}})), ["a", "b"]);
+        assert_eq!(field_paths(&json!({"a.b.c": 1})), ["a.b.c"]);
+        assert!(field_paths(&json!("not an object")).is_empty());
+    }
+
+    /// A branch's keys are as much a claim about the payload as a sibling's,
+    /// and `$or` itself is a combinator rather than a field.
+    #[test]
+    fn field_paths_reaches_into_or_branches() {
+        let cond = json!({
+            "action": "completed",
+            "$or": [
+                {"workflow_run.conclusion": "failure"},
+                {"$or": [{"workflow_run.conclusion": "timed_out"}]},
+            ],
+        });
+        assert_eq!(
+            field_paths(&cond),
+            ["workflow_run.conclusion", "action"],
+            "deduped, and no $or"
+        );
+    }
+
+    /// The same reservation `evaluate` enforces: a `$`-prefixed key in field
+    /// position never names a payload field, so it is never corroborated.
+    #[test]
+    fn field_paths_skips_a_reserved_key() {
+        assert!(field_paths(&json!({"$and": [{"a": 1}]})).is_empty());
+    }
+
+    #[test]
+    fn field_paths_stops_at_the_or_depth_cap() {
+        let mut cond = json!({"deep": 1});
+        for _ in 0..MAX_OR_DEPTH + 2 {
+            cond = json!({"$or": [cond]});
+        }
+        assert!(field_paths(&cond).is_empty(), "the cap holds");
+    }
+
+    /// The incident, as a unit test: the right leaf at the wrong depth.
+    #[test]
+    fn same_leaf_paths_finds_the_leaf_further_down() {
+        let payload = json!({
+            "manifest": {"manifest": {"id": "pull-requests", "version": "0.1.0"}},
+            "files": ["apps/pull-requests/index.html"],
+        });
+        assert_eq!(same_leaf_paths(&payload, "id"), ["manifest.manifest.id"]);
+        assert!(same_leaf_paths(&payload, "nothing_like_this").is_empty());
+    }
+
+    #[test]
+    fn same_leaf_paths_leads_with_the_shallowest_and_never_echoes_the_path() {
+        let payload = json!({"a": {"id": 1}, "b": {"c": {"id": 2}}, "id": 3});
+        assert_eq!(same_leaf_paths(&payload, "a.id"), ["id", "b.c.id"]);
+    }
+
+    #[test]
+    fn same_leaf_paths_stops_at_the_depth_cap() {
+        let mut payload = json!({"id": 1});
+        for _ in 0..MAX_SUGGESTION_DEPTH + 2 {
+            payload = json!({"down": payload});
+        }
+        assert!(same_leaf_paths(&payload, "id").is_empty());
     }
 }

@@ -102,7 +102,12 @@ A terminal does the same, and is the fallback when nothing is paired at all:
 ```bash
 lucidos pair            # prints a code; type it into the device
 lucidos pair --qr       # draws it as a QR the phone can scan
+lucidos pair --port 5251  # when two gateways are running, say which one
 ```
+
+It finds the gateway by probing. With two running it refuses rather than
+guessing, and names the ports it found: a code only works on the gateway that
+minted it.
 
 `lucidos` is on no `PATH`. A desktop install keeps it inside the app bundle, at
 `Lucidos.app/Contents/Resources/lucidos`. A headless install keeps it under the
@@ -120,8 +125,15 @@ device is seen, so an active device never reaches it. That window is a
 convenience: the gateway never reads it, and age is not an input to the auth
 decision.
 
-Four things about it are worth knowing, because each surprises people:
+Five things about it are worth knowing, because each surprises people:
 
+- **A device pairs to a GATEWAY, not to a machine.** Almost every install runs
+  one gateway, so the distinction never shows. It shows on a machine running
+  two, which is supported: the packaged app on 5252 beside a dev checkout on
+  5251. Each keeps its own device list and its own codes. So a code minted on
+  one is refused by the other, and Settings → Devices lists the gateway serving
+  that page. Pair the phone against the address it actually reaches. ADR 0132
+  says why the local token stays shared while the device list does not.
 - **A browser pairs even on that machine.** Proving you are local means reading
   a file only your user can read, and a browser cannot read files. So Safari on
   the host pairs exactly like a phone does. Two things never pair, because both

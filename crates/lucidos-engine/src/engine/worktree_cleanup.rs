@@ -62,9 +62,10 @@
 //!   "Low disk space on your machine" `NotificationCreated`; the alert re-arms
 //!   once disk recovers above soft. The body is deliberately framed around
 //!   the volume (not Lucidos) and branches on Lucidos's own footprint vs.
-//!   [`LARGE_FOOTPRINT_BYTES`] so the suggestion matches reality — small
-//!   footprint says "look elsewhere on your machine", large footprint
-//!   suggests Settings → Disk Usage. Below [`FREE_DISK_HARD_BYTES`] (5 GB) it
+//!   [`LARGE_FOOTPRINT_BYTES`] so the suggestion matches reality: a small
+//!   footprint says "look elsewhere on your machine", a large one says clean
+//!   up here. Every disk notification taps through to
+//!   [`DISK_USAGE_PAGE_PATH`], and names it. Below [`FREE_DISK_HARD_BYTES`] (5 GB) it
 //!   ALSO widens its Tier 1 idle window from 24 h to [`FORCE_TIER_1_IDLE`]
 //!   (1 h) so build artifacts from recently-idle worktrees get reclaimed
 //!   aggressively, and emits "Lucidos reclaimed disk space" with the bytes
@@ -100,6 +101,7 @@ use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir, SHORT_THREAD_ID_LEN};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::types::AgentSession;
+use crate::scheduler::notifications::settings_tap;
 
 /// `last_activity_age` lies across long `AskUserQuestion` waits — CC is alive
 /// on stdin but emits no events. Probing `agent_sessions` is the only reliable
@@ -212,6 +214,58 @@ const TEMP_WORKTREE_PREFIXES: &[&str] = &["harden-", "apply-", "merge-"];
 pub const LARGE_FOOTPRINT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// The `settings_view` every disk notification's tap deep-links to. Must be a
+/// renderable subview: see [`settings_tap`].
+const DISK_USAGE_SETTINGS_VIEW: &str = "disk-usage";
+
+/// The same page written the way the UI's own breadcrumbs read
+/// (`SETTINGS_SYSTEM_SUBPANEL_ITEMS` in the frontend store). Every disk
+/// notification names it, so a reader without the tap to hand can still walk
+/// there. **Disk Usage is a subpanel of System, not a top-level category**: the
+/// bodies said "Settings → Disk Usage", a page with no Disk Usage on it.
+const DISK_USAGE_PAGE_PATH: &str = "Settings → System → Disk Usage";
+
+/// Body for the soft-threshold heads-up.
+///
+/// The body frames the pressure around the user's machine, not Lucidos: the
+/// trigger is system-wide free space, and Lucidos's own footprint is usually a
+/// small slice of it. The two branches differ in the REMEDY, never in the
+/// destination. A large footprint means cleaning here reclaims real space; a
+/// small one means the page is where you confirm the pressure is elsewhere.
+fn disk_low_body(free_bytes: u64, lucidos_bytes: u64, large_footprint_bytes: u64) -> String {
+    let free_gb = free_bytes as f64 / BYTES_PER_GB;
+    let lucidos_gb = lucidos_bytes as f64 / BYTES_PER_GB;
+    let volume = format!("Only {free_gb:.1} GB free on the volume hosting your Lucidos workspace.");
+    if lucidos_bytes >= large_footprint_bytes {
+        format!(
+            "{volume} Lucidos worktrees use {lucidos_gb:.1} GB: clean idle ones from \
+             {DISK_USAGE_PAGE_PATH} to reclaim space. New coding-agent sessions may fail \
+             to spawn until disk is freed."
+        )
+    } else {
+        format!(
+            "{volume} Lucidos itself uses just {lucidos_gb:.1} GB, so most of the pressure \
+             is from other apps on your machine. {DISK_USAGE_PAGE_PATH} has the breakdown. \
+             New coding-agent sessions may fail to spawn until you free space elsewhere."
+        )
+    }
+}
+
+/// Body for the hard-threshold auto-cleanup report.
+///
+/// The title attributes the action to Lucidos. The body names the system-wide
+/// free space first, so the reader sees the trigger was the volume rather than
+/// Lucidos eating disk.
+fn auto_cleanup_body(free_bytes: u64, freed_bytes: u64) -> String {
+    let free_gb = free_bytes as f64 / BYTES_PER_GB;
+    let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
+    format!(
+        "Your machine is critically low on disk ({free_gb:.1} GB free). Lucidos reclaimed \
+         {freed_gb:.1} GB from idle coding-agent worktrees. Close saved threads or remove \
+         unused worktrees from {DISK_USAGE_PAGE_PATH} to reclaim more."
+    )
+}
 
 /// Subdirectories of a worktree that are always safe to delete on Tier 1 —
 /// regenerable build artifacts. Order matters only for logging.
@@ -471,7 +525,7 @@ impl WorktreeCleanup {
                 }
                 ShortThreadLookup::NotFound => {
                     // Orphan worktrees are excluded from the footprint to
-                    // match `inventory_worktrees` (Settings → Disk Usage).
+                    // match `inventory_worktrees`, which feeds the same page.
                     if let Some(freed) = self
                         .try_orphan_path(&dir, &path, pre_size, zero_info_grace)
                         .await
@@ -915,62 +969,34 @@ impl WorktreeCleanup {
 
     /// Heads-up that free disk has crossed the soft threshold. Fires once per
     /// pressure episode (re-armed on recovery above soft).
-    ///
-    /// The body is framed around the user's machine, not Lucidos: the trigger
-    /// is system-wide free space, and Lucidos's own footprint is usually a
-    /// small slice of that. Body branches on the footprint so the suggestion
-    /// matches reality (point at Settings only when cleaning would actually
-    /// help).
     async fn emit_disk_low_alert(&self, free_bytes: u64, lucidos_bytes: u64) {
-        let free_gb = free_bytes as f64 / BYTES_PER_GB;
-        let lucidos_gb = lucidos_bytes as f64 / BYTES_PER_GB;
         let title = "Low disk space on your machine".to_string();
-        let message = if lucidos_bytes >= self.large_footprint_bytes {
-            format!(
-                "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
-                 Lucidos worktrees use {:.1} GB — clean idle ones from Settings → Disk Usage to reclaim space. \
-                 New coding-agent sessions may fail to spawn until disk is freed.",
-                free_gb, lucidos_gb,
-            )
-        } else {
-            format!(
-                "Only {:.1} GB free on the volume hosting your Lucidos workspace. \
-                 Lucidos itself uses just {:.1} GB — most of the pressure is from other apps on your machine. \
-                 New coding-agent sessions may fail to spawn until you free space elsewhere.",
-                free_gb, lucidos_gb,
-            )
-        };
+        let message = disk_low_body(free_bytes, lucidos_bytes, self.large_footprint_bytes);
         log!(
-            "[WorktreeCleanup] crossed below soft threshold ({:.1} GB free, Lucidos {:.1} GB) — emitting disk-low NotificationCreated",
-            free_gb,
-            lucidos_gb,
+            "[WorktreeCleanup] crossed below soft threshold ({:.1} GB free, Lucidos {:.1} GB), emitting disk-low NotificationCreated",
+            free_bytes as f64 / BYTES_PER_GB,
+            lucidos_bytes as f64 / BYTES_PER_GB,
         );
         self.emit_notification(title, message, "disk-low").await;
     }
 
     /// Auto-cleanup action notification: hard pressure forced reclamation and
     /// we actually freed bytes. Fires per cycle that does work, so the user
-    /// sees ongoing progress while disk recovers. Title attributes the action
-    /// to Lucidos (it's helpful to know who did it), but the body still names
-    /// the system-wide free space first so the user understands the trigger
-    /// is the volume, not Lucidos eating disk.
+    /// sees ongoing progress while disk recovers.
     async fn emit_auto_cleanup_alert(&self, free_bytes: u64, freed_bytes: u64) {
-        let free_gb = free_bytes as f64 / BYTES_PER_GB;
-        let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
         let title = "Lucidos reclaimed disk space".to_string();
-        let message = format!(
-            "Your machine is critically low on disk ({:.1} GB free). Lucidos reclaimed {:.1} GB from idle coding-agent worktrees. \
-             Close saved threads or remove unused worktrees from Settings → Disk Usage to reclaim more.",
-            free_gb, freed_gb,
-        );
+        let message = auto_cleanup_body(free_bytes, freed_bytes);
         log!(
-            "[WorktreeCleanup] auto-cleanup reclaimed {:.1} GB (free now {:.1} GB) — emitting NotificationCreated",
-            freed_gb,
-            free_gb,
+            "[WorktreeCleanup] auto-cleanup reclaimed {:.1} GB (free now {:.1} GB), emitting NotificationCreated",
+            freed_bytes as f64 / BYTES_PER_GB,
+            free_bytes as f64 / BYTES_PER_GB,
         );
         self.emit_notification(title, message, "auto-cleanup").await;
     }
 
+    /// Both disk notifications land on the same page, because that page answers
+    /// the question each of them raises: how much room is left on the volume,
+    /// and how much of it Lucidos holds.
     async fn emit_notification(&self, title: String, message: String, log_tag: &str) {
         let id = Uuid::new_v4().to_string();
         self.bus
@@ -983,7 +1009,7 @@ impl WorktreeCleanup {
                     app_id: None,
                     thread_id: None,
                     event_id: None,
-                    tap: crate::scheduler::notifications::Tap::Modal,
+                    tap: settings_tap(DISK_USAGE_SETTINGS_VIEW),
                     actor: None,
                 }),
                 &format!("[WorktreeCleanup] {} NotificationCreated", log_tag),

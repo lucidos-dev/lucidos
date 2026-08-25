@@ -10,6 +10,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { isMobile } from '../../utils/viewport';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
+import { WhatsNewBadge } from '../shared/WhatsNewBadge';
 import type { MenuItem } from '../../store/types';
 
 const menuItems: Array<{ id: MenuItem; label: string }> = [
@@ -213,6 +214,10 @@ export function Drawer() {
           </div>
         )}
 
+        {/* The second step of the path into What's New, after the button that
+            opened this menu drawer. The mark alone, with no words: this row is
+            a role-less `<div>`, so it is no control in the accessibility tree
+            to name. That button has already said the sentence. */}
         <div
           class={`drawer-item ${activeMenuItem.value === 'settings' ? 'active' : ''}`}
           onClick={() => {
@@ -221,6 +226,7 @@ export function Drawer() {
           }}
         >
           Settings
+          <WhatsNewBadge placement="inline" />
         </div>
       </Overlay>
     </div>

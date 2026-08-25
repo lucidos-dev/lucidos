@@ -47,7 +47,7 @@ const NAVIGATE_TARGETS: &[&str] = &[
 /// categories the LLM had no signal for; as of the 2026-08-05 restructure no
 /// category is platform-gated (only rows inside one are), so nothing has to be
 /// withheld. See `docs/plans/2026-08-05-settings-information-architecture.md`.
-const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
+pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "models",
     "permissions",
     "mcp",

@@ -452,9 +452,31 @@ impl ReleaseCheck {
         read_updates_toml(self.config_path.as_deref())
     }
 
-    /// Persist a new preference.
-    pub fn set_config(&self, cfg: &UpdatesToml) -> std::io::Result<()> {
-        write_updates_toml(self.config_path.as_deref(), cfg)
+    /// Apply a partial change, re-reading the file immediately first.
+    ///
+    /// Only the fields asked for move. This file is machine-global and every
+    /// gateway on the machine writes it, unlike the paired-device store beside
+    /// it. Take the whole preference, change one field, hand the struct back,
+    /// and the OTHER field goes back as it stood at the read. That undoes what
+    /// a second gateway wrote in between.
+    ///
+    /// Not a lock, and it does not claim to be one. It shrinks the window to
+    /// the read and rename below, where it used to span an HTTP handler. Both
+    /// writers here are a person clicking something, so that is the whole of
+    /// the problem in practice.
+    pub fn update_config(
+        &self,
+        enabled: Option<bool>,
+        notice_acknowledged: Option<bool>,
+    ) -> std::io::Result<()> {
+        let mut cfg = read_updates_toml(self.config_path.as_deref());
+        if let Some(v) = enabled {
+            cfg.enabled = v;
+        }
+        if let Some(v) = notice_acknowledged {
+            cfg.notice_acknowledged = v;
+        }
+        write_updates_toml(self.config_path.as_deref(), &cfg)
     }
 
     /// May a request go out right now? Every gate, in one place.

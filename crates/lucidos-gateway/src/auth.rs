@@ -115,7 +115,7 @@ pub fn last_seen_is_due(last_seen_at: Option<&str>, now: chrono::DateTime<chrono
         .is_ok_and(|elapsed| elapsed >= LAST_SEEN_INTERVAL)
 }
 
-/// The machine-global paired-device store, `~/.lucidos/paired-devices.json`.
+/// A gateway's paired-device store, `<data dir>/paired-devices.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedDevices {
     #[serde(default)]
@@ -156,10 +156,63 @@ impl PairedDevices {
     }
 }
 
-/// `~/.lucidos/paired-devices.json`. `None` only when `HOME` is unset.
-pub fn paired_devices_path() -> Option<PathBuf> {
+/// The paired-device store for a gateway whose data dir is `app_data`.
+///
+/// Per gateway, deliberately not machine-global. Two run side by side on one
+/// machine: the dev gateway on 5251, the packaged app on 5252. Their data dirs
+/// are what separates them. A store keyed on `HOME` handed both one file. Each
+/// loaded it once, then rewrote it whole from private memory, so every write
+/// deleted the other's devices. A device now pairs to a gateway.
+pub fn paired_devices_path(app_data: &Path) -> PathBuf {
+    app_data.join("paired-devices.json")
+}
+
+/// The pre-isolation store at `~/.lucidos/paired-devices.json`, now a seed.
+///
+/// Moving the path alone would refuse every device paired before the upgrade.
+/// That is the failure `docs/plans/2026-08-19-nobody-is-stranded-by-the-pairing-update.md`
+/// exists to prevent. [`load_or_seed`] copies it rather than moving it. The
+/// other gateway needs it too, and none can tell whether the others have
+/// already read it.
+///
+/// `None` only when `HOME` is unset.
+pub fn legacy_paired_devices_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".lucidos/paired-devices.json"))
+}
+
+/// What [`load_or_seed`] found, for the caller's boot log.
+pub struct SeededDevices {
+    pub devices: PairedDevices,
+    /// How many rows came from the legacy store. `None` when it was not read.
+    pub seeded_from_legacy: Option<usize>,
+}
+
+/// Load this gateway's store, seeding it from `legacy` the first time.
+///
+/// The seed is written straight back, so the next boot reads this gateway's own
+/// file and the legacy one is never consulted again. An absent legacy store is
+/// the ordinary first-run case. It yields an empty store rather than an error.
+pub fn load_or_seed(path: &Path, legacy: Option<&Path>) -> Result<SeededDevices, crate::BoxError> {
+    if path.exists() {
+        return Ok(SeededDevices {
+            devices: PairedDevices::load(path)?,
+            seeded_from_legacy: None,
+        });
+    }
+    let Some(legacy) = legacy.filter(|p| p.exists()) else {
+        return Ok(SeededDevices {
+            devices: PairedDevices::default(),
+            seeded_from_legacy: None,
+        });
+    };
+    let devices = PairedDevices::load(legacy)?;
+    devices.save(path)?;
+    let count = devices.devices.len();
+    Ok(SeededDevices {
+        devices,
+        seeded_from_legacy: Some(count),
+    })
 }
 
 /// Lowercase-hex SHA-256 of `value`.
@@ -655,6 +708,96 @@ mod tests {
         assert!(last_seen_is_due(Some(""), now));
         // A clock that jumped back must not make every request write.
         assert!(!last_seen_is_due(Some("2027-01-01T00:00:00Z"), now));
+    }
+
+    // ── The store is per gateway, and the old path seeds it ─────────────────
+
+    #[test]
+    fn the_store_lives_under_the_gateway_s_own_data_dir() {
+        // Two gateways run on one machine, so this must not resolve to one
+        // shared path. `HOME` is what it used to read, and does not appear.
+        let a = paired_devices_path(Path::new("/tmp/gw-a"));
+        let b = paired_devices_path(Path::new("/tmp/gw-b"));
+        assert_ne!(a, b);
+        assert!(a.ends_with("paired-devices.json"));
+    }
+
+    #[test]
+    fn the_legacy_store_seeds_a_gateway_that_has_none_yet() {
+        // The upgrade path. Moving the store without this refuses every device
+        // paired before it, on both gateways at once.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let mine = dir.path().join("gw/paired-devices.json");
+        paired_with("cred-abc").save(&legacy).unwrap();
+
+        let seeded = load_or_seed(&mine, Some(&legacy)).unwrap();
+        assert_eq!(seeded.seeded_from_legacy, Some(1));
+        assert_eq!(seeded.devices.devices[0].label, "My iPhone");
+        // Written straight back, so the next boot reads its own file.
+        assert_eq!(PairedDevices::load(&mine).unwrap(), seeded.devices);
+    }
+
+    #[test]
+    fn the_legacy_store_is_read_and_never_written() {
+        // It is copied rather than moved: the OTHER gateway still has to seed
+        // from it, and no gateway can tell whether it already has.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        paired_with("cred-abc").save(&legacy).unwrap();
+        let before = std::fs::read_to_string(&legacy).unwrap();
+
+        let mine = dir.path().join("gw/paired-devices.json");
+        load_or_seed(&mine, Some(&legacy)).unwrap();
+        let mut store = PairedDevices::load(&mine).unwrap();
+        store.devices.clear();
+        store.save(&mine).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), before);
+    }
+
+    #[test]
+    fn a_gateway_with_its_own_store_ignores_the_legacy_one() {
+        // Seeding once is the whole contract. Re-seeding would put back every
+        // device this gateway had revoked since.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        paired_with("cred-abc").save(&legacy).unwrap();
+        let mine = dir.path().join("mine.json");
+        PairedDevices::default().save(&mine).unwrap();
+
+        let seeded = load_or_seed(&mine, Some(&legacy)).unwrap();
+        assert_eq!(seeded.seeded_from_legacy, None);
+        assert!(seeded.devices.devices.is_empty());
+    }
+
+    #[test]
+    fn a_first_run_with_no_legacy_store_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.json");
+        let missing = dir.path().join("nothing-here.json");
+
+        for legacy in [None, Some(missing.as_path())] {
+            let seeded = load_or_seed(&mine, legacy).unwrap();
+            assert_eq!(seeded.seeded_from_legacy, None);
+            assert!(seeded.devices.devices.is_empty());
+            assert!(!mine.exists(), "a fresh install creates no store");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_seeded_copy_is_owner_only_too() {
+        // The seed is a write like any other, and it carries credential
+        // digests. A world-readable copy of the store is the same leak.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        paired_with("cred-abc").save(&legacy).unwrap();
+        let mine = dir.path().join("gw/paired-devices.json");
+        load_or_seed(&mine, Some(&legacy)).unwrap();
+        let mode = std::fs::metadata(&mine).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

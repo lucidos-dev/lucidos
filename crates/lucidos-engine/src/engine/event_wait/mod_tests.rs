@@ -2428,6 +2428,139 @@ async fn a_name_this_workspace_has_emitted_is_never_refused() {
     teardown_test_db(&db_name).await;
 }
 
+/// One `PluginInstalled` row, emitted the way the install path emits it.
+async fn seed_plugin_install(bus: &EventBus, id: &str, version: &str) {
+    use crate::engine::event_bus::SystemEvent;
+    bus.emit(BusEvent::System(SystemEvent::PluginInstalled {
+        id: id.to_string(),
+        manifest: json!({
+            "summary": format!("Installed {id} v{version}"),
+            "manifest": {"id": id, "version": version, "name": id},
+            "files": [format!("apps/{id}/index.html")],
+            "source_type": "git",
+        }),
+        files: vec![format!("apps/{id}/index.html")],
+        installed_at: "2026-08-25T15:12:00+00:00".to_string(),
+        source_type: "git".to_string(),
+        actor: None,
+    }))
+    .await
+    .unwrap()
+    .expect("a plugin install writes a row");
+}
+
+/// **The incident, end to end.** A path the payload does not carry arms clean
+/// and matches nothing, so the wait sat for hours. The store knows the real
+/// shape, so the warning names it.
+#[tokio::test]
+async fn a_condition_path_no_payload_carries_is_flagged_at_registration() {
+    use crate::core::event_subscription::{check_subscriptions, SubscriptionSurface};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_plugin_install(&bus, "pull-requests", "0.1.0").await;
+
+    let dead = sub("PluginInstalled", Some(json!({"version": "0.1.0"})));
+    let warnings = check_subscriptions(&pool, &[dead], SubscriptionSurface::Wait)
+        .await
+        .expect("a path is never a refusal, only a warning");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("'version'"), "{warnings:?}");
+    assert!(
+        warnings[0].contains("manifest.manifest.version"),
+        "the real path is named: {warnings:?}"
+    );
+
+    let live = sub(
+        "PluginInstalled",
+        Some(json!({"manifest.manifest.version": "0.1.0"})),
+    );
+    let quiet = check_subscriptions(&pool, &[live], SubscriptionSurface::Wait)
+        .await
+        .unwrap();
+    assert!(
+        quiet.is_empty(),
+        "the corroborated path is silent: {quiet:?}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The plugin id is at the top level now, where every sibling `Plugin*` frame
+/// carries it, so the obvious filter is simply right.
+#[tokio::test]
+async fn a_plugin_install_is_filterable_by_its_id() {
+    use crate::core::event_subscription::{check_subscriptions, SubscriptionSurface};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_plugin_install(&bus, "pull-requests", "0.1.0").await;
+
+    let on = vec![sub("PluginInstalled", Some(json!({"id": "pull-requests"})))];
+    let warnings = check_subscriptions(&pool, &on, SubscriptionSurface::Wait)
+        .await
+        .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let lookback = arming_lookback_matches(
+        &pool,
+        &on,
+        i64::MAX,
+        3600,
+        &std::collections::HashSet::new(),
+        5,
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookback.matches.len(), 1, "the condition matches the row");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Three ways the probe must stay quiet. The middle one is why the sample is
+/// built through `matchable_payload`: `thread_id` is injected there and lives
+/// in no stored payload.
+#[tokio::test]
+async fn the_path_probe_stays_quiet_when_it_cannot_know() {
+    use crate::core::event_subscription::{check_subscriptions, SubscriptionSurface};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_thread(&bus, thread_id).await;
+
+    let scoped = sub(
+        "MessageReceived",
+        Some(json!({"thread_id": thread_id.to_string()})),
+    );
+    let no_rows = sub("BackupCompleted", Some(json!({"filename": "x.tar.gz"})));
+    let optional = sub("MessageReceived", Some(json!({"actor": {"$ne": null}})));
+
+    for entry in [scoped, no_rows] {
+        let quiet = check_subscriptions(
+            &pool,
+            std::slice::from_ref(&entry),
+            SubscriptionSurface::Wait,
+        )
+        .await
+        .unwrap();
+        assert!(quiet.is_empty(), "{entry:?} warned: {quiet:?}");
+    }
+
+    // An absent optional field DOES warn, and that is the honest answer: the
+    // sample is evidence, not a schema. It is a warning and never a refusal
+    // for exactly this case.
+    let warned = check_subscriptions(&pool, &[optional], SubscriptionSurface::Wait)
+        .await
+        .expect("still accepted");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Every entry in the list, not just the first. A partly armed subscription
 /// reads as a success while watching for less than the caller asked.
 #[tokio::test]

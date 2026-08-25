@@ -152,6 +152,30 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   nothing but print their own "runs from the internal checkout" refusal.
 - **Status:** open
 
+### Legacy paired-device store seed
+
+- **Added:** 2026-08-25
+- **Lives in:** `gateway/auth.rs::legacy_paired_devices_path` and
+  `::load_or_seed`, called once from `server.rs::run` before the state is
+  built. Paired with the "read-only seed" bullet in ADR 0132 § Consequences.
+- **Impermanent because:** ADR 0132 moved the paired-device store from the
+  machine-global `~/.lucidos/paired-devices.json` to each gateway's own data
+  dir. Moving the path alone would refuse every device paired before the
+  upgrade, on every gateway at once. The seed copies the old file the first
+  time a gateway finds no store of its own, so nobody is locked out. It exists
+  only for installs that predate that move.
+- **Removal / resolution condition:** Every supported install has booted a
+  gateway at or past the release carrying ADR 0132, so each has written its own
+  store. Check the oldest version the front door still offers: an install older
+  than the seed is the only one needing it. Then:
+  - Delete both functions, or keep `load_or_seed` without its `legacy` parameter.
+  - Delete the four seed tests in `auth.rs`.
+  - Drop the seed bullet from ADR 0132 § Consequences.
+  - Drop the boot log line in `server.rs`.
+
+  Lucidos never deletes the old file itself, which stays the user's to remove.
+- **Status:** open
+
 ### Legacy attached-event-wait boot sweep
 
 - **Added:** 2026-08-06

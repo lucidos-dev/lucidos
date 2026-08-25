@@ -232,6 +232,23 @@ lucidos events emit WorkspaceAuditCompleted \
 
 The sweep never fixes anything. Fixes happen in a separate step, and only when the user asks for them — either up front ("audit and fix what you can") or after reading the report ("go fix the app theming ones").
 
+### Ask once, and lead with the whole set
+
+The user's answer is usually all of them or none of them, so ask a **single-select** card before any multi-select one. Batching them into a multi-select first charges one tap per batch for that answer. The 4-option cap also leaves no slot for an "all" option beside the batches.
+
+Ask right after the report lands, with these options in this order:
+
+| Option | Means |
+|---|---|
+| **Do all suggested fixes** | Every fix in the report. Say how many, across how many targets, in the description. |
+| *A narrower cut* | Only when one exists and is genuinely safer or cheaper, such as the direct cleanups without the coding-agent work. Skip the slot otherwise. |
+| **Let me pick which** | Follow with a multi-select card: one option per target batch, using the batching rule below. |
+| **Nothing for now** | Leave the report as the record. It needs its own option: Submit stays disabled with nothing ticked, and Cancel aborts the turn rather than declining. |
+
+The first label says *suggested* because that is what each finding's own line says. A label the report never uses makes the user hunt for the list it covers.
+
+**Skip the card when the user already asked for fixes.** "Audit and fix what you can" is the answer, so re-asking it bounces a settled decision back at them.
+
 When you do spawn fix work:
 
 - **Spawn child threads — omit `relation` (it defaults to `"child"`). Never pass `relation: "top"`.** A child thread reports back: when its session ends, this audit thread automatically resumes with the result, so you can confirm each fix landed, note what didn't, and update the report. The fix threads also nest under the audit in the thread drawer, and each one sitting on a pending change counts as an *attention descendant*, which bubbles the audit thread itself to the Current section — the user follows one row, not N. `relation: "top"` throws all of that away — the spawn records no parent *and* no spawning event, so nothing links the fix back to the audit that asked for it, and the report stays frozen at "suggested fix". The `"top"` wording ("for the user to follow themselves") does **not** cover audit remediation; the user asked for an audit, not for N loose threads.
