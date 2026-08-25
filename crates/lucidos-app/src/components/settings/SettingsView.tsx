@@ -66,8 +66,8 @@ import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
-import { WhatsNewBadge } from '../shared/WhatsNewBadge';
-import { whatsNewBadge } from '../../store/whatsNewBadge';
+import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
+import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
@@ -1513,6 +1513,7 @@ export function SettingsView() {
   function renderSubview() {
     switch (settingsSubview.value) {
       case 'system': return <SystemPage />;
+      case 'release-notices': return <SystemPage panel="release-notices" />;
       case 'whats-new': return <SystemPage panel="whats-new" />;
       case 'thread-queue': return <SystemPage panel="thread-queue" />;
       case 'models': return modelsSection();
@@ -1560,7 +1561,7 @@ export function SettingsView() {
   //
   // `news` is read once for the whole list rather than per row: it is the same
   // answer for every one of them, and only the System row spends it.
-  const news = whatsNewBadge();
+  const news = systemAttentionBadge();
   return (
     <div class="content-view active settings-panel">
       {SETTINGS_NAV_ITEMS.map(({ key, label, group }, i) => (
@@ -1580,10 +1581,10 @@ export function SettingsView() {
             // text already names the row, and repeating it would be noise.
             aria-label={key === 'system' && news ? `${label} · ${news}` : undefined}
           >
-            {/* The third step of the path into What's New. Inside the label
-                span, so the mark hugs the word and the chevron keeps the
-                row's trailing edge. */}
-            <span>{label}{key === 'system' && <WhatsNewBadge placement="inline" />}</span>
+            {/* The third step of the path into System. Inside the label span, so
+                the mark hugs the word and the chevron keeps the row's trailing
+                edge. Still the union: this row leads to both tabs. */}
+            <span>{label}{key === 'system' && <SystemAttentionBadge placement="inline" label={news} />}</span>
             <ChevronRightIcon />
           </button>
         </div>

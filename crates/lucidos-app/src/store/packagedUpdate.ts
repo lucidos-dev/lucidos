@@ -5,7 +5,7 @@
  * action module next door (`actions/app-update.ts`) owns the toast, the Tauri
  * IPC and the install, and reaches the whole menu-action graph through them. A
  * surface that only wants to know whether an update exists must not drag that
- * in. The *What's New badge* asks exactly that, from the menu-drawer button.
+ * in. The *System attention badge* asks exactly that, from the menu-drawer button.
  */
 import { latestTauriAppVersion, releaseCheck } from './store';
 import { isNewerVersion } from '../utils/version';

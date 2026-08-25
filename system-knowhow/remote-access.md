@@ -130,10 +130,12 @@ Five things about it are worth knowing, because each surprises people:
 - **A device pairs to a GATEWAY, not to a machine.** Almost every install runs
   one gateway, so the distinction never shows. It shows on a machine running
   two, which is supported: the packaged app on 5252 beside a dev checkout on
-  5251. Each keeps its own device list and its own codes. So a code minted on
-  one is refused by the other, and Settings → Devices lists the gateway serving
-  that page. Pair the phone against the address it actually reaches. ADR 0132
-  says why the local token stays shared while the device list does not.
+  5251. Each keeps its own device list, its own codes and its own cookie. So a
+  code minted on one is refused by the other, and Settings → Devices lists the
+  gateway serving that page. Pair the phone once against each gateway you want
+  it to reach: the two pairings sit side by side and do not evict each other,
+  even on one hostname. ADR 0132 says why the local token stays shared while
+  the device list does not.
 - **A browser pairs even on that machine.** Proving you are local means reading
   a file only your user can read, and a browser cannot read files. So Safari on
   the host pairs exactly like a phone does. Two things never pair, because both

@@ -10,7 +10,8 @@ import { errorDetail } from '../../utils/errorDetail';
 import { isMobile } from '../../utils/viewport';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
-import { WhatsNewBadge } from '../shared/WhatsNewBadge';
+import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
+import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import type { MenuItem } from '../../store/types';
 
 const menuItems: Array<{ id: MenuItem; label: string }> = [
@@ -226,7 +227,7 @@ export function Drawer() {
           }}
         >
           Settings
-          <WhatsNewBadge placement="inline" />
+          <SystemAttentionBadge placement="inline" label={systemAttentionBadge()} />
         </div>
       </Overlay>
     </div>

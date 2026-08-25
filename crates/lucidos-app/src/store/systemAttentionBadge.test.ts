@@ -1,5 +1,5 @@
 /**
- * The *What's New badge*: what raises it, what it says, and what it refuses to
+ * The *System attention badge*: what raises it, what it says, and what it refuses
  * read.
  *
  * The two things it must never do are the interesting half. It must not badge
@@ -8,7 +8,7 @@
  * told.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { whatsNewBadge, whatsNewBadgeLabel } from './whatsNewBadge';
+import { systemAttentionBadge, systemAttentionBadgeLabel } from './systemAttentionBadge';
 import { releaseNoticeDismissed } from './releaseNotices';
 import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from './store';
 import type { ReleaseNotice } from '../api/client';
@@ -43,48 +43,48 @@ beforeEach(() => {
   releaseNoticeDismissed.value = false;
 });
 
-describe('whatsNewBadgeLabel', () => {
+describe('systemAttentionBadgeLabel', () => {
   it('says nothing when there is nothing to act on', () => {
-    expect(whatsNewBadgeLabel(null, 0)).toBe(null);
+    expect(systemAttentionBadgeLabel(null, 0)).toBe(null);
   });
 
   it('names the release when one is offered', () => {
-    expect(whatsNewBadgeLabel('0.31.0', 0)).toBe('Lucidos 0.31.0 available');
+    expect(systemAttentionBadgeLabel('0.31.0', 0)).toBe('Lucidos 0.31.0 available');
   });
 
   it('counts what is owed, in the singular and the plural', () => {
-    expect(whatsNewBadgeLabel(null, 1)).toBe('1 thing to do');
-    expect(whatsNewBadgeLabel(null, 3)).toBe('3 things to do');
+    expect(systemAttentionBadgeLabel(null, 1)).toBe('1 thing to do');
+    expect(systemAttentionBadgeLabel(null, 3)).toBe('3 things to do');
   });
 
   it('states both when both are true', () => {
-    expect(whatsNewBadgeLabel('0.31.0', 2)).toBe('Lucidos 0.31.0 available · 2 things to do');
+    expect(systemAttentionBadgeLabel('0.31.0', 2)).toBe('Lucidos 0.31.0 available · 2 things to do');
   });
 });
 
-describe('whatsNewBadge', () => {
+describe('systemAttentionBadge', () => {
   it('is silent on a quiet workspace', () => {
     owe([notice('a', true)]);
-    expect(whatsNewBadge()).toBe(null);
+    expect(systemAttentionBadge()).toBe(null);
   });
 
   it('answers the gateway offer', () => {
     offer('0.31.0');
-    expect(whatsNewBadge()).toBe('Lucidos 0.31.0 available');
+    expect(systemAttentionBadge()).toBe('Lucidos 0.31.0 available');
   });
 
   it('answers an owed notice', () => {
     owe([notice('a', true), notice('b', false)]);
-    expect(whatsNewBadge()).toBe('1 thing to do');
+    expect(systemAttentionBadge()).toBe('1 thing to do');
   });
 
   // An unknown answer is not "you owe something". Badging here would draw a dot
   // on every cold load and clear it a moment later.
   it('badges nothing while the notices are unknown', () => {
     releaseNoticeView.value = { status: 'loading' };
-    expect(whatsNewBadge()).toBe(null);
+    expect(systemAttentionBadge()).toBe(null);
     releaseNoticeView.value = { status: 'failed', error: 'engine unreachable' };
-    expect(whatsNewBadge()).toBe(null);
+    expect(systemAttentionBadge()).toBe(null);
   });
 
   // Escape on the modal answers nothing, so the badge must survive it. The one
@@ -92,8 +92,8 @@ describe('whatsNewBadge', () => {
   it('stays up when the modal is dismissed unanswered', () => {
     owe([notice('a', false)]);
     releaseNoticeDismissed.value = true;
-    expect(whatsNewBadge()).toBe('1 thing to do');
+    expect(systemAttentionBadge()).toBe('1 thing to do');
     owe([notice('a', true)]);
-    expect(whatsNewBadge()).toBe(null);
+    expect(systemAttentionBadge()).toBe(null);
   });
 });

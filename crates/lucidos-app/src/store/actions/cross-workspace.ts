@@ -7,12 +7,24 @@ import { isTauri } from '../../utils/platform';
 import { openUrl } from './artifacts';
 import { focusThreadOrBootstrap } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
+import { openNewTab } from '../../utils/newTab';
+import { workspaceTabName } from '../../utils/workspaceWindow';
 
 /** Hash-channel deep link to a thread. Hash (not `?thread=`) is deliberate:
  *  `useStartup` strips `?thread=` unconditionally to defuse stale SW deep-
  *  links, so the query channel can't be repurposed for user-initiated
  *  cross-workspace navigation. */
 export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
+
+/** Where a peer workspace is reachable, and what to name the tab that shows it.
+ *
+ *  `tabKey` is the SLUG behind the gateway, which is what a workspace row keys
+ *  its own tab on. So a thread link and a row reach one tab between them. On a
+ *  dedicated port there is no slug, so the workspace name is the key. */
+interface WorkspaceReach {
+  base: string;
+  tabKey: string;
+}
 
 /** Base URL (no trailing slash) for reaching a target workspace's engine from the
  *  page we're on — **preserving the access context we're already in** (ADR 0014):
@@ -42,7 +54,7 @@ export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
 async function resolveWorkspaceBaseUrl(
   workspace: string,
   opts: { lazyStart: boolean },
-): Promise<string | null> {
+): Promise<WorkspaceReach | null> {
   if (WORKSPACE_ID !== null) {
     // This page is served under a gateway slug prefix, so its origin IS the
     // gateway — route cross-workspace traffic back through it.
@@ -53,49 +65,59 @@ async function resolveWorkspaceBaseUrl(
       // Control plane unreachable: navigation can still let the gateway resolve
       // (and lazy-start) the peer from the slugified name (exact when name ===
       // slug, the common case); a passive fetch gives up rather than guess.
-      return opts.lazyStart
-        ? `${location.origin}/${encodeURIComponent(slugifyWorkspaceName(workspace))}`
-        : null;
+      if (!opts.lazyStart) return null;
+      const guess = slugifyWorkspaceName(workspace);
+      return { base: `${location.origin}/${encodeURIComponent(guess)}`, tabKey: guess };
     }
     const entry =
       list.find(w => w.name === workspace) ??
       list.find(w => w.id === slugifyWorkspaceName(workspace));
     if (!entry) return null; // not registered with the gateway
     if (!opts.lazyStart && entry.health !== 'healthy') return null; // don't boot a stopped peer for a title
-    return `${location.origin}/${encodeURIComponent(entry.id)}`;
+    return {
+      base: `${location.origin}/${encodeURIComponent(entry.id)}`,
+      tabKey: entry.id,
+    };
   }
   const { workspaces } = await fetchWorkspaces();
   const entry = workspaces.find(w => w.name === workspace);
   if (!entry || !entry.engine_running || entry.port == null) return null;
-  return `${location.protocol}//${location.hostname}:${entry.port}`;
+  return {
+    base: `${location.protocol}//${location.hostname}:${entry.port}`,
+    tabKey: workspace,
+  };
 }
 
 /** Open a thread that lives in a different Lucidos workspace. Navigates in the
  *  same access context the user is already in (see `resolveWorkspaceBaseUrl`):
  *  through the gateway when behind it (`https://<gateway>/<slug>/#thread=<uuid>`),
- *  or to the target engine's own port when served directly. We use a named
- *  browser target so the user's existing tab for that workspace (if any) is
- *  reused instead of accumulating duplicate tabs — `noopener` would force
- *  `_blank` per the HTML spec, so it's omitted intentionally. */
+ *  or to the target engine's own port when served directly.
+ *
+ *  The tab is NAMED, so the user's existing tab for that workspace is reused
+ *  rather than duplicated. `openNewTab` owns the naming and the `noopener`
+ *  reasoning. Going through it also reports a blocked pop-up, which a raw
+ *  `window.open` here left as a dead click. */
 export async function openThreadInWorkspace(workspace: string, threadId: string): Promise<void> {
-  let base: string | null;
+  let reach: WorkspaceReach | null;
   try {
-    base = await resolveWorkspaceBaseUrl(workspace, { lazyStart: true });
+    reach = await resolveWorkspaceBaseUrl(workspace, { lazyStart: true });
   } catch (e) {
     showToast(`Failed to open thread in workspace '${workspace}': ${errorDetail(e)}`, 'error');
     return;
   }
-  if (base === null) {
+  if (reach === null) {
     showToast(`Workspace '${workspace}' is not available`, 'error');
     return;
   }
 
-  const url = `${base}/#thread=${threadId}`;
+  const url = `${reach.base}/#thread=${threadId}`;
   if (isTauri()) {
     openUrl(url);
     return;
   }
-  window.open(url, `lucidos-ws-${workspace}`);
+  if (!openNewTab(url, workspaceTabName(reach.tabKey))) {
+    showToast(`Your browser blocked the tab for '${workspace}'. Allow pop-ups for this site.`, 'error');
+  }
 }
 
 /** Route a thread link to the engine that owns it: a same-workspace link
@@ -145,9 +167,9 @@ export async function ensureCrossWorkspaceThreadTitle(
   if (crossWsTitles.value.has(key) || crossWsInFlight.has(key)) return;
   crossWsInFlight.add(key);
   try {
-    const base = await resolveWorkspaceBaseUrl(workspace, { lazyStart: false });
-    if (!base) return;
-    const res = await fetch(`${base}/api/v1/threads/${threadId}`);
+    const reach = await resolveWorkspaceBaseUrl(workspace, { lazyStart: false });
+    if (!reach) return;
+    const res = await fetch(`${reach.base}/api/v1/threads/${threadId}`);
     if (!res.ok) return;
     const summary = (await res.json()) as { title?: string };
     const title = summary.title?.trim();

@@ -1459,18 +1459,18 @@ html[data-theme="dark"] .split-button.open::before {
     color: var(--text-secondary);
 }
 
-/* ── The What's New badge ─────────────────────────────────────────────────
- * The mark on every step of the path into Settings > System > What's New,
- * while there is an update to take or a release notice to answer. Host chrome:
- * an app iframe has no menu drawer and no settings, so none of this ships to
- * one. The rule and the words are in store/whatsNewBadge.ts.
+/* ── The System attention badge ───────────────────────────────────────────
+ * The mark on every step of the path into Settings > System, while there is an
+ * update to take or a release notice to answer. Host chrome: an app iframe has
+ * no menu drawer and no settings, so none of this ships to one. The rule and
+ * the words are in store/systemAttentionBadge.ts.
  */
 
 /* A dot, not a count: an available update and an owed notice do not add up to
    one number. The accent is the same blue every other attention mark in the
    app wears, and the size is the version pill's unread dot, which marks the
    same panel one step further in. */
-.whats-new-badge {
+.system-attention-badge {
     display: inline-block;
     width: 0.375rem;
     height: 0.375rem;
@@ -1493,7 +1493,7 @@ html[data-theme="dark"] .split-button.open::before {
    follow the app's own precedent: 0.375rem where a dot sits beside text at the
    body step, 0.5rem where it sits on a glyph and has to read across a whole
    header row. */
-.badge.whats-new-badge-corner {
+.badge.system-attention-badge-corner {
     top: 0.25rem;
     right: 0.25rem;
     min-width: 0.5rem;
@@ -1509,12 +1509,12 @@ html[data-theme="dark"] .split-button.open::before {
    stays out of `textContent`. Its own rule rather than a shared selector list,
    because the two are separate components that may drift apart, and because
    `explainer.test.ts` pins the explainer's copy by selector. */
-.whats-new-badge-slot {
+.system-attention-badge-slot {
     display: inline;
     line-height: 0;
     margin-left: 0.375rem;
 }
 
-.whats-new-badge-slot::before {
+.system-attention-badge-slot::before {
     content: '\2060';
 }

@@ -18,9 +18,10 @@
  * last row and the way to them. So the two surfaces divide cleanly: the menu
  * switches, the picker manages.
  *
- * A right-click on a row is still switching, into a second window rather than
- * into this one. It unfolds an action row inside the panel, and the picker
- * offers the same thing from its own overflow menu.
+ * WHERE a row opens is not decided here. `utils/workspaceWindow.ts` owns that,
+ * so the picker cannot disagree: a plain activation takes this client's default
+ * mode, and a right-click unfolds the alternate as a row inside the panel. The
+ * picker offers the same alternate from its own overflow menu.
  *
  * Three shapes here, in the order they matter:
  *
@@ -44,11 +45,19 @@ import { toFailed } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { CheckIcon, ChevronDownIcon, PopOutIcon } from '../shared/icons';
-import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
+import { CheckIcon, ChevronDownIcon, PopInIcon, PopOutIcon } from '../shared/icons';
+import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
 import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { showToast, visibleWorkspaceName } from '../../store/store';
-import { offersWorkspaceWindow, openWorkspaceWindow, workspaceWindowLabel } from '../../utils/workspaceWindow';
+import {
+  alternateOpenMode,
+  middleClickActivates,
+  middleClickHandler,
+  openModeForClick,
+  openModeLabel,
+  openWorkspaceIn,
+  type WorkspaceOpenMode,
+} from '../../utils/workspaceWindow';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import { replaceOnPlainClick } from '../../utils/documentNavigation';
 import { rememberLastWorkspaceCount, recallLastWorkspaceCount } from '../../utils/lastWorkspace';
@@ -209,7 +218,9 @@ export interface SwitcherListProps {
   currentId: string | null;
   /** Where the picker is, or null on a client that cannot reach one. */
   manageHref: string | null;
-  onSwitch: (w: WorkspaceStatus) => void;
+  /** A row was activated. The event decides the mode, so a cmd-click or a
+   *  middle-click can ask for a tab where a plain click switches in place. */
+  onActivate: (w: WorkspaceStatus, e: MouseEvent) => void;
   /** Shut the menu on the way out, as every other menu row does. The document
    *  is about to be replaced either way, so this is about the frame in between:
    *  a menu left open over a page that is loading reads as a tap that missed. */
@@ -219,8 +230,8 @@ export interface SwitcherListProps {
   contextId: string | null;
   /** A right-click landed on this workspace's row. */
   onContext: (id: string) => void;
-  /** The unfolded action row was pressed. */
-  onOpenWindow: (w: WorkspaceStatus) => void;
+  /** The unfolded action row was pressed, in the mode it offered. */
+  onAlternate: (w: WorkspaceStatus, mode: WorkspaceOpenMode) => void;
 }
 
 /** One workspace. Three shapes, and which one it takes is the whole of this
@@ -233,17 +244,17 @@ export interface SwitcherListProps {
  *    `WorkspacePicker.openOrRetry` already refuses; the row links to the picker
  *    instead, where Retry lives. With no picker to reach it is inert rather than
  *    a link to nowhere.
- *  - **Everything else** switches. A stopped workspace lazy-starts behind the
- *    gateway's own boot splash, which is the good path rather than the dead one,
- *    and is exactly what tapping its row in the picker does.
+ *  - **Everything else** opens, in whatever mode this client makes the default.
+ *    A stopped workspace lazy-starts behind the gateway's own boot splash, which
+ *    is the good path rather than the dead one. That is exactly what tapping its
+ *    row in the picker does.
  *
  *  A RIGHT-CLICK is a fourth thing, and it crosses all three: it unfolds the
  *  action row below (see {@link switcherActionRow}) instead of raising the
- *  browser's own menu. The current workspace keeps it, since a second window on
- *  the workspace you are in is a real want. An unhealthy one does not, for the
- *  reason its row is not a switch either. */
+ *  browser's own menu. Which rows carry it is `alternateOpenMode`'s decision,
+ *  so the picker cannot quietly disagree. */
 function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
-  const { currentId, manageHref, onSwitch, onNavigate, onContext } = props;
+  const { currentId, manageHref, onActivate, onNavigate, onContext } = props;
   const state = workspaceState(w);
   const stateLabel = workspaceStateLabel(w);
   // aria-label mirrors data-tooltip, as it does in the picker: the dot is the
@@ -267,8 +278,13 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
   // Claim the right-click for the action row below. Without `preventDefault`
   // the browser's own menu covers the panel, which is what a right-click on a
   // workspace row does today. Nothing else is suppressed: a right-click
-  // dispatches no `click`, so the row's switch was never going to run.
-  const contextMenu = offersWorkspaceWindow(state)
+  // dispatches no `click`, so the row's own action was never going to run.
+  //
+  // Claimed for every row an action row could ever open under, NOT only the
+  // rows that have one right now. Tying the two together left one row whose
+  // right-click raised the webview's own menu over the panel, which is the
+  // very thing this suppresses. Unfolding stays `alternateOpenMode`'s call.
+  const contextMenu = state !== 'unhealthy'
     ? { onContextMenu: (e: MouseEvent) => { e.preventDefault(); onContext(w.id); } }
     : {};
 
@@ -335,7 +351,8 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
       class="brand-menu-ws-row"
       role="menuitem"
       aria-label={`Switch to ${w.name} · ${stateLabel}`}
-      onClick={() => onSwitch(w)}
+      onClick={(e: MouseEvent) => onActivate(w, e)}
+      onAuxClick={middleClickActivates(state) ? middleClickHandler((e) => onActivate(w, e)) : undefined}
       key={w.id}
       {...contextMenu}
     >
@@ -358,8 +375,12 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
  *  `WorkspaceRestartRow` renders its confirm inline for the second reason. The
  *  panel's own list already unfolds this way too, so this is the shape the
  *  surface has rather than a workaround. */
-function switcherActionRow(w: WorkspaceStatus, onOpenWindow: (w: WorkspaceStatus) => void) {
-  const label = workspaceWindowLabel();
+function switcherActionRow(
+  w: WorkspaceStatus,
+  mode: WorkspaceOpenMode,
+  onAlternate: (w: WorkspaceStatus, mode: WorkspaceOpenMode) => void,
+) {
+  const label = openModeLabel(mode);
   return (
     <button
       type="button"
@@ -368,14 +389,14 @@ function switcherActionRow(w: WorkspaceStatus, onOpenWindow: (w: WorkspaceStatus
       // Names the workspace, which the visible label cannot: the row sits under
       // it, and an `aria-label` replaces the content a screen reader would read.
       aria-label={`${label}: ${w.name}`}
-      onClick={() => onOpenWindow(w)}
+      onClick={() => onAlternate(w, mode)}
       // A colon, because a slug cannot contain one and a workspace row's key is
       // a bare slug. `${w.id}-window` could not promise that: it collides with
       // the row of a workspace actually named `<id>-window`, and two siblings
       // sharing a key is how keyed diffing reuses the wrong node.
       key={`window:${w.id}`}
     >
-      <PopOutIcon />
+      {mode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
       <span class="brand-menu-ws-name">{label}</span>
     </button>
   );
@@ -389,7 +410,7 @@ function switcherActionRow(w: WorkspaceStatus, onOpenWindow: (w: WorkspaceStatus
  *  as an empty list, and keeps the Manage row, so a gateway that dropped while
  *  the menu was open still leaves a way out. */
 export function workspaceSwitcherList(props: SwitcherListProps) {
-  const { state, manageHref, contextId, onNavigate, onOpenWindow } = props;
+  const { state, currentId, manageHref, contextId, onNavigate, onAlternate } = props;
   if (state.status === 'not-loaded' || state.status === 'loading') return null;
   return (
     <div class="brand-menu-ws-list" role="group" aria-label="Switch workspace">
@@ -402,17 +423,20 @@ export function workspaceSwitcherList(props: SwitcherListProps) {
           rather than at the end of the list, so it cannot be read as belonging
           to whichever row it happened to land beside.
 
-          `offersWorkspaceWindow` is asked again here, and not only where the
+          `alternateOpenMode` is asked again here, and not only where the
           right-click is claimed. `contextId` and `state` arrive as independent
           props, so this function cannot assume its caller paired them: a row
           may only carry the action while its own state still justifies one. */}
       {state.status === 'loaded' &&
-        state.data.flatMap((w) => [
-          switcherRow(w, props),
-          w.id === contextId && offersWorkspaceWindow(workspaceState(w))
-            ? switcherActionRow(w, onOpenWindow)
-            : null,
-        ])}
+        state.data.flatMap((w) => {
+          const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
+          return [
+            switcherRow(w, props),
+            w.id === contextId && mode !== null
+              ? switcherActionRow(w, mode, onAlternate)
+              : null,
+          ];
+        })}
       {manageHref !== null && (
         <a
           class="brand-menu-ws-row brand-menu-ws-manage"
@@ -521,6 +545,22 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   const loading = list.value.status === 'not-loaded' || list.value.status === 'loading';
   const showSkeleton = useDelayedFlag(expanded.value && loading);
 
+  // Every way out of this list, in either mode. The menu always shuts. An
+  // in-place switch replaces the document, and a menu left over the loading
+  // page reads as a tap that missed. A separate one happens elsewhere, so the
+  // menu would sit over work already done.
+  //
+  // The toast names the workspace, and it is the only report the user gets.
+  // This is a direct click, so the telemetry carve-out in
+  // `.claude/rules/frontend.md` does not cover it.
+  const open = (w: WorkspaceStatus, mode: WorkspaceOpenMode) => {
+    contextId.value = null;
+    onClose();
+    void openWorkspaceIn(mode, w.id).catch((e: unknown) => {
+      showToast(`Could not open ${w.name}: ${e}`, 'error');
+    });
+  };
+
   return (
     <>
       {workspacesMenuRow({
@@ -540,24 +580,16 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
             state: list.value,
             currentId: WORKSPACE_ID,
             manageHref,
-            onSwitch: (w) => { onClose(); openWorkspace(w.id); },
+            // A null mode is a gesture that is not an activation at all (a
+            // macOS Ctrl-click, which the action row already answers).
+            onActivate: (w, e) => {
+              const mode = openModeForClick(e);
+              if (mode !== null) open(w, mode);
+            },
             onNavigate: onClose,
             contextId: contextId.value,
             onContext: (id) => { contextId.value = id; },
-            // Shuts the menu, as every other action row does. This page is not
-            // replaced (the workspace opens elsewhere), so the menu would
-            // otherwise sit there over a job already done.
-            //
-            // The toast names the workspace, and it is the only report the user
-            // gets: this is a direct click, so the telemetry carve-out in
-            // `.claude/rules/frontend.md` does not cover it.
-            onOpenWindow: (w) => {
-              contextId.value = null;
-              onClose();
-              void openWorkspaceWindow(w.id).catch((e: unknown) => {
-                showToast(`Could not open ${w.name}: ${e}`, 'error');
-              });
-            },
+            onAlternate: open,
           })}
         </LoadingFade>
       )}

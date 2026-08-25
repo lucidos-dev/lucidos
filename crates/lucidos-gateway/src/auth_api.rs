@@ -107,13 +107,24 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             // fresh liveness stamp for the devices list, and a fresh cookie so
             // a device in use never reaches its `Max-Age`. Both ride the same
             // beat, so an active device pays one whole-file save per day.
-            let refresh = state
-                .touch_device(&id, chrono::Utc::now())
-                .then(|| refreshed_credential_cookie(&state, req.headers()))
-                .flatten();
+            //
+            // A credential that arrived under the LEGACY name is re-issued at
+            // once instead, whatever the beat says. That is the whole migration
+            // off the shared cookie: until it happens, this device holds the one
+            // slot every gateway on the host writes, so the next one to pair
+            // there evicts it.
+            // Read once. This runs on every proxied request, and `authorize`
+            // has already scanned the same header.
+            let presented = auth::presented_credential(req.headers(), state.device_cookie_name());
+            let migrating = presented.is_some_and(auth::PresentedCredential::is_legacy);
+            let due = state.touch_device(&id, chrono::Utc::now());
+            let refresh = presented
+                .filter(|_| migrating || due)
+                .and_then(|p| refreshed_credential_cookie(&state, req.headers(), p));
+            let cookie_name = state.device_cookie_name().to_string();
             let mut response = next.run(req).await;
             if let Some(cookie) = refresh {
-                if !response_speaks_for_the_credential(&response) {
+                if !response_speaks_for_the_credential(&response, &cookie_name) {
                     // Appended, never inserted. `Set-Cookie` is multi-valued, and
                     // this wraps every handler, so replacing the header would
                     // drop any other cookie the response set.
@@ -149,27 +160,43 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
 /// clears the caller's own cookie, and it runs behind this middleware. So a
 /// revoke landing on the day a restamp is due would otherwise hand the browser
 /// a fresh credential instead of clearing it.
-fn response_speaks_for_the_credential(response: &Response) -> bool {
+///
+/// `name` is this gateway's own. Another gateway's cookie on the same response
+/// is not ours to read as an answer, and there is no such response anyway.
+///
+/// Matched with the `=`, so a longer name that merely starts with ours cannot
+/// answer for it. Every name here shares the `lucidos_device_` stem.
+fn response_speaks_for_the_credential(response: &Response, name: &str) -> bool {
+    let prefix = format!("{name}=");
     response
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .any(|v| v.trim_start().starts_with(auth::COOKIE_DEVICE_CREDENTIAL))
+        .any(|v| v.trim_start().starts_with(&prefix))
 }
 
 /// The same credential this request carried, in a cookie with a fresh window.
 ///
-/// `None` when the request carried no readable credential, or the header will
-/// not build. Both leave the existing cookie alone, which is the safe miss: the
-/// device stays paired either way, and the server never checks the window.
+/// Always under THIS gateway's name, whichever name it arrived under. That is
+/// what moves a device off the legacy shared cookie without asking it to pair
+/// again.
+///
+/// `None` when the header will not build, which leaves the existing cookie
+/// alone. That is the safe miss: the device stays paired either way, and the
+/// server never checks the window.
+///
+/// `presented` is passed in rather than re-read, so the caller's one scan of
+/// the `Cookie` header is the only one.
 fn refreshed_credential_cookie(
     state: &GatewayState,
     headers: &HeaderMap,
+    presented: auth::PresentedCredential<'_>,
 ) -> Option<axum::http::HeaderValue> {
-    let credential = auth::presented_credential(headers)?;
     let secure = auth::request_is_secure(headers, state.serves_tls());
-    auth::credential_cookie(credential, secure).parse().ok()
+    auth::credential_cookie(state.device_cookie_name(), presented.value(), secure)
+        .parse()
+        .ok()
 }
 
 #[derive(Serialize)]
@@ -307,7 +334,7 @@ async fn pair(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            auth::credential_cookie(&credential, secure),
+            auth::credential_cookie(state.device_cookie_name(), &credential, secure),
         )],
         Json(serde_json::json!({ "paired": true })),
     )
@@ -361,7 +388,7 @@ async fn revoke_device(
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     if revoked_self {
-        if let Ok(value) = auth::cleared_credential_cookie().parse() {
+        if let Ok(value) = auth::cleared_credential_cookie(state.device_cookie_name()).parse() {
             response.headers_mut().insert(header::SET_COOKIE, value);
         }
     }
@@ -436,6 +463,9 @@ mod tests {
         assert!(!is_public_path("/~/api/v1/auth/pair/steal"));
         assert!(!is_public_path("/~/api/v1/authx"));
     }
+
+    /// A gateway's own cookie name, for the pure helpers below.
+    const TEST_COOKIE: &str = "lucidos_device_deadbeef";
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -591,14 +621,21 @@ mod tests {
         state
     }
 
-    const DEVICE_COOKIE: (&str, &str) = ("cookie", "lucidos_device=cred-abc");
+    /// The pre-split cookie every gateway used to write. Still accepted.
+    const LEGACY_DEVICE_COOKIE: (&str, &str) = ("cookie", "lucidos_device=cred-abc");
+
+    /// What a browser paired to `state` since the split sends back.
+    fn own_device_cookie(state: &GatewayState) -> String {
+        format!("{}=cred-abc", state.device_cookie_name())
+    }
 
     #[tokio::test]
     async fn a_device_unseen_for_a_day_is_restamped_and_gets_a_fresh_cookie() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
 
-        let response = get(&state, "/dev/api/v1/threads/list", &[DEVICE_COOKIE]).await;
+        let own = own_device_cookie(&state);
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
 
         let cookie = response
@@ -606,9 +643,10 @@ mod tests {
             .get(header::SET_COOKIE)
             .and_then(|v| v.to_str().ok())
             .expect("a restamped device is handed a fresh window");
-        // The same credential, and every attribute the original carried. A
-        // refresh that dropped HttpOnly would hand app iframes the credential.
-        assert!(cookie.contains("lucidos_device=cred-abc"), "{cookie}");
+        // The same credential, under THIS gateway's name, and every attribute
+        // the original carried. A refresh that dropped HttpOnly would hand app
+        // iframes the credential.
+        assert!(cookie.contains(&own), "{cookie}");
         assert!(cookie.contains("HttpOnly"), "{cookie}");
         assert!(cookie.contains("SameSite=Lax"), "{cookie}");
         assert!(cookie.contains("Max-Age="), "{cookie}");
@@ -627,7 +665,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let state = state_with_device(dir.path(), Some(&now));
 
-        let response = get(&state, "/dev/api/v1/threads/list", &[DEVICE_COOKIE]).await;
+        let own = own_device_cookie(&state);
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(
@@ -638,6 +677,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_legacy_cookie_still_authorizes_and_is_moved_to_this_gateway_s_name() {
+        // Nobody paired before the split meets the pairing screen. The device
+        // is let in on the old shared name. The same response then hands it
+        // this gateway's own, so it stops holding the one contested slot.
+        // Seen today, so the daily restamp is not what triggers the re-issue.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+
+        let response = get(&state, "/dev/api/v1/threads/list", &[LEGACY_DEVICE_COOKIE]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("a legacy credential is migrated on sight");
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn two_gateways_on_one_host_do_not_share_a_cookie_name() {
+        // Measured before this split: pairing the second gateway took the first
+        // from 200 to 401, because a cookie is scoped to the host and ignores
+        // the port. Distinct names are what let one browser hold both.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = state_with_device(dir_a.path(), None);
+        let b = state_with_device(dir_b.path(), None);
+        assert_ne!(a.device_cookie_name(), b.device_cookie_name());
+
+        // One browser holding both cookies is answered by each gateway.
+        let both = format!(
+            "{}=cred-abc; {}=cred-abc",
+            a.device_cookie_name(),
+            b.device_cookie_name()
+        );
+        for state in [&a, &b] {
+            let response = get(state, "/dev/api/v1/threads/list", &[("cookie", &both)]).await;
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        }
+    }
+
+    #[tokio::test]
     async fn a_refresh_never_overwrites_what_the_handler_said_about_the_cookie() {
         // `revoke_device` clears the caller's own cookie and runs behind this
         // middleware. A revoke landing on a day the device was also due a
@@ -645,9 +729,11 @@ mod tests {
         let mut cleared = StatusCode::NO_CONTENT.into_response();
         cleared.headers_mut().insert(
             header::SET_COOKIE,
-            auth::cleared_credential_cookie().parse().unwrap(),
+            auth::cleared_credential_cookie(TEST_COOKIE)
+                .parse()
+                .unwrap(),
         );
-        assert!(response_speaks_for_the_credential(&cleared));
+        assert!(response_speaks_for_the_credential(&cleared, TEST_COOKIE));
 
         // Another handler's unrelated cookie is not ours, so the refresh rides
         // alongside it rather than standing down or replacing it.
@@ -655,10 +741,11 @@ mod tests {
         other
             .headers_mut()
             .insert(header::SET_COOKIE, "theme=dark; Path=/".parse().unwrap());
-        assert!(!response_speaks_for_the_credential(&other));
+        assert!(!response_speaks_for_the_credential(&other, TEST_COOKIE));
 
         assert!(!response_speaks_for_the_credential(
-            &StatusCode::OK.into_response()
+            &StatusCode::OK.into_response(),
+            TEST_COOKIE
         ));
     }
 
@@ -668,7 +755,8 @@ mod tests {
         // input to the auth decision.
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
-        let response = get(&state, "/dev/api/v1/threads/list", &[DEVICE_COOKIE]).await;
+        let own = own_device_cookie(&state);
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
     }
 

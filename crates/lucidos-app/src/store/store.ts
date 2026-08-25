@@ -193,7 +193,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -226,10 +226,13 @@ export const settingsSubview = signal<SettingsSubview>('main');
 export const settingsScrollTarget = signal<string | null>(null);
 
 export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
-  // Leads the subpanels because it is the one a user arrives at rather than
-  // goes looking for: the Lucidos menu's version row opens it, and the update
-  // notice links to it. It also sits closest to what Overview already says,
-  // which release is running and how to move it forward.
+  // The subpanels lead with the two a user ARRIVES at rather than goes looking
+  // for, and notices lead those: the badge and the notice modal both send the
+  // reader here, and a notice is the only thing in Settings that asks for work.
+  { key: 'release-notices', label: 'Release Notices', short: 'Notices' },
+  // Next, because the Lucidos menu's version row opens it and the update notice
+  // links to it. It also sits closest to what Overview already says, which
+  // release is running and how to move it forward.
   { key: 'whats-new', label: "What's New" },
   { key: 'thread-queue', label: 'Thread Queue' },
   { key: 'backup', label: 'Backup' },

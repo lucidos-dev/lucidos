@@ -491,9 +491,12 @@ export function saveToDownloads(filename: string, contents: string): Promise<Sav
   return invoke<SavedDownload>('save_to_downloads', { filename, contents });
 }
 
-/** Open a workspace in a NEW top-level app window (lib.rs
- *  `open_workspace_window`). The desktop half of `openWorkspaceWindow`, which is
- *  the only thing that should call it.
+/** Show a workspace in a window (lib.rs `show_workspace_window`). The desktop
+ *  half of `openWorkspaceIn`, which is the only thing that should call it.
+ *
+ *  The shell decides WHICH window: it focuses one already on the workspace,
+ *  points the calling window at it when that window is on the picker, or opens
+ *  a new one. Only the shell can see every window, so only the shell can choose.
  *
  *  Takes the workspace SLUG, never a URL, and the shell composes the URL itself
  *  on the calling window's own origin. A `window-*` webview carries the full IPC
@@ -501,8 +504,8 @@ export function saveToDownloads(filename: string, contents: string): Promise<Sav
  *  not one the gateway serves, or the window could not be built.
  *
  *  Only call when isTauri() is true. */
-export function openWorkspaceInNativeWindow(workspace: string): Promise<void> {
-  return invoke('open_workspace_window', { workspace });
+export function showWorkspaceInNativeWindow(workspace: string): Promise<void> {
+  return invoke('show_workspace_window', { workspace });
 }
 
 /** Surface the engine's connect URLs (localhost / LAN / Tailscale). Only call

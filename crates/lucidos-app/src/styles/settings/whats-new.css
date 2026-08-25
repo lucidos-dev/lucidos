@@ -141,11 +141,35 @@
     padding: 0.75rem;
 }
 
-/* A read notice stays in the list so its instruction is never lost, and recedes
-   so the unread ones above it read first. */
+/* An answered notice is a record of what was asked and what you did. It is not
+   asking any more, so it reads as a struck-through checklist item. */
 .release-notice-row[data-state="resolved"] {
     background: transparent;
     border: 1px solid var(--border-color);
+}
+
+.release-notice-row[data-state="resolved"] .release-notice-row-title {
+    color: var(--text-secondary);
+    text-decoration: line-through;
+}
+
+/* Opacity rather than a colour, so the bold and code the markdown may carry
+   recede with the rest instead of staying at full contrast. */
+.release-notice-row[data-state="resolved"] .release-notice-body {
+    opacity: 0.7;
+}
+
+/* Sized by its ink, so it rides the title's line instead of making the head row
+   taller than the text it marks. */
+.release-notice-row-check {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--accent-green);
+}
+
+/* The fold's body, clear of the toggle that opened it. */
+.release-notice-answered-toggle + .release-notice-list {
+    margin-top: var(--space-sm);
 }
 
 .release-notice-row-head {
@@ -178,16 +202,22 @@
     font-weight: 600;
 }
 
+/* Buttons at the trailing edge, the way every other action in the app sits: a
+   card's controls belong under its far corner, not tucked under its first
+   word. */
 .release-notice-row-actions {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.5rem;
     margin-top: 0.75rem;
 }
 
 /* Says which notice has to come first, so a disabled button is never a dead end
-   with no explanation. */
+   with no explanation. It takes the leading edge back off the buttons, which
+   is why it renders before them. */
 .release-notice-row-hint {
+    margin-right: auto;
     color: var(--text-muted);
     font-size: var(--font-size-xs);
 }

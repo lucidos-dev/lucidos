@@ -402,7 +402,7 @@ See also: *paired device*, *pairing code*, *preference*, *active device*.
 ### Paired device
 A *device* you have allowed to reach Lucidos over the network. The *workspace gateway* answers no network caller that is not paired, so joining the tailnet is no longer enough by itself. Pairing is per device and per browser, and it survives restarts until you revoke it. A *paired device* reaches every *workspace* that gateway serves: workspaces are not a boundary against each other, because a *coding agent* in one can already read another through the shell.
 
-**Pairing is per gateway, which shows only when a machine runs two.** Almost every install runs one, and there the gateway and the machine are the same thing. A machine running the packaged app beside a dev checkout runs two, each with its own device list and its own *pairing code*. So a code minted on one is refused by the other, **Devices** lists the one serving that page, and revoking there revokes there (ADR 0132).
+**Pairing is per gateway, which shows only when a machine runs two.** Almost every install runs one, and there the gateway and the machine are the same thing. A machine running the packaged app beside a dev checkout runs two. Each keeps its own device list, its own *pairing code* and its own cookie. So a code minted on one is refused by the other, **Devices** lists the one serving that page, and revoking there revokes there (ADR 0132). One browser can hold a pairing to both at once, so pairing the second does not sign you out of the first.
 
 **Per browser means per browser, and on iOS that includes the home-screen app.** iOS gives it a storage container of its own, so it is a separate device from Safari on the same phone and pairs separately. That is why the pairing screen shows a phone browser the install steps first, and why a phone can appear twice in **Devices**.
 **A pairing ends when you revoke it, and at no other time.** Lucidos runs no idle or absolute timeout, so a device you have not opened in a year still works. That is deliberate. A stolen credential in use never goes stale, so an expiry would cut off only the devices you forgot. Revoking is what answers the one you know you lost.
@@ -727,7 +727,9 @@ It arrives as a card over the workspace, with the instruction and, where there i
 
 **One at a time, oldest first.** Skip several releases and you get them in order, "1 of 3", each replacing the last as you answer it. A later notice is not drawn until the one before it is answered, so they cannot be worked through out of order. **Got it** answers the one you are reading. Escape and the X close the card and answer nothing, so an unanswered notice comes back next time you open the workspace.
 
-Answered notices stay readable under **What you need to do**, at the top of *What's New*, with their buttons. That is where to go if you tapped one action and want the others, or closed the card on the way to doing something else.
+Every notice this workspace has met lives at **Settings > System > Release Notices**, its own tab. Go there if you closed the card on the way to doing something else, or tapped one action and want the others. It is apart from *What's New* on purpose: that panel says what CHANGED, and a notice says what to do about it.
+
+Anything still owed leads the page. Answered notices fold away below, behind a shut **Already answered** row. Open that and each one is ticked, struck through, and its button greyed out. It is a record of what the release asked and what you did, not something still asking. To do one again, just say so in the prompt.
 
 Answering is remembered per *workspace*, not per *device*: settle it on your laptop and your phone will not ask. The workspace's own place in the sequence is the *release notice cursor* (`docs/glossary.md`). A brand new workspace starts level and hears from its next upgrade instead, so nothing lands over the first-run welcome.
 
@@ -744,10 +746,12 @@ Three ways in, all of them places the question comes up. The Lucidos menu's vers
 
 The two update links open the release they just announced, rather than the one you are running: they exist to answer "what is in it", and the answer is that one release. They also open the panel at the top, so an offer never lands you where you last happened to be reading. Every other way in opens the release you are running, which is what the panel is about when nothing is being offered.
 
-### What's New badge
-A small blue dot on the way into *What's New*, saying something there is waiting for you. It appears at every step of the path in: the hamburger that opens the menu drawer, that drawer's **Settings** row, **System**, and the **What's New** tab itself.
+### System attention badge
+A small blue dot on the way into **Settings > System**, saying something there is waiting for you. It appears at every step of the path in: the hamburger that opens the menu drawer, that drawer's **Settings** row, **System**, and then the tab that owes the work.
 
-Two things raise it: a Lucidos update you can take, and a *release notice* you have not answered. Both are work, which is what separates the dot from news you might simply read. Hover the hamburger and it says which.
+Two things raise it, and they sit on two different tabs. A Lucidos update you can take is *What's New*. A *release notice* you have not answered is **Release Notices**. Both are work, which is what separates the dot from news you might simply read. Hover the hamburger and it says which.
+
+Upstream of those two tabs one dot stands for both, because that path leads to both. On a tab it means work on that tab, so an update never dots Release Notices.
 
 **It clears by being acted on, never by being seen.** Install the update, or answer the notice, and it goes. Opening the panel and closing it again changes nothing, and neither does closing a release notice card with Escape.
 
@@ -781,7 +785,37 @@ Only *this* endpoint's deliveries are compared, so two webhooks fed by the same 
 See also: *webhook*, *domain event*.
 
 ### Workspace
-A user's complete Lucidos instance: one PostgreSQL database inside the shared Lucidos Postgres cluster + `data/` directory (artifacts, apps, knowhow, triggers, intents, config, auth-modules, scripts). Multiple workspaces run concurrently (each is its own isolated engine + database), fronted by a single *workspace gateway* (dev term) that addresses each one by its *workspace address*, the path prefix `/<slug>/`. From the workspace picker (at `/~/`, or just `/` when there's more than one) you switch between them, create / rename / delete them, toggle each one's *auto-start*, and **restore one from a backup** (drop in an encrypted `.enc` backup file + its backup key; the name is filled in from the backup, and you must change it when its address is already taken). Every workspace you've launched stays **listed** in the picker even after it stops; opening a stopped one starts it on demand. You can also **switch without going back to the picker**: the Lucidos menu's Workspaces row (tap the Lucidos mark in the header) unfolds the same list, marks the one you are in, and takes you across in one tap, with each row showing whether that workspace is running and how many unread notifications are waiting there. Only switching lives in the menu, so creating, renaming, deleting, restoring and starting or stopping still send you to the picker, which the list's last row links to. On first run there are no workspaces yet, so the picker offers both ways in side by side: name your first workspace (suggesting "personal" or "work"), or restore one from a backup. Nothing is auto-created for you.
+A user's complete Lucidos instance: one PostgreSQL database inside the shared
+Lucidos Postgres cluster, plus a `data/` directory (artifacts, apps, knowhow,
+triggers, intents, config, auth-modules, scripts). Multiple workspaces run
+concurrently, each its own isolated engine and database. A single *workspace
+gateway* (dev term) fronts them and addresses each by its *workspace address*,
+the path prefix `/<slug>/`.
+
+The workspace picker is at `/~/`, or just `/` when there is more than one. From
+it you switch between them, create, rename and delete them, and toggle each
+one's *auto-start*. You can also **restore one from a backup** there: drop in an
+encrypted `.enc` backup file and its backup key. The name is filled in from the
+backup, and you must change it when its address is already taken. Every
+workspace you have launched stays **listed** in the picker even after it stops,
+and opening a stopped one starts it on demand.
+
+You can also **switch without going back to the picker**. The Lucidos menu's
+Workspaces row (tap the Lucidos mark in the header) unfolds the same list and
+marks the one you are in. Each row shows whether that workspace is running, and
+how many unread notifications are waiting there.
+
+Where a tap opens it depends on the client. The installed desktop app gives each
+workspace its own window, and brings that window forward when it is already
+open. A browser tab and an installed web app switch in place instead, and in a
+browser cmd-click or middle-click opens a tab. A right-click always offers the
+other one.
+
+Only switching lives in the menu. Creating, renaming, deleting, restoring and
+starting or stopping still send you to the picker, which the list's last row
+links to. On first run there are no workspaces yet, so the picker offers both
+ways in side by side: name your first workspace (suggesting "personal" or
+"work"), or restore one from a backup. Nothing is auto-created for you.
 
 ### Workspace address
 The path a *workspace* is served at (`/personal/`), also the name of its folder and of its database. It is derived from the workspace's name when the workspace is created (lower-cased, with anything that is not a letter or digit turned into `-`) and then **fixed forever**: renaming a workspace changes its label, never its address, so the two can end up different. The picker shows a workspace's address only when it would otherwise surprise you, which is exactly when a rename has moved the label off the address, or when two workspaces share a label and the address is the only thing telling them apart. **No two workspaces can share an address, and no two can share a name either**: creating or renaming to a name another workspace already has is refused, naming the one that has it (a name a running restore is about to give its workspace counts as taken too, and you can wait for it instead) (matched ignoring case and surrounding spaces, since "Work" and "work" are no more tellable apart in a list than two identical names). Where only the *address* is taken, because the workspace holding it goes by a different name now, a create simply gets the next free address, `/personal-2/`, and the picker says so before you create it; a restore is refused instead, since restoring into a suffixed address would quietly leave you with a second copy of the same workspace. Workspaces that already shared a name before this rule keep working untouched, and the picker shows their addresses so you can still tell them apart.

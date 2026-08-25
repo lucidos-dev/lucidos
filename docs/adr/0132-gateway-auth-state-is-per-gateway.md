@@ -34,6 +34,13 @@ else writes it. Pending pairing codes stay in process memory, which is now
 correct rather than merely cheap: the gateway that mints a code is the gateway
 that stores the device.
 
+**The credential cookie is named per gateway too**, `lucidos_device_<id>`, where
+the id digests the same data dir that scopes the store. A cookie is scoped to
+the host and ignores the port. Two gateways on one hostname therefore shared one
+slot, and each pairing evicted the other. The old shared name is still read as a
+fallback. A credential arriving under it is re-issued under the gateway's own
+name on that same response.
+
 **The local token stays machine-wide** at `~/.lucidos/local-token`, and every
 gateway accepts it. It answers whether a caller is a process on this machine,
 which is a property of the machine.
@@ -81,6 +88,12 @@ fix trades a silent clobber for a silent refusal.
   never deleted and never written again.
 - `lucidos pair` fails on a two-gateway machine until told which one. That is
   the point, and the message names the ports it found.
+- One browser can hold a pairing to every gateway on a hostname at once, which
+  the shared cookie name made impossible.
+- A device paired before the cookie split keeps working and is moved to its
+  gateway's own cookie on its next authorized request. The legacy cookie is left
+  in place rather than cleared: clearing it would sign the browser out of every
+  other gateway on the host.
 - The remaining machine-wide state is the local token, `updates.toml`,
   `network.toml` (read-only here) and the port registry, which belongs to the
   dev scripts and the engines.

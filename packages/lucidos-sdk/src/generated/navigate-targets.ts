@@ -39,6 +39,7 @@ export const SETTINGS_VIEW_TARGETS = [
   'system',
   'appearance',
   'keyboard-shortcuts',
+  'release-notices',
   'whats-new',
   'thread-queue',
   'backup',

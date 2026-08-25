@@ -100,7 +100,7 @@ describe('Settings nav structure', () => {
     expect(stripped).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
     // Reachability is the BUTTON, the only way into a category, so a gate is
     // any `key` comparison between the map and it. A decoration the row hangs
-    // off its own label is not one: the What's New badge picks its category
+    // off its own label is not one: the System attention badge picks its category
     // out that way and hides nothing.
     const map = stripped.indexOf('SETTINGS_NAV_ITEMS.map(');
     const row = stripped.indexOf('<div class="settings-section settings-nav-item"', map);

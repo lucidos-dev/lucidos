@@ -20,7 +20,6 @@ import { isNewerVersion } from '../../utils/version';
 import { lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
-import { ReleaseNoticesSection } from './ReleaseNoticesSection';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import type { VNode } from 'preact';
@@ -363,17 +362,8 @@ export function WhatsNewPage() {
     if (loadable.status === 'loaded') markWhatsNewSeen(release);
   }, [release, loadable.status]);
 
-  // The two halves of this page are two fetches, so a dead changelog must not
-  // take the notices with it. The notices are the part that asks something of
-  // the reader. An engine flaky enough to fail one request is exactly when they
-  // come looking for the instruction.
   if (loadable.status === 'failed') {
-    return (
-      <>
-        <ReleaseNoticesSection />
-        <LoadableError error={loadable.error} noun="the changelog" />
-      </>
-    );
+    return <LoadableError error={loadable.error} noun="the changelog" />;
   }
 
   const releases = loadable.status === 'loaded' ? loadable.data : [];
@@ -455,11 +445,6 @@ export function WhatsNewPage() {
   }
 
   return (
-    <>
-      {/* Above the history, because it is the part that asks something of the
-          reader. It renders nothing when the workspace owes nothing, which is
-          the ordinary case. */}
-      <ReleaseNoticesSection />
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="whats-new:releases">
         Releases
@@ -489,6 +474,5 @@ export function WhatsNewPage() {
         ) : null}
       </LoadingFade>
     </div>
-    </>
   );
 }

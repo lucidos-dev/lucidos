@@ -69,7 +69,7 @@ pub struct WindowSnapshot {
 pub fn any_window_is_navigated(windows: &[WindowSnapshot]) -> bool {
     windows
         .iter()
-        .any(|s| crate::notifications::window_is_navigated(&s.url))
+        .any(|s| crate::window_target::window_is_navigated(&s.url))
 }
 
 pub fn record_path(app_data: &Path) -> PathBuf {
@@ -81,7 +81,7 @@ pub fn record_path(app_data: &Path) -> PathBuf {
 /// Pure, so the whole rule is testable without an NSWindow. Three parts.
 ///
 /// A window counts only when it is actually ON a workspace, which
-/// `notifications::window_workspace` decides from its URL. The boot splash and
+/// `window_target::window_workspace` decides from its URL. The boot splash and
 /// the picker are not workspaces and must not be recorded as one.
 ///
 /// `open` is REPLACED, so a window the user closed leaves the record.
@@ -103,7 +103,7 @@ pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSe
         geometry: previous.geometry.clone(),
     };
     for snapshot in ordered {
-        let Some(workspace) = crate::notifications::window_workspace(&snapshot.url) else {
+        let Some(workspace) = crate::window_target::window_workspace(&snapshot.url) else {
             continue;
         };
         session
@@ -183,7 +183,7 @@ pub fn restore_plan(session: &WindowSession, restore: bool) -> Vec<(String, Opti
     session
         .open
         .iter()
-        .filter(|id| crate::notifications::is_workspace_slug(id))
+        .filter(|id| crate::window_target::is_workspace_slug(id))
         .map(|id| (id.clone(), session.geometry.get(id).copied()))
         .collect()
 }

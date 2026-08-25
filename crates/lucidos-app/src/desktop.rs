@@ -1045,7 +1045,7 @@ pub(crate) fn launch_plan(
 ) -> LaunchPlan {
     let tapped = tap
         .as_deref()
-        .and_then(crate::notifications::window_workspace)
+        .and_then(crate::window_target::window_workspace)
         .map(str::to_string);
     let mut wanted: Vec<(&String, Option<crate::window_restore::Rect>)> = restore
         .iter()
@@ -1073,7 +1073,7 @@ pub(crate) fn launch_plan(
         None if wanted.is_empty() => origin.to_string(),
         None => {
             let (id, _) = wanted.remove(0);
-            crate::notifications::workspace_url(origin, id)
+            crate::window_target::workspace_url(origin, id)
         }
     };
     LaunchPlan {
@@ -1081,7 +1081,7 @@ pub(crate) fn launch_plan(
         extra: wanted
             .into_iter()
             .map(|(id, frame)| PlannedWindow {
-                url: crate::notifications::workspace_url(origin, id),
+                url: crate::window_target::workspace_url(origin, id),
                 frame,
             })
             .collect(),

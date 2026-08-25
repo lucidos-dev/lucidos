@@ -1227,7 +1227,7 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`) | Open an app UI |
-| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System subpanel (`system`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging`). Omit `settings_view` for the Settings home list. |
+| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System subpanel (`system`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging`). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |

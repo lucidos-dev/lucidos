@@ -36,10 +36,16 @@ import { isInteractiveTarget } from '../../utils/dom';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { applyAppBadge } from '../../store/actions/app-badge';
+import { WORKSPACE_ID } from '../../utils/basePath';
 import {
-  offersWorkspaceWindow,
-  openWorkspaceWindow,
-  workspaceWindowLabel,
+  alternateOpenMode,
+  defaultOpenMode,
+  middleClickActivates,
+  middleClickHandler,
+  openModeForClick,
+  openModeLabel,
+  openWorkspaceIn,
+  type WorkspaceOpenMode,
 } from '../../utils/workspaceWindow';
 import {
   recallLastWorkspace,
@@ -246,6 +252,18 @@ function PopOutIcon() {
       <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
       <polyline points="15 3 21 3 21 9" />
       <line x1="10" y1="14" x2="21" y2="3" />
+    </svg>
+  );
+}
+
+// The mirror: the arrow lands inside the box, "this loads here". Local for the
+// same reason its pop-out twin is.
+function PopInIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="12 6 12 12 18 12" />
+      <line x1="21" y1="3" x2="12" y2="12" />
     </svg>
   );
 }
@@ -741,16 +759,27 @@ export function WorkspacePicker() {
   // stopped workspace lazy-starts behind the gateway's own auto-refreshing boot
   // splash, which is the good path, not the dead-skeleton case. This mirrors the
   // auto-open guard above, which already skips an unhealthy remembered workspace.
-  function openOrRetry(w: WorkspaceStatus, state: WorkspaceState) {
+  //
+  // `mode` is how the activation asked to open it: a plain one takes this
+  // client's default, and a cmd-click or middle-click asks for a tab. On the
+  // desktop client the default is a window, and the shell decides which. A
+  // `null` mode is a gesture that is not an activation, so the row does
+  // nothing: a macOS Ctrl-click, which the row menu already answers.
+  function openOrRetry(w: WorkspaceStatus, state: WorkspaceState, mode: WorkspaceOpenMode | null) {
+    if (mode === null) return;
     if (state === 'unhealthy') {
       void withBusy(() => restartWorkspace(w.id).then(refresh));
       return;
     }
-    openWorkspace(w.id);
+    // `withBusy` reports a rejection on the picker's own error line, which is
+    // the only surface it has: no toast host is mounted here.
+    void withBusy(async () => {
+      await openWorkspaceIn(mode, w.id);
+    });
   }
 
-  /** Right-click a row: open that row's own overflow menu, where "Open in new
-   *  window" lives beside rename and delete.
+  /** Right-click a row: open that row's own overflow menu, where the ALTERNATE
+   *  open mode lives beside rename and delete.
    *
    *  The menu is anchored to the OVERFLOW BUTTON rather than to the row, for
    *  two reasons. It is CSS-positioned under that button, so this is where it
@@ -971,6 +1000,7 @@ export function WorkspacePicker() {
               // Non-null for the one state that is a fault, which is also the
               // one the dot draws in red. See `workspaceFaultNote`.
               const fault = workspaceFaultNote(w);
+              const alternateMode = alternateOpenMode(state, WORKSPACE_ID, w.id);
               return (
                 <li class="ws-picker-row" key={w.id}>
                   {renamingId.value === w.id ? (
@@ -1025,7 +1055,13 @@ export function WorkspacePicker() {
                       // content, so the fault note rendered inside would go
                       // unread if it were not folded in.
                       aria-label={fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`}
-                      onClick={() => openOrRetry(w, state)}
+                      onClick={(e) => openOrRetry(w, state, openModeForClick(e))}
+                      // Only where a middle press would open something beside.
+                      // On an unhealthy row the primary action is a RESTART,
+                      // and a wheel press must never reboot an engine.
+                      onAuxClick={middleClickActivates(state)
+                        ? middleClickHandler((e) => openOrRetry(w, state, openModeForClick(e)))
+                        : undefined}
                       onContextMenu={(e) => openRowMenu(e, w.id)}
                       onKeyDown={(e) => {
                         // Only the row itself opens on Enter/Space — a keydown
@@ -1034,7 +1070,10 @@ export function WorkspacePicker() {
                         if (e.target !== e.currentTarget) return;
                         if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault();
-                          openOrRetry(w, state);
+                          // A keystroke carries no gesture, so it takes the
+                          // default mode. Its modifiers mean nothing here: they
+                          // are the browser's own on a link, not on a key press.
+                          openOrRetry(w, state, defaultOpenMode());
                         }
                       }}
                     >
@@ -1075,7 +1114,15 @@ export function WorkspacePicker() {
                           {w.unread_count > 99 ? '99+' : w.unread_count}
                         </span>
                       )}
-                      <div class="ws-picker-actions" onClick={(e) => e.stopPropagation()}>
+                      {/* Both, because they are different events: a middle
+                          press dispatches `auxclick` and no `click` at all, so
+                          the click stopper alone let a middle-click on Stop or
+                          the ⋯ trigger fall through and open the workspace. */}
+                      <div
+                        class="ws-picker-actions"
+                        onClick={(e) => e.stopPropagation()}
+                        onAuxClick={(e) => e.stopPropagation()}
+                      >
                         {running ? (
                           <div class="ws-picker-stop-wrap">
                             <button
@@ -1170,9 +1217,17 @@ export function WorkspacePicker() {
                             {/* Leads the menu because it is the only item that
                                 OPENS the workspace, which is what the row is
                                 for; the three below it configure or destroy it.
-                                Which rows carry it is `offersWorkspaceWindow`,
-                                shared with the in-app switcher. */}
-                            {offersWorkspaceWindow(state) && (
+                                It carries the ALTERNATE mode, so it is always
+                                the thing a plain tap on the row does not do.
+                                `alternateOpenMode` decides which rows get one,
+                                and the in-app switcher asks the same function.
+
+                                `WORKSPACE_ID` is null here, since the picker is
+                                served at `/~/`, inside no workspace. That is
+                                what withholds the desktop client's "switch this
+                                window": the default already repoints THIS
+                                window, so the item would say nothing new. */}
+                            {alternateMode !== null && (
                               <button
                                 class="ws-picker-menu-item"
                                 role="menuitem"
@@ -1185,12 +1240,12 @@ export function WorkspacePicker() {
                                   // surface it has: no toast host is mounted
                                   // here.
                                   void withBusy(async () => {
-                                    await openWorkspaceWindow(w.id);
+                                    await openWorkspaceIn(alternateMode, w.id);
                                   });
                                 }}
                               >
-                                <PopOutIcon />
-                                <span>{workspaceWindowLabel()}</span>
+                                {alternateMode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
+                                <span>{openModeLabel(alternateMode)}</span>
                               </button>
                             )}
                             <button

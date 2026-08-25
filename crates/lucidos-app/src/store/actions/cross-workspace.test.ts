@@ -72,6 +72,10 @@ const stubLocation = (origin: string) => {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.isTauri.mockReturnValue(false);
+  // A tab the browser actually opened. `openNewTab` reads the return value to
+  // tell an open from a blocked pop-up. A bare `vi.fn()` returns undefined,
+  // which would make every one of these look blocked.
+  mocks.windowOpen.mockReturnValue({ closed: false, opener: null });
   vi.stubGlobal('window', { ...window, open: mocks.windowOpen });
 });
 
@@ -91,12 +95,15 @@ describe('openThreadInWorkspace — behind the gateway', () => {
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
+  // The tab is named off the SLUG, never the display name. A workspace row
+  // names its own tab the same way. So a thread link and a row reach one tab
+  // between them, rather than opening two on the same workspace.
   it('resolves the authoritative slug from the workspace name when they differ', async () => {
     mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'my-space', name: 'My Space' })]);
 
     await openThreadInWorkspace('My Space', TID);
 
-    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/my-space/#thread=${TID}`, 'lucidos-ws-My Space');
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/my-space/#thread=${TID}`, 'lucidos-ws-my-space');
   });
 
   it('falls back to slugifying the name when the control plane is unreachable', async () => {
@@ -104,7 +111,23 @@ describe('openThreadInWorkspace — behind the gateway', () => {
 
     await openThreadInWorkspace('Dev', TID);
 
-    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`, 'lucidos-ws-Dev');
+    // The guessed slug names the tab too, so the fallback cannot open a second
+    // tab beside the one the resolved path would have found.
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`, 'lucidos-ws-dev');
+  });
+
+  // Going through `openNewTab` is what buys this. The raw `window.open` it
+  // replaced dropped a blocked pop-up silently, so the link was a dead click.
+  it('says so when the browser blocked the tab', async () => {
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+    mocks.windowOpen.mockReturnValue(null);
+
+    await openThreadInWorkspace('dev', TID);
+
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringMatching(/blocked/i),
+      'error',
+    );
   });
 
   it('preserves the current host (Tailscale) for the gateway origin', async () => {

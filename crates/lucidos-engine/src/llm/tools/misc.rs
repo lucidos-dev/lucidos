@@ -60,6 +60,7 @@ pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "system",
     "appearance",
     "keyboard-shortcuts",
+    "release-notices",
     "whats-new",
     "thread-queue",
     "backup",

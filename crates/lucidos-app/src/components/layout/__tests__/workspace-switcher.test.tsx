@@ -41,10 +41,10 @@ function listVNode(
     currentId: 'dev',
     manageHref: MANAGE,
     contextId: null,
-    onSwitch: NOOP,
+    onActivate: NOOP,
     onNavigate: NOOP,
     onContext: NOOP,
-    onOpenWindow: NOOP,
+    onAlternate: NOOP,
     ...over,
   });
 }
@@ -363,20 +363,71 @@ describe('the right-click itself', () => {
 
   it('takes the gesture off the browser, whose own menu would cover the panel', () => {
     const onContext = vi.fn();
-    const onSwitch = vi.fn();
-    const node = listVNode(two, { onContext, onSwitch });
+    const onActivate = vi.fn();
+    const node = listVNode(two, { onContext, onActivate });
     expect(rightClick(node, 'work').claimed).toBe(true);
     expect(onContext).toHaveBeenCalledWith('work');
     // A right-click dispatches no `click`, and nothing here reaches for one.
-    expect(onSwitch).not.toHaveBeenCalled();
+    expect(onActivate).not.toHaveBeenCalled();
   });
 
   it('is wired on the workspace you are already in', () => {
+    // In a browser its alternate is a second tab, which is a real want. The
+    // node suite is not Tauri, where that row's alternate would be a no-op.
     expect(rightClick(listVNode(two), 'dev').wired).toBe(true);
   });
 
   it('is left to the browser on an unhealthy row, which offers nothing', () => {
     const data = [ws({ id: 'dev' }), ws({ id: 'work', health: 'unhealthy', last_error: 'boom' })];
     expect(rightClick(listVNode({ status: 'loaded', data }), 'work').wired).toBe(false);
+  });
+});
+
+describe('activating a row', () => {
+  const two = { status: 'loaded' as const, data: [ws({ id: 'dev' }), ws({ id: 'work' })] };
+
+  /** A row's handler for `name`, or undefined when it carries none. */
+  function handler(node: unknown, id: string, name: 'onClick' | 'onAuxClick') {
+    return rowNode(node, id).props[name] as ((e: unknown) => void) | undefined;
+  }
+
+  it('hands the EVENT on, so the caller can read the gesture off it', () => {
+    // The row does not decide the mode. `openModeForClick` does, and it has its
+    // own tests; splitting it here would be a second copy of that rule.
+    const onActivate = vi.fn();
+    const node = listVNode(two, { onActivate });
+    const event = { button: 0, metaKey: true };
+    handler(node, 'work', 'onClick')?.(event);
+    expect(onActivate).toHaveBeenCalledWith(two.data[1], event);
+  });
+
+  it('answers the middle button, which dispatches no click of its own', () => {
+    // Without this the row takes cmd-click and ignores the wheel press, which
+    // are one intent to the user.
+    const onActivate = vi.fn();
+    const node = listVNode(two, { onActivate });
+    const preventDefault = vi.fn();
+    handler(node, 'work', 'onAuxClick')?.({ button: 1, preventDefault });
+    expect(onActivate).toHaveBeenCalledTimes(1);
+    expect(preventDefault).toHaveBeenCalled();
+  });
+
+  it('leaves the right button to the action row', () => {
+    // `auxclick` fires for it too, and it already means "unfold the alternate".
+    // Taking it here would open a tab AND unfold the row off one gesture.
+    const onActivate = vi.fn();
+    const node = listVNode(two, { onActivate });
+    const preventDefault = vi.fn();
+    handler(node, 'work', 'onAuxClick')?.({ button: 2, preventDefault });
+    expect(onActivate).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('leaves the current and unhealthy rows with nothing to activate', () => {
+    const data = [ws({ id: 'dev' }), ws({ id: 'broken', health: 'unhealthy', last_error: 'boom' })];
+    const node = listVNode({ status: 'loaded', data });
+    expect(handler(node, 'dev', 'onClick')).toBeUndefined();
+    expect(handler(node, 'dev', 'onAuxClick')).toBeUndefined();
+    expect(handler(node, 'broken', 'onAuxClick')).toBeUndefined();
   });
 });

@@ -1,6 +1,7 @@
 /**
- * The *What's New badge* on the path in: the menu hamburger, the drawer's
- * Settings row, the Settings home's System row, and System's What's New tab.
+ * The *System attention badge* on the path in: the menu hamburger, the drawer's
+ * Settings row, the Settings home's System row, and the System tab that owes
+ * the work.
  *
  * The two hook-free components are invoked directly and their vnode trees
  * walked, the `thread-toggle-attention-badge.test.tsx` way. The other two hosts
@@ -17,10 +18,16 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { VNode } from 'preact';
-import { WhatsNewBadge } from '../WhatsNewBadge';
+import { SystemAttentionBadge } from '../SystemAttentionBadge';
 import { HamburgerButton } from '../../layout/ContentNav';
 import { findByClass, textOf, type AnyVNode } from '../../layout/__tests__/vnodeWalk';
 import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from '../../../store/store';
+import {
+  releaseNoticeBadge,
+  systemTabBadge,
+  updateBadge,
+  systemAttentionBadge,
+} from '../../../store/systemAttentionBadge';
 import { drawerClosing, drawerOpen } from '../../layout/Drawer';
 
 const DRAWER = readFileSync(
@@ -33,7 +40,7 @@ const SYSTEM = readFileSync(
   fileURLToPath(new URL('../../settings/SystemPage.tsx', import.meta.url)), 'utf8',
 );
 const BADGE = readFileSync(
-  fileURLToPath(new URL('../WhatsNewBadge.tsx', import.meta.url)), 'utf8',
+  fileURLToPath(new URL('../SystemAttentionBadge.tsx', import.meta.url)), 'utf8',
 );
 
 /** Owe one notice, the shortest way to raise the badge. */
@@ -47,8 +54,10 @@ function oweOne(): void {
   };
 }
 
+/** The component takes the answer rather than reading it, so the helper reads
+ *  the union for it. That is what the upstream hosts pass. */
 function badge(placement: 'corner' | 'inline'): VNode | null {
-  return WhatsNewBadge({ placement }) as VNode | null;
+  return SystemAttentionBadge({ placement, label: systemAttentionBadge() }) as VNode | null;
 }
 
 beforeEach(() => {
@@ -73,7 +82,7 @@ describe('the mark itself', () => {
     expect(corner.props['aria-hidden']).toBe('true');
     const slot = badge('inline') as AnyVNode;
     expect(slot.props['aria-hidden']).toBe('true');
-    expect(findByClass(slot, 'whats-new-badge')).toHaveLength(1);
+    expect(findByClass(slot, 'system-attention-badge')).toHaveLength(1);
   });
 
   it('adds no text to its host, on either placement', () => {
@@ -116,36 +125,66 @@ describe('the menu hamburger', () => {
 
   it('hosts the mark, whatever the mark then decides to draw', () => {
     const kids = (HamburgerButton() as AnyVNode).props.children as unknown[];
-    expect(kids.some((k) => (k as AnyVNode | null)?.type === WhatsNewBadge)).toBe(true);
+    expect(kids.some((k) => (k as AnyVNode | null)?.type === SystemAttentionBadge)).toBe(true);
   });
 });
 
-describe('the three rows that carry the mark inline', () => {
-  it('puts it on the menu drawer\'s Settings row', () => {
+describe('the rows that carry the mark inline', () => {
+  it('puts it on the menu drawer\'s Settings row, as the union', () => {
     const row = DRAWER.indexOf('\n          Settings\n');
     expect(row, 'the Settings row').toBeGreaterThan(-1);
-    expect(DRAWER.slice(row, row + 120)).toContain('<WhatsNewBadge placement="inline" />');
+    expect(DRAWER.slice(row, row + 160))
+      .toContain('<SystemAttentionBadge placement="inline" label={systemAttentionBadge()} />');
   });
 
   it('puts it on the System row alone, never on every Settings category', () => {
-    expect(SETTINGS).toContain('{key === \'system\' && <WhatsNewBadge placement="inline" />}');
-  });
-
-  it('puts it on the What\'s New tab alone, never on every System subpanel', () => {
-    expect(SYSTEM).toContain('item.key === \'whats-new\' && <WhatsNewBadge placement="inline" />');
+    expect(SETTINGS)
+      .toContain('{key === \'system\' && <SystemAttentionBadge placement="inline" label={news} />}');
   });
 
   // The mark is decorative, so a host that CAN name itself has to say the
   // words. The drawer row cannot: it is a role-less div, and the hamburger
   // that opened it has already said them.
-  it('makes the two badged buttons speak the sentence', () => {
+  it('makes the badged buttons speak the sentence', () => {
     expect(SETTINGS).toContain('aria-label={key === \'system\' && news ?');
-    expect(SYSTEM).toContain('aria-label={item.key === \'whats-new\' && news ?');
+    expect(SYSTEM).toContain('aria-label={badge ? `${item.label} · ${badge}` : undefined}');
   });
 
   it('adds no off-screen text to any row', () => {
     // `.drawer-item.active` is asserted to read exactly "Settings" by
     // `e2e/settings-backup-navigation-desktop.spec.ts`.
     expect(BADGE).not.toContain('visually-hidden');
+  });
+});
+
+/**
+ * The last step of the path splits, because the two causes sit on two tabs.
+ *
+ * A mark on a tab promises work on THAT tab. An update must never dot Release
+ * Notices, and an owed notice must never dot What's New.
+ */
+describe('the two System tabs that can owe something', () => {
+  it('dots Release Notices for an owed notice, and nothing else', () => {
+    oweOne();
+    expect(systemTabBadge('release-notices')).toBe('1 thing to do');
+    expect(systemTabBadge('whats-new')).toBe(null);
+    expect(systemTabBadge('backup')).toBe(null);
+    // The path above the two tabs still leads to both, so it keeps the union.
+    expect(systemAttentionBadge()).toBe('1 thing to do');
+  });
+
+  it('dots What\'s New for an available update, and nothing else', () => {
+    releaseCheck.value = { latest: { version: '9.9.9' } } as typeof releaseCheck.value;
+    expect(systemTabBadge('whats-new')).toBe('Lucidos 9.9.9 available');
+    expect(systemTabBadge('whats-new')).toBe(updateBadge());
+    expect(systemTabBadge('release-notices')).toBe(releaseNoticeBadge());
+    expect(systemTabBadge('release-notices')).toBe(null);
+  });
+
+  it('leaves the switcher unable to mark a tab it has no sentence for', () => {
+    // Every other subpanel answers null, so a new one is unmarked until
+    // somebody names a source for it.
+    expect(systemTabBadge('thread-queue')).toBe(null);
+    expect(systemTabBadge('overview')).toBe(null);
   });
 });

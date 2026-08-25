@@ -142,6 +142,10 @@ struct GatewayInner {
     /// This gateway's own paired-device store, under its data dir. Never shared
     /// with another gateway on the machine (`auth::paired_devices_path`).
     paired_devices_path: PathBuf,
+    /// The credential cookie this gateway writes and reads first
+    /// (`auth::device_cookie_name`). Per gateway, because a cookie ignores the
+    /// port, so one name would put two gateways in one slot on a hostname.
+    device_cookie_name: String,
     /// Paired devices, the source of truth for who may reach this gateway over
     /// the network. Held in memory and written through on every change.
     ///
@@ -284,6 +288,7 @@ impl GatewayState {
                 gateway_port: 5251,
                 local_token: "test-local-token".to_string(),
                 paired_devices_path: scratch.join("paired-devices.json"),
+                device_cookie_name: auth::device_cookie_name(&scratch),
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
                 paired_devices_writing: Mutex::new(()),
                 pending_pairings: Mutex::new(auth::PendingPairings::default()),
@@ -332,9 +337,19 @@ impl GatewayState {
     /// because an unrelated thread panicked.
     pub fn authorize(&self, headers: &axum::http::HeaderMap) -> auth::Authorization {
         match self.inner.paired_devices.lock() {
-            Ok(paired) => auth::authorize(headers, &self.inner.local_token, &paired),
+            Ok(paired) => auth::authorize(
+                headers,
+                &self.inner.local_token,
+                &paired,
+                &self.inner.device_cookie_name,
+            ),
             Err(_) => auth::Authorization::Unauthorized,
         }
+    }
+
+    /// The credential cookie name this gateway writes (`auth::device_cookie_name`).
+    pub fn device_cookie_name(&self) -> &str {
+        &self.inner.device_cookie_name
     }
 
     /// Does this process terminate TLS on its own socket?
@@ -2736,6 +2751,7 @@ pub async fn run() -> Result<(), BoxError> {
     let state =
         GatewayState {
             inner: Arc::new(GatewayInner {
+                device_cookie_name: auth::device_cookie_name(&app_data),
                 app_data,
                 registry_path,
                 gateway_port,
@@ -3841,15 +3857,19 @@ mod tests {
         (dir_a, dir_b, a, b)
     }
 
-    fn cookie_header(credential: &str) -> axum::http::HeaderMap {
+    /// A `Cookie` header carrying `credential` under `name`.
+    fn cookie_header_named(name: &str, credential: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
             axum::http::header::COOKIE,
-            format!("{}={credential}", auth::COOKIE_DEVICE_CREDENTIAL)
-                .parse()
-                .unwrap(),
+            format!("{name}={credential}").parse().unwrap(),
         );
         h
+    }
+
+    /// What a browser paired to `state` sends back.
+    fn cookie_header(state: &GatewayState, credential: &str) -> axum::http::HeaderMap {
+        cookie_header_named(state.device_cookie_name(), credential)
     }
 
     #[test]
@@ -3879,7 +3899,7 @@ mod tests {
         );
 
         // And the credential names its own gateway, nobody else's.
-        let headers = cookie_header(&credential);
+        let headers = cookie_header(&a, &credential);
         assert!(matches!(
             a.authorize(&headers),
             auth::Authorization::Device { .. }
@@ -3914,7 +3934,7 @@ mod tests {
         assert!(a.paired_devices().devices.is_empty());
         assert_eq!(b.paired_devices().devices.len(), 1);
         assert!(matches!(
-            b.authorize(&cookie_header(&cred_b)),
+            b.authorize(&cookie_header(&b, &cred_b)),
             auth::Authorization::Device { .. }
         ));
     }

@@ -1,5 +1,5 @@
 /**
- * The *What's New badge*'s dot is glued to the label it marks.
+ * The *System attention badge*'s dot is glued to the label it marks.
  *
  * A dot is an atomic inline, and line breaking allows a break in front of one.
  * A squeezed label therefore drops its trailing mark onto a line of its own.
@@ -23,19 +23,19 @@ const CSS = readFileSync(
   fileURLToPath(new URL('../global/host-components.css', import.meta.url)), 'utf8',
 );
 const MARKUP = readFileSync(
-  fileURLToPath(new URL('../../components/shared/WhatsNewBadge.tsx', import.meta.url)), 'utf8',
+  fileURLToPath(new URL('../../components/shared/SystemAttentionBadge.tsx', import.meta.url)), 'utf8',
 );
 
 describe('the What\'s New badge dot', () => {
   it('wears the accent token, never a colour of its own', () => {
-    expect(decl(block(CSS, '.whats-new-badge {'), 'background')).toBe('var(--accent)');
+    expect(decl(block(CSS, '.system-attention-badge {'), 'background')).toBe('var(--accent)');
   });
 
   it('takes its corner placement from `.badge`, never a second copy', () => {
     // `.badge` already carries the absolute corner AND, through
     // `.app-header .badge`, the bar's repaint and the ring that stops a mark
     // fusing with its glyph. Restating the geometry here would opt out of both.
-    const corner = block(CSS, '.whats-new-badge-corner {');
+    const corner = block(CSS, '.system-attention-badge-corner {');
     expect(decl(corner, 'position')).toBe(null);
     expect(decl(corner, 'background')).toBe(null);
     // What IS its own: an empty box stays round, where `.badge` pads and
@@ -48,12 +48,12 @@ describe('the What\'s New badge dot', () => {
     // `main.tsx` imports `header.css`, where `.badge` lives, AFTER this sheet.
     // A single-class modifier ties on specificity and loses, so the dot renders
     // at the counted badge's size as an empty pill.
-    expect(CSS).toMatch(/\n\.badge\.whats-new-badge-corner \{/);
+    expect(CSS).toMatch(/\n\.badge\.system-attention-badge-corner \{/);
   });
 });
 
 describe('the inline slot', () => {
-  const slot = block(CSS, '.whats-new-badge-slot {');
+  const slot = block(CSS, '.system-attention-badge-slot {');
 
   it('is a plain inline box, so the joiner is not hidden by an atomic one', () => {
     expect(decl(slot, 'display')).toBe('inline');
@@ -68,7 +68,7 @@ describe('the inline slot', () => {
   });
 
   it('forbids a break either side of the dot', () => {
-    expect(decl(block(CSS, '.whats-new-badge-slot::before {'), 'content')).toBe("'\\2060'");
+    expect(decl(block(CSS, '.system-attention-badge-slot::before {'), 'content')).toBe("'\\2060'");
   });
 
   it('keeps the joiner out of the markup, so it stays out of textContent', () => {

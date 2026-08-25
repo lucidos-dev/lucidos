@@ -175,6 +175,6 @@ that state today.
 
 **Ask the frontend which workspace a window is on.** A command the page calls on
 load. Rejected: the URL already says it, and
-`notifications::window_workspace` already parses it for the notification-tap
+`window_target::window_workspace` already parses it for the notification-tap
 targeting. A page-supplied answer is also a page choosing what gets recorded
 about it.

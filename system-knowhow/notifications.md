@@ -520,7 +520,41 @@ Tests are named after the section ID of the rule they verify. A failing `s2_scen
 
 **Frontend (`crates/lucidos-app/src/store/`):**
 
-The native-desktop OS surface is exercised in `actions/native-push.test.ts` (driven by the `NativePushRequested` SSE): banner on Tauri + fresh + non-active (with the deep link forwarded in SW-message shape), the no-op gates (not Tauri, stale frame, page active), the empty-title `Lucidos` fallback, and `setupNativePushTapRouting` **draining** the durable pending-tap stash (`take_pending_native_taps`) through `dispatchDeepLink` on all four triggers (startup cold path, `native-notification-tapped` warm signal, window `focus`, page `visibilitychange`; plus multi-tap drain, empty-drain no-op, off-Tauri no-op), and the **workspace scoping** the page owes: it drains with its own `WORKSPACE_ID` (re-read per drain, `null` on a no-gateway engine), dispatches everything handed back, and navigates nothing. The **window targeting** behind that is Rust-side and unit-tested in `notifications.rs` (`cargo test -p lucidos-app`): `choose_tap_target` focusing a window already on the raising workspace (preferring `main`), pointing a picker/root window at it, aiming the boot navigation while the client is still starting, opening a NEW window rather than taking one off another workspace, and falling back to the main window for an unattributed tap; plus `tap_belongs_to` leaving another workspace's tap in the stash and `window_context` reading the slug out of a window URL. The active-device **seed** is exercised in `utils/nativeWindow.test.ts`: `startNativeWindowActiveTracking` pulls `get_native_window_active` and seeds the cache (correcting the `true` default) before registering the transition listener, keeps tracking transitions after, leaves the default on a failed seed, and is a no-op off-Tauri.
+The native-desktop OS surface is exercised in `actions/native-push.test.ts`,
+driven by the `NativePushRequested` SSE. It covers the banner on Tauri when the
+frame is fresh and the page is not active, with the deep link forwarded in
+SW-message shape. It covers the three no-op gates: not Tauri, a stale frame, an
+active page. It covers the empty-title `Lucidos` fallback.
+
+It also covers `setupNativePushTapRouting` **draining** the durable pending-tap
+stash (`take_pending_native_taps`) through `dispatchDeepLink`. All four triggers
+are exercised: the startup cold path, the `native-notification-tapped` warm
+signal, window `focus`, and page `visibilitychange`. So are a multi-tap drain,
+an empty-drain no-op and an off-Tauri no-op.
+
+Last comes the **workspace scoping** the page owes. It drains with its own
+`WORKSPACE_ID`, re-read per drain and `null` on a no-gateway engine. It
+dispatches everything handed back, and navigates nothing.
+
+The **window targeting** behind that is Rust-side, and unit-tested with
+`cargo test -p lucidos-app`. `choose_tap_target` (in `notifications.rs`) is
+covered on all five of its outcomes:
+
+- focusing a window already on the raising workspace, preferring `main`;
+- pointing a picker or root window at it;
+- aiming the boot navigation while the client is still starting;
+- opening a NEW window rather than taking one off another workspace;
+- falling back to the main window for an unattributed tap.
+
+Beside it, `tap_belongs_to` is covered leaving another workspace's tap in the
+stash. So is `window_context` reading the slug out of a window URL, which lives
+in `window_target.rs` with the URL helpers both window choosers share.
+
+The active-device **seed** is exercised in `utils/nativeWindow.test.ts`.
+`startNativeWindowActiveTracking` pulls `get_native_window_active` and seeds the
+cache, correcting the `true` default, before registering the transition
+listener. It keeps tracking transitions after, leaves the default on a failed
+seed, and is a no-op off-Tauri.
 
 The §4 row matrix is exercised in `__tests__/notification-toast-requested.test.ts` (driven by the `NotificationToastRequested` SSE, the trigger that replaced the PresenceCheck pong handler) — Row 1 auto-read, Row 2/3 toast, Row 4 hidden no-toast, null-event_id fall-through, the staleness gate (`TOAST_REQUEST_STALE_AFTER_MS`), overflow folding, and the `handleGlobalEvent('NotificationToastRequested')` wiring. The pong-only invariant lives in `actions/presence-pong.test.ts` (`s3_fresh_presence_check_within_grace_pongs_but_does_not_toast` — a fresh, active PresenceCheck pongs but renders NO toast).
 

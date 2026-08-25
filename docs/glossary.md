@@ -206,8 +206,77 @@ The tiny shared crate (`crates/lucidos-tailscale/`, `libc` its only dependency) 
 ### Sigil namespace
 The single reserved path prefix — `~` — under which **all** *Workspace gateway*-owned surface lives: `/~/api/v1/health`, `/~/api/v1/control/*`, and the picker + its bundled assets (`/~/assets/*`, `/~/sw.js`, …). Introduced by ADR 0014 to make the first path segment unambiguous between a workspace and the gateway's own root files **without a growing reserved-word list**: the only rule is that a workspace slug can never start with the sigil — and slugs are `[a-z0-9-]`, so that's automatic (`gateway::registry::slugify`/`is_valid_id`). Replaces 0013's `/ws/<id>/` prefix (which kept workspaces in their own namespace) by flipping it: workspaces get the bare `/<slug>/` and the gateway retreats behind `/~/`.
 
+### Open mode
+Where activating a *workspace* row puts that workspace. `in-place` replaces this view; `separate` puts it beside. One rule for both surfaces that list workspaces, in `crates/lucidos-app/src/utils/workspaceWindow.ts` (`WorkspaceOpenMode`). So the *in-app workspace switcher* and the *workspace picker* cannot disagree.
+
+Every row has a **default mode** and an **alternate mode**. A plain activation takes the default; a right-click offers the alternate as a row of its own. The client shape picks the pair:
+
+| Client | Default | Alternate |
+|---|---|---|
+| Packaged desktop app | `separate`, a native window | `in-place`, "Switch this window" |
+| Browser tab | `in-place` | `separate`, a tab; also cmd-click and middle-click |
+| Installed PWA | `in-place` | none |
+
+A PWA has none because `window.open` there ejects the user into the browser. An alternate is otherwise withheld wherever it would say nothing new. An `unhealthy` row offers neither mode. `in-place` is offered only when this view is already on some OTHER workspace, which is why the picker never shows it.
+
+A `separate` activation is only a REQUEST on the desktop client. The shell answers it with a *window target*, since only the shell can see every window.
+
+### Window target
+Which client window should show a *workspace*. Decided in Rust, because only the client process can see every window, read what each is pointed at, and create one (`crates/lucidos-app/src/window_target.rs`).
+
+`choose_workspace_target` answers a row activation with one of three:
+
+- **`Focus`**: a window is already on that workspace, so front it. This is what keeps a second window off a workspace that has one.
+- **`Navigate`**: the CALLING window is on no workspace, i.e. the picker, so repoint it rather than leave a stray behind.
+- **`NewWindow`**: neither, so build one.
+
+Its sibling `choose_tap_target` answers a native notification banner instead. That one has no calling window. So it may take ANY neutral window, and may aim the boot navigation (`LaunchInto`), neither of which a click may do. Both read the same URL classification (`WindowContext`: `Unnavigated`, `Neutral`, `Workspace(slug)`) and the same `preferred_label`, so they cannot disagree about what a window is. Keyed on the *workspace address* slug throughout, which is also what the *window session* (ADR 0123) remembers a frame by.
+
 ### In-app workspace switcher
-The Lucidos menu's **Workspaces** row and the list it unfolds inside the menu panel (`crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx`): every workspace the *Workspace gateway* serves, each with the status dot the picker draws (the `.ws-picker-dot` vocabulary, and the same `workspaceState` reading behind it), and one tap switches to it. Switching is a plain navigation to the *workspace address* (`openWorkspace`), so a stopped workspace lazy-starts behind the gateway's *boot splash* exactly as it does from the picker; an `unhealthy` one is never opened, since that lands in a dead app shell, and its row links to the picker where Retry lives. **Not a second workspace picker, and never called one**: the *workspace picker* is the gateway's own page under the *sigil namespace* and keeps everything the menu deliberately cannot do (create, rename, delete, restore, start, stop, auto-start, Network access). The list's last row, *Manage workspaces*, is the way there. Gated on **two** conditions that are deliberately not the same one, which is the whole subtlety of the row (`WorkspaceSwitcher.tsx`'s own header comment spells out the trap). `canList` (`WORKSPACE_ID !== null`) is whether the control plane is reachable: the client addresses `/~/api/v1/control/*` as an absolute PATH, so it resolves only while the gateway is this page's ORIGIN, i.e. while we are served under `/<slug>/`. That, and only that, makes the row an expander. `manageHref` (`gatewayPickerHref() !== null`) is the weaker question of whether there is a picker to LINK to, which a direct engine-port page can still answer from the stamped gateway port even though every relative control call there would hit the engine and 404, so that page keeps the plain link out. Neither, on a legacy no-gateway engine: the row stays as the static label that names the workspace you are in. Collapsing the two into one gate puts an expander on the middle case and answers a tap with a 404. The listing is fetched when the row is UNFOLDED, never when the menu opens, and refetched on every unfold; it also feeds `adoptWorkspaceDisplayName`, so a rename made in the picker reaches the header without a reload. Restores the one-tap hop that `docs/plans/2026-08-08-lucidos-menu-absorbs-the-workspace-switcher.md` gave up when it retired `ControlPanel`, whose other three jobs (the brand badge, Refresh, the restart guards) stayed in the menu and are not part of this.
+The Lucidos menu's **Workspaces** row, and the list it unfolds inside the menu
+panel (`crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx`). It
+lists every workspace the *Workspace gateway* serves. Each row carries the
+status dot the picker draws, the same `.ws-picker-dot` vocabulary over the same
+`workspaceState` reading. One tap opens that workspace in this client's default
+*open mode*.
+
+An `in-place` activation is a plain navigation to the *workspace address*
+(`openWorkspace`). So a stopped workspace lazy-starts behind the gateway's
+*boot splash*, exactly as it does from the picker. An `unhealthy` one is never
+opened, since that lands in a dead app shell. Its row links to the picker
+instead, where Retry lives.
+
+**Not a second workspace picker, and never called one.** The *workspace picker*
+is the gateway's own page under the *sigil namespace*. It keeps everything the
+menu deliberately cannot do: create, rename, delete, restore, start, stop,
+auto-start, Network access. The list's last row, *Manage workspaces*, is the way
+there.
+
+Gated on **two** conditions that are deliberately not the same one. That is the
+whole subtlety of the row, and `WorkspaceSwitcher.tsx`'s own header comment
+spells out the trap.
+
+- `canList` (`WORKSPACE_ID !== null`) is whether the control plane is reachable.
+  The client addresses `/~/api/v1/control/*` as an absolute PATH, so it resolves
+  only while the gateway is this page's ORIGIN, i.e. while we are served under
+  `/<slug>/`. That, and only that, makes the row an expander.
+- `manageHref` (`gatewayPickerHref() !== null`) is the weaker question of
+  whether there is a picker to LINK to. A direct engine-port page can still
+  answer it from the stamped gateway port. Every relative control call there
+  would hit the engine and 404, so that page keeps the plain link out.
+- Neither, on a legacy no-gateway engine: the row stays as the static label that
+  names the workspace you are in.
+
+Collapsing the two into one gate puts an expander on the middle case, and
+answers a tap with a 404.
+
+The listing is fetched when the row is UNFOLDED, never when the menu opens, and
+refetched on every unfold. It also feeds `adoptWorkspaceDisplayName`, so a
+rename made in the picker reaches the header without a reload. The row restores
+the one-tap hop that
+`docs/plans/2026-08-08-lucidos-menu-absorbs-the-workspace-switcher.md` gave up
+when it retired `ControlPanel`. That component's other three jobs (the brand
+badge, Refresh, the restart guards) stayed in the menu and are not part of this.
 
 ### Flat back stack
 The invariant that a Lucidos document never leaves another one on the browser's history stack. Every navigation between them replaces the current entry instead of pushing one. `utils/documentNavigation.ts` owns the rule for the navigations a user triggers, and a source scan pins `utils/openExternalUrl.ts` as the only remaining `location.href` assignment. It matters on mobile, where a swipe right from the left screen edge IS iOS's back gesture. `shouldSuppressEdgeNavigation` cannot cancel every touch, so leaving the previous workspace one entry back turned each hole in it into a silent teleport. The cost is that browser back no longer returns to the *workspace picker*, which the *in-app workspace switcher*'s Manage workspaces row reaches instead.

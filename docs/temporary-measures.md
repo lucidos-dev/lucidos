@@ -152,6 +152,32 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   nothing but print their own "runs from the internal checkout" refusal.
 - **Status:** open
 
+### Legacy credential-cookie fallback
+
+- **Added:** 2026-08-25
+- **Lives in:** `gateway/auth.rs::LEGACY_COOKIE_DEVICE_CREDENTIAL` and the
+  fallback arm of `::presented_credential`, plus the `migrating` branch of
+  `auth_api.rs::enforce` that re-issues on sight. Paired with the migration
+  bullet in ADR 0132 § Consequences.
+- **Impermanent because:** ADR 0132 gave each gateway its own cookie name,
+  because a cookie is scoped to the host and ignores the port. Every browser
+  paired before that holds its credential under the old shared name, and
+  refusing it would meet those devices with the pairing screen. The fallback
+  reads it once and hands back this gateway's own name on the same response.
+  It serves only browsers that predate the split.
+- **Removal / resolution condition:** Every device in every gateway's store has
+  made one authorized request since the split, so each browser has adopted the
+  per-gateway name. `last_seen_at` in the store is the read: a row stamped at
+  or after the upgrade has been through the migration. Then:
+  - Delete the const and the fallback arm, so `presented_credential` reads one
+    name and can drop `PresentedCredential` for a plain `Option<&str>`.
+  - Delete the `migrating` branch in `enforce`, leaving the daily beat.
+  - Delete the legacy-cookie tests in `auth.rs` and `auth_api.rs`.
+  - Drop the fallback sentence from ADR 0132 § Decision.
+
+  A device that never comes back was never going to authorize again anyway.
+- **Status:** open
+
 ### Legacy paired-device store seed
 
 - **Added:** 2026-08-25

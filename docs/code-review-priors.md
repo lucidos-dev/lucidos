@@ -816,6 +816,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A total function over an enum keeps every arm, including one today's
+  callers never reach. That is not dead code.** `openModeLabel` in
+  `utils/workspaceWindow.ts` names both `WorkspaceOpenMode` values, and one
+  combination cannot arise right now: it is only ever called with a row's
+  ALTERNATE mode, and `alternateOpenMode` never answers `separate` under Tauri.
+  So `openModeLabel('separate')` cannot take its `'Open in new window'` arm in
+  production, and a reviewer reads it as an unreachable branch against
+  CLAUDE.md's no-dead-code rule.
+
+  Deleting it would make the function WRONG for an input its signature accepts.
+  The next surface to label a row's DEFAULT mode hits that arm at once. It would
+  then get "Open in new tab" on the desktop client, silently. The rule targets
+  code that can never be right to run, not a branch that is correct and
+  currently unvisited. The test that pins the arm is pinning the contract, not
+  asserting live behaviour.
+
+  Re-flag only if the enum itself loses the variant, or if the function stops
+  being total (an arm that throws, or a default that guesses).
+
 - **`answerableQuestionId` reads the DOM rather than the thread projection, and
   the staleness a reviewer sees is not removable by reading the store instead.**
   `scrollState.ts` decides whether a send is really an answer by asking the

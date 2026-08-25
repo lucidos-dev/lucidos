@@ -19,6 +19,12 @@
 //! `native-notification-tapped` — the SAME event + payload shape the page
 //! already routes through `dispatchDeepLink` (`store/actions/native-push.ts`).
 
+#[cfg(any(target_os = "macos", test))]
+use crate::window_target::{
+    is_workspace_slug, labels_in, preferred_label, window_context, window_origin, workspace_url,
+    WindowContext,
+};
+
 /// Separator between the workspace slug and the engine notification id inside a
 /// UN request identifier. Safe on both sides: a uuid never contains it, and a
 /// gateway slug is `[a-z0-9]+(-[a-z0-9]+)*` (`SLUG_RE` in `utils/basePath.ts`).
@@ -135,123 +141,12 @@ fn tap_belongs_to(link: &serde_json::Value, workspace: Option<&str>) -> bool {
     }
 }
 
-/// A workspace slug the gateway would serve. Mirrors `SLUG_RE` in
-/// `utils/basePath.ts` (lowercase alphanumerics joined by single hyphens, no
-/// leading/trailing hyphen), which is itself `registry::slugify`'s output shape.
-/// The gateway's reserved sigil (`/~/…`, ADR 0014) fails it on the character
-/// class, which is why nothing tests for `~` separately.
-///
-/// Compiled on every platform: it is also the gate on the slug a page hands
-/// `crate::open_workspace_window`, not only on a slug read back off a URL.
-pub(crate) fn is_workspace_slug(segment: &str) -> bool {
-    !segment.is_empty()
-        && !segment.starts_with('-')
-        && !segment.ends_with('-')
-        && !segment.contains("--")
-        && segment
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// What an app window's current URL says about where it is pointed.
-#[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowContext<'a> {
-    /// Not pointed at the gateway yet: the declared `main` window still on the
-    /// bundled `tauri://localhost` before `desktop::launch` navigates it.
-    Unnavigated,
-    /// On the gateway but inside no workspace: the picker (`/~/…`) or the bare
-    /// root the picker is reached through. Not a workspace, so reusing it steps
-    /// on nobody.
-    Neutral,
-    /// Serving this workspace (`/<slug>/…`).
-    Workspace(&'a str),
-}
-
-/// Everything after `http://` / `https://`, or `None` for any other scheme.
-/// A non-http URL is the bundled app URL, i.e. a window that has not been
-/// navigated to the gateway.
-fn strip_http_scheme(url: &str) -> Option<&str> {
-    ["http://", "https://"].into_iter().find_map(|prefix| {
-        let (head, rest) = url.split_at_checked(prefix.len())?;
-        head.eq_ignore_ascii_case(prefix).then_some(rest)
-    })
-}
-
-/// The `scheme://host[:port]` a window is served off, or `None` when it is not
-/// on an http(s) URL at all (an unnavigated window). Backs the origin every tap
-/// target URL is built on: the client is normally on the stable loopback
-/// gateway, but a window reached some other way should target itself.
-///
-/// **Deliberately NOT `tauri::Url::origin()`.** That returns the *opaque* origin
-/// for any non-special scheme, which serializes to the literal `"null"`, and the
-/// one URL a window is most likely to be on when a tap arrives during startup is
-/// `tauri://localhost`. Building `null/<slug>/` from that produces a URL nothing
-/// can parse, so `desktop::launch` would fail to navigate and leave the client
-/// on the boot splash for good. Restricting to http(s) by construction is what
-/// makes that unrepresentable.
-///
-/// Also the origin `crate::open_workspace_window` opens a second window on, so
-/// it is compiled on every platform rather than only where the tap delegate is.
-pub(crate) fn window_origin(url: &str) -> Option<&str> {
-    let rest = strip_http_scheme(url)?;
-    let authority = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    (authority > 0).then(|| &url[..url.len() - rest.len() + authority])
-}
-
 /// The origin to build tap-target URLs on: the first window actually served off
 /// one. `None` when no window is (every window unnavigated, or none open), in
 /// which case the caller falls back to this install's stable gateway URL.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn gateway_origin(windows: &[(String, String)]) -> Option<&str> {
     windows.iter().find_map(|(_, url)| window_origin(url))
-}
-
-/// The workspace a window is serving, or `None` when it is serving none.
-///
-/// `None` covers both non-workspace shapes at once, because every caller here
-/// treats them alike: an unnavigated window still on the bundled app URL, and
-/// one on the gateway root or the `~` sigil. [`window_context`] is the same
-/// rule with the two told apart, for the one caller that needs it.
-///
-/// Compiled on every platform: `window_session` records a window's workspace
-/// from its URL, and that is not macOS-only the way the tap delegate is.
-pub(crate) fn window_workspace(url: &str) -> Option<&str> {
-    let after_scheme = strip_http_scheme(url)?;
-    // The authority runs to the first '/', '?' or '#'. Anything but a '/' means
-    // there is no path at all (`http://host`, `http://host?x`), i.e. the root.
-    let path = match after_scheme.find(['/', '?', '#']) {
-        Some(i) if after_scheme.as_bytes()[i] == b'/' => &after_scheme[i + 1..],
-        _ => return None,
-    };
-    let segment = &path[..path.find(['/', '?', '#']).unwrap_or(path.len())];
-    is_workspace_slug(segment).then_some(segment)
-}
-
-/// Has this window reached the gateway at all?
-///
-/// False for the bundled `tauri://localhost` every window starts on, and true
-/// from the moment it is navigated, workspace or picker alike. `window_session`
-/// needs the distinction: a window still on the splash says nothing about the
-/// user's arrangement, while one sitting on the picker says they left it there.
-pub(crate) fn window_is_navigated(url: &str) -> bool {
-    strip_http_scheme(url).is_some()
-}
-
-/// Classify a window by its URL. Pure + platform-independent so the whole
-/// targeting decision is unit-testable off macOS (the UN delegate that drives it
-/// is not).
-#[cfg(any(target_os = "macos", test))]
-fn window_context(url: &str) -> WindowContext<'_> {
-    if let Some(workspace) = window_workspace(url) {
-        return WindowContext::Workspace(workspace);
-    }
-    match strip_http_scheme(url) {
-        // On the gateway but inside no workspace: the root, the `~` sigil, or a
-        // path the gateway would not resolve to a workspace at all.
-        Some(_) => WindowContext::Neutral,
-        None => WindowContext::Unnavigated,
-    }
 }
 
 /// Where a native banner tap should land. Decided in Rust because only the
@@ -271,25 +166,6 @@ pub(crate) enum TapTarget {
     LaunchInto { url: String },
     /// The tap names no workspace: bring the main window forward, as before.
     MainWindow,
-}
-
-/// The gateway URL serving `workspace`, e.g. `http://localhost:3210/myws/`.
-/// `origin` carries no trailing slash; the slug is known-safe (callers gate on
-/// [`is_workspace_slug`]), so nothing needs escaping.
-pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
-    format!("{origin}/{workspace}/")
-}
-
-/// The window a tap prefers among equally eligible ones: `main` when it is in
-/// the running (it is the window a trayed client hides, so reusing it is what
-/// the user sees come back), else the lowest label, so the choice is
-/// deterministic rather than dependent on map iteration order.
-#[cfg(any(target_os = "macos", test))]
-fn preferred_label<'a>(labels: &[&'a str]) -> Option<&'a str> {
-    if labels.contains(&crate::MAIN_WINDOW_LABEL) {
-        return Some(crate::MAIN_WINDOW_LABEL);
-    }
-    labels.iter().min().copied()
 }
 
 /// Pick the window a tap raised by `owner` belongs in, given every top-level app
@@ -319,15 +195,7 @@ pub(crate) fn choose_tap_target(
     };
     let url = workspace_url(origin, owner);
 
-    let labels_where = |want: WindowContext<'_>| -> Vec<&str> {
-        windows
-            .iter()
-            .filter(|(_, url)| window_context(url) == want)
-            .map(|(label, _)| label.as_str())
-            .collect()
-    };
-
-    if let Some(label) = preferred_label(&labels_where(WindowContext::Workspace(owner))) {
+    if let Some(label) = preferred_label(&labels_in(windows, WindowContext::Workspace(owner))) {
         return TapTarget::Focus(label.to_string());
     }
     // Deliberately BEFORE the neutral branch: `main` is unnavigated only while
@@ -338,7 +206,7 @@ pub(crate) fn choose_tap_target(
     }) {
         return TapTarget::LaunchInto { url };
     }
-    if let Some(label) = preferred_label(&labels_where(WindowContext::Neutral)) {
+    if let Some(label) = preferred_label(&labels_in(windows, WindowContext::Neutral)) {
         return TapTarget::Navigate {
             label: label.to_string(),
             url,
@@ -901,57 +769,10 @@ mod tests {
     }
 
     #[test]
-    fn window_context_reads_the_workspace_out_of_a_window_url() {
-        assert_eq!(
-            window_context("http://localhost:3210/myws/"),
-            WindowContext::Workspace("myws")
-        );
-        assert_eq!(
-            window_context("https://host:8443/my-ws-2/#thread=abc"),
-            WindowContext::Workspace("my-ws-2")
-        );
-        // The picker and the gateway root are not workspaces, so a tap may reuse
-        // them without stepping on anything.
-        assert_eq!(
-            window_context("http://localhost:3210/~/"),
-            WindowContext::Neutral
-        );
-        assert_eq!(
-            window_context("http://localhost:3210/~/?pick"),
-            WindowContext::Neutral
-        );
-        assert_eq!(
-            window_context("http://localhost:3210/"),
-            WindowContext::Neutral
-        );
-        assert_eq!(
-            window_context("http://localhost:3210"),
-            WindowContext::Neutral
-        );
-        assert_eq!(
-            window_context("http://localhost:3210?x=1"),
-            WindowContext::Neutral
-        );
-        // Not a slug the gateway would resolve to a workspace.
-        assert_eq!(
-            window_context("http://localhost:3210/Not_A_Slug/"),
-            WindowContext::Neutral
-        );
-        // The bundled app URL: `desktop::launch` has not navigated this window yet.
-        assert_eq!(
-            window_context("tauri://localhost"),
-            WindowContext::Unnavigated
-        );
-        assert_eq!(window_context(""), WindowContext::Unnavigated);
-    }
-
-    #[test]
     fn gateway_origin_is_the_first_window_actually_served_off_one() {
-        // An unnavigated window contributes NO origin. `tauri::Url::origin()` on
-        // `tauri://localhost` returns the opaque origin, which serializes to the
-        // literal "null": building `null/<slug>/` from that yields a URL nothing
-        // can parse, and `desktop::launch` would then never leave the boot splash.
-        // Skipping it and falling back to the stable gateway URL is the fix.
+        // An unnavigated window contributes NO origin, so it is skipped rather
+        // than yielding the literal "null" that nothing can parse. See
+        // `window_target::window_origin`, which owns that rule and its cases.
         assert_eq!(
             gateway_origin(&windows(&[("main", "tauri://localhost")])),
             None
@@ -966,21 +787,6 @@ mod tests {
             ])),
             Some("http://localhost:3210")
         );
-        // No path, https, and a bracketed IPv6 authority all keep their port.
-        assert_eq!(
-            gateway_origin(&windows(&[("main", "http://localhost:3210")])),
-            Some("http://localhost:3210")
-        );
-        assert_eq!(
-            gateway_origin(&windows(&[("main", "https://host.example:8443/~/?pick")])),
-            Some("https://host.example:8443")
-        );
-        assert_eq!(
-            gateway_origin(&windows(&[("main", "http://[::1]:3210/myws/")])),
-            Some("http://[::1]:3210")
-        );
-        // A scheme with no authority at all is not an origin.
-        assert_eq!(gateway_origin(&windows(&[("main", "http://")])), None);
     }
 
     #[test]

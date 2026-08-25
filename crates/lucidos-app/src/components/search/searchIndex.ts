@@ -78,6 +78,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // System subpanels
+  { id: 'release-notices', label: 'Release Notices', subview: 'release-notices', path: 'Settings → System', anchor: 'release-notices:list', keywords: 'release notice notices after upgrade to do action needed workspace audit drift got it answered' },
   { id: 'whats-new', label: "What's New", subview: 'whats-new', path: 'Settings → System', keywords: 'changelog release notes version history whats new updates changes released' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },

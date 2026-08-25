@@ -6,7 +6,7 @@
  * action module reaches compose and chat, and a surface that only wants to know
  * whether anything is owed must not drag those in.
  *
- * The *What's New badge* is what made it matter. Read from the menu drawer, the
+ * The *System attention badge* is what made it matter. Read from the menu drawer, the
  * action module widened the existing import cycle (`pane` to `Drawer` to
  * `menu`) until it reached `connection`. A cycle through a mocked module hands
  * its importers the real one, which is what
@@ -41,7 +41,7 @@ export function releaseNoticeModalOpen(): boolean {
 
 /** How many notices are still owed, counting the one on screen.
  *
- *  Drives the modal's "1 of 3" and the *What's New badge*. Everything from the
+ *  Drives the modal's "1 of 3" and the *System attention badge*. Everything from the
  *  owed one onward is unanswered by construction, so this is a count of the
  *  tail. It answers `0` for every state but `loaded`, so an unknown list is
  *  never reported as work outstanding. */

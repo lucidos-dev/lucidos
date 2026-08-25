@@ -25,6 +25,7 @@ mod traffic_lights;
 mod updater;
 mod window_restore;
 mod window_session;
+mod window_target;
 
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
 /// Boots the bundled Postgres + engine and supervises them with no window. The
@@ -729,7 +730,20 @@ fn open_app_window(
 /// the workspace the user is viewing. Falls back to the gateway on the stable
 /// packaged port, or to the bundled entry in dev.
 fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
-    if let Some(url) = app.get_webview_window("main").and_then(|w| w.url().ok()) {
+    // The FOCUSED window first, which is what this function's own doc promises
+    // and what macOS does. Reading `main` alone opened the second window on
+    // `main`'s workspace. So from any other window, a second window on the one
+    // you were looking at was the single thing New Window could not give you.
+    //
+    // `main` stays the fallback: a tray reopen focuses nothing.
+    let focused = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_app_window(label))
+        .find(|(_, window)| window.is_focused().unwrap_or(false))
+        .map(|(_, window)| window);
+    let source = focused.or_else(|| app.get_webview_window(MAIN_WINDOW_LABEL));
+    if let Some(url) = source.and_then(|w| w.url().ok()) {
         if url.scheme() == "http" || url.scheme() == "https" {
             return WebviewUrl::External(url);
         }
@@ -745,34 +759,38 @@ fn new_window_url(app: &tauri::AppHandle) -> WebviewUrl {
     WebviewUrl::App("index.html".into())
 }
 
-/// The URL a second window on `workspace` should load, or `None` when
-/// `workspace` is not a slug the gateway would serve.
+/// Every top-level app window as `(label, url)`, the shape both window choosers
+/// take. Panel previews are left out: nothing ever targets one.
 ///
-/// The caller's OWN origin is preferred, because that is what the web path does:
-/// both workspace lists reach a workspace as the origin-relative `/<slug>/`. So a
-/// client reached over a tailnet address opens its second window there too. A
-/// dev window on the vite port stays put. `fallback_origin` covers a caller on no
-/// http(s) URL at all, i.e. the bundled asset scheme before `desktop::launch` has
-/// navigated it.
-///
-/// Pure, so the whole rule is unit-testable without a window.
-fn workspace_window_url(
-    caller_url: Option<&str>,
-    workspace: &str,
-    fallback_origin: &str,
-) -> Option<String> {
-    if !notifications::is_workspace_slug(workspace) {
-        return None;
-    }
-    let origin = caller_url
-        .and_then(notifications::window_origin)
-        .unwrap_or(fallback_origin);
-    Some(notifications::workspace_url(origin, workspace))
+/// An unreadable URL reads as "not navigated", which sends that window down the
+/// boot path rather than making it a target. Say so, or it is silently stranded.
+fn app_window_urls(app: &tauri::AppHandle) -> Vec<(String, String)> {
+    app.webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_app_window(label))
+        .map(|(label, window)| {
+            let url = window.url().map(|u| u.to_string()).unwrap_or_else(|e| {
+                eprintln!("[Tauri] Could not read the URL of window {label}: {e}");
+                String::new()
+            });
+            (label, url)
+        })
+        .collect()
 }
 
-/// Open `workspace` in a NEW top-level app window: what "Open in new window"
-/// does on a workspace row, in the gateway picker and in the Lucidos menu's
-/// switcher.
+/// A composed workspace URL as a `tauri::Url`. The composer only ever emits an
+/// http(s) URL, so a failure here means the origin itself was unusable.
+fn parse_window_url(url: &str) -> Result<tauri::Url, String> {
+    url.parse::<tauri::Url>()
+        .map_err(|e| format!("could not open {url}: {e}"))
+}
+
+/// Show `workspace` in a window: what activating its row does on the packaged
+/// desktop client, in the gateway picker and in the Lucidos menu's switcher.
+///
+/// Three outcomes, and `window_target::choose_workspace_target` picks between
+/// them: focus the window already on the workspace, point the calling window at
+/// it, or open a new one.
 ///
 /// A command exists at all because the web answer is unavailable here. A browser
 /// opens a tab with `window.open`, which WKWebView drops: wry installs a
@@ -780,25 +798,45 @@ fn workspace_window_url(
 /// window does.
 ///
 /// It takes a SLUG, never a URL, and composes the URL itself. Every `window-*`
-/// webview holds the full IPC permission set on the gateway origin (ADR 0028). A
-/// URL chosen by the page would therefore be the page choosing what loads in a
-/// window carrying that grant.
+/// webview holds the full IPC permission set on the gateway origin (ADR 0028).
+/// A URL chosen by the page would be the page choosing what loads in a window
+/// carrying that grant.
 #[tauri::command]
-fn open_workspace_window(
+fn show_workspace_window(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     workspace: String,
 ) -> Result<(), String> {
     let caller = window.url().ok().map(|u| u.to_string());
     let fallback = desktop::gateway_url(desktop::engine_port());
-    let url = workspace_window_url(caller.as_deref(), &workspace, &fallback)
-        .ok_or_else(|| format!("{workspace:?} is not a workspace"))?;
-    let parsed = url
-        .parse::<tauri::Url>()
-        .map_err(|e| format!("could not open {url}: {e}"))?;
-    // No frame: this is the user opening a window now, not a launch restoring
-    // one. The session records the size it ends up at, for next time.
-    open_app_window(&app, WebviewUrl::External(parsed), None)
+    let origin = window_target::target_origin(caller.as_deref(), &fallback);
+    let windows = app_window_urls(&app);
+    let target =
+        window_target::choose_workspace_target(&windows, window.label(), &workspace, origin)
+            .ok_or_else(|| format!("{workspace:?} is not a workspace"))?;
+
+    match target {
+        window_target::WorkspaceTarget::Focus(label) => {
+            front_window(&app, &label);
+            Ok(())
+        }
+        window_target::WorkspaceTarget::Navigate { label, url } => {
+            let parsed = parse_window_url(&url)?;
+            let target = app
+                .get_webview_window(&label)
+                .ok_or_else(|| format!("could not point {label} at {url}: no such window"))?;
+            target
+                .navigate(parsed)
+                .map_err(|e| format!("could not point {label} at {url}: {e}"))?;
+            front_window(&app, &label);
+            Ok(())
+        }
+        window_target::WorkspaceTarget::NewWindow { url } => {
+            // No frame: this is the user opening a window now, not a launch
+            // restoring one. The session records the size it ends up at.
+            open_app_window(&app, WebviewUrl::External(parse_window_url(&url)?), None)
+        }
+    }
 }
 
 /// Reopen the extra windows this launch owes, at the frames they were left at.
@@ -1992,20 +2030,7 @@ fn front_window(app: &tauri::AppHandle, label: &str) {
 /// that runs first finds nothing.
 #[cfg(target_os = "macos")]
 pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> Option<String> {
-    let windows: Vec<(String, String)> = app
-        .webview_windows()
-        .into_iter()
-        .filter(|(label, _)| is_app_window(label))
-        .map(|(label, window)| {
-            let url = window.url().map(|u| u.to_string()).unwrap_or_else(|e| {
-                // An unreadable URL reads as "not navigated", which sends the
-                // tap down the boot path. Say so, or it is silently stranded.
-                eprintln!("[Tauri] Could not read the URL of window {label}: {e}");
-                String::new()
-            });
-            (label, url)
-        })
-        .collect();
+    let windows = app_window_urls(app);
 
     // Prefer an origin a window is actually on, so a client reached over
     // something other than the stable loopback URL still targets itself.
@@ -2179,7 +2204,7 @@ pub fn run() {
             toggle_window_maximize,
             set_window_title,
             cursor::set_window_cursor,
-            open_workspace_window,
+            show_workspace_window,
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
@@ -2674,69 +2699,6 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn the_titlebar_script_is_empty_off_macos() {
         assert_eq!(titlebar_inset_script(), "");
-    }
-
-    /// The stable gateway URL, standing in for what the command passes as its
-    /// fallback. Any value works: what the tests pin is when it is reached for.
-    const FALLBACK: &str = "http://localhost:3210";
-
-    /// The second window lands on the origin the CALLING window is already on,
-    /// which is what makes this match the web path's origin-relative `/<slug>/`.
-    #[test]
-    fn a_new_workspace_window_takes_the_callers_own_origin() {
-        assert_eq!(
-            workspace_window_url(Some("http://localhost:3210/dev/?pick"), "work", FALLBACK),
-            Some("http://localhost:3210/work/".to_string())
-        );
-        // Reached over a tailnet address, so the second window goes there too:
-        // sending it to loopback would open a window the user cannot use.
-        assert_eq!(
-            workspace_window_url(Some("https://box.tailnet.ts.net/dev/"), "work", FALLBACK),
-            Some("https://box.tailnet.ts.net/work/".to_string())
-        );
-        // A dev window on the vite port stays on it.
-        assert_eq!(
-            workspace_window_url(Some("http://localhost:5173/~/"), "work", FALLBACK),
-            Some("http://localhost:5173/work/".to_string())
-        );
-    }
-
-    /// A caller on no http(s) origin at all: the bundled asset scheme, before
-    /// `desktop::launch` has navigated the window. `tauri::Url::origin()` would
-    /// answer the literal "null" there, which is why the fallback exists.
-    #[test]
-    fn a_caller_on_no_http_origin_falls_back_to_the_gateway_url() {
-        for caller in [None, Some("tauri://localhost"), Some("")] {
-            assert_eq!(
-                workspace_window_url(caller, "work", FALLBACK),
-                Some("http://localhost:3210/work/".to_string()),
-                "caller {caller:?}"
-            );
-        }
-    }
-
-    /// The page supplies the slug. So this refusal is the whole gate on what can
-    /// load in a window carrying the `window-*` IPC grant (ADR 0028).
-    #[test]
-    fn a_workspace_that_is_not_a_slug_opens_nothing() {
-        for bad in [
-            "",
-            "..",
-            "../../etc",
-            "~",
-            "work/../dev",
-            "Work",
-            "work space",
-            "http://evil.example.com",
-            "-work",
-            "work-",
-        ] {
-            assert_eq!(
-                workspace_window_url(Some("http://localhost:3210/dev/"), bad, FALLBACK),
-                None,
-                "{bad:?} was accepted"
-            );
-        }
     }
 
     #[test]

@@ -17,11 +17,14 @@ describe('settings navigation', () => {
     expect(keys).not.toContain('environment-variables');
     expect(keys).not.toContain('debugging');
     expect(keys).not.toContain('whats-new');
+    expect(keys).not.toContain('release-notices');
     expect(keys).not.toContain('communication-surfaces');
-    // What's New leads: it is the one subpanel a user ARRIVES at rather than
-    // goes looking for (the Lucidos menu's version row opens it, and the update
-    // notice links to it), so it sits closest to Overview's own subject.
-    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
+    // The two a user ARRIVES at lead, notices first. The badge and the notice
+    // modal both send the reader to Release Notices, and the Lucidos menu's
+    // version row opens What's New. Both sit closest to Overview's subject.
+    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['release-notices', 'whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
+    expect(settingsSubviewLabel('release-notices')).toBe('Release Notices');
+    expect(settingsSubviewShortLabel('release-notices')).toBe('Notices');
     expect(settingsSubviewLabel('whats-new')).toBe("What's New");
     expect(settingsSubviewLabel('thread-queue')).toBe('Thread Queue');
     expect(settingsSubviewLabel('backup')).toBe('Backup');

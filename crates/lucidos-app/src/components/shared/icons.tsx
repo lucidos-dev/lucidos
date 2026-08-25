@@ -480,6 +480,19 @@ export function PopOutIcon() {
   );
 }
 
+/** The mirror of {@link PopOutIcon}: the same frame, with the arrow landing
+ *  INSIDE it rather than leaving it. "Switch this window", where the pop-out
+ *  says "open another one". */
+export function PopInIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="12 6 12 12 18 12" />
+      <line x1="21" y1="3" x2="12" y2="12" />
+    </svg>
+  );
+}
+
 export function FullscreenIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

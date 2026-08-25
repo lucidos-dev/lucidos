@@ -17,16 +17,17 @@ import { webviewGoBack, webviewGoForward } from '../../utils/tauri';
 import { MenuIcon, CloseIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { NavChevron, type NavHistoryItem } from '../shared/NavChevron';
-import { WhatsNewBadge } from '../shared/WhatsNewBadge';
-import { whatsNewBadge } from '../../store/whatsNewBadge';
+import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
+import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 
 export function HamburgerButton() {
   const isOpen = drawerOpen.value && !drawerClosing.value;
-  // The first step of the path into What's New, so it carries the mark. The
-  // Settings row inside the menu drawer carries the next one. The mark itself
-  // is decorative, so this button speaks the sentence in its own name (see
-  // `WhatsNewBadge`).
-  const news = whatsNewBadge();
+  // The first step of the path into System, so it carries the mark, and the
+  // union of both causes because it leads to both tabs. The Settings row inside
+  // the menu drawer carries the next step. The mark itself is decorative, so
+  // this button speaks the sentence in its own name (see
+  // `SystemAttentionBadge`).
+  const news = systemAttentionBadge();
   const action = isOpen ? 'Close menu' : 'Open menu';
   const label = news ? `${action} · ${news}` : action;
 
@@ -41,7 +42,7 @@ export function HamburgerButton() {
       data-tooltip={label}
     >
       {isOpen ? <CloseIcon /> : <MenuIcon />}
-      <WhatsNewBadge placement="corner" />
+      <SystemAttentionBadge placement="corner" label={news} />
     </button>
   );
 }

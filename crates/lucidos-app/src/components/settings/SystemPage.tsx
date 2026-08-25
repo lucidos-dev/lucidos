@@ -49,8 +49,9 @@ import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
-import { WhatsNewBadge } from '../shared/WhatsNewBadge';
-import { whatsNewBadge } from '../../store/whatsNewBadge';
+import { ReleaseNoticesPage } from './ReleaseNoticesPage';
+import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
+import { systemTabBadge } from '../../store/systemAttentionBadge';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -60,7 +61,7 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
-export type SystemPanel = 'overview' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
+export type SystemPanel = 'overview' | 'release-notices' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -72,28 +73,31 @@ const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsN
 ];
 
 function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
-  // Read once for the row of tabs: one answer, and only What's New spends it.
-  const news = whatsNewBadge();
   return (
     <div class="settings-section system-subpanel-switcher">
       <div class="settings-row-options system-subpanel-options">
-        {SYSTEM_PANELS.map(item => (
-          <button
-            key={item.key}
-            class={`settings-option${activePanel === item.key ? ' active' : ''}`}
-            aria-current={activePanel === item.key ? 'page' : undefined}
-            // The mark is decorative, so the tab says the words. Only the
-            // badged tab carries a label, for the reason the Settings nav row
-            // gives.
-            aria-label={item.key === 'whats-new' && news ? `${item.label} · ${news}` : undefined}
-            onClick={() => openSettingsSubview(item.subview)}
-          >
-            {item.label}
-            {/* The last step of the path. This switcher renders above Overview
-                too, so the mark is on screen the moment System opens. */}
-            {item.key === 'whats-new' && <WhatsNewBadge placement="inline" />}
-          </button>
-        ))}
+        {SYSTEM_PANELS.map(item => {
+          // BY SOURCE, never the union: this is the last step of the path, so a
+          // mark here promises work on the tab it sits on. An update dotting
+          // Release Notices would send the reader to a page with nothing on it.
+          const badge = systemTabBadge(item.key);
+          return (
+            <button
+              key={item.key}
+              class={`settings-option${activePanel === item.key ? ' active' : ''}`}
+              aria-current={activePanel === item.key ? 'page' : undefined}
+              // The mark is decorative, so the tab says the words. Only a badged
+              // tab carries a label, for the reason the Settings nav row gives.
+              aria-label={badge ? `${item.label} · ${badge}` : undefined}
+              onClick={() => openSettingsSubview(item.subview)}
+            >
+              {item.label}
+              {/* This switcher renders above Overview too, so the mark is on
+                  screen the moment System opens. */}
+              <SystemAttentionBadge placement="inline" label={badge} />
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -200,6 +204,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   function renderPanel() {
     switch (panel) {
+      case 'release-notices': return <ReleaseNoticesPage />;
       case 'whats-new': return <WhatsNewPage />;
       case 'thread-queue': return <ThreadQueueView />;
       case 'backup': return <BackupSection />;

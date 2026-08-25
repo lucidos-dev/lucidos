@@ -1042,7 +1042,12 @@ mod tests {
     /// resident because it is chosen while writing the call: a condition naming
     /// an operator that does not exist is refused, and one naming a field the
     /// old way silently matches nothing.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 115_569;
+    /// Raised by 10 to a measured 115,579 for `navigate_ui`'s `release-notices`
+    /// settings view. *Release notices* moved out of What's New onto their own
+    /// System tab. The agent has to be able to send a user to the tab that owes
+    /// them work. Every other System subpanel but Communication Surfaces is
+    /// already reachable that way.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 115_579;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.30.4 — 2026-08-25
+
+### Changed
+
+- Clicking a workspace opens it the way your client works best. The desktop app opens a window and offers "Switch this window" on right-click. A browser switches in place, and opens a tab on cmd-click or middle-click. An installed PWA stays in one window.
+- A workspace already on screen is focused instead of opened again, so you get one window per workspace, and opening from the picker leaves no stray picker window behind. A browser reuses the tab already showing that workspace.
+- Release notices have their own tab under Settings > System, ahead of What's New. The tab is always there, with an empty state. The attention dot now marks the tab that owes you something: What's New for a waiting update, Release Notices for an unanswered notice.
+- An answered release notice folds into an "Already answered" list, ticked and struck through, so the page opens on what is still owed. Answered and queued notices carry no live button.
+
+### Fixed
+
+- Two Lucidos gateways on one machine each keep their own paired devices. Pairing a phone to one no longer signs it out of the other, and devices paired today stay paired.
+- File > New Window opens on the workspace of the window you are in.
 ## v0.30.3 — 2026-08-25
 
 ### Changed
